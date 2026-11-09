@@ -6,6 +6,8 @@ RequestExecutionLevel user
 SetCompressor zlib
 !include "MUI2.nsh"
 !define MUI_ABORTWARNING
+!define MUI_ICON "@ICON@"
+!define MUI_UNICON "@ICON@"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "@SOURCE@\resources\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
@@ -22,6 +24,7 @@ Section "Any NLE"
   CreateShortcut "$SMPROGRAMS\Any NLE\Any NLE.lnk" "$INSTDIR\any-nle-gui.exe"
   CreateShortcut "$SMPROGRAMS\Any NLE\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Any NLE" "DisplayName" "Any NLE"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Any NLE" "DisplayIcon" "$INSTDIR\any-nle-gui.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Any NLE" "DisplayVersion" "@VERSION@"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Any NLE" "UninstallString" '"$INSTDIR\Uninstall.exe"'
 SectionEnd

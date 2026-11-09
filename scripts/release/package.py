@@ -5,6 +5,7 @@ from build_ffmpeg import fetch, sha
 from appimage_runtime import bundle as appimage_runtime
 from windows_pe import verify as verify_windows_pe
 ROOT=pathlib.Path(__file__).resolve().parents[2]
+ICONS=ROOT/'packaging/icons'
 TARGETS={
 'aarch64-apple-darwin':('macOS_ARM','.zip'), 'x86_64-apple-darwin':('macOS_x64','.zip'),
 'x86_64-pc-windows-msvc':('Windows_x64','.exe'), 'aarch64-pc-windows-msvc':('Windows_ARM','.exe'),
@@ -101,6 +102,8 @@ def package(target,binaries,backend,notices,output,version):
     if 'apple' in target:
         contents=stage/'Any NLE.app/Contents'
         info={'CFBundleName':'Any NLE','CFBundleDisplayName':'Any NLE','CFBundleIdentifier':'industries.whatever.any-nle','CFBundleExecutable':'any-nle-gui','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.1.0','CFBundleVersion':'0.1.0','LSMinimumSystemVersion':'12.0','NSHighResolutionCapable':True}
+        info['CFBundleIconFile']='any-nle.icns'
+        shutil.copy2(ICONS/'any-nle.icns',resources/info['CFBundleIconFile'])
         (contents/'Info.plist').write_bytes(plistlib.dumps(info))
         subprocess.run(['codesign','--force','--deep','--sign','-',str(stage/'Any NLE.app')],check=True)
         subprocess.run(['codesign','--verify','--deep','--strict',str(stage/'Any NLE.app')],check=True)
@@ -113,7 +116,7 @@ def package(target,binaries,backend,notices,output,version):
         resource_dirs=sorted((p for p in resources.rglob('*') if p.is_dir()),key=lambda p:len(p.parts),reverse=True)
         uninstall='\n'.join('  Delete "$INSTDIR\\'+str(p.relative_to(stage)).replace('/','\\')+'"' for p in resource_files)
         uninstall+='\n'+'\n'.join('  RMDir "$INSTDIR\\'+str(p.relative_to(stage)).replace('/','\\')+'"' for p in resource_dirs+[resources])
-        script=(ROOT/'packaging/windows.nsi').read_text().replace('@VERSION@',version).replace('@SOURCE@',str(stage.resolve())).replace('@OUTPUT@',str((output/(stem+extension)).resolve())).replace('@UNINSTALL_RESOURCES@',uninstall)
+        script=(ROOT/'packaging/windows.nsi').read_text().replace('@VERSION@',version).replace('@SOURCE@',str(stage.resolve())).replace('@OUTPUT@',str((output/(stem+extension)).resolve())).replace('@ICON@',str(ICONS/'any-nle.ico')).replace('@UNINSTALL_RESOURCES@',uninstall)
         nsifile=output/(stem+'.nsi'); nsifile.write_text(script)
         makensis=shutil.which('makensis') or r'C:\Program Files (x86)\NSIS\makensis.exe'
         version_output=subprocess.check_output([makensis,'/VERSION'],text=True).strip()
@@ -125,7 +128,7 @@ def package(target,binaries,backend,notices,output,version):
         (stage/'AppRun').write_text('#!/bin/sh\nHERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$HERE/usr/bin/any-nle-gui" "$@"\n')
         (stage/'AppRun').chmod(0o755)
         (stage/'any-nle.desktop').write_text('[Desktop Entry]\nType=Application\nName=Any NLE\nExec=any-nle-gui\nIcon=any-nle\nCategories=AudioVideo;\nTerminal=false\n')
-        shutil.copy2(ROOT/'packaging/any-nle.svg',stage/'any-nle.svg')
+        shutil.copy2(ICONS/'any-nle.png',stage/'any-nle.png')
         arch='aarch64' if target.startswith('aarch64') else 'x86_64'
         spec=json.loads((ROOT/'packaging/ffmpeg.json').read_text())['appimagetool']
         tool=output/('appimagetool-'+arch+'.AppImage')

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify actual extracted packages, target architectures and six-job gate receipts."""
-import argparse,hashlib,json,os,pathlib,shutil,struct,subprocess,tempfile,zipfile
-from package import TARGETS
+import argparse,hashlib,json,os,pathlib,plistlib,shutil,struct,subprocess,tempfile,zipfile
+from package import ICONS,TARGETS
 from build_ffmpeg import sha
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 VERSION='0.1.0-alpha.1'
@@ -19,6 +19,38 @@ def architecture(path,target):
     else:
         if b[:4]!=b'\xcf\xfa\xed\xfe':raise ValueError('expected thin 64-bit Mach-O')
         if struct.unpack_from('<I',b,4)[0]!=(0x0100000c if arm else 0x01000007):raise ValueError('wrong Mach-O architecture')
+
+def verify_launcher_icon(target, extracted, package):
+    if 'apple' in target:
+        contents = extracted/'Any NLE.app/Contents'
+        icon = plistlib.loads((contents/'Info.plist').read_bytes()).get('CFBundleIconFile')
+        if icon != 'any-nle.icns' or sha(contents/'Resources'/icon) != sha(ICONS/icon):
+            raise ValueError('macOS bundle icon mismatch')
+    elif 'linux' in target:
+        icon = sha(ICONS/'any-nle.png')
+        desktop = (extracted/'any-nle.desktop').read_text().splitlines()
+        if 'Icon=any-nle' not in desktop or any(
+            sha(extracted/name) != icon for name in ('any-nle.png', '.DirIcon')
+        ):
+            raise ValueError('AppImage launcher icon mismatch')
+    else:
+        ico = (ICONS/'any-nle.ico').read_bytes()
+        reserved, kind, count = struct.unpack_from('<HHH', ico)
+        if (reserved, kind) != (0, 1) or not 1 <= count <= 16:
+            raise ValueError('invalid Windows icon source')
+        images = []
+        for i in range(count):
+            size, start = struct.unpack_from('<II', ico, 6 + 16*i + 8)
+            image = ico[start:start + size]
+            if len(image) != size or not image.startswith(b'\x89PNG\r\n\x1a\n'):
+                raise ValueError('invalid Windows icon image')
+            images.append(image)
+        # RC and NSIS retain the exact PNG icon payloads in the PE resources.
+        for path in (package, extracted/'any-nle-gui.exe'):
+            binary = path.read_bytes()
+            if not all(image in binary for image in images):
+                raise ValueError('Windows launcher icon mismatch: ' + path.name)
+
 def verify_package(target,directory,version):
     directory=pathlib.Path(directory);suffix,extension=TARGETS[target];stem=f'Any.NLE_{suffix}_v{version}'
     package=directory/(stem+extension);stage=directory/(stem+'.stage')
@@ -48,6 +80,7 @@ def verify_package(target,directory,version):
             if p.is_file():
                 counterpart=extracted/p.relative_to(stage)
                 if not counterpart.is_file() or sha(p)!=sha(counterpart):raise ValueError('extracted package differs from audited stage')
+        verify_launcher_icon(target,extracted,package)
         m=json.loads((bindir/'backend-manifest.json').read_text())
         if m['target']!=target:raise ValueError('manifest target mismatch')
         for name in ('any-nle','any-nle-gui','ffmpeg','ffprobe'):
@@ -61,7 +94,7 @@ def verify_package(target,directory,version):
             if not result.startswith(name+' version 8.1 '):raise ValueError('packaged backend smoke failed')
             if any(f in result for f in ('--enable-gpl','--enable-version3','--enable-nonfree')):raise ValueError('packaged forbidden backend license')
         if 'apple' in target:subprocess.run(['codesign','--verify','--deep','--strict',str(temp/'Any NLE.app')],check=True)
-    receipt={'schema':'anynle.candidate-verification/1','target':target,'version':version,'package':package.name,'sha256':sha(package),'extracted_bytes_match':True,'architecture_verified':True,'cli_smoke':True,'backend_smoke':True}
+    receipt={'schema':'anynle.candidate-verification/1','target':target,'version':version,'package':package.name,'sha256':sha(package),'extracted_bytes_match':True,'architecture_verified':True,'launcher_icon_verified':True,'cli_smoke':True,'backend_smoke':True}
     pathlib.Path('candidate-verification.json').write_text(json.dumps(receipt,indent=2)+'\n');print(json.dumps(receipt));return receipt
 
 def verify_all(directory,version):
@@ -70,7 +103,7 @@ def verify_all(directory,version):
         candidate=directory/('any-nle-'+suffix)
         r=json.loads((candidate/'candidate-verification.json').read_text());p=candidate/f'Any.NLE_{suffix}_v{version}{ext}'
         if r['target']!=target or r['version']!=version or r['package']!=p.name or sha(p)!=r['sha256']:raise ValueError('candidate verification does not bind asset')
-        if not all(r[k] for k in ('extracted_bytes_match','architecture_verified','cli_smoke','backend_smoke')):raise ValueError('candidate gate incomplete')
+        if not all(r[k] for k in ('extracted_bytes_match','architecture_verified','launcher_icon_verified','cli_smoke','backend_smoke')):raise ValueError('candidate gate incomplete')
         public=json.loads((candidate/'public-acceptance.json').read_text())
         if public['profile']!='synthetic-only' or public['passed']<92 or public['private_corpus_qualification'] is not False:raise ValueError('public qualification gate invalid')
         smoke=json.loads((candidate/'backend-smoke.json').read_text())
