@@ -95,6 +95,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y build-essential pkg-config libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libssl-dev
+      - name: Run explicit public synthetic profile
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        shell: bash
+        run: |
+          python scripts/public_acceptance.py --output public-checks
+          python -m unittest discover -s scripts/release -p test_release.py -v
       - name: Install Windows FFmpeg build tools
         if: startsWith(matrix.runner, 'windows-')
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
@@ -113,13 +120,6 @@ jobs:
       - name: Exercise bundled backend with synthetic picture and PCM
         shell: bash
         run: python scripts/release/backend_smoke.py --backend backend --target '${{ matrix.target }}' --output backend-smoke.json
-      - name: Run explicit public synthetic profile
-        env:
-          PYTHON: ${{ steps.python.outputs.python-path }}
-        shell: bash
-        run: |
-          python scripts/public_acceptance.py --output public-checks
-          python -m unittest discover -s scripts/release -p test_release.py -v
       - name: Build native Rust GUI and CLI
         shell: bash
         run: cargo build --locked --release --manifest-path crates/Cargo.toml --target '${{ matrix.target }}' --bin any-nle --bin any-nle-gui

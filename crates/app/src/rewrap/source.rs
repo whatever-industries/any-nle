@@ -156,6 +156,12 @@ pub(super) fn free_space(parent: &Path) -> R<u64> {
     // available_space queries bytes available to this user on the target volume;
     // fs2 uses GetDiskFreeSpaceExW on Windows and statvfs on Unix. Do not use a
     // subprocess or total free blocks (which can include privileged reserves).
+    // On Windows a volume query can succeed for a nonexistent path.
+    let metadata = std::fs::metadata(parent)
+        .map_err(|e| format!("cannot read available disk space: {e}"))?;
+    if !metadata.is_dir() {
+        return Err("cannot read available disk space: destination is not a directory".into());
+    }
     fs2::available_space(parent).map_err(|e| format!("cannot read available disk space: {e}"))
 }
 
