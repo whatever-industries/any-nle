@@ -522,7 +522,7 @@ Review licence and provenance before code adoption.
 - **Avid local API as a read-back oracle (test tool only, never a product dependency).**
       Media Composer embeds an undocumented local gRPC service `mcapi.MCAPI` (third-party
       research: github.com/leancoderkavy/avid-media-composer-mcp, MIT, docs/NATIVE_API_RESEARCH.md;
-      49 methods, port 9100, no SDK needed on Windows 2024.12). The User's Mac build 2025.12.0.58863
+      49 methods on port 9100 in the Windows 2024.12 report). The User's Mac build 2025.12.0.58863
       contains the same `MCAPI.proto` / `MCAPI_Types.proto` descriptors (GetMarkers, ExportFile, ...).
       Plan: confirm the listener with Avid open; read-only probe (reflection, GetAppInfo, GetBins,
       GetMobInfo, GetMobTrackInfo, GetMarkers, GetBinColumnInfo) on a disposable copy of an existing
