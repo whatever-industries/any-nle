@@ -19,7 +19,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: native-release-${{ inputs.version }}
+  group: native-release-build-${{ inputs.version }}-${{ github.sha }}
   cancel-in-progress: false
 jobs:
   build:
@@ -169,6 +169,9 @@ jobs:
           path: release-candidate/
   release:
     needs: build
+    concurrency:
+      group: native-release-publish-${{ inputs.version }}
+      cancel-in-progress: false
     runs-on: ubuntu-22.04
     permissions:
       contents: write

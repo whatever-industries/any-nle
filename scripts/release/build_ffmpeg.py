@@ -20,7 +20,9 @@ def build(target, output, work):
     if not source.exists():
         with tarfile.open(archive) as t: t.extractall(work, filter='data')
     config = list(spec['configure'])
-    if 'windows' in target:
+    windows = 'windows' in target
+    suffix = '.exe' if windows else ''
+    if windows:
         # FFmpeg is built with MinGW/clang, independently from the MSVC Rust app.
         # Static compiler runtimes avoid a hidden dependency on an MSYS2 install.
         config += ['--target-os=mingw32', '--extra-ldflags=-static']
@@ -31,7 +33,8 @@ def build(target, output, work):
     build_log = work/'build.log'
     try:
         with build_log.open('w') as log:
-            for cmd in (['sh', './configure', *config], ['make', '-j', str(min(os.cpu_count() or 2, 8)), 'ffmpeg', 'ffprobe']):
+            programs = ['ffmpeg' + suffix, 'ffprobe' + suffix]
+            for cmd in (['sh', './configure', *config], ['make', '-j', str(min(os.cpu_count() or 2, 8)), *programs]):
                 subprocess.run(cmd, cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
     except (OSError, subprocess.CalledProcessError):
         for path in (build_log, source/'ffbuild'/'config.log'):
@@ -40,7 +43,6 @@ def build(target, output, work):
                     print(f'Last lines of {path.name}:', file=sys.stderr)
                     sys.stderr.writelines(deque(log, maxlen=40))
         raise
-    suffix = '.exe' if 'windows' in target else ''
     tools = {}
     for name in ('ffmpeg', 'ffprobe'):
         p = output/(name+suffix); shutil.copy2(source/(name+suffix), p)
