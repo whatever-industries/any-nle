@@ -249,13 +249,22 @@ fn posix_abspath(path: &str) -> String {
 }
 
 /// A media path's relative form on save and in the converter's OP-Atom builder.
+fn is_windows_absolute(path: &str) -> bool {
+    let b = path.as_bytes();
+    let separator = |byte| matches!(byte, b'/' | b'\\');
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && separator(b[2]) {
+        return true;
+    }
+    if b.len() < 2 || !separator(b[0]) || !separator(b[1]) {
+        return false;
+    }
+    let mut unc = path[2..].split(['/', '\\']);
+    !unc.next().unwrap_or("").is_empty() && !unc.next().unwrap_or("").is_empty()
+}
+
 /// Absolute Windows drive/UNC paths stay absolute rather than passing through a POSIX cwd.
 pub fn media_relpath(path: &str, start: &str) -> String {
-    let windows = path.replace('\\', "/");
-    let b = windows.as_bytes();
-    let mut unc = windows.strip_prefix("//").unwrap_or("").split('/');
-    let unc_absolute = !unc.next().unwrap_or("").is_empty() && !unc.next().unwrap_or("").is_empty();
-    if (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/') || unc_absolute {
+    if is_windows_absolute(path) {
         return path.to_string();
     }
     relpath(path, start)
@@ -277,9 +286,13 @@ pub fn relpath(path: &str, start: &str) -> String {
     }
 }
 
-/// Python `os.path.basename` on POSIX.
+/// The filename in a POSIX path or an absolute Windows drive/UNC path.
 pub fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    if is_windows_absolute(path) {
+        path.rsplit(['/', '\\']).next().unwrap_or(path)
+    } else {
+        path.rsplit('/').next().unwrap_or(path)
+    }
 }
 
 /// `ET.SubElement(parent, tag, {attr: value}).tail = tail`.
@@ -977,5 +990,12 @@ mod tests {
         assert_eq!(relpath("/x/c.mxf", "/a/b"), "../../x/c.mxf");
         assert_eq!(relpath("/a/b", "/a/b"), ".");
         assert_eq!(relpath("/a//b/./c/../d", "/a"), "b/d");
+    }
+
+    #[test]
+    fn media_titles_use_windows_and_posix_filename_rules() {
+        assert_eq!(basename(r"C:\Media\example.mov"), "example.mov");
+        assert_eq!(basename(r"\\server\share\example.wav"), "example.wav");
+        assert_eq!(basename(r"/media/example\name.mov"), r"example\name.mov");
     }
 }

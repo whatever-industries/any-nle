@@ -26,6 +26,8 @@ import uuid
 import xml.etree.ElementTree as ET
 from typing import TYPE_CHECKING, NamedTuple
 
+from .media_paths import media_basename
+
 if TYPE_CHECKING:
     from typing import Iterator
 
@@ -1295,7 +1297,7 @@ def new_movie_media(
     )
     _leaf(element, "FilePath", file_path, "\n\t\t")
     _leaf(element, "ImplementationID", _BMP_IMPLEMENTATION_ID, "\n\t\t")
-    _leaf(element, "Title", os.path.basename(file_path), "\n\t\t")
+    _leaf(element, "Title", media_basename(file_path), "\n\t\t")
     _leaf(element, "FileKey", str(uuid.uuid4()), "\n\t\t")
     if conformed_rate is not None:
         _leaf(element, "ConformedAudioRate", str(conformed_rate), "\n\t\t")
@@ -1386,7 +1388,7 @@ def new_audio_media(
     )
     _leaf(element, "FilePath", file_path, "\n\t\t")
     _leaf(element, "ImplementationID", _BMP_IMPLEMENTATION_ID, "\n\t\t")
-    _leaf(element, "Title", os.path.basename(file_path), "\n\t\t")
+    _leaf(element, "Title", media_basename(file_path), "\n\t\t")
     _leaf(element, "FileKey", file_key, "\n\t\t")
     _leaf(element, "ConformedAudioRate", str(conformed_rate), "\n\t\t")
     if stream_number:
@@ -1519,7 +1521,7 @@ def new_media(
     )
     _leaf(element, "FilePath", file_path, "\n\t\t")
     _leaf(element, "ImplementationID", _BMP_IMPLEMENTATION_ID, "\n\t\t")
-    _leaf(element, "Title", os.path.basename(file_path), "\n\t\t")
+    _leaf(element, "Title", media_basename(file_path), "\n\t\t")
     _leaf(element, "FileKey", str(uuid.uuid4()), "\n\t\t")
     _leaf(element, "Infinite", "true", "\n\t\t")
     _leaf(element, "ContentAndMetadataState", content_state, "\n\t\t")

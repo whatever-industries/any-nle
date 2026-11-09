@@ -6,7 +6,7 @@ SUITES=[('gui',['-p','anynle-gui','--lib'],6),('inventory',['-p','anynle-app','-
 APP_TESTS=['rewrap::source::space_tests::available_space_queries_existing_volume','rewrap::source::space_tests::available_space_missing_path_refuses','rewrap::tests::existing_destination_is_refused_before_backend_or_inputs','rewrap::tests::pcm_counter_rejects_truncated_klv_and_counts_payload_bytes','rewrap::tests::private_klv_keys_are_allowed_only_inside_declared_header_metadata','rewrap::tests::exact_timecode_and_invalid_origins','rewrap::tests::mov_lane_admission_refuses_unqualified_width_before_source_access','rewrap::execution::ownership_tests::exclusive_creation_reports_only_the_owned_media_directory']
 def run(output):
     output=pathlib.Path(output); output.mkdir(parents=True,exist_ok=True)
-    results=[]
+    results=[]; failures=[]
     selected=[(n,args,minimum,ROOT/'crates/Cargo.toml') for n,args,minimum in SUITES+[(n,['-p','anynle-app','--lib',n],1) for n in APP_TESTS]]
     selected += [(n,['--test',n],minimum,ROOT/'prproj/Cargo.toml') for n,minimum in [('original_media',3),('destination_layout',6)]]
     selected += [('source_open_cancellation',['--lib','source::progress_tests::cancellation_observer_runs_before_a_bin_is_opened'],1,ROOT/'avid-reader/Cargo.toml')]
@@ -18,8 +18,12 @@ def run(output):
         counts=re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;',log)
         passed=sum(int(a) for a,b,c in counts)
         if proc.returncode or passed<minimum or any(int(b) or int(c) for a,b,c in counts) or re.search(r'(?im)^.*\b(skip|skipped|skipping)\b',log):
-            print(log); raise ValueError('public profile failed or incomplete: '+name)
+            print(log)
+            failures.append(name)
+            continue
         results.append({'suite':name,'passed':passed,'minimum':minimum,'failed':0,'ignored':0})
+    if failures:
+        raise ValueError('public profile failed or incomplete: '+', '.join(failures))
     receipt={'schema':'anynle.public-acceptance/1','profile':'synthetic-only','platform':platform.system(),'architecture':platform.machine(),'platform_exclusions':['Unix-only symlink and /bin/sh child-process controls'] if os.name=='nt' else [],'private_corpus_qualification':False,'suites':results,'passed':sum(r['passed'] for r in results)}
     (output/'public-acceptance.json').write_text(json.dumps(receipt,indent=2)+'\n'); print(json.dumps(receipt))
 if __name__=='__main__':
