@@ -53,11 +53,9 @@ Implementation, evidence and remaining gates.
       descriptors, profiles, legacy AMA and other platforms.
 - [x] Remove the identified private diagnostics from reachable GitHub export history.
       The reviewed private export and cleanup evidence are retained.
-- [ ] Finalize the public-release decision. The last private audit recorded residual
-      server-side objects, with a Support request submitted. The repository remains
-      private. Source and export history.
-- [ ] Run the six-target CI build and audit the extracted packages before release.
-      [Release gates](RELEASE.md).
+- [x] Publish [Any NLE v0.1.0-alpha.1](https://github.com/whatever-industries/any-nle/releases/tag/v0.1.0-alpha.1)
+      from the reviewed public source. All six platform builds, extracted-package audits
+      and download checksum checks passed. [Release gates](RELEASE.md).
 
 ## Cataloged audio configuration gaps (User, 2026-11-07)
 
@@ -482,9 +480,12 @@ Review licence and provenance before code adoption.
       presets and job replay, and shows space estimates and **“Creates new media.”**
       before execution. The completion page offers the output folder, searchable
       report and Open in Premiere when installed. [Current wizard](GUI-WIZARD.md).
-- [ ] **Finish application qualification.** Run the final packaged wizard and
-      backend on supported platforms, with native Premiere read-back where available.
-      Release packaging and audit gates are tracked above.
+- [ ] **Test the published macOS package in Premiere.** Convert a small Avid bin
+      through the packaged wizard and its bundled backend. Check picture, timecode
+      and audio routing in Premiere, including after save and reopen.
+- [ ] **Next platform check: Windows x64.** Install the published package, run the
+      same bin through the wizard and repeat the Premiere checks. Keep the remaining
+      platform checks open until they have their own evidence.
 - [ ] **Extend the wizard for new directions and destination versions.** Reuse the
       direction-specific flow when another route is implemented. Offer a target
       Premiere version choice when the output differs by version. Proxy and
