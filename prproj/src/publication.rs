@@ -44,7 +44,7 @@ fn exclusive_rename(stage: &Path, target: &Path) -> io::Result<bool> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in staging path"))?;
     let new = CString::new(target.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in project path"))?;
-    // SDK sys/stdio.h: RENAME_EXCL=4. Availability is a filesystem capability.
+    // Darwin sys/stdio.h defines RENAME_EXCL as 4. Support depends on the filesystem.
     if unsafe { renamex_np(old.as_ptr(), new.as_ptr(), 4) } == 0 {
         return Ok(true);
     }
