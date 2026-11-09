@@ -480,12 +480,18 @@ Review licence and provenance before code adoption.
       presets and job replay, and shows space estimates and **“Creates new media.”**
       before execution. The completion page offers the output folder, searchable
       report and Open in Premiere when installed. [Current wizard](GUI-WIZARD.md).
-- [ ] **Test the published macOS package in Premiere.** Convert a small Avid bin
-      through the packaged wizard and its bundled backend. Check picture, timecode
-      and audio routing in Premiere, including after save and reopen.
+- [x] **Run the published Apple Silicon package through Premiere.** The wizard and
+      bundled backend converted a small 23.976 Avid split-edit bin. Both sequences
+      opened online and played to the end in Premiere 26.5.2. Sampled picture and
+      rendered PCM matched the retained reference after save and reopen, including
+      separate checks of both mono lanes. Absolute sequence start remains open below.
 - [ ] **Next platform check: Windows x64.** Install the published package, run the
       same bin through the wizard and repeat the Premiere checks. Keep the remaining
       platform checks open until they have their own evidence.
+- [ ] **Qualify the exact 23.976 sequence start.** The fixture's Avid TC1 starts at
+      `01:00:00:00`. Premiere displays `00:59:56:09` from the current compatibility
+      origin, including after save and reopen. Preserve the tested relative edit
+      timing while qualifying the absolute clock.
 - [ ] **Extend the wizard for new directions and destination versions.** Reuse the
       direction-specific flow when another route is implemented. Offer a target
       Premiere version choice when the output differs by version. Proxy and
