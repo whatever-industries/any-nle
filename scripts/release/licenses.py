@@ -127,7 +127,7 @@ def collect(output, source_root=ROOT):
                 for row in selected:
                     path = supplements / row['file']
                     if hashlib.sha256(path.read_bytes()).hexdigest() != row['sha256']:
-                        raise ValueError('license supplement hash mismatch')
+                        raise ValueError('license supplement hash mismatch: ' + row['file'])
                     target = output / 'licenses/rust' / (package['name'] + '-' + package['version']) / row['file']
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(path, target)

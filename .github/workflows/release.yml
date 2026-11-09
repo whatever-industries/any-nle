@@ -102,6 +102,9 @@ jobs:
         run: |
           python scripts/public_acceptance.py --output public-checks
           python -m unittest discover -s scripts/release -p test_release.py -v
+      - name: Collect dependency licenses and SBOM
+        shell: bash
+        run: python scripts/release/licenses.py notices
       - name: Install Windows FFmpeg build tools
         if: startsWith(matrix.runner, 'windows-')
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
@@ -123,9 +126,6 @@ jobs:
       - name: Build native Rust GUI and CLI
         shell: bash
         run: cargo build --locked --release --manifest-path crates/Cargo.toml --target '${{ matrix.target }}' --bin any-nle --bin any-nle-gui
-      - name: Collect dependency licenses and SBOM
-        shell: bash
-        run: python scripts/release/licenses.py notices
       - name: Install Windows installer compiler
         if: startsWith(matrix.runner, 'windows-')
         shell: pwsh
