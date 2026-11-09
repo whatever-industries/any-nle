@@ -1,0 +1,13 @@
+[package]
+name = "anynle-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Projection between the converter's avid2prproj.model/1 and anynle.graph/1"
+publish = false
+
+[lib]
+name = "bridge"
+
+[dependencies]
+anynle-graph = { path = "../graph" }
+prproj = { path = "../../prproj" }

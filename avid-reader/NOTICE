@@ -1,0 +1,33 @@
+avid-reader contains a partial Rust port of pyavb
+(https://github.com/markreidvfx/pyavb, commit ff64e06b60077ecabe5db3fef239898b08363898):
+the AVB container/object-table layout and the read() logic of the classes listed in
+src/objects.rs. pyavb is MIT-licensed, Copyright (c) 2022 Mark Reid; its license text is in
+LICENSE-pyavb. The MXF header reader (src/mxf.rs) is written from SMPTE ST 377-1 and does not
+derive from pyavb or Filmcraft.
+
+src/interpolation.rs ports all numerical functions in pyavb's
+src/avb/interpolation.py at the same pinned revision (MIT, Copyright (c) 2022
+Mark Reid). A synthetic oracle fixture was generated from that revision.
+Matching pyavb calculations does not establish Avid rendering equivalence.
+
+src/parameter_registry_data.rs contains the 735 UUID/name entries from pyavb's
+src/avb/parameter_uuids.py at the same pinned revision (MIT, Copyright (c) 2022
+Mark Reid). The names were extracted from AAF files by pyavb and are not
+independently verified Avid UI meanings.
+
+src/bin_nav.rs ports the read-only Bin navigation helpers from pyavb's
+src/avb/bin.py at the same pinned revision (MIT, Copyright (c) 2022 Mark Reid).
+
+src/bin_writer.rs ports bounded payload serialization for ABIN, BINF, ASET,
+BVst and ATTR from pyavb bin.py and attributes.py at the same pinned revision
+(MIT, Copyright (c) 2022 Mark Reid). It does not write complete AVB files.
+
+src/misc_writer.rs ports bounded payload serialization for APOS, ABOB, DIDP,
+MCBR, MCMR and TMBC from pyavb misc.py at the same pinned revision (MIT,
+Copyright (c) 2022 Mark Reid). It does not write complete AVB files.
+
+src/animatte.rs is a port of FilmCraft's bounded AniMatte reader
+(https://github.com/storytold/filmcraft, PR #1056 at dd9457a978040899dfb171e63d9979c41678ad5c,
+crates/interchange/src/avid_bin/animatte.rs), MIT-licensed, Copyright (c) 2026 ArtCraft Team and
+the FilmCraft contributors; its license text is in LICENSE-filmcraft. Ported at the User's
+request (2026-10-20); this crate does not depend on or link FilmCraft code.

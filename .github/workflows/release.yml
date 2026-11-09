@@ -1,0 +1,182 @@
+name: Native release candidate
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Reviewed release version
+        required: true
+        default: 0.1.0-alpha.1
+      private_gate_sha256:
+        description: SHA256 of the retained private full acceptance and privacy receipt
+        required: true
+      qualified_source_sha:
+        description: Reviewed filtered export commit SHA (must equal this run checkout)
+        required: true
+      publish:
+        description: Publish after all six candidates and uploaded hashes pass
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: native-release-${{ inputs.version }}
+  cancel-in-progress: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            suffix: macOS_ARM
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            suffix: macOS_x64
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: Windows_x64
+            msystem: UCRT64
+            compiler: mingw-w64-ucrt-x86_64-toolchain
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            suffix: Windows_ARM
+            msystem: CLANGARM64
+            compiler: mingw-w64-clang-aarch64-toolchain
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            suffix: Linux_x64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: Linux_ARM
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      RUSTFLAGS: ${{ startsWith(matrix.runner, 'windows-') && '-C target-feature=+crt-static' || '' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Validate reviewed inputs and source export
+        env:
+          VERSION: ${{ inputs.version }}
+          PRIVATE_GATE: ${{ inputs.private_gate_sha256 }}
+          QUALIFIED_SOURCE: ${{ inputs.qualified_source_sha }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os,pathlib,re,subprocess
+          assert os.environ['VERSION']=='0.1.0-alpha.1'
+          assert re.fullmatch('[0-9a-f]{64}',os.environ['PRIVATE_GATE'])
+          source=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert re.fullmatch('[0-9a-f]{40}',os.environ['QUALIFIED_SOURCE'])
+          assert os.environ['QUALIFIED_SOURCE']==source==os.environ['GITHUB_SHA'],'qualified source differs from run checkout'
+          forbidden='prproj/tests/data/convert_model/golden/'
+          paths=subprocess.check_output(['git','ls-tree','-r','--name-only','HEAD'],text=True).splitlines()
+          assert not any(p.startswith(forbidden) for p in paths),'private fixture path in publication tree'
+          pathlib.Path('gate-binding.txt').write_text('private-receipt-sha256 '+os.environ['PRIVATE_GATE']+'\nsource '+subprocess.check_output(['git','rev-parse','HEAD'],text=True))
+          PY
+      - name: Install exact Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup target add '${{ matrix.target }}' --toolchain 1.95.0
+          rustup default 1.95.0
+          rustc --version
+          cargo --version
+      - name: Install Linux native development dependencies
+        if: startsWith(matrix.runner, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libssl-dev
+      - name: Install Windows FFmpeg build tools
+        if: startsWith(matrix.runner, 'windows-')
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: base-devel git python ${{ matrix.compiler }}
+          cache: false
+      - name: Build pinned LGPL backend on Windows
+        if: startsWith(matrix.runner, 'windows-')
+        shell: msys2 {0}
+        run: python3 scripts/release/build_ffmpeg.py --target '${{ matrix.target }}' --output backend --work backend-work
+      - name: Build pinned LGPL backend on Unix
+        if: "!startsWith(matrix.runner, 'windows-')"
+        run: python scripts/release/build_ffmpeg.py --target '${{ matrix.target }}' --output backend --work backend-work
+      - name: Exercise bundled backend with synthetic picture and PCM
+        shell: bash
+        run: python scripts/release/backend_smoke.py --backend backend --target '${{ matrix.target }}' --output backend-smoke.json
+      - name: Run explicit public synthetic profile
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+        shell: bash
+        run: |
+          python scripts/public_acceptance.py --output public-checks
+          python -m unittest discover -s scripts/release -p test_release.py -v
+      - name: Build native Rust GUI and CLI
+        shell: bash
+        run: cargo build --locked --release --manifest-path crates/Cargo.toml --target '${{ matrix.target }}' --bin any-nle --bin any-nle-gui
+      - name: Collect dependency licenses and SBOM
+        shell: bash
+        run: python scripts/release/licenses.py notices
+      - name: Install Windows installer compiler
+        if: startsWith(matrix.runner, 'windows-')
+        shell: pwsh
+        run: |
+          $nsis = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          $version = if (Test-Path $nsis) { & $nsis /VERSION } else { '' }
+          if ($version -ne 'v3.11') { choco upgrade nsis --version=3.11 --allow-downgrade --yes --no-progress }
+          if ((& $nsis /VERSION) -ne 'v3.11') { throw 'Reviewed NSIS 3.11 is required' }
+      - name: Package native release
+        shell: bash
+        run: python scripts/release/package.py --target '${{ matrix.target }}' --binaries 'crates/target/${{ matrix.target }}/release' --backend backend --notices notices --output dist --version '${{ inputs.version }}'
+      - name: Audit packaged files and provenance
+        shell: bash
+        run: |
+          python scripts/release/audit.py 'dist/Any.NLE_${{ matrix.suffix }}_v${{ inputs.version }}.stage' --known-upstream-fixtures packaging/audit-known-upstream-fixtures.json --output package-audit.json
+          python scripts/release/verify_candidate.py --target '${{ matrix.target }}' --output dist --version '${{ inputs.version }}'
+      - name: Retain privately reviewable candidate and exact checks
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: any-nle-${{ matrix.suffix }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            dist/Any.NLE_*.zip
+            dist/Any.NLE_*.exe
+            dist/Any.NLE_*.AppImage
+            dist/Any.NLE_*.provenance.tar.gz
+            dist/Any.NLE_*.sha256
+            package-audit.json
+            backend-smoke.json
+            candidate-verification.json
+            public-checks/public-acceptance.json
+            gate-binding.txt
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: any-nle-*
+          path: candidates
+      - name: Verify all six packages before staging
+        run: python3 scripts/release/verify_candidate.py --all candidates --version '${{ inputs.version }}'
+      - name: Stage, download-verify, and optionally publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+        run: python3 scripts/release/publish.py --candidates candidates --version "$VERSION" --publish "$PUBLISH"

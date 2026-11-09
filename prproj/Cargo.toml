@@ -1,0 +1,14 @@
+[package]
+name = "prproj"
+version = "0.1.0"
+edition = "2021"
+description = "Adobe Premiere Pro .prproj document core (Rust port of py_premiere's xml layer)"
+license = "MIT"
+publish = false
+
+[dependencies]
+# zlib backend (system libz on macOS) so deflate output matches Python's zlib byte for byte.
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+
+[profile.release]
+overflow-checks = true

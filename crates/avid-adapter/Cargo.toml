@@ -1,0 +1,12 @@
+[package]
+name = "anynle-avid-adapter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "avid_adapter"
+
+[dependencies]
+avid-reader = { path = "../../avid-reader" }
+anynle-graph = { path = "../graph" }

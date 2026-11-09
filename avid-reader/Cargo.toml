@@ -1,0 +1,13 @@
+[package]
+name = "avid-reader"
+version = "0.1.0"
+edition = "2021"
+description = "Reads Avid Media Composer bins (.avb) into the avid2prproj JSON model"
+license = "MIT"
+publish = false
+
+[dependencies]
+getrandom = "=0.2.17"
+
+[profile.release]
+overflow-checks = true

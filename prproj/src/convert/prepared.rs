@@ -1,0 +1,606 @@
+//! Typed writer input. Original files are never represented as PCM OP-Atom model/1 clips.
+use super::model::*;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipMetadata {
+    pub id: String,
+    pub name: String,
+    pub material_umid: Option<String>,
+    pub tape_name: Option<String>,
+    pub avid: Option<AvidInfo>,
+    pub time_display: Option<i64>,
+    pub rate: Option<Fraction>,
+    pub markers: Vec<Marker>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct OriginalVideo {
+    pub codec: String,
+    pub width: i64,
+    pub height: i64,
+    pub rate: Fraction,
+    pub duration: i64,
+    pub stream_index: i64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SampleRepresentation {
+    Aac,
+    Pcm16,
+    Pcm24,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct OriginalAudio {
+    pub sample_rate: i64,
+    pub channels: i64,
+    pub duration: i64,
+    pub stream_index: i64,
+    pub representation: SampleRepresentation,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct OriginalChannel {
+    pub avid_track: i64,
+    pub channel_index: i64,
+    pub gain_db: f64,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct OriginalClip {
+    pub metadata: ClipMetadata,
+    pub path: String,
+    pub container: String,
+    pub video: Option<OriginalVideo>,
+    pub audio: Option<OriginalAudio>,
+    pub channels: Vec<OriginalChannel>,
+    pub groups: Vec<Vec<i64>>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum PreparedClip {
+    Legacy(Clip),
+    Original(OriginalClip),
+}
+impl PreparedClip {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Legacy(c) => &c.id,
+            Self::Original(c) => &c.metadata.id,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedProjectInput {
+    pub project_name: String,
+    pub options: Options,
+    pub clips: Vec<PreparedClip>,
+    pub bins: Vec<Bin>,
+    pub sequences: Vec<Sequence>,
+    pub texts: Vec<PreparedText>,
+    pub video_dissolves: Vec<PreparedVideoDissolve>,
+    pub picture_effects: Vec<PreparedPictureEffect>,
+    pub multicams: Vec<super::multicam::PreparedMulticam>,
+    pub multicam_uses: Vec<super::multicam::PreparedMulticamUse>,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MotionKey {
+    pub ticks: i64,
+    pub position: [f64; 2],
+    pub scale: [f64; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PictureEffect {
+    Flip { horizontal: bool, vertical: bool },
+    Resize([MotionKey; 2]),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedPictureEffect {
+    pub sequence: usize,
+    pub event: usize,
+    pub effect: PictureEffect,
+}
+
+pub(super) fn validate_picture_effects(effects: &[PreparedPictureEffect], sequences: &[Sequence]) -> Result<(), ModelError> {
+    let fail = |s: &str| ModelError(s.into());
+    if effects.len() > MAX_ITEMS { return Err(fail("prepared picture effect count exceeds limit")); }
+    let mut owners = HashSet::new();
+    for p in effects {
+        let sequence = sequences.get(p.sequence).ok_or_else(|| fail("unknown picture effect sequence"))?;
+        let event = sequence.events.get(p.event).ok_or_else(|| fail("unknown picture effect edit"))?;
+        if event.video_track.is_none() || !owners.insert((p.sequence, p.event)) {
+            return Err(fail("picture effect needs one unique picture edit"));
+        }
+        match p.effect {
+            PictureEffect::Flip { horizontal, vertical }
+                if (horizontal || vertical) && event.transform.is_none()
+                    && event.matte.is_none() && event.color_correction.is_none() => {}
+            PictureEffect::Resize(keys) => {
+                check_rate(sequence.rate, "Resize sequence rate")?;
+                let frame = ticks_per_unit(sequence.rate);
+                let end = event.source_in.checked_add(event.duration).and_then(|n| n.checked_sub(frame));
+                if event.transform.as_ref().is_none_or(|t| t.crop != [0.0; 4] || t.rotation != 0.0 || t.anchor != (0.0, 0.0))
+                    || event.matte.is_some() || event.color_correction.is_some()
+                    || frame <= 0 || event.speed_ratio.is_some() || event.time_remap.is_some()
+                    || keys[0].ticks != event.source_in || event.source_in % frame != 0 || Some(keys[1].ticks) != end
+                    || keys[1].ticks <= keys[0].ticks
+                    || keys.iter().any(|k| k.position.iter().any(|x| !x.is_finite() || x.abs() > 64.0)
+                        || k.scale.iter().any(|x| !(0.0..=10000.0).contains(x)))
+                {
+                    return Err(fail("invalid Linear Resize key times or values"));
+                }
+            }
+            _ => return Err(fail("empty Flip effect or unqualified effect stack")),
+        }
+    }
+    Ok(())
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedVideoDissolve {
+    pub sequence: usize,
+    pub outgoing: usize,
+    pub incoming: usize,
+    pub duration: i64,
+    pub before_cut: i64,
+}
+
+pub(super) fn validate_video_dissolves(
+    dissolves: &[PreparedVideoDissolve], sequences: &[Sequence],
+) -> Result<(), ModelError> {
+    let fail = |s: &str| ModelError(s.into());
+    if dissolves.len() > MAX_ITEMS { return Err(fail("prepared dissolve count exceeds limit")); }
+    let mut spans = Vec::with_capacity(dissolves.len());
+    for d in dissolves {
+        let s = sequences.get(d.sequence).ok_or_else(|| fail("dissolve references unknown sequence"))?;
+        let out = s.events.get(d.outgoing).ok_or_else(|| fail("dissolve references unknown outgoing edit"))?;
+        let inc = s.events.get(d.incoming).ok_or_else(|| fail("dissolve references unknown incoming edit"))?;
+        let track = out.video_track.filter(|&t| inc.video_track == Some(t))
+            .ok_or_else(|| fail("dissolve endpoints are not on one picture track"))?;
+        let after = d.duration.checked_sub(d.before_cut).filter(|n| *n > 0)
+            .ok_or_else(|| fail("invalid dissolve extent"))?;
+        check_rate(s.rate, "dissolve sequence rate")?;
+        let frame = ticks_per_unit(s.rate);
+        if frame <= 0 || d.before_cut <= 0 || d.before_cut % frame != 0 || after % frame != 0
+            || out.record_start.checked_add(out.duration) != Some(inc.record_start)
+            || d.before_cut > out.duration || after > inc.duration
+            || [out, inc].iter().any(|e| e.speed_ratio.is_some() || e.time_remap.is_some())
+        {
+            return Err(fail("invalid two-sided dissolve cut, frame grid, or endpoint duration"));
+        }
+        let start = inc.record_start.checked_sub(d.before_cut).ok_or_else(|| fail("dissolve start overflows"))?;
+        let end = inc.record_start.checked_add(after).ok_or_else(|| fail("dissolve end overflows"))?;
+        spans.push((d.sequence, track, start, end));
+    }
+    spans.sort_unstable();
+    if spans.windows(2).any(|p| (p[0].0, p[0].1) == (p[1].0, p[1].1) && p[1].2 < p[0].3) {
+        return Err(fail("prepared video dissolves overlap"));
+    }
+    Ok(())
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedTextKind { Caption, Graphic }
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedText {
+    pub sequence: usize,
+    pub source_id: String,
+    pub kind: PreparedTextKind,
+    pub track: i64,
+    pub start: i64,
+    pub duration: i64,
+    pub content: String,
+}
+pub fn validate_texts(texts: &[PreparedText], sequences: &[Sequence]) -> Result<(), ModelError> {
+    let fail = |s: &str| ModelError(s.into());
+    if texts.len() > MAX_ITEMS { return Err(fail("prepared text count exceeds limit")); }
+    let mut ids = HashSet::new();
+    let mut payload_bytes = texts.len().checked_mul(std::mem::size_of::<PreparedText>()).ok_or_else(|| fail("text budget overflow"))?;
+    for t in texts {
+        let s = sequences.get(t.sequence).ok_or_else(|| fail("text references unknown sequence"))?;
+        check_text(&t.source_id, "text source id", 32768, false)?;
+        payload_bytes = payload_bytes.checked_add(t.source_id.len()).and_then(|n|n.checked_add(t.content.len())).filter(|n|*n <= 64<<20).ok_or_else(||fail("text payload exceeds 64 MiB"))?;
+        if t.content.is_empty() || t.content.len() > 32768 || t.content.chars().any(|c| c.is_control() && c != '\n' && c != '\t') { return Err(fail("text content exceeds bounds or contains unsupported controls")); }
+        if !ids.insert((t.sequence, &t.source_id)) || !(1..=64).contains(&t.track) || t.start < 0 || t.duration <= 0 || t.start.checked_add(t.duration).is_none_or(|end| end > crate::caption::builder::SYNTHETIC_DURATION - 3600 * crate::build::time::TICKS_PER_SECOND) { return Err(fail("invalid prepared text identity, track or span")); }
+        if s.rate.num <= 0 || s.rate.den <= 0 { return Err(fail("text sequence rate must be positive")); }
+        let scaled = crate::build::time::TICKS_PER_SECOND as i128 * s.rate.den as i128;
+        if scaled % s.rate.num as i128 != 0 { return Err(fail("text sequence rate is not exactly representable")); }
+        let frame = i64::try_from(scaled / s.rate.num as i128).map_err(|_| fail("text frame clock overflow"))?;
+        if frame <= 0 || t.start % frame != 0 || t.duration % frame != 0 { return Err(fail("text span is not exactly frame aligned")); }
+    }
+    let mut captions: Vec<_> = texts.iter().filter(|t|t.kind == PreparedTextKind::Caption).collect();
+    captions.sort_by_key(|t|(t.sequence,t.start));
+    for pair in captions.windows(2) {
+        if pair[0].sequence == pair[1].sequence && pair[1].start < pair[0].start + pair[0].duration { return Err(fail("prepared captions overlap on the active subtitle track")); }
+    }
+    let graphic_sequences: HashSet<_> = texts.iter().filter(|t|t.kind == PreparedTextKind::Graphic).map(|t|t.sequence).collect();
+    let mut spans = Vec::new();
+    for &si in &graphic_sequences {
+        if sequences[si].events.len() > MAX_ITEMS { return Err(fail("text sequence event count exceeds limit")); }
+        for e in &sequences[si].events {
+            if let Some(track) = e.video_track { let end=e.record_start.checked_add(e.duration).ok_or_else(||fail("media endpoint overflow"))?;spans.push((si,track,e.record_start,end,false)); }
+        }
+    }
+    for t in texts.iter().filter(|t|t.kind == PreparedTextKind::Graphic) { spans.push((t.sequence,t.track,t.start,t.start+t.duration,true)); }
+    spans.sort_unstable();
+    let (mut lane,mut media_end,mut text_end)=(None,0,0);
+    for (sequence,track,start,end,is_text) in spans {
+        if lane != Some((sequence,track)) {lane=Some((sequence,track));media_end=0;text_end=0;}
+        if (is_text && start < media_end.max(text_end)) || (!is_text && start < text_end) {return Err(fail("prepared graphic overlaps another item on its video track"));}
+        if is_text {text_end=text_end.max(end);}else{media_end=media_end.max(end);}
+    }
+    Ok(())
+}
+impl PreparedProjectInput {
+    pub fn from_model(m: &Model) -> Result<Self, ModelError> {
+        validate_model(m)?;
+        Ok(Self {
+            project_name: m.project_name.clone(),
+            options: m.options.clone(),
+            clips: m
+                .clips
+                .values()
+                .cloned()
+                .map(PreparedClip::Legacy)
+                .collect(),
+            bins: m.bins.clone(),
+            sequences: m.sequences.clone(),
+            texts: Vec::new(),
+            video_dissolves: Vec::new(),
+            picture_effects: Vec::new(),
+            multicams: Vec::new(),
+            multicam_uses: Vec::new(),
+        })
+    }
+    /// Strict legacy/native media subset for rewrap planning. Timeline references
+    /// remain in this typed input and are validated jointly by `validate`.
+    pub fn build_native_media_model(&self) -> Result<Model, ModelError> {
+        self.validate()?;
+        let clips: ClipMap = self
+            .clips
+            .iter()
+            .filter_map(|c| match c {
+                PreparedClip::Legacy(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        let bins = self
+            .bins
+            .iter()
+            .map(|b| Bin {
+                name: b.name.clone(),
+                clips: b
+                    .clips
+                    .iter()
+                    .filter(|id| clips.contains_key(id))
+                    .cloned()
+                    .collect(),
+            })
+            .collect();
+        let model = Model {
+            project_name: self.project_name.clone(),
+            options: self.options.clone(),
+            clips,
+            bins,
+            sequences: vec![],
+        };
+        validate_model(&model)?;
+        Ok(model)
+    }
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_texts(&self.texts, &self.sequences)?;
+        validate_video_dissolves(&self.video_dissolves, &self.sequences)?;
+        validate_picture_effects(&self.picture_effects, &self.sequences)?;
+        let fail = |s: &str| ModelError(s.into());
+        // Count every retained nested payload without allocating another text/value tree.
+        // This conservative bounded representation is separate from peak RSS.
+        use std::fmt::Write;
+        struct Counter(usize);
+        impl std::fmt::Write for Counter {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0 = self
+                    .0
+                    .checked_add(s.len())
+                    .filter(|n| *n <= 64 << 20)
+                    .ok_or(std::fmt::Error)?;
+                Ok(())
+            }
+        }
+        let mut count = Counter(
+            std::mem::size_of::<Self>()
+                + self.clips.capacity() * std::mem::size_of::<PreparedClip>()
+                + self.bins.capacity() * std::mem::size_of::<Bin>()
+                + self.sequences.capacity() * std::mem::size_of::<Sequence>(),
+        );
+        write!(&mut count, "{self:?}")
+            .map_err(|_| fail("prepared input payload exceeds 64 MiB"))?;
+        // Strict old validators validate legacy metadata/options and every legacy clip.
+        let legacy: Model = Model {
+            project_name: self.project_name.clone(),
+            options: self.options.clone(),
+            clips: Default::default(),
+            bins: vec![],
+            sequences: vec![],
+        };
+        validate_model(&legacy)?;
+        if self.clips.len() > MAX_ITEMS
+            || self.bins.len() > MAX_ITEMS
+            || self.sequences.len() > 10_000
+        {
+            return Err(fail("prepared input collection limit"));
+        }
+        let mut clips = HashMap::new();
+        let mut budget = std::mem::size_of::<Self>() + self.project_name.len();
+        for c in &self.clips {
+            if clips.insert(c.id(), c).is_some() {
+                return Err(fail("duplicate prepared clip id"));
+            }
+            budget = budget
+                .checked_add(clip_bytes(c))
+                .ok_or_else(|| fail("prepared input size overflow"))?;
+            if budget > 64 << 20 {
+                return Err(fail("prepared input exceeds 64 MiB"));
+            }
+            match c {
+                PreparedClip::Original(c) => validate_original(c)?,
+                PreparedClip::Legacy(c) => super::model::validate_clip(c, "prepared legacy clip")?,
+            }
+        }
+        for b in &self.bins {
+            super::model::check_text(&b.name, "prepared bin", 4096, false)?;
+            for id in &b.clips {
+                if !clips.contains_key(id.as_str()) {
+                    return Err(fail("prepared bin references unknown clip"));
+                }
+            }
+        }
+        for (i, s) in self.sequences.iter().enumerate() {
+            super::model::validate_sequence(s, &format!("prepared sequences[{i}]"))?;
+            for e in &s.events {
+                let c = clips
+                    .get(e.clip.as_str())
+                    .ok_or_else(|| fail("prepared event references unknown clip"))?;
+                let (video, labels, duration, audio_count) = match c {
+                    PreparedClip::Legacy(c) => (
+                        c.video.is_some(),
+                        c.audio
+                            .iter()
+                            .filter_map(|a| a.avid_track)
+                            .collect::<Vec<_>>(),
+                        c.audio
+                            .iter()
+                            .map(|a| a.duration)
+                            .chain(c.video.iter().map(|v| v.duration))
+                            .max()
+                            .unwrap(),
+                        c.audio.len(),
+                    ),
+                    PreparedClip::Original(c) => (
+                        c.video.is_some(),
+                        c.channels.iter().map(|a| a.avid_track).collect(),
+                        c.audio
+                            .iter()
+                            .map(|a| a.duration)
+                            .chain(c.video.iter().map(|v| v.duration))
+                            .max()
+                            .unwrap(),
+                        c.channels.len(),
+                    ),
+                };
+                if e.video_track.is_some() && !video
+                    || e.audio_tracks.len() > audio_count
+                    || e.audio_channels
+                        .iter()
+                        .chain(e.stereo.iter().flat_map(|s| &s.channels))
+                        .any(|n| !labels.contains(n))
+                {
+                    return Err(fail("prepared event stream/channel reference mismatch"));
+                }
+                let unit = ticks_per_unit(s.rate);
+                if e.record_start % unit != 0
+                    || e.duration % unit != 0
+                    || e.source_in as i128 + e.source_duration.unwrap_or(e.duration) as i128
+                        > duration as i128
+                {
+                    return Err(fail("prepared event range/grid mismatch"));
+                }
+                if let PreparedClip::Original(c) = c {
+                    if e.speed_ratio.is_some() || e.time_remap.is_some() {
+                        return Err(fail("original-file retiming is not qualified"));
+                    }
+                    if !e.stereo.is_empty()
+                        && (e.audio.volume_db.is_some() || !e.audio.volume_keys.is_empty())
+                    {
+                        return Err(fail("original stereo volume automation requires a qualified stereo component"));
+                    }
+                    for st in &e.stereo {
+                        if st.pans.iter().any(Option::is_some)
+                            && !(st.pans[0].is_none_or(|p| p == -100.0)
+                                && st.pans[1].is_none_or(|p| p == 100.0))
+                        {
+                            return Err(fail(
+                                "original stereo per-channel pan requires qualification",
+                            ));
+                        }
+                        if !c.groups.contains(&st.channels) {
+                            return Err(fail(
+                                "original grouped event lacks exact declared channels",
+                            ));
+                        }
+                    }
+                    let mono: Vec<_> = if e.audio_channels.is_empty() {
+                        labels.iter().copied().take(e.audio_tracks.len()).collect()
+                    } else {
+                        e.audio_channels.clone()
+                    };
+                    if mono.iter().any(|n| !c.groups.contains(&vec![*n])) {
+                        return Err(fail("original mono event requires a declared mono group"));
+                    }
+                    // Every selected physical stream must cover this range, not just the longest one.
+                    let end = e.source_in as i128 + e.duration as i128;
+                    if e.video_track.is_some()
+                        && c.video.as_ref().is_none_or(|v| end > v.duration as i128)
+                        || (!e.audio_tracks.is_empty() || !e.stereo.is_empty())
+                            && c.audio.as_ref().is_none_or(|a| end > a.duration as i128)
+                    {
+                        return Err(fail("original event exceeds selected physical stream"));
+                    }
+                }
+            }
+        }
+        super::multicam::validate(self, &clips)
+    }
+}
+pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
+    let require = |b: bool, s: &str| if b { Ok(()) } else { Err(ModelError(s.into())) };
+    super::model::check_text(&c.metadata.id, "original id", 256, false)?;
+    super::model::check_text(&c.metadata.name, "original name", 4096, false)?;
+    super::model::check_path(&c.path, "original path")?;
+    if let Some(rate) = c.metadata.rate {
+        super::model::check_rate(rate, "original clip rate")?;
+    }
+    if let Some(id) = &c.metadata.material_umid {
+        require(
+            id.len() == 64
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b)),
+            "original master identity is not full upper-case hex",
+        )?;
+    }
+    if let Some(tape) = &c.metadata.tape_name {
+        super::model::check_text(tape, "original tape", 4096, false)?;
+    }
+    if let Some(avid) = &c.metadata.avid {
+        require(
+            avid.columns.len() <= 512 && avid.aux_timecodes.len() <= 64,
+            "original metadata collection limit",
+        )?;
+        super::model::check_text(&avid.mob_id, "original Avid identity", 4096, false)?;
+        let mut keys = HashSet::new();
+        for (k, v) in &avid.columns {
+            require(keys.insert(k), "duplicate original metadata column")?;
+            super::model::check_text(k, "original metadata column", 256, false)?;
+            super::model::check_text(v, "original metadata value", 4096, true)?;
+        }
+        require(
+            avid.color_rgb16
+                .is_none_or(|rgb| rgb.into_iter().all(|n| (0..=65535).contains(&n))),
+            "original metadata color range",
+        )?;
+        for s in avid.source_file.iter().chain(avid.source_path.iter()) {
+            super::model::check_text(s, "original source metadata", 4096, false)?;
+        }
+    }
+    require(
+        c.video.is_some() || c.audio.is_some(),
+        "original has no streams",
+    )?;
+    require(
+        matches!(c.container.as_str(), "mov" | "wav"),
+        "unqualified original container",
+    )?;
+    if let Some(v) = &c.video {
+        require(
+            c.container == "mov" && v.codec == "avc1" && v.stream_index == 0,
+            "unqualified original picture stream/profile",
+        )?;
+        super::model::check_dimensions(v.width, v.height, "original video")?;
+        super::model::check_rate(v.rate, "original video")?;
+        super::model::check_ticks(v.duration as i128, "original video", true)?;
+        require(
+            v.duration % ticks_per_unit(v.rate) == 0,
+            "original picture extent is not whole frames",
+        )?;
+    }
+    if let Some(a) = &c.audio {
+        require(
+            matches!(a.channels, 1 | 2)
+                && matches!(a.sample_rate, 44100 | 48000 | 96000)
+                && a.stream_index == if c.video.is_some() { 1 } else { 0 },
+            "unqualified original audio shape/stream",
+        )?;
+        require(
+            match (&a.representation, c.container.as_str()) {
+                (SampleRepresentation::Aac, "mov") => a.channels == 2,
+                (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "wav") => true,
+                _ => false,
+            },
+            "unqualified original sample representation",
+        )?;
+        super::model::check_ticks(a.duration as i128, "original audio", true)?;
+        require(
+            a.duration % ticks_per_unit(Fraction::new(a.sample_rate, 1)) == 0,
+            "original audio extent is not whole samples",
+        )?;
+        require(
+            c.channels.len() == a.channels as usize,
+            "original audio channel coverage incomplete",
+        )?;
+    } else {
+        require(
+            c.channels.is_empty() && c.groups.is_empty(),
+            "original audio mapping without stream",
+        )?;
+    }
+    let mut labels = HashSet::new();
+    let mut physical = HashSet::new();
+    for ch in &c.channels {
+        require(
+            (1..=64).contains(&ch.avid_track)
+                && labels.insert(ch.avid_track)
+                && physical.insert(ch.channel_index)
+                && c.audio
+                    .as_ref()
+                    .is_some_and(|a| (0..a.channels).contains(&ch.channel_index)),
+            "original channel mapping invalid",
+        )?;
+        super::model::check_db(ch.gain_db, "original gain", -96., 96.)?;
+    }
+    let mut grouped = HashSet::new();
+    for g in &c.groups {
+        if let Some(first) = g
+            .first()
+            .and_then(|n| c.channels.iter().find(|a| a.avid_track == *n))
+        {
+            require(
+                g.iter().all(|n| {
+                    c.channels
+                        .iter()
+                        .find(|a| a.avid_track == *n)
+                        .is_some_and(|a| a.gain_db == first.gain_db)
+                }),
+                "per-channel gain within an original stereo group requires qualification",
+            )?;
+        }
+        require(
+            matches!(g.len(), 1 | 2) && g.iter().all(|n| labels.contains(n) && grouped.insert(*n)),
+            "original groups overlap or name missing channels",
+        )?;
+    }
+    require(
+        grouped == labels,
+        "original groups must cover every logical channel",
+    )?;
+    for m in &c.metadata.markers {
+        super::model::validate_marker(m, "original marker", false)?;
+    }
+    Ok(())
+}
+
+fn clip_bytes(c: &PreparedClip) -> usize {
+    match c {
+        PreparedClip::Legacy(c) => {
+            std::mem::size_of::<Clip>()
+                + c.id.len()
+                + c.name.len()
+                + c.audio
+                    .iter()
+                    .map(|a| a.path.len() + std::mem::size_of::<AudioFile>())
+                    .sum::<usize>()
+                + c.video.as_ref().map_or(0, |v| v.path.len() + v.codec.len())
+        }
+        PreparedClip::Original(c) => {
+            std::mem::size_of::<OriginalClip>()
+                + c.path.len()
+                + c.metadata.id.len()
+                + c.metadata.name.len()
+                + c.channels.len() * std::mem::size_of::<OriginalChannel>()
+        }
+    }
+}

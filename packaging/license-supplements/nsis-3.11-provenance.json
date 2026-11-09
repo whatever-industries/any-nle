@@ -1,0 +1,8 @@
+{
+  "version": "3.11",
+  "revision": "7359413009afd4f0fff472d841fc2f2cc0e0a5f8",
+  "url": "https://raw.githubusercontent.com/NSIS-Dev/nsis/7359413009afd4f0fff472d841fc2f2cc0e0a5f8/COPYING",
+  "sha256": "dc0f74a312c08ffc900548a67ae9a3670ed28ad25a3afda1fe0504da16f89361",
+  "compressor": "zlib",
+  "scope": "Main installer stub, MUI and standard plugins; LZMA/CPL and bzip2 modules not selected."
+}

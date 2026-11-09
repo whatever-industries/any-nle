@@ -1,0 +1,11 @@
+[package]
+name = "anynle-graph"
+version = "0.1.0"
+edition = "2021"
+description = "anynle.graph/1: the program-neutral edit graph Any NLE readers write and writers read"
+publish = false
+
+[lib]
+name = "graph"
+
+[dependencies]

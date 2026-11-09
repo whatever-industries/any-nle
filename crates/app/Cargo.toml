@@ -1,0 +1,30 @@
+[package]
+name = "anynle-app"
+version = "0.1.0"
+edition = "2021"
+description = "any-nle: qualified source interpretation and explicit destination preparation"
+publish = false
+
+[[bin]]
+name = "any-nle"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "=0.22.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fs2 = "=0.4.3"
+anynle-graph = { path = "../graph" }
+anynle-bridge = { path = "../bridge" }
+anynle-mapping = { path = "../mapping" }
+anynle-fcpxml = { path = "../fcpxml" }
+anynle-avid-adapter = { path = "../avid-adapter" }
+anynle-premiere-adapter = { path = "../premiere-adapter" }
+avid-reader = { path = "../../avid-reader" }
+prproj = { path = "../../prproj" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = { version = "=0.17.2", default-features = false }
+objc2 = "=0.6.5"
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSApplication", "NSAlert", "NSButton", "NSWindow", "NSResponder", "NSView"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSString"] }

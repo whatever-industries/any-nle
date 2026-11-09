@@ -1,0 +1,13 @@
+[package]
+name = "anynle-premiere-adapter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "premiere_adapter"
+
+[dependencies]
+anynle-graph = { path = "../graph" }
+anynle-bridge = { path = "../bridge" }
+prproj = { path = "../../prproj" }

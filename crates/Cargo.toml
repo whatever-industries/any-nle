@@ -1,0 +1,9 @@
+# The cross-program crates (anynle.graph/1 and what is built on it). A separate workspace so
+# `avid-reader/` and `prproj/` keep their own lock files, targets and release profiles
+# (docs/GRAPH-MODEL.md); they are used here as path dependencies.
+[workspace]
+resolver = "2"
+members = ["graph", "bridge", "mapping", "fcpxml", "app", "premiere-adapter", "avid-adapter", "gui"]
+
+[profile.release]
+overflow-checks = true

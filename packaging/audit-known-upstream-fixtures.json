@@ -1,0 +1,13 @@
+{
+  "schema": "anynle.known-upstream-archive-fixtures/1",
+  "fixtures": [
+    {
+      "sha256": "f17d507a54c6816698890022e7684ac8800a417959e1a243ce296a29659a291d",
+      "bytes": 425,
+      "source_url": "https://github.com/facebook/zstd/blob/v1.5.6/tests/gzip/hufts-segv.gz",
+      "source_archive_sha256": "30f35f71c1203369dc979ecde0400ffea93c27391bfd2ac5a9715d2173d92ff7",
+      "member": "zstd-1.5.6/tests/gzip/hufts-segv.gz",
+      "reason": "Intentional malformed gzip decoder regression fixture. Exact upstream bytes are retained in the pinned corresponding source. Raw content and recognizable embedded zlib streams are scanned; gzip expansion is impossible and explicitly recorded."
+    }
+  ]
+}

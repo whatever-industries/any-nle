@@ -1,0 +1,11 @@
+/local/
+/target/
+/node_modules/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+/avid-reader/target/
+
+# agent worktrees
+.claude/worktrees/

@@ -1,0 +1,29 @@
+{
+  "schema": "avid2prproj.model/1",
+  "project": {"name": "Example OP-Atom conversion"},
+  "options": {"bin_mode": "separate"},
+  "clips": [
+    {
+      "id": "clip-1",
+      "name": "Example clip",
+      "material_umid": "060A2B340101010501010F101300000000000000000000000000000000000001",
+      "video": {"path": "/Volumes/Media/Avid MediaFiles/MXF/1/V01.EXAMPLE.mxf", "codec": "AVdn",
+                "width": 1920, "height": 1080, "rate": "24/1", "duration_ticks": 2561328000000},
+      "audio": [
+        {"path": "/Volumes/Media/Avid MediaFiles/MXF/1/A01.EXAMPLE.mxf", "sample_rate": 48000, "bits": 16, "duration_ticks": 2561328000000},
+        {"path": "/Volumes/Media/Avid MediaFiles/MXF/1/A02.EXAMPLE.mxf", "sample_rate": 48000, "bits": 16, "duration_ticks": 2561328000000}
+      ]
+    }
+  ],
+  "bins": [{"name": "Example Avid bin", "clips": ["clip-1"]}],
+  "sequences": [
+    {
+      "name": "Example sequence", "rate": "24/1", "width": 1920, "height": 1080,
+      "events": [
+        {"clip": "clip-1", "record_start_ticks": 0, "source_in_ticks": 254016000000,
+         "duration_ticks": 1270080000000, "video_track": 1, "audio_tracks": [1, 2]}
+      ],
+      "markers": [{"name": "Locator", "comment": "from Avid locator", "start_ticks": 508032000000}]
+    }
+  ]
+}

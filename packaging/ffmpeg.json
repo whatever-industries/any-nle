@@ -1,0 +1,29 @@
+{
+  "version": "8.1",
+  "url": "https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz",
+  "sha256": "b072aed6871998cce9b36e7774033105ca29e33632be5b6347f3206898e0756a",
+  "license": "LGPL-2.1-or-later",
+  "configure": [
+    "--disable-autodetect",
+    "--disable-gpl",
+    "--disable-nonfree",
+    "--disable-version3",
+    "--disable-shared",
+    "--enable-static",
+    "--disable-programs",
+    "--enable-ffmpeg",
+    "--enable-ffprobe",
+    "--disable-network",
+    "--disable-doc",
+    "--disable-debug",
+    "--disable-x86asm",
+    "--disable-indevs",
+    "--disable-outdevs",
+    "--enable-indev=lavfi"
+  ],
+  "appimagetool": {
+    "version": "1.9.1",
+    "x86_64": "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0",
+    "aarch64": "f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158"
+  }
+}

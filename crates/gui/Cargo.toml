@@ -1,0 +1,24 @@
+[package]
+name = "anynle-gui"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.95"
+description = "Any NLE native conversion wizard"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "any-nle-gui"
+path = "src/main.rs"
+
+[dependencies]
+anynle-app = { path = "../app" }
+anynle-mapping = { path = "../mapping" }
+prproj = { path = "../../prproj" }
+eframe = { version = "=0.37.0", default-features = false, features = ["glow", "accesskit", "default_fonts", "wayland", "x11"] }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg"] }
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+tempfile = "3"

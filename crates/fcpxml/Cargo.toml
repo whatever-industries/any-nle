@@ -1,0 +1,16 @@
+[package]
+name = "anynle-fcpxml"
+version = "0.1.0"
+edition = "2021"
+description = "anynle.graph/1 -> FCPXML 1.9 (DaVinci Resolve, Final Cut Pro)"
+publish = false
+
+[lib]
+name = "fcpxml"
+
+[dependencies]
+anynle-graph = { path = "../graph" }
+
+[dev-dependencies]
+anynle-bridge = { path = "../bridge" }
+prproj = { path = "../../prproj" }

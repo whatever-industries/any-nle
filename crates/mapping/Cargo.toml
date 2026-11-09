@@ -1,0 +1,16 @@
+[package]
+name = "anynle-mapping"
+version = "0.1.0"
+edition = "2021"
+description = "Pair policies between a source and a target program (today: Avid -> Premiere)"
+publish = false
+
+[lib]
+name = "mapping"
+
+[dependencies]
+anynle-graph = { path = "../graph" }
+prproj = { path = "../../prproj" }
+
+[dev-dependencies]
+anynle-bridge = { path = "../bridge" }
