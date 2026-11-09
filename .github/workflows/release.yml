@@ -142,23 +142,31 @@ jobs:
         run: |
           python scripts/release/audit.py 'dist/Any.NLE_${{ matrix.suffix }}_v${{ inputs.version }}.stage' --known-upstream-fixtures packaging/audit-known-upstream-fixtures.json --output package-audit.json
           python scripts/release/verify_candidate.py --target '${{ matrix.target }}' --output dist --version '${{ inputs.version }}'
+      - name: Assemble the release candidate artifact
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib, shutil, sys
+          sys.path.insert(0, "scripts/release")
+          from package import TARGETS
+          suffix, extension = TARGETS["${{ matrix.target }}"]
+          stem = f"Any.NLE_{suffix}_v${{ inputs.version }}"
+          output = pathlib.Path("release-candidate")
+          output.mkdir()
+          for filename in (stem + extension, stem + ".provenance.tar.gz"):
+              for name in (filename, filename + ".sha256"):
+                  shutil.copy2(pathlib.Path("dist") / name, output / name)
+          for name in ("package-audit.json", "backend-smoke.json", "candidate-verification.json", "gate-binding.txt"):
+              shutil.copy2(name, output / name)
+          shutil.copy2("public-checks/public-acceptance.json", output / "public-acceptance.json")
+          PY
       - name: Retain privately reviewable candidate and exact checks
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: any-nle-${{ matrix.suffix }}
           retention-days: 7
           if-no-files-found: error
-          path: |
-            dist/Any.NLE_*.zip
-            dist/Any.NLE_*.exe
-            dist/Any.NLE_*.AppImage
-            dist/Any.NLE_*.provenance.tar.gz
-            dist/Any.NLE_*.sha256
-            package-audit.json
-            backend-smoke.json
-            candidate-verification.json
-            public-checks/public-acceptance.json
-            gate-binding.txt
+          path: release-candidate/
   release:
     needs: build
     runs-on: ubuntu-22.04

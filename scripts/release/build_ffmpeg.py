@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build the pinned, local-files-only LGPL backend; never copy a host FFmpeg."""
-import argparse, hashlib, json, os, pathlib, shutil, subprocess, tarfile, urllib.request
+import argparse, hashlib, json, os, pathlib, shutil, subprocess, sys, tarfile, urllib.request
+from collections import deque
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 def sha(path):
     h = hashlib.sha256()
@@ -27,9 +28,18 @@ def build(target, output, work):
             config += ['--arch=aarch64', '--cc=clang', '--cxx=clang++', '--ar=llvm-ar', '--nm=llvm-nm', '--ranlib=llvm-ranlib']
     env = dict(os.environ)
     env.update(SOURCE_DATE_EPOCH='1776384000')
-    with (work/'build.log').open('w') as log:
-        for cmd in ([str(source/'configure'), *config], ['make', '-j', str(min(os.cpu_count() or 2, 8)), 'ffmpeg', 'ffprobe']):
-            subprocess.run(cmd, cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+    build_log = work/'build.log'
+    try:
+        with build_log.open('w') as log:
+            for cmd in (['sh', './configure', *config], ['make', '-j', str(min(os.cpu_count() or 2, 8)), 'ffmpeg', 'ffprobe']):
+                subprocess.run(cmd, cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        for path in (build_log, source/'ffbuild'/'config.log'):
+            if path.is_file():
+                with path.open(encoding='utf-8', errors='replace') as log:
+                    print(f'Last lines of {path.name}:', file=sys.stderr)
+                    sys.stderr.writelines(deque(log, maxlen=40))
+        raise
     suffix = '.exe' if 'windows' in target else ''
     tools = {}
     for name in ('ffmpeg', 'ffprobe'):
@@ -51,8 +61,12 @@ def build(target, output, work):
         # Preserve a toolchain notice superset, including MinGW/GCC runtime
         # exceptions or LLVM support notices. Compiler tools are not shipped.
         prefix=os.environ.get('MINGW_PREFIX')
-        compiler_notices=pathlib.Path(prefix or '')/'share/licenses'
-        if not prefix or not compiler_notices.is_dir():
+        if not prefix:
+            raise ValueError('Windows compiler runtime notices are unavailable')
+        if os.name=='nt':
+            prefix=subprocess.check_output(['cygpath', '-w', prefix], text=True).strip()
+        compiler_notices=pathlib.Path(prefix)/'share/licenses'
+        if not compiler_notices.is_dir():
             raise ValueError('Windows compiler runtime notices are unavailable')
         destination=output/'licenses/windows-toolchain'
         shutil.copytree(compiler_notices,destination,dirs_exist_ok=True)
