@@ -262,9 +262,9 @@ fn is_windows_absolute(path: &str) -> bool {
     !unc.next().unwrap_or("").is_empty() && !unc.next().unwrap_or("").is_empty()
 }
 
-/// Absolute Windows drive/UNC paths stay absolute rather than passing through a POSIX cwd.
+/// Keep the absolute reference when the media path cannot be made project-relative.
 pub fn media_relpath(path: &str, start: &str) -> String {
-    if is_windows_absolute(path) {
+    if is_windows_absolute(path) || (path.starts_with('/') && is_windows_absolute(start)) {
         return path.to_string();
     }
     relpath(path, start)
@@ -997,5 +997,17 @@ mod tests {
         assert_eq!(basename(r"C:\Media\example.mov"), "example.mov");
         assert_eq!(basename(r"\\server\share\example.wav"), "example.wav");
         assert_eq!(basename(r"/media/example\name.mov"), r"example\name.mov");
+    }
+
+    #[test]
+    fn foreign_posix_media_path_stays_absolute_in_windows_projects() {
+        assert_eq!(
+            media_relpath("/media/example.mov", r"C:\Projects"),
+            "/media/example.mov"
+        );
+        assert_eq!(
+            media_relpath("/media/example.mov", r"\\?\C:\Projects"),
+            "/media/example.mov"
+        );
     }
 }

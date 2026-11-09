@@ -12,9 +12,11 @@ def media_basename(path: str) -> str:
 
 
 def relative_media_path(path: str, directory: str) -> str:
-    # Absolute paths are the existing fallback for media on another drive. Keep that
-    # fallback for Windows paths on every host, without interpreting them through cwd.
-    if PureWindowsPath(path).is_absolute():
+    # Use the absolute reference across drives or path styles. Preserve the
+    # recorded Windows reference independently of the host's working directory.
+    if PureWindowsPath(path).is_absolute() or (
+        path.startswith("/") and PureWindowsPath(directory).is_absolute()
+    ):
         return path
     try:
         return os.path.relpath(path, directory)

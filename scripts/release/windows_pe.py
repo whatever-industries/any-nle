@@ -4,6 +4,9 @@ import struct
 
 SYSTEM_DLLS = set('''advapi32 avrt bcrypt bcryptprimitives cabinet cfgmgr32 clbcatq combase comctl32 comdlg32 crypt32 cryptbase cryptsp d2d1 d3d9 d3d11 d3d12 d3dcompiler_47 dbghelp dcomp dnsapi dwmapi dwrite dxgi gdi32 gdi32full hid imagehlp imm32 iphlpapi kernel32 kernelbase mmdevapi mpr msacm32 msasn1 mscms msctf msimg32 msvcp_win msvcrt mswsock ncrypt netapi32 normaliz ntdll ole32 oleacc oleaut32 opengl32 powrprof profapi propsys psapi rpcrt4 rtworkq secur32 setupapi shcore shell32 shfolder shlwapi srvcli sspicli ucrtbase user32 userenv usp10 uxtheme version wer windowscodecs winhttp wininet winmm winspool wintrust winusb wldap32 ws2_32 wtsapi32'''.split())
 
+# AccessKit uses the Windows UI Automation provider API.
+SYSTEM_DLLS.add('uiautomationcore')
+
 def imports(binary):
     data=pathlib.Path(binary).read_bytes()
     def uint(offset,fmt):
@@ -61,7 +64,12 @@ def imports(binary):
 
 def verify(binary):
     names=imports(binary)
-    for name in names:
-        if not name.endswith('.dll') or not (name[:-4] in SYSTEM_DLLS or name.startswith(('api-ms-win-','ext-ms-win-'))):
-            raise ValueError('unbundled non-system Windows runtime dependency: '+name)
+    unknown = [
+        name for name in names
+        if not name.endswith('.dll') or not (
+            name[:-4] in SYSTEM_DLLS or name.startswith(('api-ms-win-', 'ext-ms-win-'))
+        )
+    ]
+    if unknown:
+        raise ValueError('unbundled non-system Windows runtime dependency: '+', '.join(unknown))
     return names
