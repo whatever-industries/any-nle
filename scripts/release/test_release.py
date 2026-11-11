@@ -45,6 +45,50 @@ class BackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             with self.assertRaises(FileNotFoundError):verify_backend(pathlib.Path(t),'aarch64-apple-darwin')
 
+    def test_source_download_retries_a_reset_and_publishes_only_verified_bytes(self):
+        from build_ffmpeg import fetch, sha
+        from hashlib import sha256
+        from unittest.mock import patch
+        from urllib.error import URLError
+
+        data = b'verified synthetic source'
+        with tempfile.TemporaryDirectory() as temp:
+            archive = pathlib.Path(temp) / 'source.tar.xz'
+            expected = sha256(data).hexdigest()
+            with patch('build_ffmpeg.urllib.request.urlopen', side_effect=[
+                URLError(ConnectionResetError()), io.BytesIO(data)
+            ]) as request, patch('build_ffmpeg.time.sleep') as delay:
+                fetch('https://example.invalid/source.tar.xz', archive, expected)
+            self.assertEqual(request.call_count, 2)
+            delay.assert_called_once_with(2)
+            self.assertEqual(sha(archive), expected)
+            self.assertEqual(list(archive.parent.iterdir()), [archive])
+
+            archive.unlink()
+            with patch('build_ffmpeg.urllib.request.urlopen', return_value=io.BytesIO(b'wrong')):
+                with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+                    fetch('https://example.invalid/source.tar.xz', archive, expected)
+            self.assertEqual(list(archive.parent.iterdir()), [])
+
+    def test_offline_source_requires_the_exact_prepared_archive(self):
+        from build_ffmpeg import fetch
+        from hashlib import sha256
+        from unittest.mock import patch
+
+        data = b'verified synthetic source'
+        expected = sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as temp, patch('build_ffmpeg.urllib.request.urlopen') as request:
+            archive = pathlib.Path(temp) / 'source.tar.xz'
+            url = 'https://example.invalid/source.tar.xz'
+            with self.assertRaises(FileNotFoundError):
+                fetch(url, archive, expected, offline=True)
+            archive.write_bytes(b'wrong')
+            with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+                fetch(url, archive, expected, offline=True)
+            archive.write_bytes(data)
+            fetch(url, archive, expected, offline=True)
+            request.assert_not_called()
+
 class LicenseTests(unittest.TestCase):
     def test_author_names_are_not_a_grant_but_full_mit_authors_are(self):
         from licenses import applicable_grant

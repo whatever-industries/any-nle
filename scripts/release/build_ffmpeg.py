@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Build the pinned, local-files-only LGPL backend; never copy a host FFmpeg."""
 import argparse, hashlib, json, os, pathlib, shutil, subprocess, sys, tarfile, urllib.request
+import http.client
+import tempfile
+import time
+import urllib.error
 from collections import deque
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 def sha(path):
@@ -8,14 +12,47 @@ def sha(path):
     with open(path, 'rb') as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b''): h.update(chunk)
     return h.hexdigest()
-def fetch(url, dest, expected):
-    if not dest.exists(): urllib.request.urlretrieve(url, dest)
-    if sha(dest) != expected: raise ValueError('download checksum mismatch')
-def build(target, output, work):
+def fetch(url, dest, expected, *, offline=False):
+    if dest.exists():
+        if sha(dest) != expected:
+            raise ValueError('FFmpeg source checksum mismatch')
+        return
+    if offline:
+        raise FileNotFoundError(f'verified FFmpeg source archive is missing: {dest}')
+
+    with tempfile.TemporaryDirectory(dir=dest.parent) as temporary:
+        staged = pathlib.Path(temporary) / dest.name
+        for delay in (2, 5, None):
+            try:
+                with urllib.request.urlopen(url, timeout=30) as response, staged.open('wb') as output:
+                    shutil.copyfileobj(response, output)
+                break
+            except urllib.error.HTTPError as error:
+                if delay is None or not (error.code in (408, 429) or 500 <= error.code <= 599):
+                    raise
+                error.close()
+            except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead):
+                if delay is None:
+                    raise
+            print(f'FFmpeg source connection failed. Retrying in {delay} seconds.', flush=True)
+            time.sleep(delay)
+        if sha(staged) != expected:
+            raise ValueError('FFmpeg source checksum mismatch')
+        staged.replace(dest)
+
+
+def source_archive(spec, directory, *, offline=False):
+    directory.mkdir(parents=True, exist_ok=True)
+    archive = directory / 'ffmpeg-8.1.tar.xz'
+    fetch(spec['url'], archive, spec['sha256'], offline=offline)
+    return archive
+
+
+def build(target, output, work, *, offline_source=False):
     spec = json.loads((ROOT/'packaging/ffmpeg.json').read_text())
     output, work = pathlib.Path(output).resolve(), pathlib.Path(work).resolve()
     output.mkdir(parents=True, exist_ok=True); work.mkdir(parents=True, exist_ok=True)
-    archive = work/'ffmpeg-8.1.tar.xz'; fetch(spec['url'], archive, spec['sha256'])
+    archive = source_archive(spec, work, offline=offline_source)
     source = work/'ffmpeg-8.1'
     if not source.exists():
         with tarfile.open(archive) as t: t.extractall(work, filter='data')
@@ -80,5 +117,20 @@ def build(target, output, work):
     shutil.copy2(work/'build.log', output/'ffmpeg-build.log')
     print(json.dumps({'target': target, 'backend': str(output), 'tools': tools}))
 if __name__ == '__main__':
-    p=argparse.ArgumentParser(); p.add_argument('--target',required=True); p.add_argument('--output',required=True); p.add_argument('--work',required=True)
-    a=p.parse_args(); build(a.target,a.output,a.work)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--target')
+    parser.add_argument('--output')
+    parser.add_argument('--work', required=True, type=pathlib.Path)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--prepare-source', action='store_true')
+    mode.add_argument('--offline-source', action='store_true')
+    args = parser.parse_args()
+    if args.prepare_source:
+        if args.target or args.output:
+            parser.error('--prepare-source only takes --work')
+        spec = json.loads((ROOT / 'packaging/ffmpeg.json').read_text())
+        print(source_archive(spec, args.work))
+    else:
+        if not args.target or not args.output:
+            parser.error('--target and --output are required to build')
+        build(args.target, args.output, args.work, offline_source=args.offline_source)

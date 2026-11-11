@@ -26,7 +26,27 @@ concurrency:
   group: native-release-build-${{ inputs.version }}-${{ github.sha }}
   cancel-in-progress: false
 jobs:
+  backend-source:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Fetch and verify pinned FFmpeg source
+        run: python scripts/release/build_ffmpeg.py --prepare-source --work backend-work
+      - name: Share verified FFmpeg source with native builders
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ffmpeg-build-source
+          path: backend-work/ffmpeg-8.1.tar.xz
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
   build:
+    needs: backend-source
     strategy:
       fail-fast: false
       matrix:
@@ -109,6 +129,11 @@ jobs:
       - name: Collect dependency licenses and SBOM
         shell: bash
         run: python scripts/release/licenses.py notices
+      - name: Retrieve verified FFmpeg source
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ffmpeg-build-source
+          path: backend-work
       - name: Install Windows FFmpeg build tools
         if: startsWith(matrix.runner, 'windows-')
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
@@ -120,10 +145,10 @@ jobs:
       - name: Build pinned LGPL backend on Windows
         if: startsWith(matrix.runner, 'windows-')
         shell: msys2 {0}
-        run: python3 scripts/release/build_ffmpeg.py --target '${{ matrix.target }}' --output backend --work backend-work
+        run: python3 scripts/release/build_ffmpeg.py --target '${{ matrix.target }}' --output backend --work backend-work --offline-source
       - name: Build pinned LGPL backend on Unix
         if: "!startsWith(matrix.runner, 'windows-')"
-        run: python scripts/release/build_ffmpeg.py --target '${{ matrix.target }}' --output backend --work backend-work
+        run: python scripts/release/build_ffmpeg.py --target '${{ matrix.target }}' --output backend --work backend-work --offline-source
       - name: Exercise bundled backend with synthetic picture and PCM
         shell: bash
         run: python scripts/release/backend_smoke.py --backend backend --target '${{ matrix.target }}' --output backend-smoke.json
