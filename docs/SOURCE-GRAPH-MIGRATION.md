@@ -29,8 +29,10 @@ owner clocks and omitted portable objects retain bounded native receipts and los
 Malformed references and contradictions refuse. Occurrence IDs are scoped to the
 input revision; they are not native identity claims or object addresses.
 
-This is a foundation for additional source and destination adapters. It does not
-implement Resolve import, Avid export, new nesting, effects, retiming or codecs.
+The separate [Resolve source reader](RESOLVE-SOURCE-READER.md) feeds graph/2
+from a bounded native archive profile. Its saved Resolve clocks and channel
+selectors retain their own provenance. Product route qualification remains
+separate from the source adapter.
 
 ## Compatibility profiles
 
@@ -42,13 +44,14 @@ implement Resolve import, Avid export, new nesting, effects, retiming or codecs.
 | Held FCPXML conversion | Explicit legacy reader/graph/1 profile. Graph/2 is not implicitly accepted or normalized into this route. |
 | Color preview | Reads palette/item/marker facts directly from either graph version; successful timeline preparation is unnecessary. |
 
-Ordinary Premiere preparation uses `ClockProfile::LegacyImport`. It applies the
-exact old fallback rules to the retained **raw** legacy tuple: integer display-base
-conversion, zero for absent/drop/off-tick/overflowing legacy starts. It does not
-round graph/2's corrected exact start to imitate old output. Diagnostics identify
-this compatibility interpretation. Audio never acquires a clock from adjacent
-picture. Sequence exact start stays unknown when the native timecode owner rate
-has not been qualified; its old start interpretation is retained separately.
+Ordinary Premiere media preparation uses `ClockProfile::LegacyImport`. It applies
+the exact old fallback rules to the retained **raw** legacy tuple: integer
+display-base conversion, zero for absent/drop/off-tick/overflowing legacy starts.
+It does not round graph/2's exact media start to imitate old output. Audio never
+acquires a clock from adjacent picture. For the sequence zero point only,
+preparation uses the qualified direct 23.976 non-drop TC1 when present. Other
+sequence origins retain their compatibility fallback. Diagnostics identify the
+clock interpretation.
 
 Graph/2's optional typed `SourceClock` carries effective count, exact rate,
 display base, drop flag and typed resolution provenance. Validation checks exact

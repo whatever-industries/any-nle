@@ -1,5 +1,4 @@
-//! Scoped compatibility for one zero-only packet after complete DNxHR LB pictures.
-//! This is not a generic MXF padding rule. Keep normal parsing and all source guards.
+//! Qualify indexed zero-only tails in the retained DNxHR LB and ProRes freeze layouts.
 use super::backend::{integer, run, Probe};
 use super::receipts::{obj, text};
 use super::source::layout;
@@ -17,6 +16,12 @@ const FRAME: u64 = 188416;
 const MAX_FRAMES: i64 = 8192;
 const MAX_TAIL: u64 = 65536;
 const PREFIX: [u8; 5] = [0, 0, 2, 128, 3];
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Profile {
+    Dnx,
+    ProResFreeze,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Terminal {
     pub(super) frames: i64,
@@ -24,12 +29,14 @@ pub(super) struct Terminal {
     pub(super) bytes: u64,
     pub(super) sha256: String,
     header_prefix: Vec<u8>,
+    frame_bytes: u64,
+    profile: Profile,
 }
 fn require(ok: bool, why: &str) -> R<()> {
     if ok {
         Ok(())
     } else {
-        Err(format!("terminal DNx packet refused: {why}"))
+        Err(format!("terminal picture packet refused: {why}"))
     }
 }
 fn read(file: &mut File, offset: u64, size: u64, max: u64) -> R<Vec<u8>> {
@@ -92,13 +99,16 @@ impl Terminal {
     }
     pub(super) fn receipt(&self) -> Value {
         obj(vec![
-            ("reason", text("verified zero-only terminal packet after complete scoped DNxHR LB coded pictures; compatibility handling, not a universal padding rule")),
+            ("reason", text(match self.profile {
+                Profile::Dnx => "verified zero-only terminal packet after complete scoped DNxHR LB coded pictures; compatibility handling, not a universal padding rule",
+                Profile::ProResFreeze => "verified zero-only terminal packet after the complete generated ProRes Freeze Frame",
+            })),
             ("packet_index", Value::Int(self.frames)),
-            ("file_offset", text((self.essence_offset + self.frames as u64 * FRAME).to_string())),
+            ("file_offset", text((self.essence_offset + self.frames as u64 * self.frame_bytes).to_string())),
             ("bytes", text(self.bytes.to_string())),
             ("sha256", text(&self.sha256)),
             ("coded_header_prefix_sha256", text(hex(&sha256(&self.header_prefix)))),
-            ("coded_picture_bytes", text((self.frames as u64 * FRAME).to_string())),
+            ("coded_picture_bytes", text((self.frames as u64 * self.frame_bytes).to_string())),
             ("filter", text(self.filter())),
         ])
     }
@@ -125,7 +135,24 @@ impl Terminal {
             (1..=MAX_FRAMES).contains(&frames) && s.packets == frames + 1,
             "not a bounded N+1 packet case",
         )?;
-        let terminal = Self::physical(path, frames)?;
+        Self::qualify_packets(path, probe, tool, Self::physical(path, frames)?)
+    }
+    pub(super) fn qualify_freeze(path: &Path, probe: &Probe, tool: &Path) -> R<Self> {
+        require(
+            probe.streams.len() == 1 && probe.streams[0].packets == 121
+                && probe.streams[0].ticks == 120 * ticks_per_unit(Fraction::new(24, 1)),
+            "generated freeze needs its 120-picture span plus one tail",
+        )?;
+        let terminal = Self::physical_profile(path, 120, Profile::ProResFreeze)?;
+        Self::qualify_packets(path, probe, tool, terminal)
+    }
+    pub(super) fn recheck(&self, path: &Path, probe: &Probe, tool: &Path, rate: Fraction) -> R<Self> {
+        match self.profile {
+            Profile::Dnx => Self::qualify(path, probe, tool, rate),
+            Profile::ProResFreeze => Self::qualify_freeze(path, probe, tool),
+        }
+    }
+    fn qualify_packets(path: &Path, probe: &Probe, tool: &Path, terminal: Self) -> R<Self> {
         let raw = json::parse(&run(Command::new(tool)
             .args([
                 "-v",
@@ -147,6 +174,9 @@ impl Terminal {
         Ok(terminal)
     }
     fn physical(path: &Path, frames: i64) -> R<Self> {
+        Self::physical_profile(path, frames, Profile::Dnx)
+    }
+    fn physical_profile(path: &Path, frames: i64, profile: Profile) -> R<Self> {
         require((1..=MAX_FRAMES).contains(&frames), "frame budget exceeded")?;
         let layout = layout(path)?;
         require(
@@ -162,14 +192,30 @@ impl Terminal {
                 && e.body_sid != 0,
             "unsupported picture wrapping",
         )?;
-        let coded = frames as u64 * FRAME;
+        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        let frame_bytes = match profile {
+            Profile::Dnx => FRAME,
+            Profile::ProResFreeze => {
+                let prefix = read(&mut file, e.offset, 28, 28)?;
+                let size = u64::from(u32::from_be_bytes(prefix[..4].try_into().unwrap()));
+                require(
+                    e.key[14..] == [6, 1]
+                        && prefix[4..8] == *b"icpf"
+                        && prefix[16..20] == [0x07, 0x80, 0x04, 0x38]
+                        && (28..=2 << 20).contains(&size),
+                    "unsupported ProRes freeze essence header",
+                )?;
+                size
+            }
+        };
+        let coded = frames as u64 * frame_bytes;
         require(e.bytes > coded, "no physical bytes after coded span")?;
         let bytes = e.bytes - coded;
         require(
-            bytes <= MAX_TAIL && bytes < FRAME,
+            bytes <= MAX_TAIL && bytes < frame_bytes
+                && (profile == Profile::Dnx || bytes == 32000),
             "terminal span exceeds bound",
         )?;
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
         let data = read(&mut file, index.offset, index.bytes, 128 << 10)?;
         let fields = fields(&data)?;
         require(
@@ -177,7 +223,10 @@ impl Terminal {
             "invalid index instance identifier",
         )?;
         require(
-            uint(&fields, 0x3f0b, 8)? == (24000u64 << 32 | 1001)
+            uint(&fields, 0x3f0b, 8)? == match profile {
+                Profile::Dnx => 24000u64 << 32 | 1001,
+                Profile::ProResFreeze => 24u64 << 32 | 1,
+            }
                 && uint(&fields, 0x3f0c, 8)? == 0
                 && uint(&fields, 0x3f0d, 8)? == frames as u64 + 1
                 && uint(&fields, 0x3f05, 4)? == 0
@@ -220,17 +269,29 @@ impl Terminal {
             "index array has wrong size",
         )?;
         let mut header_prefix = Vec::new();
+        let first_picture = if profile == Profile::ProResFreeze {
+            Some(read(&mut file, e.offset, frame_bytes, 2 << 20)?)
+        } else {
+            None
+        };
         for i in 0..=frames as usize {
             let row = &array[8 + i * 11..8 + (i + 1) * 11];
             require(
                 row[0] == 0
                     && row[1] == 0
                     && row[2] == 0x80
-                    && u64::from_be_bytes(row[3..11].try_into().unwrap()) == i as u64 * FRAME,
+                    && u64::from_be_bytes(row[3..11].try_into().unwrap()) == i as u64 * frame_bytes,
                 "index does not pin every coded boundary",
             )?;
             if i < frames as usize {
-                let current = header(&mut file, e.offset + i as u64 * FRAME)?;
+                let offset = e.offset + i as u64 * frame_bytes;
+                let current = if let Some(first) = &first_picture {
+                    let picture = read(&mut file, offset, frame_bytes, 2 << 20)?;
+                    require(&picture == first, "generated ProRes pictures are not byte-identical")?;
+                    picture[..28].to_vec()
+                } else {
+                    header(&mut file, offset)?
+                };
                 if i == 0 {
                     header_prefix = current;
                 } else {
@@ -249,6 +310,8 @@ impl Terminal {
             bytes,
             sha256: hex(&sha256(&tail)),
             header_prefix,
+            frame_bytes,
+            profile,
         })
     }
     fn check_packets(&self, raw: &Value, stream: usize) -> R<()> {
@@ -263,7 +326,7 @@ impl Terminal {
             let size = if n == self.frames as usize {
                 self.bytes
             } else {
-                FRAME
+                self.frame_bytes
             };
             require(
                 integer(p, "stream_index")? == stream as i64
@@ -271,7 +334,7 @@ impl Terminal {
                     && integer(p, "dts")? == n as i64
                     && integer(p, "duration")? == 1
                     && integer(p, "pos")? as i128
-                        == i128::from(self.essence_offset) + n as i128 * i128::from(FRAME)
+                        == i128::from(self.essence_offset) + n as i128 * i128::from(self.frame_bytes)
                     && integer(p, "size")? as i128 == i128::from(size),
                 "parsed packet does not match physical coded/tail boundary",
             )?;
@@ -326,7 +389,7 @@ mod tests {
                     .join(format!("anynle-terminal-{}-{n}-{}.mxf", std::process::id(),NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed))),
             )
         }
-        fn physical(&self, body: &[u8], fields: &BTreeMap<u16, Vec<u8>>) -> R<Terminal> {
+        fn write(&self, body: &[u8], fields: &BTreeMap<u16, Vec<u8>>) {
             // Deliberately minimal physical framing control, not a native/application fixture.
             let mut bytes = Vec::new();
             fn klv(out: &mut Vec<u8>, key: [u8; 16], value: &[u8]) {
@@ -360,6 +423,9 @@ mod tests {
                 &local,
             );
             fs::write(&self.0, bytes).unwrap();
+        }
+        fn physical(&self, body: &[u8], fields: &BTreeMap<u16, Vec<u8>>) -> R<Terminal> {
+            self.write(body, fields);
             Terminal::physical(&self.0, 2)
         }
     }
@@ -465,6 +531,36 @@ mod tests {
         assert!(super::fields(&[0x3f, 0x08, 0, 1, 0, 0x3f, 0x08, 0, 1, 0]).is_err());
     }
     #[test]
+    fn prores_freeze_tail_requires_equal_complete_pictures_and_zero_padding() {
+        let scratch = Scratch::new();
+        let (_, mut fields) = control();
+        const SIZE: usize = 40960;
+        let mut picture = vec![0; SIZE];
+        picture[..4].copy_from_slice(&(SIZE as u32).to_be_bytes());
+        picture[4..8].copy_from_slice(b"icpf");
+        picture[16..20].copy_from_slice(&[0x07, 0x80, 0x04, 0x38]);
+        let mut body = picture.repeat(120);
+        body.resize(body.len() + 32000, 0);
+        fields.insert(0x3f0b, (24u64 << 32 | 1).to_be_bytes().to_vec());
+        fields.insert(0x3f0d, 121u64.to_be_bytes().to_vec());
+        let mut array = Vec::from(121u32.to_be_bytes());
+        array.extend(11u32.to_be_bytes());
+        for n in 0..121 {
+            array.extend([0, 0, 128]);
+            array.extend(((n * SIZE) as u64).to_be_bytes());
+        }
+        fields.insert(0x3f0a, array);
+        scratch.write(&body, &fields);
+        let terminal = Terminal::physical_profile(&scratch.0, 120, Profile::ProResFreeze).unwrap();
+        assert_eq!((terminal.frames, terminal.bytes), (120, 32000));
+        for offset in [SIZE + 28, 120 * SIZE] {
+            body[offset] = 1;
+            scratch.write(&body, &fields);
+            assert!(Terminal::physical_profile(&scratch.0, 120, Profile::ProResFreeze).is_err());
+            body[offset] = 0;
+        }
+    }
+    #[test]
     fn packet_layer_must_match_every_physical_boundary() {
         let t = Terminal {
             frames: 2,
@@ -472,6 +568,8 @@ mod tests {
             bytes: 512,
             sha256: String::new(),
             header_prefix: Vec::new(),
+            frame_bytes: FRAME,
+            profile: Profile::Dnx,
         };
         let make = || {
             Value::Obj(vec![(

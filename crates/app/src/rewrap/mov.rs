@@ -1,4 +1,4 @@
-//! Bounded ProRes LT / discrete interleaved PCM MOV preparation.
+//! Bounded ProRes MOV preparation, with discrete interleaved PCM for LT masters.
 //! PCM samples are byte-interleaved, never mixed/resampled. Only generated trailing
 //! moov metadata is rewritten: media/chunk offsets and compressed picture bytes stay put.
 use super::{
@@ -31,7 +31,7 @@ pub(super) fn validate_source(s: &Stream, raw: &Value, v: &VideoFile) -> R<()> {
         .ok_or("missing ProRes picture")?;
     if s.kind != "video"
         || s.codec != "prores"
-        || s.profile != "LT"
+        || s.profile != if v.codec == "apch" { "HQ" } else { "LT" }
         || s.pix != "yuv422p10le"
         || s.width != 1920
         || s.height != 1080
@@ -43,7 +43,7 @@ pub(super) fn validate_source(s: &Stream, raw: &Value, v: &VideoFile) -> R<()> {
         || string(p, "sample_aspect_ratio") != Some("1:1")
         || string(p, "field_order") != Some("progressive")
     {
-        return Err("ProRes MOV initially requires progressive square-pixel 1920x1080 ProRes LT at 24/1; geometry/profile corrections are not inferred".into());
+        return Err("ProRes MOV requires progressive square-pixel 1920x1080 at 24/1 with the qualified picture profile".into());
     }
     Ok(())
 }
@@ -340,21 +340,17 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
     if packed.is_some() {
         c.args(["-map", "1:a:0"]);
     }
-    c.args([
-        "-c",
-        "copy",
-        "-r:v",
-        "24",
-        "-map_metadata",
-        "0",
-        "-timecode",
-        &job.tc,
-        "-write_tmcd",
-        "1",
-        "-f",
-        "mov",
-    ])
-    .arg(partial);
+    let picture = &plan.inputs[job.inputs[0]];
+    if let Some(tail) = &picture.terminal {
+        c.args(["-bsf:v:0", &tail.filter()]);
+    }
+    c.args(["-c", "copy", "-r:v", "24", "-map_metadata", "0"]);
+    if let Some(tc) = &job.tc {
+        c.args(["-timecode", tc, "-write_tmcd", "1"]);
+    } else {
+        c.args(["-write_tmcd", "0"]);
+    }
+    c.args(["-f", "mov"]).arg(partial);
     run(&mut c)?;
     if let Some((count, bits)) = packed {
         fix_description(partial, count, bits)?;
@@ -385,25 +381,26 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
         .iter()
         .filter(|s| string(s, "codec_type") == Some("data"))
         .collect::<Vec<_>>();
-    let source = &plan.inputs[job.inputs[0]].probe.streams[0];
+    let source = &picture.probe.streams[0];
+    let packets = picture.terminal.as_ref().map_or(source.packets, |tail| tail.frames);
     if video.len() != 1
         || audio.len() != usize::from(channels > 0)
-        || data.len() != 1
+        || data.len() != usize::from(job.tc.is_some())
         || streams.len() != video.len() + audio.len() + data.len()
     {
         return Err("unexpected MOV stream topology".into());
     }
     let v = video[0];
     if exact_ticks(v)? != source.ticks
-        || integer(v, "nb_read_packets")? != source.packets
+        || integer(v, "nb_read_packets")? != packets
         || string(v, "codec_name") != Some("prores")
-        || string(v, "profile") != Some("LT")
+        || string(v, "profile") != Some(source.profile.as_str())
         || string(v, "pix_fmt") != Some("yuv422p10le")
         || integer(v, "width")? != 1920
         || integer(v, "height")? != 1080
         || string(v, "sample_aspect_ratio") != Some("1:1")
         || string(v, "r_frame_rate") != Some("24/1")
-        || v.get("tags").and_then(|t| string(t, "timecode")) != Some(job.tc.as_str())
+        || v.get("tags").and_then(|t| string(t, "timecode")) != job.tc.as_deref()
         || integer(v, "start_pts")? != 0
     {
         return Err("MOV picture descriptor/clock changed".into());
@@ -425,11 +422,13 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
             }
         }
     }
-    if string(data[0], "codec_tag_string") != Some("tmcd")
-        || exact_ticks(data[0])? != source.ticks
-        || data[0].get("tags").and_then(|t| string(t, "timecode")) != Some(job.tc.as_str())
-    {
-        return Err("MOV timecode track changed".into());
+    if let Some(track) = data.first() {
+        if string(track, "codec_tag_string") != Some("tmcd")
+            || exact_ticks(track)? != source.ticks
+            || track.get("tags").and_then(|t| string(t, "timecode")) != job.tc.as_deref()
+        {
+            return Err("MOV timecode track changed".into());
+        }
     }
     let fingerprint = run(Command::new(&plan.ffmpeg)
         .args(["-v", "error", "-nostdin", "-i"])

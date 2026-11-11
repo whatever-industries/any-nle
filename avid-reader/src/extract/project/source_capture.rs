@@ -9,6 +9,8 @@ use std::fmt::Write as _;
 use std::mem::size_of;
 use std::rc::Rc;
 mod groups;
+mod timewarp;
+pub(super) use timewarp::{direct_input as timewarp_input, is_sampled_effect, uses_editable_position};
 
 type SharedBudget = Rc<RefCell<Budget>>;
 struct Budget {
@@ -87,6 +89,30 @@ fn copy_text(budget: &SharedBudget, text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     out.push_str(text);
     out
+}
+fn copy_text_properties<'a, V: AsRef<str>>(
+    budget: &SharedBudget,
+    properties: Result<impl IntoIterator<Item = (&'static str, usize, &'a str, V)>, &'static str>,
+    retained: &mut Vec<NativeTextProperty>,
+    reason: &mut Option<String>,
+) -> bool {
+    match properties {
+        Ok(properties) => {
+            for (scope, list, name, value) in properties {
+                if !reserve(budget, retained, 1) {
+                    return false;
+                }
+                retained.push(NativeTextProperty {
+                    scope: copy_text(budget, scope),
+                    list,
+                    name: copy_text(budget, name),
+                    value: copy_text(budget, value.as_ref()),
+                });
+            }
+        }
+        Err(error) => *reason = Some(copy_text(budget, error)),
+    }
+    true
 }
 fn formatted(budget: &SharedBudget, args: std::fmt::Arguments<'_>) -> String {
     struct Counter(usize, bool);
@@ -311,6 +337,8 @@ pub(super) struct MasterMeta {
     pub(super) offsets: Vec<Observed<i64>>,
     pub(super) marker_witnesses: Vec<MasterMarkerWitness>,
     pub(super) originals: Vec<Option<OriginalTrack>>,
+    pub(super) rendered_freeze: bool,
+    pub(super) rendered_gain: Option<MobId>,
 }
 impl InputContext {
     pub(super) fn failed(&self) -> bool {
@@ -393,7 +421,9 @@ impl InputContext {
                 };
                 offsets.push(offset);
                 if !reserve(&self.budget, &mut originals, 1) { break; }
-                let descriptor = ctx.mobs.get(&native.file_mob).and_then(|m| ctx.deref(m.get("descriptor")));
+                let file = ctx.mobs.get(&native.file_mob);
+                let file_track = matched.and_then(|t| ctx.only_source_clip(t).ok()).and_then(|c| int(c, "track_id"));
+                let descriptor = file.and_then(|m| ctx.deref(m.get("descriptor")));
                 let original = descriptor.and_then(|d| {
                     let mut locators = Vec::new();
                     let mut current = Some(d);
@@ -413,6 +443,28 @@ impl InputContext {
                     }
                     if locators.is_empty() { return None; }
                     if !charge(&self.budget, size_of::<OriginalTrack>()) { return None; }
+                    let motion_audio_track_start = if native.kind == KIND_SOUND
+                        && d.class == *b"MPGA" && d.get("sub_frame_alignment") == Some(&Value::UInt(0))
+                        && d.get("origin") == Some(&Value::UInt(0))
+                    {
+                        file.and_then(|m| {
+                            let rate = float(m, "edit_rate").and_then(Rate::from_avid)?;
+                            if !matches!((rate.num, rate.den), (24, 1) | (24_000, 1001)) {
+                                return None;
+                            }
+                            let tracks = ctx.tracks(m);
+                            let mut found = tracks.iter().copied().filter(|t| {
+                                int(t, "index") == file_track && file_track.is_some()
+                                    && ctx.deref(t.get("component")).and_then(|c| int(c, "media_kind_id")) == Some(KIND_SOUND)
+                            });
+                            let t = found.next()?;
+                            if found.next().is_some() { return None; }
+                            let child = ctx.only_source_clip(t).ok()?;
+                            (int(child, "start_time") == Some(0)
+                                && float(child, "edit_rate").and_then(Rate::from_avid) == Some(rate))
+                                .then(|| int(t, "start_pos")).flatten()
+                        })
+                    } else { None };
                     Some(OriginalTrack {
                         locators,
                         descriptor_class: copy_text(&self.budget, std::str::from_utf8(&d.class).unwrap_or("????")),
@@ -421,7 +473,8 @@ impl InputContext {
                         channels: int(d, "channels"),
                         sample_rate: float(d, "sample_rate"),
                         stored_quantization_bits: int(d, "quantization_bits"),
-                        file_track: matched.and_then(|t| ctx.only_source_clip(t).ok()).and_then(|c| int(c, "track_id")),
+                        file_track,
+                        motion_audio_track_start,
                     })
                 });
                 originals.push(original);
@@ -453,6 +506,8 @@ impl InputContext {
             }
         }
         MasterMeta {
+            rendered_freeze: false,
+            rendered_gain: None,
             id,
             offsets,
             marker_witnesses,
@@ -522,6 +577,80 @@ struct QueryFact {
     record_rate: Option<Rate>,
     retimed: bool,
     motion: Option<(i64, i64)>,
+    motion_adapter_phase: Option<i64>,
+    saved_timewarp: Option<Vec<i64>>,
+}
+pub(super) fn automatic_adapter_attrs<'a>(ctx: &Ctx<'a>, node: &Node) -> Option<&'a [(String, Value)]> {
+    match ctx.deref(node.get("attributes"))?.get("entries")? {
+        Value::Attrs(a) if a.iter().any(|(k,v)| k == "_MIXMATCH_MOTIONADAPTER" && v.as_int() == Some(2)) => Some(a),
+        _ => None,
+    }
+}
+
+/// Admit only the saved progressive automatic adapter, not a creative speed or a graph.
+pub(super) fn qualified_automatic_adapter<'a>(
+    ctx: &Ctx<'a>, c: &'a Node, attrs: &[(String, Value)], kind: i64, length: i64,
+) -> Option<(&'a Node, MobId, i64, i64, i64, i64, (i64, i64))> {
+    let attr = |name: &str| {
+        let mut values = attrs.iter().filter(|(k, _)| k == name);
+        let (_, v) = values.next()?;
+        values.next().is_none().then(|| v.as_int()).flatten()
+    };
+    let rate = |node| float(node, "edit_rate").and_then(Rate::from_avid);
+    let absent = |name| matches!(c.get(name), None | Some(Value::Null));
+    let phase = int(c, "phase_offset").filter(|p| *p >= 0)?;
+    if !matches!(kind, KIND_PICTURE | KIND_SOUND)
+        || c.get("effect_id").and_then(Value::as_str) != Some(if kind == KIND_PICTURE {
+            "EFF_TIMEWARP.MOTION_CTL"
+        } else { "EFF_TIMEWARP.AUDIO_TIME_WARP" })
+        || int(c, "mc_mode") != Some(0)
+        || !(2..=16_384).contains(&length)
+        || attr("_MIXMATCH_MOTIONADAPTER") != Some(2) || attr("_MFX_INPUT_FORMAT") != Some(2)
+        || attr("_MFX_OUTPUT_FORMAT") != Some(2) || attr("_SFX_RENDER") != Some(2)
+        || attr("_SFX_IGNORE_RENDER_SETTING") != Some(1)
+        || attrs.iter().any(|(k, _)| k == "_MFX_GRAPH_ENABLED")
+        || !absent("source_param_list") || !absent("precomputed")
+        || float(c, "offset_adjust") != Some(0.0)
+        || c.get("new_source_calculation") != Some(&Value::Bool(false))
+    { return None; }
+    let params = ctx.deref(c.get("param_list"))?;
+    let Value::RefList(params) = params.get("items")? else { return None; };
+    let [param] = params.as_slice() else { return None; };
+    let param = ctx.deref(Some(param))?;
+    let Some(Value::Uuid(uuid)) = param.get("uuid") else { return None; };
+    let curve = ctx.deref(param.get("control_track"))?;
+    let Value::List(points) = curve.get("control_points")? else { return None; };
+    let [Value::Node(point)] = points.as_slice() else { return None; };
+    if uuid.to_string() != "8d568283-847e-11d5-935a-50f857c10000"
+        || int(param, "value") != Some(0) || int(point, "value") != Some(0)
+        || !matches!(point.get("offset"), Some(Value::List(v)) if v.as_slice() == [Value::Int(-phase), Value::Int(1)])
+        || int(point, "timescale") != Some(1) || !matches!(point.get("pp"), Some(Value::List(v)) if v.is_empty())
+    { return None; }
+    let tracks = ctx.tracks(c);
+    let [track] = tracks.as_slice() else { return None; };
+    let component = ctx.deref(track.get("component"))?;
+    if component.class != *b"SCLP" && component.class != *b"SEQU" { return None; }
+    let parts = ctx.segments(component);
+    let mut meaningful = parts.iter().filter(|(_, n)| !(n.class == *b"FILL" && int(n, "length") == Some(0)));
+    let (0, clip) = *meaningful.next()? else { return None; };
+    if clip.class != *b"SCLP" || meaningful.next().is_some() { return None; }
+    let source_length = int(clip, "length")?;
+    let source_in = int(clip, "start_time")?;
+    let label = int(clip, "track_id").filter(|n| *n > 0)?;
+    let ratio = Rate::automatic_adapter_span(rate(clip)?, rate(c)?)?;
+    let qualified_range = match ratio {
+        (1000, 1001) => source_in == phase && source_length == (length * 1001 + 999) / 1000,
+        (1001, 1000) => source_length == length
+            && i128::from(source_in) == i128::from(phase) * 1000 / 1001,
+        _ => false,
+    };
+    if !qualified_range || int(clip, "media_kind_id") != Some(kind)
+        || !matches!(c.get("speed_ratio"), Some(Value::List(v))
+            if v.as_slice() == [Value::Int(ratio.0), Value::Int(ratio.1)])
+    {
+        return None;
+    }
+    Some((clip, mob_id(clip)?, source_in, phase, source_length, label, ratio))
 }
 struct TextFact { scope: usize, text: SourceText }
 pub(super) struct Capture {
@@ -534,9 +663,12 @@ pub(super) struct Capture {
     markers: Vec<MarkerFact>,
     transitions: Vec<TransitionFact>,
     queries: Vec<QueryFact>,
+    adapter_issues: Vec<SourceIssue>,
     texts: Vec<TextFact>,
     group_uses: Vec<groups::UseFact>,
     charged_ops: usize,
+    primary_timecode_seen: bool,
+    clock: Option<SequenceClock>,
 }
 impl std::fmt::Debug for Capture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -563,9 +695,12 @@ impl Capture {
             markers: Vec::new(),
             transitions: Vec::new(),
             queries: Vec::new(),
+            adapter_issues: Vec::new(),
             texts: Vec::new(),
             group_uses: Vec::new(),
             charged_ops: 0,
+            primary_timecode_seen: false,
+            clock: None,
         }
     }
     pub(super) fn reserve_track_format(&mut self, values: &mut Vec<(i64, i64)>) -> bool {
@@ -645,17 +780,22 @@ impl Capture {
                         // Reserve the parser's bounded output growth and stack before
                         // decoding; no database or decoded node escapes this scope.
                         if !charge(&self.budget, body.len().saturating_mul(2).saturating_add(2048)) { return; }
-                        if text_kind == TextKind::TitlerPlus {
-                            match super::text::properties(body) {
-                                Ok(properties) => for (scope, list, name, value) in properties {
-                                    if !reserve(&self.budget, &mut native_properties, 1) { return; }
-                                    native_properties.push(NativeTextProperty {
-                                        scope: copy_text(&self.budget, scope), list,
-                                        name: copy_text(&self.budget, name), value: copy_text(&self.budget, value),
-                                    });
-                                },
-                                Err(reason) => native_properties_reason = Some(copy_text(&self.budget, reason)),
-                            }
+                        let kept = match text_kind {
+                            TextKind::SubCap => copy_text_properties(
+                                &self.budget,
+                                super::text::subcap_properties(ctx, node),
+                                &mut native_properties,
+                                &mut native_properties_reason,
+                            ),
+                            TextKind::TitlerPlus => copy_text_properties(
+                                &self.budget,
+                                super::text::properties(body),
+                                &mut native_properties,
+                                &mut native_properties_reason,
+                            ),
+                        };
+                        if !kept {
+                            return;
                         }
                         super::text::decode(body, text_kind)
                     },
@@ -751,11 +891,9 @@ impl Capture {
             });
         });
     }
-    /// A marker on a direct, sequence-spanning TCCP has a qualified record-local
-    /// clock without qualifying the sequence's absolute start timecode. Preserve
-    /// other top-level timecode owners as unresolved facts; do not treat an
-    /// arbitrary metadata graph as an editable A/V placement.
-    pub(super) fn timecode_track_markers(
+    /// A direct, sequence-spanning TCCP can place its own markers in record
+    /// time. Absolute start additionally requires an unambiguous, qualified TC1.
+    pub(super) fn timecode_track(
         &mut self,
         ctx: &Ctx<'_>,
         native_track: &Node,
@@ -775,6 +913,27 @@ impl Capture {
             && rate == self.rate
             && length.is_some_and(|n| n >= 0)
             && length == sequence_length;
+        if track == 1 {
+            if self.primary_timecode_seen {
+                self.clock = None;
+            } else if qualified
+                && rate == Rate::new(24000, 1001)
+                && int(component, "fps") == Some(24)
+                && int(component, "flags") == Some(0)
+            {
+                // Premiere's 23.976 preset displays a 24-count non-drop
+                // clock. Different rates, DF and wrapped counts are unqualified.
+                if let Some(count) = int(component, "start").filter(|n| (0..24 * 60 * 60 * 24).contains(n)) {
+                    self.clock = rate.map(|rate| SequenceClock {
+                        count: count as u64,
+                        rate,
+                        display_base: 24,
+                        track_ordinal: ordinal,
+                    });
+                }
+            }
+            self.primary_timecode_seen = true;
+        }
         // Separate metadata namespace: collecting a marker must not renumber
         // existing A/V occurrences or choose among equal track labels.
         let mut n = 0;
@@ -862,7 +1021,29 @@ impl Capture {
             t.incoming = owner;
         }
     }
-    pub(super) fn query(&mut self, op: usize, node: &Node, motion: Option<(i64, i64)>) {
+    pub(super) fn query(&mut self, op: usize, node: &Node, motion: Option<(i64, i64)>, motion_adapter_phase: Option<i64>) {
+        self.query_with_timewarp(op, node, motion, motion_adapter_phase, None, false);
+    }
+    pub(super) fn query_rendered_freeze(&mut self, op: usize, render: &Node) -> bool {
+        if self.rate != Rate::new(24, 1)
+            || self.stack.iter().rev().skip(1).any(|&i| self.scopes[i].class != *b"SEQU")
+        {
+            return false;
+        }
+        self.query_with_timewarp(op, render, None, None, None, true);
+        !self.failed()
+    }
+    pub(super) fn query_rendered_gain(&mut self, op: usize, render: &Node) -> bool {
+        if self.rate != Rate::new(24, 1)
+            || self.stack.iter().rev().skip(1)
+                .any(|&i| !matches!(&self.scopes[i].class, b"SEQU" | b"PVOL"))
+        {
+            return false;
+        }
+        self.query_with_timewarp(op, render, None, None, None, true);
+        !self.failed()
+    }
+    fn query_with_timewarp(&mut self, op: usize, node: &Node, motion: Option<(i64, i64)>, motion_adapter_phase: Option<i64>, saved_timewarp: Option<Vec<i64>>, rendered: bool) {
         let Some(scope) = self.stack.last().map(|i| &self.scopes[*i]) else {
             return;
         };
@@ -892,9 +1073,67 @@ impl Capture {
             position_known: scope.position_known,
             enclosing_span_known,
             record_rate: self.rate,
-            retimed: scope.retimed,
+            retimed: scope.retimed && !rendered,
             motion,
+            motion_adapter_phase,
+            saved_timewarp,
         });
+    }
+    pub(super) fn unresolved_motion_adapter(&mut self, record: i64, kind: i64, track: i64) {
+        self.unresolved_motion(record, kind, track, "Avid Motion Adapter timing is not supported");
+    }
+    pub(super) fn unresolved_motion(&mut self, record: i64, kind: i64, track: i64, reason: &'static str) {
+        let Some(scope) = self.stack.last().map(|i| &self.scopes[*i]) else {
+            return;
+        };
+        add_rate_issue(
+            &IssueContext {
+                owner: &scope.id,
+                record,
+                position_known: scope.position_known,
+                rate: self.rate,
+                kind,
+                track,
+            },
+            reason,
+            Vec::new(),
+            &self.budget,
+            &mut self.adapter_issues,
+        );
+    }
+    pub(super) fn query_sampled_timewarp(
+        &mut self, ctx: &Ctx<'_>, op: usize, effect: &Node, input: &Node,
+        ratio: (i64, i64), record: i64, kind: i64, track: i64, sparse: bool,
+    ) -> bool {
+        let rate = if sparse { Rate::new(24_000, 1001) } else { Rate::new(24, 1) };
+        let direct = kind == KIND_PICTURE && self.rate == rate
+            && self.stack.iter().rev().skip(1).all(|&i| self.scopes[i].class == *b"SEQU")
+            && timewarp::master_picture_matches(ctx, input);
+        let mut owned = Vec::new();
+        let mut retain = |frames: &[i64]| {
+            if !reserve(&self.budget, &mut owned, frames.len()) { return false; }
+            owned.extend_from_slice(frames);
+            true
+        };
+        let qualified = direct && if sparse {
+            timewarp::visible_sparse_frames(ctx, effect, input, ratio)
+                .is_some_and(|frames| retain(&frames))
+        } else {
+            timewarp::visible_frames(ctx, effect, input, ratio)
+                .is_some_and(|frames| frames.is_none_or(|frames| retain(&frames)))
+        };
+        if !qualified {
+            let reason = if sparse {
+                "Avid Timewarp uses an unsupported Position curve; constant speed would change its cadence"
+            } else {
+                "Avid Timewarp has no supported saved picture map; a constant speed would change its cadence"
+            };
+            self.unresolved_motion(record, kind, track, reason);
+            return false;
+        }
+        let map = (!owned.is_empty()).then_some(owned);
+        self.query_with_timewarp(op, input, Some(ratio), None, map, false);
+        !self.failed()
     }
     fn op_cost(&mut self, op: &Op) -> usize {
         let mut cost = 0;
@@ -1006,12 +1245,32 @@ fn add_issue(
     budget: &SharedBudget,
     issues: &mut Vec<SourceIssue>,
 ) {
+    add_classified_issue(context, SourceIssueKind::Route, reason, route, budget, issues);
+}
+fn add_rate_issue(
+    context: &IssueContext<'_>,
+    reason: &str,
+    route: Vec<RouteWitness>,
+    budget: &SharedBudget,
+    issues: &mut Vec<SourceIssue>,
+) {
+    add_classified_issue(context, SourceIssueKind::RouteTiming, reason, route, budget, issues);
+}
+fn add_classified_issue(
+    context: &IssueContext<'_>,
+    issue_kind: SourceIssueKind,
+    reason: &str,
+    route: Vec<RouteWitness>,
+    budget: &SharedBudget,
+    issues: &mut Vec<SourceIssue>,
+) {
     if !reserve(budget, issues, 1) {
         return;
     }
     issues.push(SourceIssue {
         owner: copy_text(budget, context.owner),
         reason: copy_text(budget, reason),
+        issue_kind,
         route,
         record_start: if context.position_known {
             Observed::Known(context.record)
@@ -1051,6 +1310,21 @@ fn qualified_query(
         kind: q.kind,
         track: q.track,
     };
+    if fact.motion_adapter_phase.is_some() {
+        let source_rate = fact.rate;
+        if source_rate.zip(fact.record_rate)
+            .and_then(|(source, record)| Rate::automatic_adapter_span(source, record)).is_none()
+            || !fact.position_known || !fact.enclosing_span_known
+            || !fact.label.is_some_and(|n| n > 0)
+            || !routes.get(&q.id).is_some_and(|r| r.kind == Some(MOB_MASTER) && r.rate == source_rate)
+        {
+            add_rate_issue(&context, "Avid Motion Adapter does not resolve to a qualified direct master at its saved source rate", route, budget, &mut issues);
+        } else if reserve(budget, &mut pieces, 1) {
+            pieces.push(Piece { master: q.id, label: q.label, record: q.record,
+                source: q.offset, length: q.length, rate: source_rate.unwrap(), route });
+        }
+        return (pieces, issues);
+    }
     let reason = if fact.start.is_none() {
         Some("source start is absent")
     } else if fact.label.is_none() {
@@ -1059,14 +1333,21 @@ fn qualified_query(
         Some("source track label is not positive")
     } else if fact.length.is_none() {
         Some("source length is absent")
+    } else if fact.rate.is_some() && fact.record_rate.is_some() && fact.rate != fact.record_rate {
+        add_rate_issue(
+            &context,
+            "source component rate differs from its record owner; conversion is unqualified",
+            route,
+            budget,
+            &mut issues,
+        );
+        return (pieces, issues);
     } else if !fact.enclosing_span_known {
         Some("enclosing component span is unresolved or differs from its source input")
     } else if !fact.position_known {
         Some("record position follows unresolved native timing")
     } else if fact.rate.is_none() {
         Some("source owner rate is unresolved")
-    } else if fact.rate != fact.record_rate {
-        Some("source component rate differs from its record owner; conversion is unqualified")
     } else if fact.retimed && fact.motion.is_none() {
         Some("retimed route range is unresolved")
     } else {
@@ -1150,7 +1431,7 @@ fn qualified_resolve(
                 budget,
             ));
         }
-        return add_issue(
+        return add_rate_issue(
             context,
             "mixed or unknown route-owner rates are not qualified",
             route,
@@ -1191,7 +1472,16 @@ fn qualified_resolve(
                 );
             }
             let track = track.unwrap();
-            if track.rate != Some(rate) || !track.range_qualified {
+            if track.rate != Some(rate) {
+                return add_rate_issue(
+                    context,
+                    "source composition track rate differs or is unknown",
+                    route,
+                    budget,
+                    issues,
+                );
+            }
+            if !track.range_qualified {
                 return add_issue(
                     context,
                     "source composition units or ranges are unresolved",
@@ -1273,7 +1563,7 @@ fn qualified_resolve(
                             budget,
                         ));
                         if component_rate != Some(rate) {
-                            add_issue(
+                            add_rate_issue(
                                 context,
                                 "mixed source component rate is unqualified",
                                 next,
@@ -1450,7 +1740,7 @@ fn finish_source(
     }
     let mut events = Vec::new();
     let mut starts = Vec::new();
-    let mut unresolved = Vec::new();
+    let mut unresolved = std::mem::take(&mut capture.adapter_issues);
     let mut info = pending.info;
     // The source path does not run the legacy flattened resolver. Every emitted
     // range below was independently resolved from observed route/rate witnesses.
@@ -1461,7 +1751,7 @@ fn finish_source(
         starts.push(events.len());
         match op {
             Op::Source(q) | Op::Motion { query: q, .. } => {
-                let Some(fact) = capture.queries.iter().find(|f| f.op == op_index) else {
+                let Some(fact) = capture.queries.iter_mut().find(|f| f.op == op_index) else {
                     continue;
                 };
                 let (pieces, issues) = qualified_query(routes, &q, fact, &capture.budget);
@@ -1482,7 +1772,8 @@ fn finish_source(
                         kind: q.kind,
                         track: q.track,
                     };
-                    add_issue(
+                    let report = if fact.saved_timewarp.is_some() { add_rate_issue } else { add_issue };
+                    report(
                         &context,
                         "motion source does not have one qualified range",
                         Vec::new(),
@@ -1526,7 +1817,7 @@ fn finish_source(
                             continue;
                         };
                         event.length = length;
-                        event.speed = Some(ratio);
+                        event.speed = fact.motion_adapter_phase.is_none().then_some(ratio);
                         event.source_length = piece.length;
                     }
                     let range = QualifiedRange {
@@ -1546,6 +1837,8 @@ fn finish_source(
                         reason: None,
                         volume_automation: None,
                         picture_extension: None,
+                        motion_adapter_phase: fact.motion_adapter_phase,
+                        saved_timewarp: fact.saved_timewarp.take(),
                     });
                 }
             }
@@ -1750,6 +2043,7 @@ fn finish_source(
         id: capture.id,
         info,
         rate: capture.rate,
+        clock: capture.clock,
         combiner_channels,
         events,
         transitions,
@@ -1890,6 +2184,8 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
                                 offsets: meta.offsets,
                                 marker_witnesses: meta.marker_witnesses,
                                 originals: meta.originals,
+                                rendered_freeze: meta.rendered_freeze,
+                                rendered_gain: meta.rendered_gain,
                             });
                         }
                         Err(reason) => {

@@ -84,7 +84,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let project=root.join("published.prproj");std::fs::write(&project,b"published project").unwrap();
         let occupied=root.join("conversion.json");std::fs::write(&occupied,b"incumbent receipt").unwrap();
-        let plan=Plan { destination:root.clone(),inputs:vec![],jobs:vec![],
+        let plan=Plan { destination:root.clone(),inputs:vec![],jobs:vec![],mono:vec![],
             ffmpeg:"ffmpeg".into(),ffprobe:"ffprobe".into(),versions:vec![],estimate:0,free:0 };
         let error=plan.record_project_with_mode(&project,"test").unwrap_err();
         assert!(error.contains("project published") && error.contains("media retained"));

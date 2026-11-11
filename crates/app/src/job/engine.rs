@@ -5,7 +5,7 @@ use avid_reader::source::SourceInput;
 use mapping::{AvidToPremiere, BinMode};
 use prproj::convert::{prepared::PreparedClip, writer::PreparedProject};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -94,12 +94,15 @@ fn path_key(path: &Path) -> Result<String, String> {
         .to_string_lossy()
         .to_lowercase())
 }
-fn check_paths(spec: &JobSpec, receipt: &Path, replay: &Path) -> Result<(), String> {
+fn check_project_paths(spec: &JobSpec, receipt: &Path, replay: &Path) -> Result<(), String> {
     output::preflight(&spec.output, Some(receipt))?;
     output::preflight(&spec.output, Some(replay))?;
     if path_key(receipt)? == path_key(replay)? {
         return Err("Receipt and replay paths overlap".into());
     }
+    Ok(())
+}
+fn check_new_media_paths(spec: &JobSpec, receipt: &Path, replay: &Path) -> Result<(), String> {
     if let Some(dir) = &spec.new_media {
         let dir = path_key(dir)?;
         for p in [&spec.output, receipt, replay] {
@@ -112,6 +115,10 @@ fn check_paths(spec: &JobSpec, receipt: &Path, replay: &Path) -> Result<(), Stri
         }
     }
     Ok(())
+}
+fn check_paths(spec: &JobSpec, receipt: &Path, replay: &Path) -> Result<(), String> {
+    check_project_paths(spec, receipt, replay)?;
+    check_new_media_paths(spec, receipt, replay)
 }
 /// One-shot, Send-safe value. It contains encoded project bytes, never a live editor or UUID source.
 pub struct PreparedJob {
@@ -152,25 +159,150 @@ pub fn prepare(
     cancel: &CancelToken,
     cb: &mut dyn FnMut(Progress),
 ) -> Result<PreparedJob, String> {
-    cancel.check()?;
-    if spec.schema != "anynle.job/1" {
-        return Err("Unsupported job schema".into());
+    prepare_for_review(spec, cancel, cb).map_err(ReviewBlocker::cli_summary)
+}
+
+fn blocker(kind: BlockerKind) -> impl FnOnce(String) -> ReviewBlocker {
+    move |message| ReviewBlocker::new(kind, message)
+}
+
+fn unresolved_masters(source: &graph::source::SourceGraph) -> Vec<String> {
+    let mut masters = source
+        .sidecars
+        .iter()
+        .filter(|s| s.adapter == "avid.source")
+        .filter_map(|s| match s.data.get("unresolved_masters") {
+            Some(graph::Value::Arr(masters)) => Some(masters),
+            _ => None,
+        })
+        .flatten();
+    let mut details = Vec::new();
+    for master in masters.by_ref().take(8) {
+        if let (Some(graph::Value::Str(name)), Some(graph::Value::Str(reason))) =
+            (master.get("name"), master.get("reason"))
+        {
+            details.push(format!("{name}: {reason}"));
+        }
     }
-    if serde_json::to_vec(&spec).map_err(|e| e.to_string())?.len() > MAX_JOB_BYTES {
-        return Err("Job settings exceed 1 MiB".into());
+    if masters.next().is_some() {
+        details.push("More clips are affected in the selected bins.".into());
+    }
+    details
+}
+
+pub(crate) fn sequence_timing_blocker(source: &graph::source::SourceGraph) -> Option<ReviewBlocker> {
+    let mut blocked = source
+        .losses
+        .iter()
+        .filter(|loss| loss.aspect == avid_adapter::UNQUALIFIED_ROUTE_TIMING)
+        .peekable();
+    blocked.peek()?;
+    let names: HashMap<&str, &str> = source
+        .sequences
+        .iter()
+        .map(|sequence| (sequence.id.as_str(), sequence.name.as_str()))
+        .collect();
+    let mut issue = ReviewBlocker::new(
+        BlockerKind::SequenceTiming,
+        "Conversion would omit edits with unsupported Avid sequence timing",
+    );
+    let mut seen = HashSet::new();
+    for loss in blocked {
+        if seen.insert((loss.object.as_str(), loss.reason.as_str())) {
+            if issue.affected.len() == 8 {
+                issue.affected.push("More edits are affected in the selected bins.".into());
+                break;
+            }
+            let name = names.get(loss.object.as_str()).copied().unwrap_or("Selected sequence");
+            issue.affected.push(format!("{name} · {}", loss.reason));
+        }
+    }
+    Some(issue)
+}
+
+fn review_subjects(
+    source: &graph::source::SourceGraph,
+    notes: &[ReportNote],
+) -> HashMap<String, String> {
+    let wanted: HashSet<&str> = notes
+        .iter()
+        .filter(|n| matches!(n.severity.as_str(), "loss" | "warning"))
+        .map(|n| n.object.as_str())
+        .collect();
+    let mut subjects = HashMap::new();
+    let mut names: HashMap<&str, &str> = HashMap::new();
+    for item in &source.items {
+        names.insert(&item.id, &item.name);
+    }
+    for sequence in &source.sequences {
+        names.insert(&sequence.id, &sequence.name);
+        for transition in &sequence.transitions {
+            if wanted.contains(transition.id.as_str()) {
+                let lane = match transition.kind {
+                    graph::StreamKind::Audio => "A",
+                    graph::StreamKind::Video => "V",
+                };
+                subjects.insert(
+                    transition.id.clone(),
+                    format!("{} · {lane}{}", sequence.name, transition.track),
+                );
+            }
+        }
+    }
+    for bin in &source.bins {
+        names.insert(&bin.id, &bin.name);
+    }
+    for id in wanted {
+        if subjects.contains_key(id) {
+            continue;
+        }
+        // Native child occurrence IDs extend their sequence's ID with slash
+        // components. Use the closest enclosing name, never a different ID.
+        let mut object = id;
+        loop {
+            if let Some(name) = names.get(object).filter(|name| !name.is_empty()) {
+                subjects.insert(id.to_owned(), (*name).to_owned());
+                break;
+            }
+            match object.rsplit_once('/') {
+                Some((parent, _)) => object = parent,
+                None => break,
+            }
+        }
+    }
+    subjects
+}
+
+pub fn prepare_for_review(
+    spec: JobSpec,
+    cancel: &CancelToken,
+    cb: &mut dyn FnMut(Progress),
+) -> Result<PreparedJob, ReviewBlocker> {
+    use BlockerKind::*;
+    let check_cancel = || cancel.check().map_err(blocker(Retry));
+    check_cancel()?;
+    if spec.schema != "anynle.job/1" {
+        return Err(ReviewBlocker::new(ProjectSource, "Unsupported job schema"));
+    }
+    if serde_json::to_vec(&spec)
+        .map_err(|e| ReviewBlocker::new(ProjectSource, e.to_string()))?
+        .len() > MAX_JOB_BYTES
+    {
+        return Err(ReviewBlocker::new(ProjectSource, "Job settings exceed 1 MiB"));
     }
     if spec
         .output
         .extension()
         .is_none_or(|x| !x.eq_ignore_ascii_case("prproj"))
     {
-        return Err("Choose a .prproj project output".into());
+        return Err(ReviewBlocker::new(ProjectOutput, "Choose a .prproj project output"));
     }
-    let receipt = sidecar(&spec.output, ".anynle-report.json")?;
-    let replay = sidecar(&spec.output, ".anynle-job.json")?;
-    check_paths(&spec, &receipt, &replay)?;
-    let mut inv = super::inventory(&spec, cancel, cb)?;
-    let bins = super::inventory::selected_paths(&spec, &inv)?;
+    let receipt = sidecar(&spec.output, ".anynle-report.json").map_err(blocker(ProjectOutput))?;
+    let replay = sidecar(&spec.output, ".anynle-job.json").map_err(blocker(ProjectOutput))?;
+    check_project_paths(&spec, &receipt, &replay).map_err(blocker(ProjectOutput))?;
+    check_new_media_paths(&spec, &receipt, &replay).map_err(blocker(NewMedia))?;
+    let mut inv = super::inventory(&spec, cancel, cb).map_err(blocker(ProjectSource))?;
+    let bins = super::inventory::selected_paths(&spec, &inv).map_err(blocker(ProjectSource))?;
     let inputs = bins
         .iter()
         .map(|path| {
@@ -185,26 +317,28 @@ pub fn prepare(
                 revision,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(blocker(Retry))?;
     source_input::recheck_checked(&inputs, &mut || cancel.check())
-        .map_err(|e| format!("Bin inventory changed; run pre-flight again: {e}"))?;
+        .map_err(|e| ReviewBlocker::new(Retry, format!("Bin inventory changed; run pre-flight again: {e}")))?;
     for choice in &spec.effects {
         let capability = inv
             .effects
             .iter()
             .find(|e| e.key == choice.key)
-            .ok_or_else(|| format!("Unknown effect choice {}", choice.key))?;
+            .ok_or_else(|| ReviewBlocker::new(Effects, format!("Unknown effect choice {}", choice.key)))?;
         if !capability.modes.contains(&choice.mode) {
-            return Err(format!(
+            return Err(ReviewBlocker::new(Effects, format!(
                 "Effect {} does not support that conversion mode",
                 choice.key
-            ));
+            )));
         }
     }
     let mut policy = if spec.policy_json.trim().is_empty() {
         AvidToPremiere::default()
     } else {
-        AvidToPremiere::from_json_text(&spec.policy_json).map_err(|e| e.to_string())?
+        AvidToPremiere::from_json_text(&spec.policy_json)
+            .map_err(|e| ReviewBlocker::new(ProjectSource, e.to_string()))?
     };
     policy.bin_mode = match spec.mode {
         ClipMode::RewrapNative | ClipMode::Separate => BinMode::Separate,
@@ -212,13 +346,14 @@ pub fn prepare(
         ClipMode::Merged => BinMode::Merged,
     };
     // The packaged wizard requires verified bundled tools. Explicit developer paths are deliberate overrides.
-    let tools = backend_bundle::resolve(spec.ffmpeg.as_deref(), spec.ffprobe.as_deref(), true)?;
+    let tools = backend_bundle::resolve(spec.ffmpeg.as_deref(), spec.ffprobe.as_deref(), true)
+        .map_err(blocker(MediaTools))?;
     progress(
         cb,
         "source",
         "Reading qualified Avid source facts and resolving media",
     );
-    cancel.check()?;
+    check_cancel()?;
     let names = bins
         .iter()
         .map(|p| {
@@ -233,7 +368,7 @@ pub fn prepare(
         .clone()
         .unwrap_or_else(|| names[0].clone());
     let read_source = |cb: &mut dyn FnMut(Progress)| {
-        avid_adapter::read_with_originals_controlled(
+        avid_adapter::read_with_originals_for_review(
             &inputs,
             &spec.media_roots,
             &project,
@@ -262,6 +397,17 @@ pub fn prepare(
             },
             &mut || cancel.check(),
         )
+        .map_err(|issue| {
+            use avid_adapter::SourceReadIssue;
+            let (kind, message) = match issue {
+                SourceReadIssue::Bin(m) => (ProjectSource, m),
+                SourceReadIssue::OriginalLocator(m) => (OriginalLocator, m),
+                SourceReadIssue::OriginalMedia(m) => (OriginalMedia, m),
+                SourceReadIssue::MediaScan(m) => (AvidMedia, m),
+                SourceReadIssue::SourceFacts(m) => (SourceContent, m),
+            };
+            ReviewBlocker::new(kind, message)
+        })
     };
     let mut read = read_source(cb)?;
     // Direct native links need the same source-stability protection as new-media inputs.
@@ -280,22 +426,25 @@ pub fn prepare(
         "source verification",
         "Hashing referenced native media in place; no footage is copied",
     );
-    let mut media_inputs = source_input::pin_checked(&native_paths, &mut || cancel.check())?;
+    let mut media_inputs = source_input::pin_checked(&native_paths, &mut || cancel.check())
+        .map_err(blocker(AvidMedia))?;
     if !media_inputs.is_empty() {
-        cancel.check()?;
+        check_cancel()?;
         let again = read_source(cb)?;
         if again.graph != read.graph {
-            return Err(
-                "Source interpretation changed while native media was being verified".into(),
-            );
+            return Err(ReviewBlocker::new(
+                Retry,
+                "Source interpretation changed while native media was being verified",
+            ));
         }
-        source_input::recheck_checked(&media_inputs, &mut || cancel.check())?;
+        source_input::recheck_checked(&media_inputs, &mut || cancel.check())
+            .map_err(blocker(AvidMedia))?;
         read = again;
     }
     media_inputs.extend(read.original_inputs.iter().cloned());
-    cancel.check()?;
-    source_input::recheck_checked(&inputs, &mut || cancel.check())?;
-    read.graph.encoded_len().map_err(|e| e.to_string())?;
+    check_cancel()?;
+    source_input::recheck_checked(&inputs, &mut || cancel.check()).map_err(blocker(Retry))?;
+    read.graph.encoded_len().map_err(|e| ReviewBlocker::new(SourceContent, e.to_string()))?;
     let mut notes = Vec::new();
     for text in read
         .diagnostics
@@ -317,10 +466,14 @@ pub fn prepare(
         .iter()
         .any(|l| l.aspect == "source_master")
     {
-        return Err("Selected content contains unresolved masters; exclude those bins or resolve their media before conversion".into());
+        let kind = if read.missing_native_picture { AvidMedia } else { SourceContent };
+        let mut issue = ReviewBlocker::new(kind, "Selected content contains unresolved masters; exclude those bins or resolve their media before conversion");
+        issue.affected = unresolved_masters(&read.graph);
+        return Err(issue);
     }
     if !read.scan_issues.is_empty() || !read.audio_group_issues.is_empty() {
-        return Err(format!(
+        let kind = if read.scan_issues.is_empty() { SourceContent } else { AvidMedia };
+        return Err(ReviewBlocker::new(kind, format!(
             "Media scan or channel routing needs resolution: {}",
             read.scan_issues
                 .iter()
@@ -328,7 +481,10 @@ pub fn prepare(
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("; ")
-        ));
+        )));
+    }
+    if let Some(issue) = sequence_timing_blocker(&read.graph) {
+        return Err(issue);
     }
     for l in read
         .graph
@@ -339,6 +495,10 @@ pub fn prepare(
         notes.push(note("loss", &l.object, &l.reason, &l.aspect));
     }
     let native = spec.mode == ClipMode::RewrapNative;
+    let gain = rewrap::gain_paths(&read.graph);
+    if !native && !gain.is_empty() {
+        return Err(ReviewBlocker::new(Rewrap, "AudioSuite Gain requires the native prepared-media mode to copy the saved render to WAV"));
+    }
     let prepared = premiere_adapter::prepare_originals(
         &read.graph,
         &policy.to_options(),
@@ -348,7 +508,7 @@ pub fn prepare(
             premiere_adapter::ClockProfile::LegacyImport
         },
     )
-    .map_err(|e| format!("Premiere preparation failed: {e}"))?;
+    .map_err(|e| ReviewBlocker::new(SourceContent, format!("Premiere preparation failed: {e}")))?;
     for d in prepared.diagnostics {
         notes.push(note(
             "info",
@@ -361,7 +521,7 @@ pub fn prepare(
         notes.push(note("loss", l.object, l.reason, l.aspect));
     }
     drop(prepared.ownership);
-    let input = prepared.input;
+    let mut input = prepared.input;
     let mut originals = Vec::new();
     let mut seen = HashSet::new();
     let mut native_count = 0;
@@ -369,7 +529,7 @@ pub fn prepare(
         match clip {
             PreparedClip::Original(c) => {
                 if seen.insert(c.path.clone()) {
-                    originals.push(original_stamp(Path::new(&c.path))?);
+                    originals.push(original_stamp(Path::new(&c.path)).map_err(blocker(OriginalMedia))?);
                 }
             }
             PreparedClip::Legacy(_) => native_count += 1,
@@ -409,32 +569,34 @@ pub fn prepare(
         "preparation",
         "Preparing the destination document and any new-media plan",
     );
-    cancel.check()?;
+    check_cancel()?;
     let media = if native && native_count > 0 {
         let dir = spec
             .new_media
             .as_deref()
-            .ok_or("Native OP-Atom clips need a NEW media output folder. Creates new media.")?;
+            .ok_or_else(|| ReviewBlocker::new(NewMedia, "Native OP-Atom clips need a NEW media output folder. Creates new media."))?;
         let model = input
             .build_native_media_model()
-            .map_err(|e| e.to_string())?;
-        prproj::convert::native_av::preflight(&model).map_err(|e| e.to_string())?;
+            .map_err(|e| ReviewBlocker::new(Rewrap, e.to_string()))?;
+        let native_media = rewrap::NativeMediaPreparation {
+            model: &model,
+            writer_input: Some(&mut input),
+            gain: &gain,
+        };
+        native_media.preflight().map_err(blocker(Rewrap))?;
         let roots = spec
             .media_roots
             .iter()
             .chain(&spec.original_roots)
             .map(|p| p.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let plan = rewrap::Plan::prepare_media(
-            &model,
-            dir,
-            &roots,
-            &spec.output,
-            None,
-            &tools.ffmpeg,
-            &tools.ffprobe,
-            true,
-        )?;
+        let plan = native_media
+            .prepare(dir, &roots, &spec.output, None, &tools.ffmpeg, &tools.ffprobe)
+            .map_err(|issue| match issue {
+                rewrap::PrepareIssue::Destination(m) => ReviewBlocker::new(NewMedia, m),
+                rewrap::PrepareIssue::Tools(m) => ReviewBlocker::new(MediaTools, m),
+                rewrap::PrepareIssue::Source(m) => ReviewBlocker::new(Rewrap, m),
+            })?;
         notes.push(note(
             "notice",
             "media",
@@ -446,7 +608,7 @@ pub fn prepare(
         None
     };
     if !native && spec.new_media.is_some() {
-        return Err("A new-media folder applies only to the rewrap mode".into());
+        return Err(ReviewBlocker::new(Rewrap, "A new-media folder applies only to the rewrap mode"));
     }
     if native_count == 0 {
         notes.push(note(
@@ -459,9 +621,10 @@ pub fn prepare(
     let bindings = media.as_ref().map(|p| p.bindings()).unwrap_or_default();
     let mut ids = prproj::RandomUuids::new();
     let layout = if let Some(folder) = &spec.project_folder {
-        let root = std::fs::canonicalize(folder).map_err(|e| e.to_string())?;
+        let root = std::fs::canonicalize(folder)
+            .map_err(|e| ReviewBlocker::new(ProjectSource, e.to_string()))?;
         if input.bins.len() != bins.len() {
-            return Err("Prepared bins do not match the selected source folders".into());
+            return Err(ReviewBlocker::new(ProjectSource, "Prepared bins do not match the selected source folders"));
         }
         let parents = bins
             .iter()
@@ -481,13 +644,14 @@ pub fn prepare(
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReviewBlocker::new(ProjectSource, e))?;
         let seconds = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?
             .as_secs();
         Some(prproj::convert::writer::DestinationBinLayout {
-            root_name: import_name(seconds)?,
+            root_name: import_name(seconds).map_err(blocker(ProjectOutput))?,
             parents,
         })
     } else {
@@ -510,17 +674,17 @@ pub fn prepare(
             native,
         ),
     }
-    .map_err(|e| format!("Premiere document preparation failed: {e}"))?;
+    .map_err(|e| ReviewBlocker::new(SourceContent, format!("Premiere document preparation failed: {e}")))?;
     document
         .check_reserved_output(&receipt)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
     document
         .check_reserved_output(&replay)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
     if let Some(p) = &media {
         document
             .check_reserved_output(p.directory())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ReviewBlocker::new(NewMedia, e.to_string()))?;
     }
     for d in &document.report().notes {
         notes.push(note("info", "writer", d, "Writer preparation report."));
@@ -533,13 +697,14 @@ pub fn prepare(
             "Structural preparation is not application qualification.",
         ));
     }
-    cancel.check()?;
+    check_cancel()?;
     let review = Review {
         inventory: inv,
         estimated_bytes: media.as_ref().map(|p| p.estimated_bytes()),
         available_bytes: media.as_ref().map(|p| p.available_bytes()),
+        subjects: review_subjects(&read.graph, &notes),
         notes,
-        cli_equivalent: cli_command(&spec)?,
+        cli_equivalent: cli_command(&spec).map_err(blocker(Retry))?,
     };
     Ok(PreparedJob {
         spec,
@@ -619,6 +784,23 @@ fn write_json<T: serde::Serialize>(
     file.write_all(text.as_bytes())
         .map_err(|e| format!("Partial receipt retained at {}: {e}", path.display()))
 }
+
+fn report_sidecar_failure(result: &mut Completion, stage: &str, message: String) {
+    if result.status == CompletionStatus::Complete {
+        result.message = format!("Project published; {message}");
+    } else {
+        result.message.push('\n');
+        result.message.push_str(&message);
+    }
+    result.status = CompletionStatus::Failed;
+    result.report.push(note(
+        "error",
+        stage,
+        message,
+        "Outputs already created are listed under retained files.",
+    ));
+}
+
 /// Cancellation is honored between stages. An active verified stream-copy finishes its safe boundary.
 pub fn execute(
     mut job: PreparedJob,
@@ -666,7 +848,7 @@ pub fn execute(
             phase = "media completion receipt";
             p.record_project_with_mode(
                 &job.spec.output,
-                "native prepared-media AV master (DNx OP1a / ProRes MOV)",
+                p.mode("native prepared-media AV master (DNx OP1a / ProRes MOV)"),
             )?;
         }
         Ok(())
@@ -707,8 +889,11 @@ pub fn execute(
     };
     if published {
         if let Err(e) = write_json(&job.replay, &job.spec, &mut job.aux_outputs) {
-            result.status = CompletionStatus::Failed;
-            result.message = format!("Project published; replay settings could not be saved: {e}");
+            report_sidecar_failure(
+                &mut result,
+                "replay settings",
+                format!("replay settings could not be saved: {e}"),
+            );
         }
         result.retained_paths = retain(&job);
     }
@@ -717,18 +902,15 @@ pub fn execute(
         result.receipt = Some(job.receipt.clone());
         if let Err(e) = write_json(&job.receipt, &result, &mut job.aux_outputs) {
             result.receipt = None;
-            result.status = CompletionStatus::Failed;
-            result.message = if published {
+            let message = if published {
                 format!(
-                    "Project published; completion receipt failed: {e}. Retained project: {}",
+                    "completion receipt failed: {e}. Retained project: {}",
                     job.spec.output.display()
                 )
             } else {
-                format!(
-                    "{}; failure/cancellation receipt could not be written: {e}",
-                    result.message
-                )
+                format!("failure/cancellation receipt could not be written: {e}")
             };
+            report_sidecar_failure(&mut result, "completion receipt", message);
         }
         result.retained_paths = retain(&job);
     }
@@ -788,6 +970,7 @@ mod tests {
                 estimated_bytes: None,
                 available_bytes: None,
                 notes: vec![],
+                subjects: HashMap::new(),
                 cli_equivalent: String::new(),
             },
             document,
@@ -845,6 +1028,52 @@ mod tests {
     }
 
     #[test]
+    fn completion_reports_replay_failure_even_if_receipt_also_fails() {
+        for block_receipt in [false, true] {
+            let t = Scratch::new();
+            let job = prepared(&t.0);
+            let replay = job.replay.clone();
+            let receipt = job.receipt.clone();
+            let done = execute(job, &CancelToken::default(), &mut |p| {
+                if p.stage == "publication" {
+                    std::fs::write(&replay, b"incumbent replay").unwrap();
+                    if block_receipt {
+                        std::fs::write(&receipt, b"incumbent receipt").unwrap();
+                    }
+                }
+            });
+            assert_eq!(done.status, CompletionStatus::Failed);
+            let project = done.output.as_ref().unwrap();
+            assert!(project.is_file());
+            assert!(done.retained_paths.contains(project));
+            assert_eq!(std::fs::read(&replay).unwrap(), b"incumbent replay");
+            assert!(!done.retained_paths.contains(&replay));
+            let replay_failure = done.message.find("replay settings could not be saved").unwrap();
+            let stages: Vec<_> = done
+                .report
+                .iter()
+                .filter(|n| n.severity == "error")
+                .map(|n| n.object.as_str())
+                .collect();
+            if block_receipt {
+                let receipt_failure = done.message.find("completion receipt failed").unwrap();
+                assert!(replay_failure < receipt_failure);
+                assert!(done.receipt.is_none());
+                assert_eq!(stages, ["replay settings", "completion receipt"]);
+                assert_eq!(std::fs::read(&receipt).unwrap(), b"incumbent receipt");
+                assert!(!done.retained_paths.contains(&receipt));
+            } else {
+                let persisted: Completion =
+                    serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+                assert_eq!(done.receipt.as_ref(), Some(&receipt));
+                assert_eq!(stages, ["replay settings"]);
+                assert_eq!(persisted.message, done.message);
+                assert_eq!(persisted.report, done.report);
+            }
+        }
+    }
+
+    #[test]
     fn import_timestamp_handles_epoch_leap_day_and_range() {
         assert_eq!(import_name(0).unwrap(), "AVID_IMPORT_1970-01-01_00:00:00");
         assert_eq!(
@@ -882,7 +1111,7 @@ mod tests {
             ..JobSpec::default()
         };
         let mut changed = false;
-        let error = prepare(spec, &CancelToken::default(), &mut |p| {
+        let error = prepare_for_review(spec, &CancelToken::default(), &mut |p| {
             if p.stage == "Inventory" && p.completed == p.total && !changed {
                 let mut data = std::fs::read(&bin).unwrap();
                 data.push(0);
@@ -893,7 +1122,8 @@ mod tests {
         .err()
         .unwrap();
         assert!(changed);
-        assert!(error.contains("Bin inventory changed"));
+        assert_eq!(error.kind, BlockerKind::Retry);
+        assert!(error.message.contains("Bin inventory changed"));
         assert!(!t.0.join("refused.prproj").exists());
         assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), 1);
     }
@@ -924,5 +1154,17 @@ mod tests {
             .err()
             .unwrap()
             .contains("schema"));
+
+        let t = Scratch::new();
+        let output = t.0.join("Existing.prproj");
+        std::fs::write(&output, b"incumbent").unwrap();
+        let spec = JobSpec { output: output.clone(), ..JobSpec::default() };
+        let issue = prepare_for_review(spec, &CancelToken::default(), &mut |_| {
+            panic!("an existing output must stop preflight before inventory")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(issue.kind, BlockerKind::ProjectOutput);
+        assert_eq!(std::fs::read(output).unwrap(), b"incumbent");
     }
 }

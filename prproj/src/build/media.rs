@@ -961,7 +961,7 @@ pub mod opatom {
         leaf(tree, e, "Duration", &video.duration.to_string(), "\n\t\t");
         leaf(tree, e, "FrameRect", &format!("0,0,{},{}", video.width, video.height), "\n\t\t");
         leaf(tree, e, "CodecType", &fourcc(video.codec)?.to_string(), "\n\t\t");
-        let color_space = if video.codec == "apcs" { PRORES_COLOR_SPACE } else { DNX_COLOR_SPACE };
+        let color_space = if matches!(video.codec, "apcs" | "apch") { PRORES_COLOR_SPACE } else { DNX_COLOR_SPACE };
         leaf(tree, e, "OriginalColorSpace", color_space, "\n\t");
         Ok(e)
     }

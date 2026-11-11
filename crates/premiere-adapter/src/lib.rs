@@ -145,6 +145,7 @@ fn loss(out: &mut Vec<Loss>, object: &str, aspect: &str, reason: impl Into<Strin
 struct Routes {
     video: Option<Option<Rational>>,
     video_rate: Option<Rational>,
+    video_duration: Option<Rational>,
     audio: HashMap<i64, Option<Rational>>,
     first_audio: Option<i64>,
 }
@@ -341,7 +342,16 @@ fn normalize_rewrap_clocks(
     let media: HashMap<_, _> = g.media.iter().map(|m| (m.id.as_str(), m)).collect();
     let mut shared = HashMap::new();
     for item in &g.items {
-        let c = clips.get_mut(&clip_id(&item.id)).unwrap();
+        let Some(c) = clips.get_mut(&clip_id(&item.id)) else {
+            // Linked originals already use their own physical stream clocks.
+            // They do not enter the native MXF model, even in rewrap mode.
+            if !item.media.is_empty()
+                && item.media.iter().all(|link| media[link.media.as_str()].original.is_some())
+            {
+                continue;
+            }
+            return Err(error(format!("{}: native media model is missing a clip", item.name)));
+        };
         if c.audio.len() > 32 {
             return Err(error(
                 "rewrap supports at most 32 discrete mono PCM sources",
@@ -353,6 +363,20 @@ fn normalize_rewrap_clocks(
             return Err(error(format!("unsupported MXF rewrap rate {rate}")));
         }
         let unit = model::ticks_per_unit(rate);
+        if video.codec == "apch" {
+            let [binding] = item.media.as_slice() else {
+                return Err(error("generated Freeze Frame requires one picture binding"));
+            };
+            let m = media[binding.media.as_str()];
+            let clock = side(sc, "avid.source", &m.id).and_then(|v| key(v, "legacy_file_clock"));
+            if video.start != 0 || m.start.is_some() || m.clock.is_some() || clock != Some(&Value::Null) {
+                return Err(error("generated Freeze Frame must use a zero-relative picture clock without source timecode"));
+            }
+            c.time_display = Some(i64::from(
+                prproj::convert::rewrap::display_format(rate, false).ok_or_else(|| error("unsupported freeze rate"))?,
+            ));
+            continue;
+        }
         let mut drop = None;
         for im in &item.media {
             let m = media[im.media.as_str()];
@@ -435,6 +459,42 @@ fn normalize_rewrap_clocks(
     Ok(())
 }
 
+fn has_unmodified_original_stereo_pair(clip: &OriginalClip, raw: Option<&Value>) -> bool {
+    // The admitted movie/AAC profile requires a physically probed stereo layout.
+    // The saved Avid facts must also witness ordinary A1=left, A2=right with no
+    // custom master mix, gain difference, or explicit pan.
+    if clip.container != "mov"
+        || !clip.audio.as_ref().is_some_and(|audio| {
+            audio.channels == 2 && audio.representation == SampleRepresentation::Aac
+        })
+        || clip.channels.len() != 2
+        || clip.channels[0].gain_db != clip.channels[1].gain_db
+    {
+        return false;
+    }
+    let Some(raw) = raw else { return false };
+    if !matches!(key(raw, "raw_groups"), Some(Value::Arr(groups)) if groups.is_empty())
+        || key(raw, "master_output_mix")
+            .and_then(|mix| key(mix, "type"))
+            .and_then(str_value) != Some("absent")
+    {
+        return false;
+    }
+    let Some(Value::Arr(tracks)) = key(raw, "tracks") else { return false };
+    [1, 2].into_iter().all(|lane| {
+        if !clip.channels.iter().any(|c| c.avid_track == lane && c.channel_index == lane - 1) {
+            return false;
+        }
+        // AVB kind 2 is sound. Picture can share the same track label.
+        let mut matching = tracks.iter().filter(|t| {
+            key(t, "kind").and_then(integer) == Some(2)
+                && key(t, "label").and_then(integer) == Some(lane)
+        });
+        matches!(matching.next().and_then(|t| key(t, "pan_raw")), Some(Value::Null))
+            && matching.next().is_none()
+    })
+}
+
 fn output_mix_notice(value: &Value) -> R<Option<String>> {
     let malformed = || error("malformed avid.source master_output_mix observation");
     let Value::Obj(fields) = value else { return Err(malformed()); };
@@ -490,12 +550,17 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         .collect();
     let mut losses = Vec::new();
     let mut diagnostics=vec![match clock {
-        ClockProfile::LegacyImport=>"legacy-import clock interpretation retained from raw clock facts; graph/2 exact clocks remain source facts",
-        ClockProfile::VerifiedRewrap=>"retained opt-in native file-clock profile; graph/2 exact clocks do not enable broader corrected timing",
+        ClockProfile::LegacyImport=>"legacy-import media clocks retained; sequence start uses the qualified 23.976 clock or the compatibility origin",
+        ClockProfile::VerifiedRewrap=>"native rewrap media clocks retained; sequence start uses the qualified 23.976 clock or the compatibility origin",
     }.into()];
     let media: HashMap<_, _> = g.media.iter().map(|m| (m.id.as_str(), m)).collect();
     let mut clips = Vec::new();
     let mut ids = HashSet::new();
+    let items_used_for_sequence_audio: HashSet<_> = g.sequences.iter()
+        .flat_map(|s| &s.placements)
+        .filter(|p| !p.audio_tracks.is_empty() || !p.grouped_audio.is_empty())
+        .map(|p| p.item.as_str())
+        .collect();
     for item in &g.items {
         let id = clip_id(&item.id);
         if !ids.insert(id.clone()) {
@@ -640,12 +705,35 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 );
             }
         }
-        if let Some(mut c)=original {
-            c.metadata.avid=avid;c.metadata.time_display=display(item.rate,drop);c.metadata.markers=markers;
-            let mut grouped=HashSet::new();
-            for g in &item.stream_groups {if g.len()!=2{return Err(error("original-file wider groups require separate qualification"));}c.groups.push(g.clone());grouped.extend(g.iter().copied());}
-            for ch in &c.channels {if !grouped.contains(&ch.avid_track){c.groups.push(vec![ch.avid_track]);}}
-            prproj::convert::prepared::validate_original(&c).map_err(|e|error(e.to_string()))?;
+        if let Some(mut c) = original {
+            c.metadata.avid = avid;
+            c.metadata.time_display = display(item.rate, drop);
+            c.metadata.markers = markers;
+            if item.stream_groups.is_empty()
+                && has_unmodified_original_stereo_pair(&c, raw)
+                && !items_used_for_sequence_audio.contains(item.id.as_str())
+            {
+                c.groups.push(vec![1, 2]);
+                diagnostics.push(format!(
+                    "{}: linked original uses stereo left/right for new edits",
+                    item.name
+                ));
+            } else {
+                let mut grouped = HashSet::new();
+                for group in &item.stream_groups {
+                    if group.len() != 2 {
+                        return Err(error("original-file wider groups require separate qualification"));
+                    }
+                    c.groups.push(group.clone());
+                    grouped.extend(group.iter().copied());
+                }
+                for channel in &c.channels {
+                    if !grouped.contains(&channel.avid_track) {
+                        c.groups.push(vec![channel.avid_track]);
+                    }
+                }
+            }
+            prproj::convert::prepared::validate_original(&c).map_err(|e| error(e.to_string()))?;
             clips.push(PreparedClip::Original(c));
         } else {
         clips.push(PreparedClip::Legacy(Clip {
@@ -670,6 +758,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         let mut r = Routes {
             video: None,
             video_rate: None,
+            video_duration: None,
             audio: HashMap::new(),
             first_audio: None,
         };
@@ -679,6 +768,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 StreamKind::Video => {
                     r.video = Some(im.source_offset);
                     r.video_rate = m.rate;
+                    r.video_duration = Some(m.duration);
                 }
                 StreamKind::Audio => {
                     let label = m.stream.unwrap_or(r.audio.len() as i64 + 1);
@@ -779,10 +869,18 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
     };
     let mut ownership = HashMap::new();
     for (si, s) in g.sequences.iter().enumerate() {
+        let exact_start = qualified_sequence_start(s);
+        if let Some(start) = exact_start {
+            diagnostics.push(format!(
+                "{}: sequence start from the qualified 23.976 clock ({start} seconds)",
+                s.name
+            ));
+        }
         model.sequences.push(prepare_sequence(
             &facts,
             s,
             si,
+            exact_start,
             &mut ownership,
             &mut losses,
             &mut model.video_dissolves,
@@ -806,15 +904,41 @@ struct Trim {
     start: Rational,
     end: Rational,
 }
+
+fn qualified_sequence_start(s: &SourceSequence) -> Option<Rational> {
+    let clock = s.clock.as_ref()?;
+    // The existing 23.976 Premiere sequence presets use non-drop display
+    // code 110. This changes only the zero point, not any record-local times.
+    (s.rate.num() == 24000
+        && s.rate.den() == 1001
+        && clock.rate == s.rate
+        && clock.display_base == 24
+        && !clock.drop
+        && clock.effective_count < 24 * 60 * 60 * 24)
+        .then_some(s.start)
+        .flatten()
+}
+
 fn prepare_sequence(
     facts: &PreparationFacts,
     s: &SourceSequence,
     si: usize,
+    exact_start: Option<Rational>,
     ownership: &mut HashMap<String, (usize, usize)>,
     losses: &mut Vec<Loss>,
     video_dissolves: &mut Vec<PreparedVideoDissolve>,
     picture_effects: &mut Vec<prproj::convert::prepared::PreparedPictureEffect>,
 ) -> R<Sequence> {
+    // Avid's actual sequence canvas is currently unqualified. Keep the exact
+    // old first-picture/default raster only in the destination compatibility profile.
+    let frame_size=match side(&facts.sidecars,"avid.source",&s.id).and_then(|v|key(v,"compatibility_frame_size")) {
+        Some(Value::Arr(values)) if values.len()==2=>match (integer(&values[0]),integer(&values[1])) {
+            (Some(w),Some(h)) if w>0&&h>0=>(w,h),
+            _=>return Err(error(format!("{}: invalid compatibility frame size",s.id))),
+        },
+        Some(_)=>return Err(error(format!("{}: invalid compatibility frame size",s.id))),
+        None=>s.frame_size.ok_or_else(||error(format!("unresolved_sequence_geometry {}: neither qualified canvas nor explicit compatibility raster is available",s.id)))?,
+    };
     if let Some(raw) =
         side(&facts.sidecars, "avid.source", &s.id).and_then(|v| key(v, "native_transitions"))
     {
@@ -876,7 +1000,8 @@ fn prepare_sequence(
         }
         if [out, input]
             .iter()
-            .any(|p| p.speed.is_some() || p.frame_map.is_some())
+            .any(|p| p.speed.is_some() || p.frame_map.is_some()
+                || side(&facts.sidecars, "avid.motion_adapter", &p.id).is_some())
         {
             return Err(error(format!(
                 "retimed_transition_endpoint {}: ordinary trim arithmetic is unqualified",
@@ -984,9 +1109,30 @@ fn prepare_sequence(
         }
         // Frame maps already address absolute media frames. Never add source origin again.
         let unit = model::ticks_per_unit(fraction(s.rate));
+        let duration_ticks = ticks(sub(tr.end, tr.start)?, "duration")?;
+        let adapter = side(&facts.sidecars, "avid.motion_adapter", &p.id);
+        let mut sample_tail = false;
+        if let Some(a) = adapter {
+            let native = key(a, "native_record_frames").and_then(integer)
+                .filter(|n| (2..=16_384).contains(n));
+            let sample = model::TICKS_PER_SECOND / 48_000;
+            let tail = key(a, "silent_audio_tail_samples").and_then(integer)
+                .filter(|n| (0..unit / sample).contains(n));
+            let extent = native.zip(tail).and_then(|(n,t)| n.checked_mul(unit)?.checked_sub(t * sample));
+            if !matches!((s.rate.num(), s.rate.den()), (24, 1) | (24_000, 1001))
+                || extent != Some(duration_ticks)
+                || delta != Rational::ZERO || p.speed.is_some()
+                || (p.video_track.is_some() && (p.frame_map.is_none() || tail != Some(0)))
+                || (p.video_track.is_none() && (p.audio_tracks.len() != 1 || !p.grouped_audio.is_empty()
+                    || ticks(p.source_in, "adapter audio in")? % sample != 0))
+            {
+                return Err(error(format!("invalid Motion Adapter preparation facts {}", p.id)));
+            }
+            sample_tail = p.video_track.is_none() && tail.is_some_and(|n| n != 0);
+        }
         if unit <= 0
             || ticks(tr.start, "record start")? % unit != 0
-            || ticks(sub(tr.end, tr.start)?, "duration")? % unit != 0
+            || (!sample_tail && duration_ticks % unit != 0)
         {
             return Err(error(format!("destination_record_grid {}: exact source record time/span is not representable on the current Premiere sequence frame grid",p.id)));
         }
@@ -995,9 +1141,20 @@ fn prepare_sequence(
         } else {
             add(p.source_in, delta)?
         };
+        if p.frame_map.is_some() && side(&facts.sidecars, "avid.source", &p.id)
+            .and_then(|v| key(v, "saved_timewarp")).and_then(boolean) == Some(true)
+        {
+            let reason = if (s.rate.num(), s.rate.den()) == (24_000, 1001) {
+                "Calculated one Premiere Time Remapping key per frame from Avid's saved Position curve. Premiere uses frame sampling and leaves out the original handles and inherited Avid render settings."
+            } else {
+                "Saved Timewarp picture cadence becomes Premiere Time Remapping with one key per frame. Avid Speed keys and handles are not recreated."
+            };
+            loss(losses, &p.id, "timewarp_editability", reason);
+        }
         let mut cc = None;
         let mut matte = None;
         let mut picture = None;
+        let mut replace_transform = false;
         for e in &p.effects {
             match e.kind.as_str() {
                 "avid.color_correction" if cc.is_none() => {
@@ -1012,10 +1169,25 @@ fn prepare_sequence(
                         source_losses(&facts.losses, &p.id, "matte"),
                     )?)
                 }
-                "avid.flip" | "avid.resize_linear" if picture.is_none() => {
+                "avid.flip" | "avid.resize_linear" | "avid.warp_linear"
+                | "avid.resize_crop_linear" | "avid.warp_crop_linear" | "avid.warp_trim_linear"
+                | "avid.resize_trim_linear" | "avid.resize_trim_crop_linear" | "avid.warp_trim_crop_linear" if picture.is_none() => {
+                    let keyed_crop = matches!(e.kind.as_str(), "avid.resize_crop_linear" | "avid.warp_crop_linear");
+                    let trimmed = matches!(e.kind.as_str(), "avid.warp_trim_linear" | "avid.resize_trim_linear"
+                        | "avid.warp_trim_crop_linear" | "avid.resize_trim_crop_linear");
+                    let needs_geometry = keyed_crop || trimmed || e.kind == "avid.warp_linear";
+                    replace_transform |= needs_geometry;
+                    if needs_geometry && frame_size != (1920, 1080) {
+                        loss(losses, &p.id, "picture_effect", "Animated crop, Warp, or trimmed Resize requires a 1920x1080 destination sequence");
+                        continue;
+                    }
+                    if (keyed_crop || trimmed) && Some(s.rate) != Rational::new(24_000, 1001) {
+                        loss(losses, &p.id, "picture_effect", "Animated crop or trimmed motion requires a 23.976 destination sequence");
+                        continue;
+                    }
                     let full_span = tr.start == p.record_start && tr.end == add(p.record_start, p.duration)?;
                     let same_rate = route.video_rate == Some(s.rate);
-                    picture = picture::prepare(p, e, full_span, same_rate, unit, losses)?;
+                    picture = picture::prepare(p, e, full_span, same_rate, unit, route.video_duration, losses)?;
                 }
                 _ => loss(
                     losses,
@@ -1037,7 +1209,7 @@ fn prepare_sequence(
                 clip: clip_id(&p.item),
                 record_start: ticks(tr.start, "record start")?,
                 source_in: ticks(source, "source in")?,
-                duration: ticks(sub(tr.end, tr.start)?, "duration")?,
+                duration: duration_ticks,
                 video_track: p.video_track,
                 audio_tracks: p.audio_tracks.clone(),
                 audio_channels: p.audio_streams.clone(),
@@ -1067,7 +1239,7 @@ fn prepare_sequence(
                 time_remap: p.frame_map.clone(),
                 color_correction: cc,
                 matte,
-                transform: p.transform.as_ref().map(|t| Transform {
+                transform: p.transform.as_ref().filter(|_| !replace_transform || picture.is_some()).map(|t| Transform {
                     position: t.position,
                     scale: t.scale,
                     rotation: t.rotation,
@@ -1218,10 +1390,12 @@ fn prepare_sequence(
         }
         markers.push(out);
     }
-    let start = side(&facts.sidecars, "avid.source", &s.id)
-        .and_then(|v| key(v, "compatibility_start"))
-        .and_then(str_value)
-        .and_then(Rational::parse)
+    let start = exact_start.or_else(|| {
+        side(&facts.sidecars, "avid.source", &s.id)
+            .and_then(|v| key(v, "compatibility_start"))
+            .and_then(str_value)
+            .and_then(Rational::parse)
+    })
         .ok_or_else(|| error(format!("{}: missing compatibility start provenance", s.id)))?;
     for t in &s.tracks {
         if t.kind == StreamKind::Video && t.level_db.is_some() {
@@ -1236,22 +1410,12 @@ fn prepare_sequence(
             );
         }
     }
-    // Avid's actual sequence canvas is currently unqualified. Keep the exact
-    // old first-picture/default raster only in the destination compatibility profile.
-    let frame_size=match side(&facts.sidecars,"avid.source",&s.id).and_then(|v|key(v,"compatibility_frame_size")) {
-        Some(Value::Arr(values)) if values.len()==2=>match (integer(&values[0]),integer(&values[1])) {
-            (Some(w),Some(h)) if w>0&&h>0=>(w,h),
-            _=>return Err(error(format!("{}: invalid compatibility frame size",s.id))),
-        },
-        Some(_)=>return Err(error(format!("{}: invalid compatibility frame size",s.id))),
-        None=>s.frame_size.ok_or_else(||error(format!("unresolved_sequence_geometry {}: neither qualified canvas nor explicit compatibility raster is available",s.id)))?,
-    };
     Ok(Sequence {
         name: s.name.clone(),
         rate: fraction(s.rate),
         width: frame_size.0,
         height: frame_size.1,
-        start: ticks(start, "sequence compatibility start")?,
+        start: ticks(start, "sequence start")?,
         events: sorted,
         markers,
         track_levels: s

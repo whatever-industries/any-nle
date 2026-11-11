@@ -1,11 +1,13 @@
-//! Bounded content-only readers. AVB-0039, AVB-0038 and AVB-0013; no cached _TTEXT authority.
+//! Bounded text readers and native appearance witnesses. AVB-0039, AVB-0038 and AVB-0013.
 use super::*;
 use crate::source::TextKind;
+use std::borrow::Cow;
 mod properties;
 pub(super) use properties::properties;
 
 pub(super) const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_DATABASE_BYTES: usize = 1024 * 1024;
+const MAX_FONT_FACE_BYTES: usize = 255;
 pub(super) fn kind(node: &Node) -> Option<TextKind> {
     if node.class != *b"TKFX" {
         return None;
@@ -32,15 +34,8 @@ pub(super) fn body<'a>(
             "aa2c2fc09372d611b4e40030658a6504",
         ),
     };
-    let list = ctx
-        .deref(node.get("param_list"))
-        .filter(|n| n.class == *b"PRLS")
-        .ok_or("text parameter list missing")?;
-    let Some(Value::RefList(items)) = list.get("items") else {
-        return Err("text parameter list malformed");
-    };
     let mut found = None;
-    for reference in items {
+    for reference in parameter_items(ctx, node)? {
         let p = ctx
             .deref(Some(reference))
             .filter(|n| n.class == *b"PRIT")
@@ -77,6 +72,95 @@ pub(super) fn body<'a>(
     }
     found.ok_or("text content parameter missing")
 }
+
+fn parameter_items<'a>(ctx: &Ctx<'a>, node: &Node) -> Result<&'a [Value], &'static str> {
+    let list = ctx
+        .deref(node.get("param_list"))
+        .filter(|n| n.class == *b"PRLS")
+        .ok_or("text parameter list missing")?;
+    match list.get("items") {
+        Some(Value::RefList(items)) => Ok(items),
+        _ => Err("text parameter list malformed"),
+    }
+}
+
+/// Keep only observed local PRIT/AVUP carriers. This receipt cannot resolve
+/// inherited font, geometry or synchronization policy.
+pub(super) fn subcap_properties<'a>(
+    ctx: &Ctx<'a>,
+    node: &Node,
+) -> Result<impl Iterator<Item = (&'static str, usize, &'static str, Cow<'a, str>)>, &'static str> {
+    let mut properties = [None, None, None, None];
+    for reference in parameter_items(ctx, node)? {
+        let p = ctx
+            .deref(Some(reference))
+            .filter(|n| n.class == *b"PRIT")
+            .ok_or("SubCap appearance parameter reference malformed")?;
+        let Some(Value::Uuid(id)) = p.get("uuid") else {
+            return Err("SubCap appearance parameter identity missing");
+        };
+        let (slot, name, value_type) = match file_order_hex(id).as_str() {
+            "38a1f47289ea4240bc9338c5f985fb68" => (0, "FontSize", 1),
+            "3e42e35b209d89439d4127dd94258812" => (1, "FONTFACE", 4),
+            "0b4dae43a79ac94aa58a15837d68a1fb" => (2, "ExtraLeading", 1),
+            "aadaff7abc12b44da6eca507158a4061" => (3, "SynchronizedAttributesSet", 4),
+            _ => continue,
+        };
+        if properties[slot].is_some() {
+            return Err("duplicate SubCap appearance parameter");
+        }
+        if !matches!(p.get("control_track"), Some(Value::Ref(0) | Value::Null)) {
+            return Err("animated SubCap appearance is not interpreted");
+        }
+        if int(p, "value_type") != Some(value_type) {
+            return Err("unqualified SubCap appearance parameter type");
+        }
+        let value = match name {
+            "FONTFACE" => {
+                let bytes = subcap_user_bytes(ctx, p, "823122720aaa764cba3df88c918b67b5")?;
+                let face = bytes
+                    .strip_suffix(&[0])
+                    .filter(|face| !face.is_empty() && face.len() <= MAX_FONT_FACE_BYTES)
+                    .and_then(|face| std::str::from_utf8(face).ok())
+                    .filter(|face| !face.chars().any(char::is_control))
+                    .ok_or("SubCap font face is not bounded NUL-terminated UTF-8")?;
+                Cow::Borrowed(face)
+            }
+            "SynchronizedAttributesSet" => {
+                subcap_user_bytes(ctx, p, "aa2c2fc09372d611b4e40030658a6504")?;
+                Cow::Borrowed("opaque-present")
+            }
+            _ => {
+                let number = int(p, "value")
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or("SubCap appearance scalar is not an i32")?;
+                Cow::Owned(number.to_string())
+            }
+        };
+        // The property belongs to this occurrence's single PRLS.
+        properties[slot] = Some(("local", 1, name, value));
+    }
+    Ok(properties.into_iter().flatten())
+}
+
+fn subcap_user_bytes<'a>(
+    ctx: &Ctx<'a>,
+    parameter: &Node,
+    user_type: &str,
+) -> Result<&'a [u8], &'static str> {
+    let value = ctx
+        .deref(parameter.get("value"))
+        .filter(|v| v.class == *b"AVUP")
+        .ok_or("SubCap appearance is not AVUP")?;
+    if !matches!(value.get("uuid"), Some(Value::Uuid(u)) if file_order_hex(u) == user_type) {
+        return Err("unqualified SubCap appearance AVUP type");
+    }
+    match value.get("data") {
+        Some(Value::Bytes(bytes)) => Ok(bytes),
+        _ => Err("SubCap appearance AVUP bytes missing"),
+    }
+}
+
 pub(super) fn decode(bytes: &[u8], kind: TextKind) -> Result<String, &'static str> {
     match kind {
         TextKind::SubCap => {

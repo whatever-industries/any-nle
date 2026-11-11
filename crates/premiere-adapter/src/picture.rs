@@ -1,19 +1,26 @@
 use super::*;
-use prproj::convert::prepared::{MotionKey, PictureEffect};
+use prproj::convert::prepared::{MotionKey, PictureEffect, TrimmedMotion, TrimmedMotionKey};
 
-fn pair(value: &Value) -> Option<[f64; 2]> {
-    let Value::Arr(values) = value else {
-        return None;
-    };
-    let [a, b] = values.as_slice() else {
-        return None;
-    };
-    let number = |n: &Value| match n {
+fn number(value: &Value) -> Option<f64> {
+    match value {
         Value::Float(f) => Some(*f),
         Value::Int(i) => Some(*i as f64),
         _ => None,
+    }
+}
+
+fn numbers<const N: usize>(value: &Value) -> Option<[f64; N]> {
+    let Value::Arr(values) = value else {
+        return None;
     };
-    Some([number(a)?, number(b)?])
+    let mut result = [0.0; N];
+    if values.len() != result.len() {
+        return None;
+    }
+    for (output, input) in result.iter_mut().zip(values) {
+        *output = number(input)?;
+    }
+    Some(result)
 }
 
 pub(super) fn prepare(
@@ -22,6 +29,7 @@ pub(super) fn prepare(
     full_span: bool,
     same_rate: bool,
     frame_ticks: i64,
+    video_duration: Option<Rational>,
     losses: &mut Vec<Loss>,
 ) -> R<Option<PictureEffect>> {
     let malformed = || {
@@ -53,9 +61,61 @@ pub(super) fn prepare(
             losses,
             &placement.id,
             "picture_effect",
-            "Linear Resize animation requires an untrimmed prepared edit at the source media rate",
+            "Linear picture animation requires the saved edit span at the source media rate",
         );
         return Ok(None);
+    }
+    let trimmed_crop = matches!(effect.kind.as_str(), "avid.warp_trim_crop_linear" | "avid.resize_trim_crop_linear");
+    if trimmed_crop || matches!(effect.kind.as_str(), "avid.warp_trim_linear" | "avid.resize_trim_linear") {
+        let Some(Value::Arr(motion)) = key(&effect.params, "motion") else { return Err(malformed()); };
+        let Some(Value::Arr(width)) = key(&effect.params, "width") else { return Err(malformed()); };
+        let ([a, b, c], [d, e, f]) = (motion.as_slice(), width.as_slice()) else { return Err(malformed()); };
+        let fixed_width = key(&effect.params, "fixed_width").and_then(boolean).ok_or_else(malformed)?;
+        let source_in = ticks(placement.source_in, "Motion media in")?;
+        let key_ticks = |frame: i64| frame.checked_mul(frame_ticks)
+            .and_then(|offset| source_in.checked_add(offset)).ok_or_else(malformed);
+        let read_motion = |v: &Value| -> R<TrimmedMotionKey> {
+            Ok(TrimmedMotionKey {
+                ticks: key_ticks(key(v, "frame").and_then(integer).ok_or_else(malformed)?)?,
+                position: key(v, "position").and_then(numbers).ok_or_else(malformed)?,
+                height: key(v, "height").and_then(number).ok_or_else(malformed)?,
+            })
+        };
+        let read_width = |v: &Value| -> R<(i64, f64)> {
+            let Value::Arr(values) = v else { return Err(malformed()); };
+            let [frame, value] = values.as_slice() else { return Err(malformed()); };
+            Ok((key_ticks(integer(frame).ok_or_else(malformed)?)?, number(value).ok_or_else(malformed)?))
+        };
+        let crop = if trimmed_crop {
+            let Some(Value::Arr(keys)) = key(&effect.params, "crop") else { return Err(malformed()); };
+            let [first, middle, last] = keys.as_slice() else { return Err(malformed()); };
+            let read_crop = |v: &Value| -> R<(i64, [f64; 4])> {
+                Ok((
+                    key_ticks(key(v, "frame").and_then(integer).ok_or_else(malformed)?)?,
+                    key(v, "edges").and_then(numbers).ok_or_else(malformed)?,
+                ))
+            };
+            Some([read_crop(first)?, read_crop(middle)?, read_crop(last)?])
+        } else {
+            None
+        };
+        let trim = TrimmedMotion {
+            motion: [read_motion(a)?, read_motion(b)?, read_motion(c)?],
+            width: [read_width(d)?, read_width(e)?, read_width(f)?],
+            fixed_width,
+            crop,
+        };
+        if video_duration.and_then(|duration| ticks(duration, "Motion source duration").ok())
+            .is_none_or(|end| !trim.keys_fit_media(end))
+        {
+            loss(losses, &placement.id, "picture_effect", "Trimmed motion keys need qualified source-media handles");
+            return Ok(None);
+        }
+        return Ok(Some(if matches!(effect.kind.as_str(), "avid.resize_trim_linear" | "avid.resize_trim_crop_linear") {
+            PictureEffect::TrimmedResize(trim)
+        } else {
+            PictureEffect::TrimmedWarp(trim)
+        }));
     }
     let Some(Value::Arr(keys)) = key(&effect.params, "keys") else {
         return Err(malformed());
@@ -63,7 +123,8 @@ pub(super) fn prepare(
     let [first, last] = keys.as_slice() else {
         return Err(malformed());
     };
-    let source_in = ticks(placement.source_in, "Resize media in")?;
+    let source_in = ticks(placement.source_in, "Motion media in")?;
+    let keyed_crop = matches!(effect.kind.as_str(), "avid.resize_crop_linear" | "avid.warp_crop_linear");
     let read = |v: &Value| -> R<MotionKey> {
         let frame = key(v, "frame")
             .and_then(integer)
@@ -75,8 +136,13 @@ pub(super) fn prepare(
             .ok_or_else(malformed)?;
         Ok(MotionKey {
             ticks: at,
-            position: key(v, "position").and_then(pair).ok_or_else(malformed)?,
-            scale: key(v, "scale").and_then(pair).ok_or_else(malformed)?,
+            position: key(v, "position").and_then(numbers).ok_or_else(malformed)?,
+            scale: key(v, "scale").and_then(numbers).ok_or_else(malformed)?,
+            crop: if keyed_crop {
+                Some(key(v, "crop").and_then(numbers).ok_or_else(malformed)?)
+            } else {
+                None
+            },
         })
     };
     Ok(Some(PictureEffect::Resize([read(first)?, read(last)?])))

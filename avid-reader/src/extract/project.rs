@@ -10,6 +10,8 @@ mod source_capture;
 mod text;
 mod volume;
 mod picture_extension;
+mod freeze;
+mod gain;
 pub(crate) use source_capture::{extract_source_paths, extract_source_files, extract_source_paths_observed};
 
 #[derive(Debug)]
@@ -101,6 +103,9 @@ struct CompileCache {
     colors: HashMap<usize, Arc<ColorCorrection>>,
     pictures: HashMap<usize, Arc<PictureEffect>>,
     mattes: HashMap<(u32, u32, u32, u32), Option<Arc<AniMatteData>>>,
+    freezes: HashMap<MobId, freeze::Freeze>,
+    ambiguous: std::collections::HashSet<MobId>,
+    gain_renders: HashMap<MobId, MobId>,
 }
 fn route_action(ctx: &Ctx<'_>, node: &Node, selector: bool, cache: &mut CompileCache) -> Arc<RouteAction> {
     let key = (node as *const Node as usize, selector);
@@ -220,13 +225,29 @@ fn retain_item(items:&mut Vec<Item>,source:Option<&source_capture::InputContext>
 fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture::InputContext>) -> BinSummary {
     let items = bin_items(file);
     let mut ctx = Ctx { file, mobs: HashMap::new() };
+    let mut ambiguous = std::collections::HashSet::new();
     // Keep the existing last-item local lookup; the project route index below is first-item.
     for mob in &items {
         if let Some(id) = mob_id(mob) {
-            ctx.mobs.insert(id, *mob);
+            if ctx.mobs.insert(id, *mob).is_some() && source.is_some() {
+                ambiguous.insert(id);
+            }
         }
     }
     let mut cache = CompileCache::default();
+    if source.is_some() {
+        let mut repeated_renders = std::collections::HashSet::new();
+        for mob in &items {
+            if let Some((id, binding)) = freeze::binding(&ctx, mob, &ambiguous) {
+                if cache.freezes.insert(id, binding).is_some() {
+                    repeated_renders.insert(id);
+                }
+            }
+        }
+        cache.freezes.retain(|id, _| !repeated_renders.contains(id));
+        cache.ambiguous = ambiguous;
+    }
+    let freeze_owners: std::collections::HashSet<_> = cache.freezes.values().map(|freeze| freeze.owner).collect();
     let mut summary = BinSummary {
         routes: Vec::new(),
         items: Vec::new(),
@@ -239,18 +260,27 @@ fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture:
             else{summary.routes.push((id,value));}
             if source.is_some_and(|source|source.failed()){break;}
         }
-        let name = mob.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let freeze = mob_id(mob).and_then(|id| cache.freezes.get(&id));
+        let named_mob = freeze.and_then(|binding| ctx.mobs.get(&binding.owner).copied()).unwrap_or(mob);
+        let name = named_mob.get("name").and_then(Value::as_str).unwrap_or("").to_string();
         match (int(mob, "mob_type_id"), int(mob, "usage_code")) {
             (Some(MOB_MASTER), _) => {
                 let result = master(&ctx, mob).map(|mut m| {
                     m.bin = bin;
+                    if freeze.is_some() {
+                        m.name.clone_from(&name);
+                    }
                     m
                 });
                 retain_item(&mut summary.items,source,Item::Master {
                     id: mob_id(mob),
                     bin,
                     name,
-                    source: source.map(|source| source.master_meta(&ctx, mob, item_index, result.as_ref().ok())),
+                    source: source.map(|source| {
+                        let mut meta = source.master_meta(&ctx, mob, item_index, result.as_ref().ok());
+                        meta.rendered_freeze = freeze.is_some();
+                        meta
+                    }),
                     result,
                 });
             }
@@ -262,6 +292,8 @@ fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture:
                 retain_item(&mut summary.items, source, Item::Group(source.unwrap().group(&ctx, mob, item_index))),
             (Some(MOB_COMPOSITION), Some(5)) if source.is_some() =>
                 retain_item(&mut summary.items, source, Item::GroupDependency { id: mob_id(mob), name }),
+            (Some(MOB_COMPOSITION), Some(6))
+                if mob_id(mob).is_some_and(|id| freeze_owners.contains(&id)) => {}
             (Some(MOB_COMPOSITION), usage) => retain_item(&mut summary.items,source,Item::Skipped(Skipped {
                 name,
                 reason: format!("composition usage {:?} (subclip/group clip) as a bin item is not converted yet", usage),
@@ -270,6 +302,11 @@ fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture:
                 name,
                 reason: format!("mob type {:?}", other),
             })),
+        }
+    }
+    for item in &mut summary.items {
+        if let Item::Master { id: Some(id), source: Some(meta), .. } = item {
+            meta.rendered_gain = cache.gain_renders.get(id).copied();
         }
     }
     summary
@@ -560,7 +597,7 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     return; // null reference (e.g. original-source end of chain)
                 }
                 if let Some(source) = &mut self.source {
-                    source.query(self.ops.len(), c, None);
+                    source.query(self.ops.len(), c, None, None);
                     if source.failed() { return; }
                 }
                 self.push_op(Op::Source(Query {
@@ -589,9 +626,69 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
             }
             b"SPED" => {
                 let ratio = match c.get("speed_ratio") {
-                    Some(Value::List(v)) => (v[0].as_int().unwrap_or(0), v[1].as_int().unwrap_or(0)),
+                    Some(Value::List(v)) if v.len() == 2 => (v[0].as_int().unwrap_or(0), v[1].as_int().unwrap_or(0)),
                     _ => (0, 0),
                 };
+                if let Some(source) = &mut self.source {
+                    if freeze::candidate(ctx, c, ratio) {
+                        if let Some((_, id)) = freeze::sequence_render(ctx, c, &self.cache.freezes)
+                            .filter(|(render, _)| self.kind == KIND_PICTURE && source.query_rendered_freeze(self.ops.len(), render))
+                        {
+                            self.push_op(Op::Source(Query {
+                                id, label: 1, offset: 0, length, record: position,
+                                via: via.to_vec(), depth, kind: self.kind, track: self.track,
+                            }));
+                        } else {
+                            source.unresolved_motion(position, self.kind, self.track,
+                                "Avid Freeze Frame has no qualified full generated picture binding");
+                        }
+                        return;
+                    }
+                }
+                // An automatic Motion Adapter may carry phase and sampling
+                // state beyond the stored span ratio. Do not treat it as an
+                // ordinary constant speed effect in the qualified source path.
+                if let Some(source) = &mut self.source {
+                    if let Some(attrs) = source_capture::automatic_adapter_attrs(ctx, c) {
+                        if let Some((input, id, source_in, phase, source_length, label, ratio)) =
+                            source_capture::qualified_automatic_adapter(ctx, c, attrs, self.kind, length)
+                        {
+                            source.query(self.ops.len(), input, Some(ratio), Some(phase));
+                            if source.failed() { return; }
+                            self.push_op(Op::Motion {
+                                query: Query { id, label, offset: source_in, length: source_length,
+                                    record: position, via: via.to_vec(), depth, kind: self.kind, track: self.track },
+                                length, ratio,
+                            });
+                        } else {
+                            source.unresolved_motion_adapter(position, self.kind, self.track);
+                        }
+                        return;
+                    }
+                }
+                if let Some(source) = &mut self.source {
+                    let sparse = source_capture::uses_editable_position(ctx, c);
+                    if sparse || source_capture::is_sampled_effect(ctx, c) {
+                        let input = source_capture::timewarp_input(ctx, c);
+                        let route = input.and_then(|n| Some((n, mob_id(n)?,
+                            int(n, "track_id")?, int(n, "start_time")?, int(n, "length")?)));
+                        let Some((input, id, label, offset, source_length)) = route else {
+                            source.unresolved_motion(position, self.kind, self.track,
+                                "Avid Timewarp picture input does not resolve to one direct source");
+                            return;
+                        };
+                        if source.query_sampled_timewarp(ctx, self.ops.len(), c, input, ratio,
+                            position, self.kind, self.track, sparse)
+                        {
+                            self.push_op(Op::Motion {
+                                query: Query { id, label, offset, length: source_length, record: position,
+                                    via: via.to_vec(), depth, kind: self.kind, track: self.track },
+                                length, ratio,
+                            });
+                        }
+                        return;
+                    }
+                }
                 let inputs: Vec<&Node> = ctx.tracks(c).into_iter().filter_map(|t| ctx.deref(t.get("component"))).collect();
                 let [input] = inputs.as_slice() else {
                     return self.problem(position, format!("motion effect with {} inputs not converted", inputs.len()));
@@ -621,7 +718,7 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     via.push("timewarp parameters present (ramps not decoded; constant speed assumed)".into());
                 }
                 if let Some(source) = &mut self.source {
-                    source.query(self.ops.len(), input, Some(ratio));
+                    source.query(self.ops.len(), input, Some(ratio), None);
                     if source.failed() { return; }
                 }
                 self.push_op(Op::Motion {
@@ -639,6 +736,22 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     length,
                     ratio,
                 });
+            }
+            b"ASPI" if self.source.is_some() && self.kind == KIND_SOUND && gain::candidate(c) => {
+                let source = self.source.as_mut().unwrap();
+                if let Some((render, id, origin)) = gain::binding(ctx, c, &self.cache.ambiguous)
+                    .filter(|(render, _, _)| source.query_rendered_gain(self.ops.len(), render))
+                {
+                    self.cache.gain_renders.insert(id, origin);
+                    self.push_op(Op::Source(Query {
+                        id, label: int(render, "track_id").unwrap(), offset: 0,
+                        length, record: position, via: via.to_vec(), depth,
+                        kind: self.kind, track: self.track,
+                    }));
+                } else {
+                    source.unresolved_motion(position, self.kind, self.track,
+                        "AudioSuite Gain needs a matching full mono PCM24 render on a 24 fps edit");
+                }
             }
             b"TKFX" | b"PVOL" => {
                 let effect = c.get("effect_id").and_then(Value::as_str).unwrap_or(c.type_name).to_string();
@@ -757,10 +870,14 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                         let before = self.ops.len();
                         self.component(input, position, via, depth + 1);
                         self.push_op(Op::Picture { before, value: fx });
-                        if self.source.is_some() && kind == PictureKind::Resize {
-                            if let Some(resize) = picture_extension::resize(ctx, c) {
+                        if self.source.is_some() {
+                            let animated = match kind {
+                                PictureKind::Resize => picture_extension::resize(ctx, c),
+                                PictureKind::Warp => picture_extension::warp(ctx, c),
+                            };
+                            if let Some(effect) = animated {
                                 self.push_op(Op::PictureExtension {
-                                    before, capture: picture_extension::Capture::new(c, position, resize),
+                                    before, capture: picture_extension::Capture::new(c, position, effect),
                                 });
                             }
                         }
@@ -875,7 +992,7 @@ fn compile_sequence_inner(ctx: &Ctx<'_>, f: usize, mob: &Node, cache: &mut Compi
         match int(component, "media_kind_id") {
             Some(KIND_TIMECODE) => {
                 if let Some(source) = &mut source {
-                    source.timecode_track_markers(ctx, track, component, index, track_ordinal, int(mob, "length"));
+                    source.timecode_track(ctx, track, component, index, track_ordinal, int(mob, "length"));
                 }
                 // Sequence start: the first TCCP on the lowest-labelled timecode track.
                 if index < tc_index {
@@ -1556,6 +1673,48 @@ mod tests {
         let start = legacy.sequences[0].start.as_ref().unwrap();
         assert_eq!((start.frames, start.fps), (86400, 24));
     }
+
+    #[test]
+    fn sequence_clock_requires_a_unique_direct_tc1_with_the_exact_record_rate() {
+        for (label, rate, length, flags, duplicate, known) in [
+            (1, 23.976, 100, 0, false, true),
+            (2, 23.976, 100, 0, false, false),
+            (1, 24.0, 100, 0, false, false),
+            (1, 23.976, 99, 0, false, false),
+            (1, 23.976, 100, 1, false, false),
+            (1, 23.976, 100, 0, true, false),
+        ] {
+            let mut f = file();
+            let tc = marked_timecode(&mut f, *b"TCCP", Some(rate), length, None);
+            let Object::Decoded(t) = f.objects[tc as usize].as_mut().unwrap() else { unreachable!() };
+            t.put("flags", Value::Int(flags));
+            let alternate = marked_timecode(&mut f, *b"TCCP", Some(23.976), 100, None);
+            let Object::Decoded(t) = f.objects[alternate as usize].as_mut().unwrap() else { unreachable!() };
+            t.fields.retain(|(k, _)| !matches!(*k, "fps" | "start"));
+            t.put("fps", Value::Int(25));
+            t.put("start", Value::Int(90000));
+            t.put("flags", Value::Int(0));
+            let mut tracks = vec![(4, alternate), (label, tc)];
+            if duplicate {
+                tracks.push((1, alternate));
+            }
+            let m = mob(&mut f, id(3), "TC1", MOB_COMPOSITION, 0, &tracks);
+            let Object::Decoded(m) = f.objects[m as usize].as_mut().unwrap() else { unreachable!() };
+            m.fields.retain(|(k, _)| *k != "edit_rate");
+            m.put("edit_rate", Value::Float(23.976));
+
+            let out = source_project(&[f]);
+            assert_eq!(
+                out.sequences[0].clock,
+                known.then(|| crate::source::SequenceClock {
+                    count: 86400,
+                    rate: crate::source::Rate::new(24000, 1001).unwrap(),
+                    display_base: 24,
+                    track_ordinal: 1,
+                })
+            );
+        }
+    }
     #[test]
     fn source_timecode_marker_uncertainty_is_retained_instead_of_inventing_record_time() {
         for (class, rate, length, track, offset) in [
@@ -1670,8 +1829,87 @@ mod tests {
         mob(&mut f,id(1),"Master",MOB_MASTER,0,&[]);
         let out=source_project(&[f]);let seq=&out.sequences[0];
         assert!(seq.events.is_empty());
-        assert!(seq.unresolved.iter().any(|i|i.reason.contains("route-owner rates")));
+        assert!(seq.unresolved.iter().any(|i|i.reason.contains("route-owner rates")
+            && i.issue_kind == crate::source::SourceIssueKind::RouteTiming));
         assert!(seq.unresolved.iter().flat_map(|i|&i.route).any(|w|w.rate==crate::source::Rate::new(24,1)));
+    }
+    #[test]
+    fn automatic_motion_adapter_is_not_an_ordinary_speed_edit() {
+        let mut f = file();
+        let input = source(&mut f, id(1), KIND_PICTURE, 1, 0, 20);
+        let mut attrs = node(*b"ATTR", "Attributes");
+        attrs.put("entries", Value::Attrs(vec![("_MIXMATCH_MOTIONADAPTER".into(), Value::Int(2))]));
+        let attrs = add(&mut f, attrs);
+        let mut speed = node(*b"SPED", "MotionEffect");
+        speed.put("media_kind_id", Value::Int(KIND_PICTURE));
+        speed.put("length", Value::Int(10));
+        speed.put("speed_ratio", Value::List(vec![Value::Int(1000), Value::Int(1001)]));
+        speed.put("attributes", Value::Ref(attrs));
+        let mut track = node([0; 4], "Track");
+        track.put("component", Value::Ref(input));
+        speed.put("tracks", Value::List(vec![Value::Node(Box::new(track))]));
+        let speed = add(&mut f, speed);
+        mob(&mut f, id(3), "Adapter", MOB_COMPOSITION, 0, &[(1, speed)]);
+        mob(&mut f, id(1), "Master", MOB_MASTER, 0, &[]);
+        let out = source_project(&[f]);
+        let seq = &out.sequences[0];
+        assert!(seq.events.is_empty());
+        assert_eq!(seq.unresolved.len(), 1);
+        assert_eq!(seq.unresolved[0].issue_kind, crate::source::SourceIssueKind::RouteTiming);
+        assert!(seq.unresolved[0].reason.contains("Motion Adapter"));
+    }
+    #[test]
+    fn selected_sparse_position_cannot_fall_back_to_its_unity_ratio() {
+        let mut f = file();
+        let input = source(&mut f, id(1), KIND_PICTURE, 1, 0, 20);
+        let mut curve = node(*b"PRCL", "ParamClip");
+        curve.put("interp_kind", Value::Int(6));
+        let keys = [(0, 0.0), (5, 2.5), (14, 16.5), (19, 19.0)];
+        curve.put("control_points", Value::List(keys.into_iter().map(|(frame, value)| {
+            let mut point = node([0; 4], "ParamControlPoint");
+            point.put("offset", Value::List(vec![Value::Int(frame), Value::Int(1)]));
+            point.put("value", Value::Float(value));
+            Value::Node(Box::new(point))
+        }).collect()));
+        let curve = add(&mut f, curve);
+        let mut item = node(*b"PRIT", "ParameterItem");
+        item.put("uuid", Value::Uuid(crate::io::Uuid {
+            data1: 0x8d56827a, data2: 0x847e, data3: 0x11d5,
+            data4: [0x93, 0x5a, 0x50, 0xf8, 0x57, 0xc1, 0x00, 0x00],
+        }));
+        item.put("enable", Value::Bool(true));
+        item.put("control_track", Value::Ref(curve));
+        let item = add(&mut f, item);
+        let mut params = node(*b"PRLS", "ParameterList");
+        params.put("items", Value::RefList(vec![Value::Ref(item)]));
+        let params = add(&mut f, params);
+        for selector in [2, 1] {
+            let mut attrs = node(*b"ATTR", "Attributes");
+            attrs.put("entries", Value::Attrs(vec![("_MFX_GRAPH_ENABLED".into(), Value::Int(selector))]));
+            let attrs = add(&mut f, attrs);
+            let mut effect = node(*b"SPED", "MotionEffect");
+            effect.put("effect_id", Value::Str("EFF_ADV_MOTION_CTL".into()));
+            effect.put("media_kind_id", Value::Int(KIND_PICTURE));
+            effect.put("length", Value::Int(20));
+            effect.put("speed_ratio", Value::List(vec![Value::Int(1), Value::Int(1)]));
+            effect.put("attributes", Value::Ref(attrs));
+            effect.put("param_list", Value::Ref(params));
+            let mut track = node([0; 4], "Track");
+            track.put("component", Value::Ref(input));
+            effect.put("tracks", Value::List(vec![Value::Node(Box::new(track))]));
+            let effect = add(&mut f, effect);
+            mob(&mut f, id(selector as u32 + 2), "Synthetic position graph", MOB_COMPOSITION, 0, &[(1, effect)]);
+        }
+        mob(&mut f, id(1), "Master", MOB_MASTER, 0, &[]);
+        let out = source_project(&[f]);
+        let [selected, inactive] = out.sequences.as_slice() else { panic!("expected two sequences") };
+        assert!(selected.events.is_empty());
+        assert!(selected.unresolved.iter().any(|issue| {
+            issue.issue_kind == crate::source::SourceIssueKind::RouteTiming
+                && issue.reason.contains("unsupported Position curve")
+        }));
+        assert_eq!(inactive.events.len(), 1);
+        assert_eq!(inactive.events[0].event.speed, Some((1, 1)));
     }
     #[test]
     fn source_retimed_marker_keeps_local_owner_without_inventing_record_phase(){
@@ -1815,30 +2053,107 @@ mod tests {
         let bytes: Vec<u8>=(0..16).map(|n|u8::from_str_radix(&hex[n*2..n*2+2],16).unwrap()).collect();
         crate::io::Reader::new(&bytes,0,false).raw_uuid().unwrap()
     }
-    fn subcap(f: &mut AvbFile, duplicate: bool) -> u32 {
+    fn subcap(f: &mut AvbFile, duplicate: bool, appearance: &[u32]) -> u32 {
         let mut data=node(*b"AVUP","CFUserParam");data.put("uuid",Value::Uuid(text_uuid("4af0193369ac2545b9e82206362fd233")));data.put("data",Value::Bytes(b"Content Alpha\0".to_vec()));let data=add(f,data);
         let mut parameter=node(*b"PRIT","ParameterItem");parameter.put("uuid",Value::Uuid(text_uuid("961a0231335b514595e0317fddf547df")));parameter.put("value",Value::Ref(data));parameter.put("control_track",Value::Ref(0));let parameter=add(f,parameter);
-        let mut list=node(*b"PRLS","ParameterList");list.put("items",Value::RefList(if duplicate {vec![Value::Ref(parameter);2]}else{vec![Value::Ref(parameter)]}));let list=add(f,list);
+        let mut items = vec![Value::Ref(parameter); if duplicate { 2 } else { 1 }];
+        items.extend(appearance.iter().copied().map(Value::Ref));
+        let mut list=node(*b"PRLS","ParameterList");list.put("items",Value::RefList(items));let list=add(f,list);
         let mut attrs=node(*b"ATTR","Attributes");attrs.put("entries",Value::Attrs(vec![("_COMMENT".into(),Value::Str("Wrong note".into())),("_TTEXT".into(),Value::Str("Wrong cache".into()))]));let attrs=add(f,attrs);
         let mut effect=node(*b"TKFX","TrackEffect");effect.put("media_kind_id",Value::Int(KIND_PICTURE));effect.put("length",Value::Int(10));effect.put("edit_rate",Value::Float(25.0));effect.put("param_list",Value::Ref(list));effect.put("attributes",Value::Ref(attrs));effect.put("effect_id",Value::Str("E4FE520A-B815-447F-A969-2D5E1C5F6C14".into()));add(f,effect)
     }
     #[test]
     fn source_text_on_filler_keeps_each_occurrence_without_inventing_media_edits() {
-        let mut f=file();let caption=subcap(&mut f,false);
+        let mut f=file();let caption=subcap(&mut f,false,&[]);
         let mut fill=node(*b"FILL","Filler");fill.put("media_kind_id",Value::Int(KIND_PICTURE));fill.put("length",Value::Int(5));let fill=add(&mut f,fill);
         let seq=timeline(&mut f,KIND_PICTURE,&[fill,caption,caption]);mob(&mut f,id(3),"Text timeline",MOB_COMPOSITION,0,&[(2,seq)]);
         let output=source_project(std::slice::from_ref(&f));let seq=&output.sequences[0];assert!(seq.events.is_empty());assert_eq!(seq.texts.len(),2);
         assert_eq!(seq.texts.iter().map(|t|t.record_start).collect::<Vec<_>>(),vec![Some(5),Some(15)]);
         assert!(seq.texts.iter().all(|t|t.content.as_deref()==Some("Content Alpha")&&t.length==Some(10)&&t.track==2&&t.reason.is_none()));assert_ne!(seq.texts[0].id,seq.texts[1].id);
+        assert!(seq.texts.iter().all(|t|t.native_properties.is_empty() && t.native_properties_reason.is_none()));
         let output=crate::source::extract_source_files(&source_inputs(1),&[&f],crate::source::SourceLimits{max_fact_bytes:64});assert!(output.is_err());
     }
     #[test]
     fn duplicate_content_and_unqualified_owner_clocks_remain_scoped_text_facts() {
-        let mut f=file();let caption=subcap(&mut f,true);mob(&mut f,id(3),"Duplicate text",MOB_COMPOSITION,0,&[(1,caption)]);
+        let mut f=file();let caption=subcap(&mut f,true,&[]);mob(&mut f,id(3),"Duplicate text",MOB_COMPOSITION,0,&[(1,caption)]);
         let out=source_project(&[f]);assert_eq!(out.sequences[0].texts[0].content,None);assert!(out.sequences[0].texts[0].reason.as_deref().unwrap().contains("duplicate"));
-        let mut f=file();let caption=subcap(&mut f,false);
+        let mut f=file();let caption=subcap(&mut f,false,&[]);
         let Object::Decoded(n)=f.objects[caption as usize].as_mut().unwrap()else{unreachable!()};n.fields.iter_mut().find(|(k,_)| *k=="edit_rate").unwrap().1=Value::Float(24.0);
         mob(&mut f,id(3),"Mixed clock text",MOB_COMPOSITION,0,&[(1,caption)]);let out=source_project(&[f]);let text=&out.sequences[0].texts[0];assert!(text.content.is_some());assert_eq!(text.record_start,None);assert!(text.reason.is_some());
+    }
+
+    fn subcap_appearance(f: &mut AvbFile, id: &str, value_type: i64, value: Value) -> u32 {
+        let mut p = node(*b"PRIT", "ParameterItem");
+        p.put("uuid", Value::Uuid(text_uuid(id)));
+        p.put("value_type", Value::Int(value_type));
+        p.put("value", value);
+        p.put("control_track", Value::Ref(0));
+        add(f, p)
+    }
+
+    fn subcap_appearance_avup(f: &mut AvbFile, id: &str, data: &[u8]) -> Value {
+        let mut p = node(*b"AVUP", "CFUserParam");
+        p.put("uuid", Value::Uuid(text_uuid(id)));
+        p.put("data", Value::Bytes(data.to_vec()));
+        Value::Ref(add(f, p))
+    }
+
+    #[test]
+    fn subcap_keeps_local_appearance_without_resolving_sync() {
+        let mut f = file();
+        let face = subcap_appearance_avup(&mut f, "823122720aaa764cba3df88c918b67b5", "Fixture Face é\0".as_bytes());
+        let sync = subcap_appearance_avup(&mut f, "aa2c2fc09372d611b4e40030658a6504", &[0; 840]);
+        let properties = [
+            subcap_appearance(&mut f, "38a1f47289ea4240bc9338c5f985fb68", 1, Value::Int(60)),
+            subcap_appearance(&mut f, "3e42e35b209d89439d4127dd94258812", 4, face),
+            subcap_appearance(&mut f, "0b4dae43a79ac94aa58a15837d68a1fb", 1, Value::Int(-3)),
+            subcap_appearance(&mut f, "aadaff7abc12b44da6eca507158a4061", 4, sync),
+        ];
+        let caption = subcap(&mut f, false, &properties);
+        mob(&mut f, id(3), "Local appearance", MOB_COMPOSITION, 0, &[(1, caption)]);
+        let output = source_project(&[f]);
+        let text = &output.sequences[0].texts[0];
+        assert_eq!(text.content.as_deref(), Some("Content Alpha"));
+        assert!(text.native_properties_reason.is_none());
+        let actual = text.native_properties.iter()
+            .map(|p| (p.scope.as_str(), p.list, p.name.as_str(), p.value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, [
+            ("local", 1, "FontSize", "60"),
+            ("local", 1, "FONTFACE", "Fixture Face é"),
+            ("local", 1, "ExtraLeading", "-3"),
+            ("local", 1, "SynchronizedAttributesSet", "opaque-present"),
+        ]);
+    }
+
+    #[test]
+    fn bad_subcap_appearance_keeps_independently_qualified_text() {
+        for case in ["duplicate", "parameter type", "animated", "AVUP type", "UTF-8"] {
+            let mut f = file();
+            let size = subcap_appearance(&mut f, "38a1f47289ea4240bc9338c5f985fb68", 1, Value::Int(60));
+            let mut properties = vec![size];
+            match case {
+                "duplicate" => properties.push(size),
+                "parameter type" => set(&mut f, size, "value_type", Value::Int(2)),
+                "animated" => set(&mut f, size, "control_track", Value::Ref(123)),
+                _ => {
+                    let (ty, body) = if case == "AVUP type" {
+                        ("4af0193369ac2545b9e82206362fd233", b"Fixture Face\0".as_slice())
+                    } else {
+                        ("823122720aaa764cba3df88c918b67b5", b"Fixture\0Face\0".as_slice())
+                    };
+                    let face = subcap_appearance_avup(&mut f, ty, body);
+                    properties.push(subcap_appearance(&mut f, "3e42e35b209d89439d4127dd94258812", 4, face));
+                }
+            }
+            let caption = subcap(&mut f, false, &properties);
+            mob(&mut f, id(3), "Malformed appearance", MOB_COMPOSITION, 0, &[(1, caption)]);
+            let output = source_project(&[f]);
+            let text = &output.sequences[0].texts[0];
+            assert_eq!(text.content.as_deref(), Some("Content Alpha"));
+            assert!(text.native_properties.is_empty(), "{case}");
+            assert!(text.native_properties_reason.as_deref().is_some_and(|reason| reason.contains(case)), "{case}");
+        }
     }
 
     fn set(f:&mut AvbFile,index:u32,key:&'static str,value:Value){

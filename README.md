@@ -1,12 +1,23 @@
 # Any NLE
 
-Convert editing projects between NLEs. Today: **selected Avid Media Composer bins to native
-Adobe Premiere Pro projects (`.prproj`)**, without Premiere installed. Avid projects are only
-read, never changed.
+Any NLE converts selected Avid Media Composer bins into native Adobe Premiere
+Pro projects (`.prproj`). The desktop wizard and CLI read Avid bins and link
+or prepare their media without requiring Premiere to be installed.
 
-Status: early development. The native wizard supports bin lists and bounded
-project-folder discovery, selection and nested destination bins. Implemented Premiere shapes
-have scoped application read-backs; automated tests establish structure and parity only.
+## Download
+
+[Download the published alpha](https://github.com/whatever-industries/any-nle/releases/tag/v0.1.0-alpha.1)
+for macOS, Windows or Linux. The packages include the desktop wizard, CLI and
+FFmpeg tools. See the [release notes](RELEASE_NOTES.md) for platform downloads,
+installation details and checksums.
+
+## Convert an Avid project
+
+1. Open the wizard and choose a project folder or select Avid bins.
+2. Select the bins to convert and point Any NLE to the source media.
+3. Choose how Premiere should represent the clips. Review missing media,
+   unsupported details and any new media required before converting.
+4. Open the generated `.prproj` in Premiere and check the timeline and media.
 
 ## What comes across
 
@@ -37,9 +48,13 @@ Changing inputs or choices requires a fresh pre-flight. Conversion never overwri
 existing project, receipt or media folder. Packaged builds include verified LGPL-only
 FFmpeg/ffprobe; unbundled CLI use requires external tools.
 
-Build the GUI and CLI with Rust1.95.0 using `cargo build --release --manifest-path
-crates/Cargo.toml --workspace`. The six-target packaging workflow is implemented, but
-cross-platform build and application checks remain pending.
+Build the GUI and CLI with Rust 1.95.0.
+
+```sh
+cargo build --locked --release --manifest-path crates/Cargo.toml --bin any-nle --bin any-nle-gui
+```
+
+The [release guide](docs/RELEASE.md) covers native packaging and verification.
 
 The older standalone model APIs remain available:
 
@@ -78,30 +93,46 @@ Optional OP-Atom media preparation: append `--rewrap-op1a NEW_MEDIA_DIRECTORY` t
 Avid→Premiere conversion. It displays **“Creates new media.”** Add `--rewrap-dry-run` for
 a preview without writes. On macOS, use `--rewrap-op1a-prompt` instead of a directory
 argument for a native folder picker and a review showing estimated additional space and
-available disk space before conversion. Requires external FFmpeg/ffprobe8.1; supported inputs and
+available disk space before conversion. Requires external FFmpeg/ffprobe 8.1; supported inputs and
 scoped qualification and remaining limits are in [docs/MEDIA-REWRAP.md](docs/MEDIA-REWRAP.md).
 Add `--rewrap-native-master` for the experimental [file-backed AV-master route](docs/NATIVE-OP1A-MASTERS.md),
 preserving supported bin audio groups and sequence routing. This explicitly replaces bin
-mode. Native read-back is limited to qualified cases.
+mode. The bounded native-source Premiere trial
+passes open/save/reopen, complete PCM24 comparison and picture/playback checks;
+User acceptance and wider compatibility remain pending.
 The same native route supports [bounded editable Avid Groups](docs/EDITABLE-GROUPS-2026-11-08.md):
 two same-rate DNx cameras with fixed two-channel mono audio. Other Group layouts
 receive a named refusal.
 
 
-Public synthetic checks (run from the repository root):
+Run the public synthetic checks from the repository root.
 
 ```sh
 python3 scripts/public_acceptance.py --output public-checks
 python3 -m unittest discover -s scripts/release -p test_release.py -v
 ```
 
-Native corpus qualification requires separate fixtures and is not implied by these checks.
+Native corpus qualification uses separate fixtures.
+
+## Resolve development
+
+The internal Resolve tools can read selected projects and write experimental
+projects. The verified Avid path links 1080p23.976 DNxHR LB OP-Atom picture and
+two independent mono MXFs per clip in a straight-cut timeline. Resolve conversion
+is still a development feature. [Scope and verification](docs/RESOLVE-PROJECT-CORE.md)
 
 The model format is in [`prproj/src/convert/model.rs`](prproj/src/convert/model.rs) and
 [`src/avid2prproj/model.py`](src/avid2prproj/model.py) (example:
 [`examples/opatom_clip.model.json`](examples/opatom_clip.model.json)). Times are integer ticks
 (254,016,000,000 per second). Loading is strict and bounded; anything unsupported is refused
 or reported with a named reason, and output is never overwritten.
+
+## Contributing
+
+Only clean-room contributions are accepted. Base format changes on public
+documentation or reproducible observations made with files and tools you are
+authorized to use. Include those sources and how to reproduce your observations
+in the pull request.
 
 ## Thanks
 

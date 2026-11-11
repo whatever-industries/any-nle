@@ -746,7 +746,7 @@ pub struct Sequence {
     pub markers: Vec<Marker>,
     pub track_levels: Vec<TrackLevel>,
     pub audio_crossfades: Vec<AudioCrossfade>,
-    /// Sequence start timecode, ticks (Avid 01:00:00:00 -> 3600 s).
+    /// Absolute sequence zero point in Premiere ticks, independent of edit positions.
     pub start: i64,
 }
 
@@ -2081,8 +2081,8 @@ pub(crate) fn validate_clip(c: &Clip, w: &str) -> R<()> {
     require(c.audio.len() <= 64, || format!("{w}.audio: expected a list of at most 64 files"))?;
     if let Some(v) = &c.video {
         let w = format!("{w}.video");
-        require(["AVdn", "apcs"].contains(&v.codec.as_str()), || {
-            format!("{w}.codec: only 'AVdn' (Avid DNx) and 'apcs' (ProRes LT) OP-Atom MXF have a verified profile")
+        require(["AVdn", "apcs", "apch"].contains(&v.codec.as_str()), || {
+            format!("{w}.codec: only DNx, ProRes LT and the prepared ProRes HQ freeze profile are supported")
         })?;
         check_dimensions(v.width, v.height, &w)?;
         check_rate(v.rate, &format!("{w}.rate"))?;

@@ -5,6 +5,7 @@ mod backend;
 mod execution;
 mod planning;
 mod mov;
+mod mono;
 mod receipts;
 mod source;
 mod terminal;
@@ -14,6 +15,8 @@ mod validation;
 mod tests;
 
 pub use validation::{normalize_source_clocks, validate_bin_audio};
+pub(crate) use planning::{NativeMediaPreparation, PrepareIssue};
+pub(crate) use mono::gain_paths;
 
 use backend::Probe;
 use graph::json::Value;
@@ -34,7 +37,7 @@ struct Input {
 struct Job {
     inputs: Vec<usize>,
     clips: Vec<Value>,
-    tc: String,
+    tc: Option<String>,
     rate: Fraction,
     mov: bool,
 }
@@ -42,6 +45,7 @@ pub struct Plan {
     destination: PathBuf,
     inputs: Vec<Input>,
     jobs: Vec<Job>,
+    mono: Vec<mono::MonoPcm>,
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
     versions: Vec<String>,

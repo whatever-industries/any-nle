@@ -25,7 +25,7 @@ pub(crate) const USAGE: &str = "usage:
                   [--rewrap-op1a NEW_DIR | --rewrap-op1a-prompt | --rewrap-media NEW_DIR] [--rewrap-dry-run] [--rewrap-native-master] [--ffmpeg PATH] [--ffprobe PATH]
       Convert Avid bins to a Premiere project. Prints what was converted, the reader's problems
       and every loss. --graph saves the qualified source anynle.graph/2 (Premiere route).
-      --rewrap-media NEW_DIR: Creates new media. DNx to MXF OP1a; qualified ProRes LT to MOV. Requires --rewrap-native-master.
+      --rewrap-media NEW_DIR: Creates new media. DNx to MXF OP1a; qualified ProRes to MOV. Requires --rewrap-native-master.
       --rewrap-op1a: Creates new media. Copies supported OP-Atom streams into NEW_DIR.
       --rewrap-op1a-prompt: macOS folder picker and space review before creating media.
       --rewrap-dry-run: preview only; creates no media/project/graph. Requires a rewrap destination option.
@@ -281,7 +281,8 @@ pub(crate) fn read_avid_source(
         .collect();
     let project = a.project.clone().unwrap_or_else(|| names[0].clone());
     let roots: Vec<PathBuf> = a.media.iter().map(PathBuf::from).collect();
-    let result = avid_adapter::read(&inputs, &roots, &project, &names)?;
+    let ffprobe = a.ffprobe.as_deref().unwrap_or_else(|| Path::new("ffprobe"));
+    let result = avid_adapter::read_with_ffprobe(&inputs, &roots, &project, &names, ffprobe)?;
     source_input::recheck(&inputs)?;
     let mut problems = result.diagnostics;
     problems.extend(result.scan_issues);
@@ -395,6 +396,14 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     output::preflight(&output, a.graph_out.as_deref())?;
     let policy = policy(a)?;
     let route = if a.rewrap_media {PremiereRoute::NativeMedia}else{PremiereRoute::resolve(a.rewrap_native_master, policy.bin_mode)};
+    let (graph, problems, inputs) = read_avid_source(a)?;
+    if let Some(issue) = crate::job::sequence_timing_blocker(&graph) {
+        return Err(issue.cli_summary());
+    }
+    let gain = rewrap::gain_paths(&graph);
+    if !gain.is_empty() && !a.rewrap_media {
+        return Err("AudioSuite Gain requires --rewrap-media and --rewrap-native-master to copy the saved render to WAV".into());
+    }
     let selected_directory = if a.rewrap_prompt {
         match media_prompt::choose_directory(&output)? {
             Some(dir) => Some(dir),
@@ -406,12 +415,11 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     } else {
         a.rewrap.clone()
     };
-    let (graph, problems, inputs) = read_avid_source(a)?;
     let policy_losses = policy.losses_source(&graph);
     let clock = if a.wants_rewrap() { premiere_adapter::ClockProfile::VerifiedRewrap }
         else { premiere_adapter::ClockProfile::LegacyImport };
-    let (model, texts, video_dissolves, picture_effects, typed, preparation_notes, bridge_losses) =
-        if !graph.multicams.is_empty() || !graph.multicam_uses.is_empty() {
+    let (model, texts, video_dissolves, picture_effects, mut typed, preparation_notes, bridge_losses) =
+        if !gain.is_empty() || !graph.multicams.is_empty() || !graph.multicam_uses.is_empty() {
             if matches!(route, PremiereRoute::Bin(_)) {
                 return Err("multicam_native_route_required: editable Groups require the native OP1a rewrap route".into());
             }
@@ -426,22 +434,33 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         };
     let prepared_event_count: usize = typed.as_ref().map_or(&model.sequences, |p| &p.sequences)
         .iter().map(|s| s.events.len()).sum();
-    route.preflight(&model).map_err(|e| e.to_string())?;
-    if let Some(notice) = route.notice() {
-        println!("{notice}");
+    let native_media = a.rewrap_media.then(|| rewrap::NativeMediaPreparation {
+        model: &model,
+        writer_input: typed.as_mut(),
+        gain: &gain,
+    });
+    if let Some(native) = &native_media {
+        native.preflight()?;
+    } else {
+        route.preflight(&model).map_err(|e| e.to_string())?;
+    }
+    if gain.is_empty() {
+        if let Some(notice) = route.notice() {
+            println!("{notice}");
+        }
     }
     let preparation = if let Some(dir) = &selected_directory {
         println!("Creates new media.");
-        let plan = if a.rewrap_media {rewrap::Plan::prepare_media(
-            &model,
-            dir,
-            &a.media,
-            &output,
-            a.graph_out.as_deref(),
-            a.ffmpeg.as_deref().unwrap_or(Path::new("ffmpeg")),
-            a.ffprobe.as_deref().unwrap_or(Path::new("ffprobe")),
-            true,
-        )?} else {rewrap::Plan::prepare(&model,dir,&a.media,&output,a.graph_out.as_deref(),a.ffmpeg.as_deref().unwrap_or(Path::new("ffmpeg")),a.ffprobe.as_deref().unwrap_or(Path::new("ffprobe")))?};
+        let ffmpeg = a.ffmpeg.as_deref().unwrap_or(Path::new("ffmpeg"));
+        let ffprobe = a.ffprobe.as_deref().unwrap_or(Path::new("ffprobe"));
+        let plan = match native_media {
+            Some(native) => native
+                .prepare(dir, &a.media, &output, a.graph_out.as_deref(), ffmpeg, ffprobe)
+                .map_err(rewrap::PrepareIssue::into_message)?,
+            None => rewrap::Plan::prepare(
+                &model, dir, &a.media, &output, a.graph_out.as_deref(), ffmpeg, ffprobe,
+            )?,
+        };
         plan.describe();
         Some(plan)
     } else {
@@ -489,12 +508,17 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         prepared.recheck_outputs().map_err(|e| e.to_string())?;
         output::preflight(&output, a.graph_out.as_deref())?;
         source_input::recheck(&inputs)?;
-        let actual = plan.execute().map_err(|e| {
-            format!(
-                "media preparation failed: {e}; retained media outputs: {}",
-                plan.directory().display()
-            )
-        })?;
+        let mut media_created = false;
+        let actual = plan
+            .execute_observed(&mut |_, _| Ok(()), &mut media_created)
+            .map_err(|e| {
+                let retained = if media_created {
+                    plan.directory().display().to_string()
+                } else {
+                    "none".into()
+                };
+                format!("media preparation failed: {e}; retained media outputs: {retained}")
+            })?;
         if actual != bindings {
             let error =
                 "executed media bindings differ from the prepared project; verified media retained";
@@ -530,10 +554,10 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         output::write_source_snapshot(path, &graph).map_err(|e| {
             publication_failure(
                 "snapshot publication failed",
-                e,
+                e.message,
                 &prepared,
                 preparation.as_ref(),
-                Some(path),
+                e.retained.then_some(path.as_path()),
             )
         })?;
         published_snapshot = Some(path.as_path());
@@ -548,7 +572,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         )
     })?;
     if let Some(plan) = &preparation {
-        plan.record_project_with_mode(&output,route.receipt_mode()).map_err(|e|{
+        plan.record_project_with_mode(&output,plan.mode(route.receipt_mode())).map_err(|e|{
             // record_project already records the completed outcome accurately.
             format!("{e}; project/assets retained: {:?}; source snapshot: {:?}; publication notes: {}",prepared.retained_paths(),published_snapshot,report.notes.join("; "))
         })?;
@@ -561,7 +585,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         graph.bins.len(),
         graph.sequences.len(),
         placements,
-        route
+        preparation.as_ref().map_or_else(|| route.to_string(), |p| p.mode(route.receipt_mode()).to_owned())
     );
     for note in &preparation_notes {
         println!("Preparation note: {note}");

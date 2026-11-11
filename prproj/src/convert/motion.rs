@@ -4,7 +4,7 @@
 //! (`data/motion_template.xml`); the chain loses DefaultMotion/DefaultMotionComponentID.
 
 use super::model::Transform;
-use super::prepared::MotionKey;
+use super::prepared::PictureEffect;
 use crate::build::time::Time;
 use crate::model::{component::set_param_keyframes, enums::KeyframeInterpolation, validators::Num};
 use crate::build::fmt::{format_lumetri_value, int_str, py_repr};
@@ -52,7 +52,12 @@ pub fn apply_motion(project: &mut Project, placed: TrackItemId, transform: &Tran
 }
 
 pub(super) fn apply_motion_keys(project: &mut Project, placed: TrackItemId, transform: &Transform,
-    keys: Option<[MotionKey; 2]>, uuids: &mut dyn UuidSource) -> Result<Vec<String>> {
+    effect: Option<PictureEffect>, uuids: &mut dyn UuidSource) -> Result<Vec<String>> {
+    let keys = match effect { Some(PictureEffect::Resize(keys)) => Some(keys), _ => None };
+    let trimmed = match effect {
+        Some(PictureEffect::TrimmedWarp(trim) | PictureEffect::TrimmedResize(trim)) => Some(trim),
+        _ => None,
+    };
     let already = project.doc.index_payloads()?;
     let fragment = project.doc.tree.parse_fragment(TEMPLATE)?;
     let spliced = project.splice(fragment, uuids)?;
@@ -80,12 +85,15 @@ pub(super) fn apply_motion_keys(project: &mut Project, placed: TrackItemId, tran
     let (ax, ay) = transform.anchor;
     set(project, params[ANCHOR], &format!("{}:{}", coord(0.5 + ax)?, coord(0.5 + ay)?))?;
     let (sx, sy) = transform.scale;
-    let uniform = sx == sy && keys.is_none_or(|keys| keys.iter().all(|k| k.scale[0] == k.scale[1]));
+    let uniform = trimmed.is_none() && sx == sy && keys.is_none_or(|keys| keys.iter().all(|k| k.scale[0] == k.scale[1]));
     set(project, params[SCALE], &format_lumetri_value(sy)?)?;
     set(project, params[SCALE_WIDTH], &format_lumetri_value(if uniform { 100.0 } else { sx })?)?;
     set(project, params[UNIFORM], if uniform { "true" } else { "false" })?;
     set(project, params[ROTATION], &format_lumetri_value(transform.rotation)?)?;
-    for (index, v) in CROPS.into_iter().zip(transform.crop) {
+    let initial_crop = keys.and_then(|keys| keys[0].crop)
+        .or_else(|| trimmed.and_then(|trim| trim.crop.map(|crop| crop[0].1)))
+        .unwrap_or(transform.crop);
+    for (index, v) in CROPS.into_iter().zip(initial_crop) {
         let percent = (v * 100.0).clamp(0.0, 100.0);
         if percent != v * 100.0 {
             notes.push("a crop outside Premiere's 0..100% was clamped".to_string());
@@ -93,11 +101,31 @@ pub(super) fn apply_motion_keys(project: &mut Project, placed: TrackItemId, tran
         set(project, params[index], &format_lumetri_value(percent)?)?;
     }
     if let Some(keys) = keys {
-        set_position_keys(&mut project.doc.tree, params[POSITION], keys)?;
+        set_position_keys(&mut project.doc.tree, params[POSITION], &keys.map(|k| (k.ticks, k.position)))?;
         let axis = |i: usize| keys.map(|k| (Time::new(k.ticks), Num::Float(k.scale[i]), KeyframeInterpolation::Linear));
         set_param_keyframes(&mut project.doc.tree, params[SCALE], &axis(1))?;
         if !uniform {
             set_param_keyframes(&mut project.doc.tree, params[SCALE_WIDTH], &axis(0))?;
+        }
+        if let [Some(first), Some(last)] = keys.map(|k| k.crop) {
+            for (axis, index) in CROPS.into_iter().enumerate() {
+                let edge = [first[axis], last[axis]];
+                let values = [0, 1].map(|k| (Time::new(keys[k].ticks), Num::Float(edge[k] * 100.0), KeyframeInterpolation::Linear));
+                set_param_keyframes(&mut project.doc.tree, params[index], &values)?;
+            }
+        }
+    }
+
+    if let Some(trim) = trimmed {
+        let tree = &mut project.doc.tree;
+        set_position_keys(tree, params[POSITION], &trim.motion.map(|k| (k.ticks, k.position)))?;
+        let scalar = |(ticks, value)| (Time::new(ticks), Num::Float(value), KeyframeInterpolation::Linear);
+        set_param_keyframes(tree, params[SCALE], &trim.motion.map(|k| scalar((k.ticks, k.height))))?;
+        set_param_keyframes(tree, params[SCALE_WIDTH], &trim.width.map(scalar))?;
+        if let Some(crop) = trim.crop {
+            for (axis, index) in CROPS.into_iter().enumerate() {
+                set_param_keyframes(tree, params[index], &crop.map(|(t, edges)| scalar((t, edges[axis] * 100.0))))?;
+            }
         }
     }
 
@@ -115,22 +143,26 @@ pub(super) fn apply_motion_keys(project: &mut Project, placed: TrackItemId, tran
     Ok(notes)
 }
 
-fn set_position_keys(tree: &mut crate::xml::Tree, param: NodeId, keys: [MotionKey; 2]) -> Result<()> {
-    let [a, b] = keys;
-    let dx = b.position[0] - a.position[0];
-    let dy = b.position[1] - a.position[1];
-    let seconds = Time::new(b.ticks - a.ticks).seconds();
-    let speed = dx.hypot(dy) / seconds;
+fn set_position_keys(tree: &mut crate::xml::Tree, param: NodeId, keys: &[(i64, [f64; 2])]) -> Result<()> {
+    let segment = |(start, a): (i64, [f64; 2]), (end, b): (i64, [f64; 2])| {
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let speed = dx.hypot(dy) / Time::new(end - start).seconds();
+        (speed, dx, dy)
+    };
     let mut records = String::new();
-    for (i, key) in keys.into_iter().enumerate() {
-        let [x, y] = key.position.map(|n| 0.5 + n);
-        let (slope_in, slope_out, in_x, in_y, out_x, out_y) = if i == 0 {
-            (0.0, speed, 0.0, 0.0, dx / 6.0, dy / 6.0)
-        } else {
-            (speed, 0.0, -dx / 6.0, -dy / 6.0, 0.0, 0.0)
-        };
+    for (i, &(ticks, position)) in keys.iter().enumerate() {
+        let [x, y] = position.map(|n| 0.5 + n);
+        let (slope_in, in_x, in_y) = i.checked_sub(1).map_or((0.0, 0.0, 0.0), |prev| {
+            let (speed, dx, dy) = segment(keys[prev], keys[i]);
+            (speed, -dx / 6.0, -dy / 6.0)
+        });
+        let (slope_out, out_x, out_y) = keys.get(i + 1).map_or((0.0, 0.0, 0.0), |&next| {
+            let (speed, dx, dy) = segment(keys[i], next);
+            (speed, dx / 6.0, dy / 6.0)
+        });
         records.push_str(&format!("{},{}:{},0,0,{},0.16666666666666666,{},0.16666666666666666,5,4,{},{},{},{};",
-            key.ticks, coord(x)?, coord(y)?, slope_in, slope_out, in_x, in_y, out_x, out_y));
+            ticks, coord(x)?, coord(y)?, slope_in, slope_out, in_x, in_y, out_x, out_y));
     }
     let start = tree.child_by_tag(param, "StartKeyframe").ok_or_else(|| crate::Error::Value("Motion Position start value is missing".into()))?;
     crate::xml::mutations::insert_leaf_before(tree, param, "StartKeyframe", "IsTimeVarying", "true")?;

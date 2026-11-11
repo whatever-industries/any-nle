@@ -200,6 +200,52 @@ fn two_edits() -> SourceGraph {
 }
 
 #[test]
+fn exact_tc1_changes_only_the_absolute_sequence_origin() {
+    let mut g = fixture();
+    let rate = Q::new(24000, 1001).unwrap();
+    let origin = Q::new(18018, 5).unwrap();
+    g.sequences[0].rate = rate;
+    let at_record_rate = |t: Q| Q::new(t.num() as i128 * 1001, t.den() as i128 * 1000).unwrap();
+    for p in &mut g.sequences[0].placements {
+        p.record_start = at_record_rate(p.record_start);
+        p.duration = at_record_rate(p.duration);
+    }
+    let id = &g.sequences[0].id;
+    g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && &s.object == id)
+        .unwrap().data = v(vec![("compatibility_start", Value::Str("3600".into()))]);
+    let baseline = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let mut expected = baseline.model.sequences[0].clone();
+    assert_eq!(expected.start, 914_457_600_000_000);
+    expected.start = 915_372_057_600_000;
+
+    let seq = &mut g.sequences[0];
+    seq.start = Some(origin);
+    seq.clock = Some(SourceClock {
+        effective_count: 86400,
+        rate,
+        display_base: 24,
+        drop: false,
+        provenance: SourceClockProvenance {
+            origin_count: 86400,
+            source_offset: 0,
+            source_rate: rate,
+            source_package: "sequence".into(),
+            timecode_track: "TC1/0".into(),
+            route: "direct sequence TC1".into(),
+        },
+    });
+    let corrected = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(corrected.model.sequences[0], expected);
+    assert_eq!(corrected.ownership, baseline.ownership);
+    assert!(corrected.diagnostics.iter().any(|s| s.contains("qualified 23.976 clock")));
+
+    // A start without its qualified clock must never select corrected timing.
+    g.sequences[0].clock = None;
+    let fallback = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(fallback.model.sequences, baseline.model.sequences);
+}
+
+#[test]
 fn ordinary_avid_dissolve_preserves_an_asymmetric_cut() {
     let mut g = two_edits();
     let t = &mut g.sequences[0].transitions[0];
@@ -274,6 +320,164 @@ fn picture_effects_follow_the_bound_video_edit_and_its_source_clock() {
     let PictureEffect::Resize(keys) = p.picture_effects[0].effect else { panic!("expected Linear Resize") };
     assert_eq!(keys.map(|k| k.ticks), [source, source + last_frame * (unit / 24)]);
     assert_eq!(keys[1].scale, [125.0, 100.0]);
+}
+
+#[test]
+fn animated_crop_keeps_four_edges_on_the_source_frame_clock() {
+    use prproj::convert::prepared::PictureEffect;
+    let mut g = fixture();
+    let rate = Q::new(24_000, 1001).unwrap();
+    let media = g.media.iter_mut().find(|m| m.kind == StreamKind::Video).unwrap();
+    media.rate = Some(rate);
+    media.duration = Q::new(240 * 1001, 24_000).unwrap();
+    let s = &mut g.sequences[0];
+    s.rate = rate;
+    s.placements.retain(|p| p.video_track.is_some());
+    let p = &mut s.placements[0];
+    p.source_in = Q::new(24 * 1001, 24_000).unwrap();
+    p.duration = Q::new(48 * 1001, 24_000).unwrap();
+    p.transform = Some(graph::Transform {
+        position: (0.0, 0.0), scale: (100.0, 100.0),
+        rotation: 0.0, anchor: (0.0, 0.0), crop: [0.0; 4],
+    });
+    let key = |frame, crop: &[f64]| v(vec![
+        ("frame", Value::Int(frame)),
+        ("position", Value::Arr(vec![Value::Int(0), Value::Int(0)])),
+        ("scale", Value::Arr(vec![Value::Int(125), Value::Int(90)])),
+        ("crop", Value::Arr(crop.iter().copied().map(Value::Float).collect())),
+    ]);
+    let keys = |end: &[f64]| v(vec![("keys", Value::Arr(vec![key(0, &[0.0; 4]), key(47, end)]))]);
+    p.effects = vec![graph::Effect {
+        kind: "avid.warp_crop_linear".into(),
+        params: keys(&[0.1, 0.2, 0.3, 0.4]),
+    }];
+    let prepared = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let PictureEffect::Resize(motion) = prepared.picture_effects[0].effect else {
+        panic!("expected Linear Motion");
+    };
+    assert_eq!(motion.map(|k| k.ticks), [254270016000, 752215464000]);
+    assert_eq!(motion.map(|k| k.crop), [Some([0.0; 4]), Some([0.1, 0.2, 0.3, 0.4])]);
+
+    let p = &mut g.sequences[0].placements[0];
+    p.effects[0].params = keys(&[0.1, 0.2, 0.3]);
+    assert!(prepare(&g, &options(), ClockProfile::LegacyImport).is_err());
+
+    g.sequences[0].placements[0].effects[0].params = keys(&[0.6, 0.2, 0.5, 0.4]);
+    assert!(prepare(&g, &options(), ClockProfile::LegacyImport).is_err());
+
+    let s = &mut g.sequences[0];
+    s.placements[0].effects[0].params = keys(&[0.1, 0.2, 0.3, 0.4]);
+    s.frame_size = Some((1280, 720));
+    let refused = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(refused.picture_effects.is_empty());
+    assert!(refused.model.sequences[0].events[0].transform.is_none());
+}
+
+#[test]
+fn fixed_warp_width_keeps_its_independent_source_handles() {
+    use prproj::convert::prepared::PictureEffect;
+    let mut g = fixture();
+    let rate = Q::new(24_000, 1001).unwrap();
+    let time = |frames: i128| Q::new(frames * 1001, 24_000).unwrap();
+    let media = g.media.iter_mut().find(|m| m.kind == StreamKind::Video).unwrap();
+    media.rate = Some(rate);
+    media.duration = time(120);
+    let seq = &mut g.sequences[0];
+    seq.rate = rate;
+    seq.placements.retain(|p| p.video_track.is_some());
+    let p = &mut seq.placements[0];
+    p.source_in = time(36);
+    p.duration = time(36);
+    p.transform = Some(graph::Transform {
+        position: (0.0, 0.0), scale: (80.0, 100.0), rotation: 0.0,
+        anchor: (0.0, 0.0), crop: [0.0; 4],
+    });
+    let params = |motion_times: [i64; 3], width: [i64; 3], fixed| {
+        let motion = motion_times.into_iter().map(|frame| v(vec![
+            ("frame", Value::Int(frame)),
+            ("position", Value::Arr(vec![Value::Int(0), Value::Int(0)])),
+            ("height", Value::Int(100)),
+        ])).collect();
+        let width = width.into_iter().zip([80, 160, 135]).map(|(frame, value)|
+            Value::Arr(vec![Value::Int(frame), Value::Int(value)])).collect();
+        v(vec![("motion", Value::Arr(motion)), ("width", Value::Arr(width)), ("fixed_width", Value::Bool(fixed))])
+    };
+    p.effects.push(graph::Effect {
+        kind: "avid.warp_trim_linear".into(),
+        params: params([0, 18, 35], [-12, 11, 35], true),
+    });
+    let result = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let PictureEffect::TrimmedWarp(trim) = result.picture_effects[0].effect else {
+        panic!("expected trimmed Warp");
+    };
+    let unit = prproj::convert::model::TICKS_PER_SECOND / 24_000 * 1001;
+    assert_eq!(trim.motion.map(|k| k.ticks), [36 * unit, 54 * unit, 71 * unit]);
+    assert_eq!(trim.width, [(24 * unit, 80.0), (47 * unit, 160.0), (71 * unit, 135.0)]);
+
+    g.sequences[0].placements[0].effects[0].params = params([0, 18, 35], [-12, 11, 35], false);
+    assert!(prepare(&g, &options(), ClockProfile::LegacyImport).is_err());
+
+    g.sequences[0].placements[0].effects[0].params = params([0, 18, 35], [-37, 11, 35], true);
+    let refused = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(refused.picture_effects.is_empty());
+    assert!(refused.model.sequences[0].events[0].transform.is_none());
+
+    g.sequences[0].placements[0].effects[0].params = params([0, 18, 35], [0, 23, 84], true);
+    let refused = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(refused.picture_effects.is_empty());
+    assert!(refused.model.sequences[0].events[0].transform.is_none());
+
+    let edit = &mut g.sequences[0].placements[0];
+    edit.source_in = time(32);
+    edit.duration = time(24);
+    edit.effects[0] = graph::Effect {
+        kind: "avid.resize_trim_linear".into(),
+        params: params([-6, 7, 23], [-23, -1, 23], true),
+    };
+    let result = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let PictureEffect::TrimmedResize(trim) = result.picture_effects[0].effect else {
+        panic!("expected trimmed Resize");
+    };
+    assert_eq!(trim.motion.map(|k| k.ticks), [26 * unit, 39 * unit, 55 * unit]);
+    assert_eq!(trim.width, [(9 * unit, 80.0), (31 * unit, 160.0), (55 * unit, 135.0)]);
+
+    let edit = &mut g.sequences[0].placements[0];
+    edit.source_in = time(8);
+    edit.effects[0].params = params([0, 15, 31], [0, 18, 23], true);
+    g.media.iter_mut().find(|m| m.kind == StreamKind::Video).unwrap().duration = time(39);
+    let refused = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(refused.picture_effects.is_empty());
+    assert!(refused.model.sequences[0].events[0].transform.is_none());
+
+    let crop = |times: [i64; 3], middle: [f64; 4]| {
+        let mut effect = params([0, 15, 31], [0, 18, 23], true);
+        let Value::Obj(ref mut fields) = effect else { unreachable!() };
+        fields.push(("crop".into(), Value::Arr(times.into_iter().zip([
+            [0.0; 4], middle, [0.1, 0.2, 0.3, 0.4],
+        ]).map(|(frame, edges)| v(vec![
+            ("frame", Value::Int(frame)),
+            ("edges", Value::Arr(edges.into_iter().map(Value::Float).collect())),
+        ])).collect())));
+        effect
+    };
+    g.media.iter_mut().find(|m| m.kind == StreamKind::Video).unwrap().duration = time(60);
+    g.sequences[0].placements[0].effects[0] = graph::Effect {
+        kind: "avid.resize_trim_crop_linear".into(),
+        params: crop([0, 18, 51], [0.02; 4]),
+    };
+    let result = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let PictureEffect::TrimmedResize(trim) = result.picture_effects[0].effect else {
+        panic!("expected trimmed Resize with crop");
+    };
+    assert_eq!(trim.crop.unwrap().map(|(t, _)| t), [8 * unit, 26 * unit, 59 * unit]);
+
+    g.sequences[0].placements[0].effects[0].params = crop([0, 18, 52], [0.02; 4]);
+    let refused = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(refused.picture_effects.is_empty());
+    assert!(refused.model.sequences[0].events[0].transform.is_none());
+
+    g.sequences[0].placements[0].effects[0].params = crop([0, 18, 51], [0.7; 4]);
+    assert!(prepare(&g, &options(), ClockProfile::LegacyImport).is_err());
 }
 
 #[test]
@@ -889,9 +1093,7 @@ fn named_aac_and_smpte_ds_prepare_only_with_matching_witnesses() {
     }
 }
 
-#[test]
-fn linked_originals_use_typed_codec_channels_and_keep_legacy_projection_strict(){
-    use prproj::convert::prepared::{PreparedClip,SampleRepresentation};
+fn original_fixture() -> SourceGraph {
     let mut g=fixture();
     for m in &mut g.media {
         let audio=m.kind==StreamKind::Audio;
@@ -900,14 +1102,67 @@ fn linked_originals_use_typed_codec_channels_and_keep_legacy_projection_strict()
         let clock=if audio{48000}else{24};
         m.original=Some(OriginalStream{saved_locators:vec!["/Saved/source.mp4".into()],container:"mov".into(),stream_index:if audio{1}else{0},channel_index:if audio{Some(m.stream.unwrap()-1)}else{None},channels:audio.then_some(2),time_base:Q::new(1,clock).unwrap(),start_pts:0,duration_ts:m.duration.to_units(clock as i64).unwrap(),sample_representation:audio.then_some("aac".into())});
     }
+    g
+}
+
+#[test]
+fn linked_originals_use_typed_codec_channels_and_keep_legacy_projection_strict() {
+    use prproj::convert::prepared::{PreparedClip, SampleRepresentation};
+    let mut g = original_fixture();
     g.validate().unwrap();let before=g.to_json_text().unwrap();
     assert!(prepare(&g,&options(),ClockProfile::LegacyImport).err().unwrap().to_string().contains("typed prepared route"));
-    let prepared=premiere_adapter::prepare_originals(&g,&options(),ClockProfile::LegacyImport).unwrap();
-    let PreparedClip::Original(c)=&prepared.input.clips[0]else{panic!("typed original missing")};
-    assert_eq!(c.audio.as_ref().unwrap().representation,SampleRepresentation::Aac);assert_eq!(c.channels.iter().map(|c|c.channel_index).collect::<Vec<_>>(),vec![0,1]);
-    assert_eq!(g.to_json_text().unwrap(),before);assert!(prepared.input.build_native_media_model().unwrap().clips.is_empty());
+    for profile in [ClockProfile::LegacyImport, ClockProfile::VerifiedRewrap] {
+        let prepared = premiere_adapter::prepare_originals(&g, &options(), profile).unwrap();
+        let PreparedClip::Original(c) = &prepared.input.clips[0] else {
+            panic!("typed original missing")
+        };
+        assert_eq!(c.audio.as_ref().unwrap().representation, SampleRepresentation::Aac);
+        assert_eq!(c.channels.iter().map(|c| c.channel_index).collect::<Vec<_>>(), vec![0, 1]);
+        assert!(prepared.input.build_native_media_model().unwrap().clips.is_empty());
+    }
+    assert_eq!(g.to_json_text().unwrap(), before);
     g.media[2].original.as_mut().unwrap().channel_index=Some(0);
     assert!(premiere_adapter::prepare_originals(&g,&options(),ClockProfile::LegacyImport).is_err());
+}
+
+#[test]
+fn source_stereo_is_kept_for_fresh_edits_without_merging_existing_mono_edits() {
+    use prproj::convert::prepared::PreparedClip;
+    let mut g = original_fixture();
+    let item = g.items[0].id.clone();
+    let witness = |pan| {
+        let track = |label, pan| v(vec![("kind", Value::Int(2)), ("label", Value::Int(label)), ("pan_raw", pan)]);
+        v(vec![
+            ("drop", Value::Bool(false)),
+            ("raw_groups", Value::Arr(vec![])),
+            ("master_output_mix", v(vec![("type", Value::Str("absent".into())), ("raw", Value::Null)])),
+            ("tracks", Value::Arr(vec![track(1, pan), track(2, Value::Null)])),
+        ])
+    };
+    let set_witness = |g: &mut SourceGraph, data| {
+        g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == item).unwrap().data = data;
+    };
+    let groups = |g: &SourceGraph| {
+        let prepared = premiere_adapter::prepare_originals(g, &options(), ClockProfile::VerifiedRewrap).unwrap();
+        let PreparedClip::Original(clip) = &prepared.input.clips[0] else {
+            panic!("typed original missing")
+        };
+        clip.groups.clone()
+    };
+    set_witness(&mut g, witness(Value::Null));
+    assert_eq!(groups(&g), vec![vec![1], vec![2]]);
+
+    let sequences: Vec<_> = g.sequences.drain(..).map(|s| s.id).collect();
+    g.sidecars.retain(|sidecar| !sequences.contains(&sidecar.object));
+    let before = g.clone();
+    assert_eq!(groups(&g), vec![vec![1, 2]]);
+    assert_eq!(g, before);
+
+    set_witness(&mut g, witness(Value::Int(0)));
+    assert_eq!(groups(&g), vec![vec![1], vec![2]]);
+    set_witness(&mut g, witness(Value::Null));
+    g.items[0].stream_groups = vec![vec![2, 1]];
+    assert_eq!(groups(&g), vec![vec![2, 1]]);
 }
 
 fn text_fact(id: &str, kind: TextKind, track: i64, start: Q, duration: Q) -> SourceText {

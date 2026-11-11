@@ -3,7 +3,7 @@
 # (docs/GRAPH-MODEL.md); they are used here as path dependencies.
 [workspace]
 resolver = "2"
-members = ["graph", "bridge", "mapping", "fcpxml", "app", "premiere-adapter", "avid-adapter", "gui"]
+members = ["graph", "bridge", "mapping", "fcpxml", "app", "premiere-adapter", "avid-adapter", "resolve-adapter", "gui"]
 
 [profile.release]
 overflow-checks = true

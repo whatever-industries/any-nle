@@ -155,6 +155,23 @@ pub struct Inputs {
     pub path_mappings: Vec<(PathBuf, PathBuf)>,
     pub new_media: Option<PathBuf>,
 }
+#[derive(Clone, Copy)]
+pub enum RequiredInput {
+    Bins,
+    BinSelection,
+    Output,
+    OutputExtension,
+}
+impl RequiredInput {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Bins => "Choose Avid bins or a project folder.",
+            Self::BinSelection => "Select at least one bin.",
+            Self::Output => "Choose a new Premiere project destination.",
+            Self::OutputExtension => "The destination must end with .prproj.",
+        }
+    }
+}
 impl Inputs {
     pub fn add_bins(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
@@ -165,21 +182,24 @@ impl Inputs {
         self.bins.sort();
     }
     pub fn required_paths(&self) -> Result<(), String> {
+        self.check_required_paths().map_err(|input| input.message().into())
+    }
+    pub fn check_required_paths(&self) -> Result<(), RequiredInput> {
         if self.project_folder.is_none() && self.bins.is_empty() {
-            return Err("Choose Avid bins or a project folder.".into());
+            return Err(RequiredInput::Bins);
         }
         if !self.entire_project && self.bins.is_empty() {
-            return Err("Select at least one bin.".into());
+            return Err(RequiredInput::BinSelection);
         }
         if self.output.as_os_str().is_empty() {
-            return Err("Choose a new Premiere project destination.".into());
+            return Err(RequiredInput::Output);
         }
         if self
             .output
             .extension()
             .is_none_or(|e| !e.eq_ignore_ascii_case("prproj"))
         {
-            return Err("The destination must end with .prproj.".into());
+            return Err(RequiredInput::OutputExtension);
         }
         Ok(())
     }

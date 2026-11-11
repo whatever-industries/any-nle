@@ -113,7 +113,42 @@ pub struct Review {
     pub estimated_bytes: Option<u64>,
     pub available_bytes: Option<u64>,
     pub notes: Vec<ReportNote>,
+    /// Display names keyed by the diagnostic's stable source object ID.
+    pub subjects: std::collections::HashMap<String, String>,
     pub cli_equivalent: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockerKind {
+    ProjectSource,
+    ProjectOutput,
+    AvidMedia,
+    OriginalLocator,
+    OriginalMedia,
+    NewMedia,
+    MediaTools,
+    Effects,
+    Rewrap,
+    SourceContent,
+    SequenceTiming,
+    Retry,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewBlocker {
+    pub kind: BlockerKind,
+    pub message: String,
+    pub affected: Vec<String>,
+}
+impl ReviewBlocker {
+    pub fn new(kind: BlockerKind, message: impl Into<String>) -> Self {
+        Self { kind, message: message.into(), affected: Vec::new() }
+    }
+    pub(crate) fn cli_summary(self) -> String {
+        if self.kind == BlockerKind::SequenceTiming && !self.affected.is_empty() {
+            format!("{}: {}", self.message, self.affected.join("; "))
+        } else {
+            self.message
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReportNote {
@@ -168,4 +203,5 @@ mod inventory;
 pub use inventory::inventory;
 
 mod engine;
-pub use engine::{execute, load, load_encoded, prepare, PreparedJob};
+pub(crate) use engine::sequence_timing_blocker;
+pub use engine::{execute, load, load_encoded, prepare, prepare_for_review, PreparedJob};

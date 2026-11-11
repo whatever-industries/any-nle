@@ -54,8 +54,27 @@ fn hex_color(s: &str) -> Option<Color32> {
     Some(Color32::from_rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
 }
 fn swatch(ui: &mut egui::Ui, c: Color32) {
-    let (r, _) = ui.allocate_exact_size(egui::vec2(18., 18.), egui::Sense::hover());
-    ui.painter().rect_filled(r, 4., c);
+    let (r, _) = ui.allocate_exact_size(egui::vec2(14., 14.), egui::Sense::hover());
+    ui.painter().rect_filled(r, 3., c);
+}
+fn mapping_arrow(ui: &mut egui::Ui) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(22., 16.), egui::Sense::hover());
+    let c = r.center();
+    let color = ui.visuals().weak_text_color();
+    // A filled vector tip stays legible at small sizes without a font glyph.
+    ui.painter().line_segment(
+        [c - egui::vec2(8., 0.), c + egui::vec2(3., 0.)],
+        egui::Stroke::new(1.75, color),
+    );
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            c + egui::vec2(8., 0.),
+            c + egui::vec2(1., -5.),
+            c + egui::vec2(1., 5.),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 fn selector(
     ui: &mut egui::Ui,
@@ -64,29 +83,38 @@ fn selector(
     names: &[&str],
     values: &[i64],
 ) {
-    let safe = (*index).clamp(0, names.len() as i64 - 1) as usize;
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(names[safe])
-        .width(140.)
-        .show_ui(ui, |ui| {
-            for (i, name) in names.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    swatch(ui, packed(values[i]));
-                    ui.selectable_value(index, i as i64, *name);
-                });
-            }
-        });
-    swatch(ui, packed(values[safe]));
+    let safe = |i: i64| i.clamp(0, names.len() as i64 - 1) as usize;
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(names[safe(*index)])
+            .width(114.)
+            .show_ui(ui, |ui| {
+                for (i, name) in names.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        swatch(ui, packed(values[i]));
+                        ui.selectable_value(index, i as i64, *name);
+                    });
+                }
+            });
+        swatch(ui, packed(values[safe(*index)]));
+    });
+}
+fn headings(ui: &mut egui::Ui, from: &str, to: &str) {
+    ui.strong(from);
+    ui.label("");
+    ui.strong(to);
+    ui.end_row();
 }
 pub fn markers(ui: &mut egui::Ui, p: &mut AvidToPremiere) {
     egui::Grid::new("marker-palette")
-        .num_columns(4)
+        .num_columns(3)
         .striped(true)
-        .spacing([18., 7.])
+        .spacing([12., 4.])
         .show(ui, |ui| {
+            headings(ui, "Avid marker", "Premiere marker");
             for (name, default) in AVID_MARKER_DEFAULTS {
                 ui.label(name);
-                ui.label("→");
+                mapping_arrow(ui);
                 let mut index = p
                     .marker_colors
                     .iter()
@@ -115,13 +143,14 @@ pub fn clips(
     error: &mut Option<String>,
 ) {
     ui.label(
-        "32 Avid palette swatches → 16 Premiere labels. Custom RGB colors use the same mapping.",
+        "Map 32 Avid swatches to 16 Premiere labels. You can also map custom RGB colors.",
     );
     egui::Grid::new("clip-palette")
-        .num_columns(5)
+        .num_columns(3)
         .striped(true)
-        .spacing([12., 7.])
+        .spacing([12., 4.])
         .show(ui, |ui| {
+            headings(ui, "Avid color", "Premiere label");
             let mut all = AVID_SWATCHES
                 .iter()
                 .map(|rgb| colors::rgb16_hex(*rgb))
@@ -135,9 +164,11 @@ pub fn clips(
                 let Some(color) = hex_color(&hex) else {
                     continue;
                 };
-                swatch(ui, color);
-                ui.label(RichText::new(&hex).monospace());
-                ui.label("→");
+                ui.horizontal(|ui| {
+                    swatch(ui, color);
+                    ui.label(RichText::new(&hex).monospace());
+                });
+                mapping_arrow(ui);
                 let [r, g, b, _] = color.to_array();
                 let rgb = [r as i64 * 257, g as i64 * 257, b as i64 * 257];
                 let mut index = colors::nearest_label(rgb, &p.clip_labels);

@@ -55,24 +55,18 @@ impl Plan {
         }
         Ok(hashes)
     }
+    #[cfg(test)]
     pub fn execute(&self) -> R<Vec<MediaRelink>> {
-        self.execute_controlled(&mut |_, _| Ok(()))
-    }
-    /// Check cancellation/progress before each output and between input verification stages.
-    /// A backend invocation already in flight completes before the next safe boundary.
-    pub fn execute_controlled(
-        &self,
-        control: &mut dyn FnMut(usize, usize) -> R<()>,
-    ) -> R<Vec<MediaRelink>> {
-        self.execute_observed(control, &mut false)
+        self.execute_observed(&mut |_, _| Ok(()), &mut false)
     }
     /// Record directory ownership only after exclusive creation succeeds.
+    /// Check cancellation and progress at safe boundaries between backend calls.
     pub fn execute_observed(
         &self,
         control: &mut dyn FnMut(usize, usize) -> R<()>,
         created: &mut bool,
     ) -> R<Vec<MediaRelink>> {
-        control(0, self.jobs.len())?;
+        control(0, self.jobs.len() + self.mono.len())?;
         if self.inputs.iter().any(|i| i.terminal.is_some()) {
             super::terminal::require_filter(&self.ffmpeg)?;
         }
@@ -84,7 +78,7 @@ impl Plan {
         }
         builder
             .create(&self.destination)
-            .map_err(|e| format!("rewrap destination: {e}"))?;
+            .map_err(|e| format!("rewrap destination {}: {e}", self.destination.display()))?;
         *created = true;
         let result = self.execute_inner_controlled(control);
         if let Err(e) = &result {
@@ -104,8 +98,9 @@ impl Plan {
     ) -> R<Vec<MediaRelink>> {
         let mut mappings = Vec::new();
         let mut records = Vec::new();
+        let total = self.jobs.len() + self.mono.len();
         for (j, job) in self.jobs.iter().enumerate() {
-            control(j, self.jobs.len())?;
+            control(j, total)?;
             println!(
                 "{} rewrap {}/{}",
                 if job.mov { "MOV" } else { "OP1a" },
@@ -125,13 +120,13 @@ impl Plan {
             let mut hashes = Vec::new();
             let mut inputs = Vec::new();
             for i in &job.inputs {
-                control(j, self.jobs.len())?;
+                control(j, total)?;
                 let input = &self.inputs[*i];
                 if stamp(&input.path)? != input.stamp {
                     return Err("input changed since preflight".into());
                 }
                 if let Some(tail) = &input.terminal {
-                    let again = super::terminal::Terminal::qualify(
+                    let again = tail.recheck(
                         &input.path,
                         &input.probe,
                         &self.ffprobe,
@@ -234,7 +229,7 @@ impl Plan {
                     ("output", text(target.to_string_lossy())),
                     ("inputs", Value::Arr(inputs.clone())),
                     ("masters", Value::Arr(job.clips.clone())),
-                    ("timecode", text(&job.tc)),
+                    ("timecode", job.tc.as_deref().map(text).unwrap_or(Value::Null)),
                     ("tools", strings(&self.versions)),
                 ]),
             )?;
@@ -257,6 +252,7 @@ impl Plan {
                 if let Some(tail) = &self.inputs[job.inputs[0]].terminal {
                     command.args(["-bsf:v:0", &tail.filter()]);
                 }
+                let tc = job.tc.as_deref().ok_or("OP1a plan lacks timecode")?;
                 command
                     .args([
                         "-r:v",
@@ -266,7 +262,7 @@ impl Plan {
                         "-c",
                         "copy",
                         "-timecode",
-                        &job.tc,
+                        tc,
                         "-f",
                         "mxf",
                     ])
@@ -274,7 +270,7 @@ impl Plan {
                 run(&mut command)?;
                 let output = probe(&self.ffprobe, &partial)?;
                 if output.op != "060e2b34040101010d01020101010900"
-                    || output.tc.as_deref() != Some(&job.tc)
+                    || output.tc.as_deref() != Some(tc)
                     || output.streams.len() != job.inputs.len()
                 {
                     return Err("output OP1a/stream/timecode validation failed".into());
@@ -308,7 +304,7 @@ impl Plan {
             for i in &job.inputs {
                 let input = &self.inputs[*i];
                 if let Some(tail) = &input.terminal {
-                    let again = super::terminal::Terminal::qualify(
+                    let again = tail.recheck(
                         &input.path,
                         &input.probe,
                         &self.ffprobe,
@@ -338,19 +334,39 @@ impl Plan {
             let record=obj(vec![("status",text("verified media; Premiere application read-back pending")),("output",text(target.to_string_lossy())),("output_probe",output_raw),("essence_sha256",strings(&hashes)),("inputs",Value::Arr(inputs)),("masters",Value::Arr(job.clips.clone())),("metadata_losses",text("Container/package identities regenerated. Sidecar preserves source facts. Optional metadata not represented by FFmpeg must be recovered from this receipt; native interpretation remains unqualified."))]);
             self.write_receipt(&format!("media-{:04}.json", j + 1), record.clone())?;
             records.push(record);
-            control(j + 1, self.jobs.len())?;
+            control(j + 1, total)?;
         }
+        for (i, pcm) in self.mono.iter().enumerate() {
+            control(self.jobs.len() + i, total)?;
+            let remaining = self.mono[i..].iter().try_fold(0u64, |n, p| n.checked_add(p.size()))
+                .ok_or("PCM output size overflow")?;
+            if free_space(&self.destination)? < remaining {
+                return Err("available space fell below the remaining PCM output size".into());
+            }
+            let output = self.mono_path(i);
+            let partial = self.destination.join(format!(".partial-audio-{:04}.wav", i + 1));
+            let record = pcm.write(&partial, &output)?;
+            self.write_receipt(&format!("audio-{:04}.json", i + 1), record.clone())?;
+            records.push(record);
+        }
+        if !self.mono.is_empty() { control(total, total)?; }
         self.write_receipt(
             "manifest.json",
             obj(vec![
-                ("schema", text(if self.jobs.iter().any(|j|j.mov) {"anynle.media-preparation/1"}else{"anynle.op1a/1"})),
+                ("schema", text(if !self.mono.is_empty() || self.jobs.iter().any(|j|j.mov) {"anynle.media-preparation/1"}else{"anynle.op1a/1"})),
                 (
                     "status",
                     text("media prepared; project completion recorded separately"),
                 ),
                 ("notice", text("Creates new media.")),
                 ("tools", strings(&self.versions)),
-                ("clock_handling",text("Native MXF timecode frame counts at exact picture edit rate; no rounded display-base timing. Picture packet time base, span and count validated before and after muxing.")),
+                ("clock_handling",text(if self.jobs.is_empty() {
+                    "Mono WAV copies the exact playable PCM span at 48 kHz with a zero-relative file origin."
+                } else if self.jobs.iter().any(|j| j.tc.is_none()) {
+                    "Generated Freeze Frame uses its zero-relative picture clock without adding timecode. Other masters use native MXF timecode counts at the exact picture edit rate."
+                } else {
+                    "Native MXF timecode frame counts at exact picture edit rate; no rounded display-base timing. Picture packet time base, span and count validated before and after muxing."
+                })),
                 ("jobs", Value::Arr(records)),
             ]),
         )?;
@@ -377,6 +393,7 @@ mod ownership_tests {
             destination: destination.clone(),
             inputs: vec![],
             jobs: vec![],
+            mono: vec![],
             ffmpeg: "unused".into(),
             ffprobe: "unused".into(),
             versions: vec![],

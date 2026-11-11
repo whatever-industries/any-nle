@@ -52,6 +52,80 @@ pub struct OriginalClip {
     pub channels: Vec<OriginalChannel>,
     pub groups: Vec<Vec<i64>>,
 }
+fn automatic_adapter_span(c: &OriginalClip, sequence_rate: Fraction) -> Option<(i128, i128)> {
+    let video = c.video.as_ref()?;
+    if c.container != "mov" || video.codec != "avc1" || video.width != 1920 || video.height != 1080
+        || !c.audio.as_ref().is_some_and(|a| {
+            a.sample_rate == 48_000 && a.channels == 2
+                && a.representation == SampleRepresentation::Aac
+        })
+    {
+        return None;
+    }
+    match ((video.rate.num, video.rate.den), (sequence_rate.num, sequence_rate.den)) {
+        ((24, 1), (24_000, 1001)) => Some((1000, 1001)),
+        ((24_000, 1001), (24, 1)) => Some((1001, 1000)),
+        _ => None,
+    }
+}
+
+// The forward cohort stores equal Source In and phase. In the reverse cohort
+// Source In is floor(phase * 1000 / 1001), which can admit two adjacent phases.
+fn automatic_adapter_phases(first: i128, span: i128, source: i128) -> std::ops::Range<i128> {
+    if span < source {
+        first..first + 1
+    } else {
+        (first * span + source - 1) / source..((first + 1) * span + source - 1) / source
+    }
+}
+
+fn is_automatic_adapter_picture(c: &OriginalClip, s: &Sequence, e: &Event, map: &[i64]) -> bool {
+    let Some((span, source)) = automatic_adapter_span(c, s.rate) else { return false; };
+    if !(2..=16_384).contains(&map.len()) || e.video_track.is_none()
+        || !e.audio_tracks.is_empty() || !e.stereo.is_empty() || e.source_duration.is_some()
+        || e.matte.is_some() || e.transform.is_some() || e.color_correction.is_some()
+    { return false; }
+    let v = c.video.as_ref().unwrap();
+    let source_unit = ticks_per_unit(v.rate);
+    let record_unit = ticks_per_unit(s.rate);
+    if e.source_in % source_unit != 0 || e.duration / record_unit != map.len() as i64 {
+        return false;
+    }
+    let first = i128::from(e.source_in / source_unit);
+    automatic_adapter_phases(first, span, source).any(|phase| {
+        map.iter().enumerate().all(|(i, &f)| {
+            let f = i128::from(f);
+            f == first + (phase + i as i128) * source / span - phase * source / span
+                && (f + 1) * i128::from(source_unit) <= i128::from(v.duration)
+        })
+    })
+}
+
+fn is_automatic_adapter_audio_tail(
+    c: &OriginalClip, s: &Sequence, e: &Event,
+    picture_spans: &HashSet<(&str, i64, i64, i64)>,
+) -> bool {
+    let Some((span, source)) = automatic_adapter_span(c, s.rate) else { return false; };
+    let sample_unit = TICKS_PER_SECOND / 48_000;
+    let source_unit = ticks_per_unit(c.video.as_ref().unwrap().rate);
+    let record_unit = ticks_per_unit(s.rate);
+    let source_samples_per_frame = source_unit / sample_unit;
+    let source_sample = e.source_in / sample_unit;
+    let first = source_sample / source_samples_per_frame - 1;
+    let nominal_span = e.duration.checked_add(record_unit - e.duration % record_unit);
+    e.video_track.is_none() && !e.audio_tracks.is_empty() && e.stereo.is_empty()
+        && e.speed_ratio.is_none() && e.time_remap.is_none() && e.source_duration.is_none()
+        && e.source_in % sample_unit == 0 && e.duration % sample_unit == 0
+        && e.source_in.checked_add(e.duration) == c.audio.as_ref().map(|a| a.duration)
+        && first >= 0
+        && automatic_adapter_phases(i128::from(first), span, source).any(|p| {
+            i128::from(source_sample % source_samples_per_frame)
+                == (p * source % span) * i128::from(source_samples_per_frame) / span
+        })
+        && nominal_span.zip(first.checked_mul(source_unit)).is_some_and(|(duration, source_in)| {
+            picture_spans.contains(&(e.clip.as_str(), e.record_start, duration, source_in))
+        })
+}
 #[derive(Clone, Debug, PartialEq)]
 pub enum PreparedClip {
     Legacy(Clip),
@@ -83,12 +157,37 @@ pub struct MotionKey {
     pub ticks: i64,
     pub position: [f64; 2],
     pub scale: [f64; 2],
+    pub crop: Option<[f64; 4]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrimmedMotionKey {
+    pub ticks: i64,
+    pub position: [f64; 2],
+    pub height: f64,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrimmedMotion {
+    pub motion: [TrimmedMotionKey; 3],
+    pub width: [(i64, f64); 3],
+    pub fixed_width: bool,
+    pub crop: Option<[(i64, [f64; 4]); 3]>,
+}
+
+impl TrimmedMotion {
+    pub fn keys_fit_media(&self, end: i64) -> bool {
+        self.motion.iter().map(|k| k.ticks).chain(self.width.iter().map(|k| k.0))
+            .chain(self.crop.iter().flatten().map(|k| k.0))
+            .all(|time| (0..end).contains(&time))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PictureEffect {
     Flip { horizontal: bool, vertical: bool },
     Resize([MotionKey; 2]),
+    TrimmedWarp(TrimmedMotion),
+    TrimmedResize(TrimmedMotion),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -116,15 +215,69 @@ pub(super) fn validate_picture_effects(effects: &[PreparedPictureEffect], sequen
                 check_rate(sequence.rate, "Resize sequence rate")?;
                 let frame = ticks_per_unit(sequence.rate);
                 let end = event.source_in.checked_add(event.duration).and_then(|n| n.checked_sub(frame));
-                if event.transform.as_ref().is_none_or(|t| t.crop != [0.0; 4] || t.rotation != 0.0 || t.anchor != (0.0, 0.0))
+                let cropped = keys[0].crop.is_some();
+                if cropped != keys[1].crop.is_some()
+                    || (cropped && (sequence.rate != Fraction::new(24_000, 1001)
+                        || (sequence.width, sequence.height) != (1920, 1080)))
+                    || event.transform.as_ref().is_none_or(|t| t.crop != [0.0; 4] || t.rotation != 0.0 || t.anchor != (0.0, 0.0))
                     || event.matte.is_some() || event.color_correction.is_some()
                     || frame <= 0 || event.speed_ratio.is_some() || event.time_remap.is_some()
                     || keys[0].ticks != event.source_in || event.source_in % frame != 0 || Some(keys[1].ticks) != end
                     || keys[1].ticks <= keys[0].ticks
                     || keys.iter().any(|k| k.position.iter().any(|x| !x.is_finite() || x.abs() > 64.0)
-                        || k.scale.iter().any(|x| !(0.0..=10000.0).contains(x)))
+                        || k.scale.iter().any(|x| !(0.0..=10000.0).contains(x))
+                        || k.crop.is_some_and(|[l, t, r, b]| {
+                            k.scale.contains(&0.0)
+                                || [l, t, r, b].iter().any(|x| !(0.0..1.0).contains(x))
+                                || l + r >= 1.0 || t + b >= 1.0
+                        }))
                 {
-                    return Err(fail("invalid Linear Resize key times or values"));
+                    return Err(fail("invalid Linear Motion key times or values"));
+                }
+            }
+            PictureEffect::TrimmedWarp(trim) | PictureEffect::TrimmedResize(trim) => {
+                let frame = ticks_per_unit(Fraction::new(24_000, 1001));
+                let end = event.source_in.checked_add(event.duration).and_then(|n| n.checked_sub(frame));
+                let [a, b, c] = trim.motion.map(|k| k.ticks);
+                let [x, y, z] = trim.width.map(|(t, _)| t);
+                let aligned_width = [x, y, z] == [a, b, c];
+                let spans_qualified = if matches!(p.effect, PictureEffect::TrimmedResize(_)) {
+                    end.is_some_and(|end| {
+                        a <= event.source_in && x <= event.source_in && c >= end && z >= end
+                            && ((a == event.source_in && x == event.source_in) || (c == end && z == end))
+                            && (trim.fixed_width || aligned_width)
+                    })
+                } else {
+                    a == event.source_in && Some(c) == end && a < y && y < c
+                        && if trim.fixed_width {
+                            (x < a && z == c) || (x == a && z > c)
+                        } else {
+                            aligned_width
+                        }
+                };
+                if sequence.rate != Fraction::new(24_000, 1001) || (sequence.width, sequence.height) != (1920, 1080)
+                    || event.transform.as_ref().is_none_or(|t| t.crop != [0.0; 4] || t.rotation != 0.0 || t.anchor != (0.0, 0.0))
+                    || event.matte.is_some() || event.color_correction.is_some()
+                    || event.speed_ratio.is_some() || event.time_remap.is_some()
+                    || !spans_qualified || !(a < b && b < c && x < y && y < z)
+                    || trim.crop.is_some_and(|keys| {
+                        let [first, middle, last] = keys.map(|(t, _)| t);
+                        end.is_none_or(|end| {
+                            first > event.source_in || last < end
+                                || (first != event.source_in && last != end)
+                        }) || !(first < middle && middle < last)
+                            || keys.iter().any(|&(t, [l, top, r, bottom])| {
+                                t < 0 || t % frame != 0
+                                    || [l, top, r, bottom].iter().any(|v| !(0.0..1.0).contains(v))
+                                    || l + r >= 1.0 || top + bottom >= 1.0
+                            })
+                    })
+                    || [a, b, c, x, y, z].iter().any(|t| *t < 0 || t % frame != 0)
+                    || trim.motion.iter().any(|k| k.position.iter().any(|v| !v.is_finite() || v.abs() > 64.0)
+                        || !(k.height > 0.0 && k.height <= 10_000.0))
+                    || trim.width.iter().any(|(_, v)| !(*v > 0.0 && *v <= 10_000.0))
+                {
+                    return Err(fail("invalid trimmed Linear Motion key times or values"));
                 }
             }
             _ => return Err(fail("empty Flip effect or unqualified effect stack")),
@@ -351,6 +504,9 @@ impl PreparedProjectInput {
         }
         for (i, s) in self.sequences.iter().enumerate() {
             super::model::validate_sequence(s, &format!("prepared sequences[{i}]"))?;
+            let mapped_picture_spans: HashSet<_> = s.events.iter().filter(|e| {
+                e.video_track.is_some() && e.time_remap.is_some()
+            }).map(|e| (e.clip.as_str(), e.record_start, e.duration, e.source_in)).collect();
             for e in &s.events {
                 let c = clips
                     .get(e.clip.as_str())
@@ -393,14 +549,17 @@ impl PreparedProjectInput {
                 }
                 let unit = ticks_per_unit(s.rate);
                 if e.record_start % unit != 0
-                    || e.duration % unit != 0
+                    || (e.duration % unit != 0 && !matches!(c, PreparedClip::Original(c)
+                        if is_automatic_adapter_audio_tail(c, s, e, &mapped_picture_spans)))
                     || e.source_in as i128 + e.source_duration.unwrap_or(e.duration) as i128
                         > duration as i128
                 {
                     return Err(fail("prepared event range/grid mismatch"));
                 }
                 if let PreparedClip::Original(c) = c {
-                    if e.speed_ratio.is_some() || e.time_remap.is_some() {
+                    if e.speed_ratio.is_some() || e.time_remap.as_ref().is_some_and(|map| {
+                        !is_automatic_adapter_picture(c, s, e, map)
+                    }) {
                         return Err(fail("original-file retiming is not qualified"));
                     }
                     if !e.stereo.is_empty()
@@ -433,7 +592,7 @@ impl PreparedProjectInput {
                     }
                     // Every selected physical stream must cover this range, not just the longest one.
                     let end = e.source_in as i128 + e.duration as i128;
-                    if e.video_track.is_some()
+                    if e.video_track.is_some() && e.time_remap.is_none()
                         && c.video.as_ref().is_none_or(|v| end > v.duration as i128)
                         || (!e.audio_tracks.is_empty() || !e.stereo.is_empty())
                             && c.audio.as_ref().is_none_or(|a| end > a.duration as i128)
@@ -496,8 +655,14 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         "unqualified original container",
     )?;
     if let Some(v) = &c.video {
+        let qualified_codec = v.codec == "avc1" || (v.codec == "apch"
+            && std::path::Path::new(&c.path).extension()
+                .and_then(|suffix| suffix.to_str())
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case("mov"))
+            && c.audio.is_none() && v.width == 1920 && v.height == 1080
+            && v.rate == Fraction::new(24, 1));
         require(
-            c.container == "mov" && v.codec == "avc1" && v.stream_index == 0,
+            c.container == "mov" && qualified_codec && v.stream_index == 0,
             "unqualified original picture stream/profile",
         )?;
         super::model::check_dimensions(v.width, v.height, "original video")?;

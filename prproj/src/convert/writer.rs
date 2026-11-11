@@ -554,6 +554,11 @@ struct WriterInput<'a> {
     multicam_uses: &'a [super::multicam::PreparedMulticamUse],
 }
 impl WriterInput<'_> {
+    fn picture_clock(&self, clip: &str) -> Option<(super::model::Fraction, i64)> {
+        self.clips.get(clip).and_then(|c| c.video.as_ref()).map(|v| (v.rate, v.duration))
+            .or_else(|| self.originals.get(clip).and_then(|c| c.video.as_ref()).map(|v| (v.rate, v.duration)))
+    }
+
     fn native_sequence_channels(&self,seq:&Sequence)->Result<usize> {
         let widths:HashSet<_>=seq.events.iter().flat_map(|e|e.stereo.iter().filter(|s|s.channels.len()>2).map(|s|s.channels.len())).collect();
         if widths.is_empty(){return Ok(0);}
@@ -1337,9 +1342,20 @@ impl Writer<'_> {
                         set_time_remap(&mut self.project, t, &keys)?;
                     }
                 }
-                self.report.notes.push(format!(
-                    "sequence {seq_name} event {i}: Avid Timewarp as Time Remapping, one key per frame from Avid's own sampled positions (provisional)"
-                ));
+                if original.is_some() {
+                    let direction = if seq.rate == Fraction::new(24, 1) {
+                        "23.976 to 24"
+                    } else {
+                        "24 to 23.976"
+                    };
+                    self.report.notes.push(format!(
+                        "sequence {seq_name} event {i}: automatic {direction} Avid Motion Adapter picture cadence as Premiere Time Remapping"
+                    ));
+                } else {
+                    self.report.notes.push(format!(
+                        "sequence {seq_name} event {i}: Avid Timewarp as Time Remapping, one key per frame from Avid's own sampled positions (provisional)"
+                    ));
+                }
             }
             if let Some(matte) = &e.matte {
                 if matte.inverted && matte.shapes.len() > 1 {
@@ -1367,13 +1383,9 @@ impl Writer<'_> {
                 }
             }
             if let Some(tf) = &e.transform {
-                let keys = match picture_effect {
-                    Some(PictureEffect::Resize(keys)) => Some(keys),
-                    _ => None,
-                };
                 for &t in &placed {
                     if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
-                        for n in apply_motion_keys(&mut self.project, t, tf, keys, self.ids)? {
+                        for n in apply_motion_keys(&mut self.project, t, tf, picture_effect, self.ids)? {
                             self.report.notes.push(format!("sequence {seq_name} event {i}: {n}"));
                         }
                     }
@@ -1669,14 +1681,10 @@ fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
         let s = &model.sequences[d.sequence];
         let out = &s.events[d.outgoing];
         let inc = &s.events[d.incoming];
-        let media = |e: &Event| {
-            model.clips.get(&e.clip).and_then(|c| c.video.as_ref()).map(|v| (v.rate, v.duration))
-                .or_else(|| model.originals.get(e.clip.as_str()).and_then(|c| c.video.as_ref()).map(|v| (v.rate, v.duration)))
-        };
         let after = d.duration - d.before_cut;
-        let qualified = media(out).is_some_and(|(rate, duration)| rate == s.rate
+        let qualified = model.picture_clock(&out.clip).is_some_and(|(rate, duration)| rate == s.rate
             && i128::from(out.source_in) + i128::from(out.duration) + i128::from(after) <= i128::from(duration))
-            && media(inc).is_some_and(|(rate, _)| rate == s.rate && inc.source_in >= d.before_cut)
+            && model.picture_clock(&inc.clip).is_some_and(|(rate, _)| rate == s.rate && inc.source_in >= d.before_cut)
             && !groups.contains(&(d.sequence, d.outgoing)) && !groups.contains(&(d.sequence, d.incoming));
         if !qualified {
             return Err(other(format!("transition_handles_unavailable: {} video dissolve needs same-rate picture with both source handles", s.name)));
@@ -1686,6 +1694,15 @@ fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
 }
 fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>)->Result<PreparedProject> {
     dissolve_handles(model)?;
+    for p in model.picture_effects {
+        if let PictureEffect::TrimmedWarp(trim) | PictureEffect::TrimmedResize(trim) = p.effect {
+            let seq = &model.sequences[p.sequence];
+            let clip = &seq.events[p.event].clip;
+            if !model.picture_clock(clip).is_some_and(|(rate, end)| rate == seq.rate && trim.keys_fit_media(end)) {
+                return Err(other("trimmed motion needs same-rate picture containing every saved key"));
+            }
+        }
+    }
     if !model.multicams.is_empty() {
         if !native_av {
             return Err(other("multicam_native_route_required: editable Groups require native OP1a bindings"));
@@ -1702,6 +1719,9 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         }
     }
     if !native_av && model.clips.values().any(|c| !c.multichannel_groups.is_empty()) { return Err(other("multichannel groups require the explicit native media route")); }
+    if !native_av && model.clips.values().any(|c| c.video.as_ref().is_some_and(|v| v.codec == "apch")) {
+        return Err(other("generated Freeze Frame requires the native media route with a prepared MOV"));
+    }
     if native_av { super::native_av::validate_bindings(legacy,media)?; }
     super::rewrap::validate_audio_formats(legacy, media)?;
     let out_path = py_path(&out_path.as_ref().to_string_lossy());
@@ -1723,7 +1743,7 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         }
         .to_string(),
     );
-    if native_av {
+    if native_av && !legacy.clips.is_empty() {
         report.notes.clear();
         report.notes.push("clip construction: native OP1a-backed AV masters; explicit route replaces bin mode".into());
         report.notes.push("timeline: native source groups routed from the Avid sequence".into());
@@ -1733,12 +1753,15 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         report.notes[0]="clip construction: native prepared-media AV masters (DNx OP1a / ProRes MOV); explicit route replaces bin mode".into();
         report.unverified[0]="Native ProRes MOV AV masters: bounded square-pixel 1080p24 LT/PCM16/24 research read-back; wider profiles and User acceptance remain pending".into();
     }
+    if native_av && model.clips.values().any(|c| c.video.as_ref().is_some_and(|v| v.codec == "apch")) {
+        report.notes.push("Traditional Freeze Frame uses its generated ProRes HQ picture as a regular clip".into());
+    }
     for c in model.clips.values().filter(|_|native_av) {
         for group in &c.multichannel_groups {
             report.notes.push(format!("clip {}: {} group {:?} -> {}",py_str_repr(&c.name),group.format,group.channels,if group.format=="5.1" {"Premiere 5.1 L,R,C,LFE,Ls,Rs"}else{"8-channel Adaptive, Avid L,C,R,Lss,Rss,Lsr,Rsr,LFE order; no automatic 7.1 speaker bus"}));
         }
     }
-    if !model.originals.is_empty() {report.notes.push("Original files: ordinary file-backed masters; explicit stream/channel mapping; no new media".into());report.unverified.push("Original-file masters and mixed timelines require native Premiere open/save/reopen, channel/sample checks and User acceptance".into());}
+    if !model.originals.is_empty() {report.notes.push("File-backed masters use explicit stream/channel mapping.".into());report.unverified.push("File-backed masters and mixed timelines require native Premiere open/save/reopen, channel/sample checks and User acceptance".into());}
     let mut project = Project::new(ids)?;
     project.set_path(&out_path); // relative media paths are computed against the output location
     let Some(project_root) = project.root_item() else { return Err(other("project has no root item")) };

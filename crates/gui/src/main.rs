@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 use anynle_gui::model;
+mod direction;
 mod palette;
 mod storage;
 mod wizard;
@@ -44,8 +45,8 @@ fn main() -> eframe::Result {
     };
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1160., 840.])
-            .with_min_inner_size([860., 620.])
+            .with_inner_size([880., 620.])
+            .with_min_inner_size([760., 520.])
             .with_app_id("industries.whatever.any-nle")
             .with_icon(icon),
         renderer: eframe::Renderer::Glow,

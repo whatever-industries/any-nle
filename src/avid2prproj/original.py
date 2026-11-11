@@ -49,8 +49,14 @@ def validate(c):
         raise ValueError('original requires an absolute path and qualified container')
     if c.video is None and c.audio is None:
         raise ValueError('original has no streams')
-    if c.video and (c.container != 'mov' or c.video.codec != 'avc1' or c.video.stream_index != 0):
-        raise ValueError('unqualified original picture')
+    if c.video:
+        v = c.video
+        qualified_codec = v.codec == 'avc1' or (
+            v.codec == 'apch' and Path(c.path).suffix.lower() == '.mov' and c.audio is None
+            and (v.width, v.height, v.rate) == (1920, 1080, Fraction(24))
+        )
+        if c.container != 'mov' or not qualified_codec or v.stream_index != 0:
+            raise ValueError('unqualified original picture')
     if c.audio:
         a = c.audio
         if a.channels not in (1, 2) or a.sample_rate not in (44100, 48000, 96000):

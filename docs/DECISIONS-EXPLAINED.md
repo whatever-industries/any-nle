@@ -166,13 +166,18 @@ Avid's bin can record an audio file one frame shorter than the file actually is.
 the length stored in the file, as Premiere's own import does; using Avid's shorter value made
 Premiere play the clip silent.
 
-### Speed [PRPROJ-0024; CONV-0023]
+### Speed [PRPROJ-0024; CONV-0023; CONV-0051]
 
 Constant speed changes and reverse from Avid (Motion Effect) become Premiere's clip speed and
-Reverse Speed. Avid's percentages are converted from what Avid actually stores (timeline frames
-per source frame), so a clip Avid labels 200 % may show as 198 % in Premiere: that is the exact
-rate Avid plays. Only the picture is retimed, as in Avid. Speed ramps (timewarps) are not
-converted yet.
+Reverse Speed. The legacy constant-speed route uses the stored span ratio. A clip Avid
+labels 200% can display as 198% in Premiere because the saved ratio describes the
+whole source span, including its final sampled frame. Matching that cadence remains open.
+
+For the qualified 1080p24 Linear and Spline ramps, Any NLE uses Avid's saved picture
+positions to build Premiere Time Remapping with one editable key per frame. The
+report identifies the change from Avid's original Speed keys and handles. A recognized
+sampled Timewarp with an unsupported or inconsistent map blocks conversion because
+using a constant speed would change the picture cadence.
 
 ### Clip color [PRPROJ-0025; CONV-0024]
 

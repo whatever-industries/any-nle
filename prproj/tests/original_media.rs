@@ -26,8 +26,9 @@ impl Drop for Scratch {
 }
 fn original(shape: &str) -> OriginalClip {
     let wav = shape.starts_with("wav");
+    let prores = shape == "prores_hq";
     let mono = shape.starts_with("wav") && shape.ends_with("mono");
-    let n = if mono { 1 } else { 2 };
+    let n = if prores { 0 } else if mono { 1 } else { 2 };
     let channels = (0..n)
         .map(|i| OriginalChannel {
             avid_track: i + 1,
@@ -49,6 +50,8 @@ fn original(shape: &str) -> OriginalClip {
         path: std::env::temp_dir()
             .join(if wav {
                 "anynle-synthetic-source.wav"
+            } else if prores {
+                "anynle-synthetic-source.mov"
             } else {
                 "anynle-synthetic-source.mp4"
             })
@@ -56,14 +59,14 @@ fn original(shape: &str) -> OriginalClip {
             .into_owned(),
         container: if wav { "wav" } else { "mov" }.into(),
         video: (!wav).then_some(OriginalVideo {
-            codec: "avc1".into(),
+            codec: if prores { "apch" } else { "avc1" }.into(),
             width: 1920,
             height: 1080,
             rate: Fraction::new(24, 1),
             duration: 2 * TICKS_PER_SECOND,
             stream_index: 0,
         }),
-        audio: Some(OriginalAudio {
+        audio: (!prores).then_some(OriginalAudio {
             sample_rate: 48000,
             channels: n,
             duration: 2 * TICKS_PER_SECOND,
@@ -79,6 +82,8 @@ fn original(shape: &str) -> OriginalClip {
         channels,
         groups: if shape == "dualmono" {
             vec![vec![1], vec![2]]
+        } else if prores {
+            vec![]
         } else {
             vec![(1..=n).collect()]
         },
@@ -125,6 +130,7 @@ fn original_master_construction_matches_independent_python_and_sample_representa
         "wav16stereo",
         "wav24mono",
         "wav24stereo",
+        "prores_hq",
     ] {
         let code = r#"import sys
 from pathlib import Path
@@ -133,7 +139,10 @@ import py_premiere
 from avid2prproj.original import Original,Video,Audio,Channel,add_item
 from avid2prproj.determinism import seeded_ids
 shape=sys.argv[2];wav=shape.startswith('wav');n=1 if wav and shape.endswith('mono') else 2
-c=Original(sys.argv[3],'wav' if wav else 'mov',None if wav else Video('avc1',1920,1080,Fraction(24),508032000000),Audio(48000,n,508032000000,0 if wav else 1,'pcm16' if shape.startswith('wav16') else 'pcm24' if wav else 'aac'),tuple(Channel(i+1,1-i if shape=='reverse' else i) for i in range(n)),((1,),(2,)) if shape=='dualmono' else (tuple(range(1,n+1)),))
+if shape=='prores_hq':
+ c=Original(sys.argv[3],'mov',Video('apch',1920,1080,Fraction(24),508032000000),None,(),())
+else:
+ c=Original(sys.argv[3],'wav' if wav else 'mov',None if wav else Video('avc1',1920,1080,Fraction(24),508032000000),Audio(48000,n,508032000000,0 if wav else 1,'pcm16' if shape.startswith('wav16') else 'pcm24' if wav else 'aac'),tuple(Channel(i+1,1-i if shape=='reverse' else i) for i in range(n)),((1,),(2,)) if shape=='dualmono' else (tuple(range(1,n+1)),))
 with seeded_ids('original-parity'):
  p=py_premiere.new().project;p._path=Path(sys.argv[1]);p._import_target=p.root_item.add_bin('Sources');add_item(p,c,'Synthetic original');p.save(sys.argv[1])
 "#;
@@ -176,6 +185,9 @@ with seeded_ids('original-parity'):
             assert!(actual.contains("<SampleType>3</SampleType>"));
         } else if shape.starts_with("wav24") {
             assert!(!actual.contains("<SampleType>"));
+        } else if shape == "prores_hq" {
+            assert!(!actual.contains("<AudioStream "));
+            assert_eq!(actual.matches("<VideoStream ").count(), 2);
         } else {
             assert!(actual.contains("<SampleType>7</SampleType>"));
         }

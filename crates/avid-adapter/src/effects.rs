@@ -7,7 +7,7 @@ pub(super) fn apply_picture_extension(
     out: &mut ReadResult, budget: &mut Budget,
 ) -> Result<(), String> {
     let (kind, params) = match effect {
-        PictureExtension::Unsupported(reason) => {
+        PictureExtension::Unsupported(reason) | PictureExtension::UnsupportedTransform(reason) => {
             return loss(out, budget, &p.id, "picture_effect", reason);
         }
         PictureExtension::Flip { horizontal, vertical } => {
@@ -16,15 +16,62 @@ pub(super) fn apply_picture_extension(
             }
             ("avid.flip", obj(vec![("horizontal", Value::Bool(horizontal)), ("vertical", Value::Bool(vertical))]))
         }
-        PictureExtension::Resize(keys) => {
+        PictureExtension::WarpTrim(trim) | PictureExtension::ResizeTrim(trim) => {
+            let resize = matches!(effect, PictureExtension::ResizeTrim(_));
+            let kind = match (resize, trim.crop.is_some()) {
+                (true, true) => "avid.resize_trim_crop_linear",
+                (true, false) => "avid.resize_trim_linear",
+                (false, true) => "avid.warp_trim_crop_linear",
+                (false, false) => "avid.warp_trim_linear",
+            };
+            if raster != Some((1920, 1080)) || p.transform.is_some() || !p.effects.is_empty()
+                || trim.motion.iter().any(|k| k.position.iter().any(|x| x.abs() > 64.0))
+            {
+                return loss(out, budget, &p.id, "picture_effect", "Trimmed picture animation requires qualified 1080p geometry and an isolated effect");
+            }
+            p.transform = Some(Transform {
+                position: trim.motion[0].position.into(),
+                scale: (trim.width[0].1, trim.motion[0].height),
+                rotation: 0.0,
+                anchor: (0.0, 0.0),
+                crop: [0.0; 4],
+            });
+            let motion = trim.motion.map(|k| obj(vec![
+                ("frame", Value::Int(k.frame)),
+                ("position", Value::Arr(k.position.into_iter().map(Value::Float).collect())),
+                ("height", Value::Float(k.height)),
+            ]));
+            let width = trim.width.map(|(frame, value)| Value::Arr(vec![Value::Int(frame), Value::Float(value)]));
+            let mut params = vec![
+                ("motion", Value::Arr(motion.into())),
+                ("width", Value::Arr(width.into())),
+                ("fixed_width", Value::Bool(trim.fixed_width)),
+            ];
+            if let Some(crop) = trim.crop {
+                let keys = crop.map(|(frame, edges)| obj(vec![
+                    ("frame", Value::Int(frame)),
+                    ("edges", Value::Arr(edges.into_iter().map(Value::Float).collect())),
+                ]));
+                params.push(("crop", Value::Arr(keys.into())));
+            }
+            (kind, obj(params))
+        }
+        PictureExtension::Resize(keys) | PictureExtension::ResizeCrop(keys) | PictureExtension::Warp(keys) => {
+            let kind = match effect {
+                PictureExtension::ResizeCrop(_) => "avid.resize_crop_linear",
+                PictureExtension::Warp(_) if avid_reader::source::ResizeKey::has_crop(keys) => "avid.warp_crop_linear",
+                PictureExtension::Warp(_) => "avid.warp_linear",
+                _ => "avid.resize_linear",
+            };
+            let keyed_crop = matches!(kind, "avid.resize_crop_linear" | "avid.warp_crop_linear");
             if !p.effects.is_empty() || p.transform.as_ref().is_some_and(|t| t.crop != [0.0; 4]) {
-                return loss(out, budget, &p.id, "picture_effect", "Animated Resize with crop or another translated effect requires separate qualification");
+                return loss(out, budget, &p.id, "picture_effect", "Animated picture motion with crop or another translated effect requires separate qualification");
             }
             if raster != Some((1920, 1080)) {
-                return loss(out, budget, &p.id, "picture_effect", "Animated Resize is qualified only for 1920x1080 geometry");
+                return loss(out, budget, &p.id, "picture_effect", "Animated picture motion is qualified only for 1920x1080 geometry");
             }
             if keys.iter().any(|k| k.position.iter().any(|x| x.abs() > 64.0)) {
-                return loss(out, budget, &p.id, "picture_effect", "Animated Resize position is outside the qualified range");
+                return loss(out, budget, &p.id, "picture_effect", "Animated picture position is outside the qualified range");
             }
             let transform = p.transform.get_or_insert(Transform {
                 position: (0.0, 0.0), scale: (100.0, 100.0), rotation: 0.0,
@@ -32,12 +79,18 @@ pub(super) fn apply_picture_extension(
             });
             transform.position = keys[0].position.into();
             transform.scale = keys[0].scale.into();
-            let keys = keys.map(|k| obj(vec![
-                ("frame", Value::Int(k.frame)),
-                ("position", Value::Arr(k.position.into_iter().map(Value::Float).collect())),
-                ("scale", Value::Arr(k.scale.into_iter().map(Value::Float).collect())),
-            ]));
-            ("avid.resize_linear", obj(vec![("keys", Value::Arr(keys.into()))]))
+            let keys = keys.map(|k| {
+                let mut params = vec![
+                    ("frame", Value::Int(k.frame)),
+                    ("position", Value::Arr(k.position.into_iter().map(Value::Float).collect())),
+                    ("scale", Value::Arr(k.scale.into_iter().map(Value::Float).collect())),
+                ];
+                if keyed_crop {
+                    params.push(("crop", Value::Arr(k.crop.into_iter().map(Value::Float).collect())));
+                }
+                obj(params)
+            });
+            (kind, obj(vec![("keys", Value::Arr(keys.into()))]))
         }
     };
     budget.value(&params)?;
@@ -252,6 +305,7 @@ pub(super) fn reserve_receipt(event: &SeqEvent, budget: &mut Budget) -> Result<(
 
 pub(super) fn apply(
     event: &SeqEvent,
+    static_picture: bool,
     raster: Option<(i64, i64)>,
     p: &mut Placement,
     out: &mut ReadResult,
@@ -307,7 +361,7 @@ pub(super) fn apply(
                 .push(format!("{} color correction: {note}", p.id));
         }
     }
-    if let Some(fx) = &event.picture {
+    if let Some(fx) = event.picture.as_ref().filter(|_| static_picture) {
         let t = fx.interpret();
         if !t.is_identity() || !t.not_converted.is_empty() || event.picture_nested {
             p.transform = Some(Transform {

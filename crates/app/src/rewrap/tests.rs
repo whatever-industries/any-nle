@@ -375,6 +375,7 @@ fn bounded_backend_output_drains_but_caps_memory() {
 fn review_shows_actual_preflight_values_without_writing() {
     let s = Scratch::new();
     let plan = Plan {
+        mono: vec![],
         destination: s.0.join("new media"),
         inputs: vec![],
         jobs: vec![],

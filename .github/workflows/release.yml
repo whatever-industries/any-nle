@@ -12,6 +12,10 @@ on:
       qualified_source_sha:
         description: Reviewed filtered export commit SHA (must equal this run checkout)
         required: true
+      build_only:
+        description: Verify all six packages and retain workflow artifacts
+        type: boolean
+        default: false
       publish:
         description: Publish after all six candidates and uploaded hashes pass
         type: boolean
@@ -186,6 +190,7 @@ jobs:
       - name: Verify all six packages before staging
         run: python3 scripts/release/verify_candidate.py --all candidates --version '${{ inputs.version }}'
       - name: Stage, download-verify, and optionally publish immutable release
+        if: ${{ !inputs.build_only }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}

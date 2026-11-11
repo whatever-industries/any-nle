@@ -161,7 +161,7 @@ pub fn preflight(model: &Model) -> Result<()> {
             .video
             .as_ref()
             .ok_or_else(|| invalid("requires picture-backed masters"))?;
-        if !matches!(v.codec.as_str(), "AVdn" | "apcs") || !super::rewrap::supported_rate(v.rate) {
+        if !matches!(v.codec.as_str(), "AVdn" | "apcs" | "apch") || !super::rewrap::supported_rate(v.rate) {
             return Err(invalid(
                 "requires supported DNx/ProRes picture and an exact rewrap rate",
             ));
@@ -300,6 +300,9 @@ pub fn validate_bindings(model: &Model, mappings: &[MediaRelink]) -> Result<()> 
             .ok_or_else(|| invalid("missing picture binding"))?;
         if vm.audio_stream.is_some() {
             return Err(invalid("picture binding is an audio selector"));
+        }
+        if v.codec == "apch" && (!c.audio.is_empty() || !vm.target_path.to_ascii_lowercase().ends_with(".mov")) {
+            return Err(invalid("generated Freeze Frame requires a picture-only MOV binding"));
         }
         let mut ordered: Vec<_> = c.audio.iter().collect();
         ordered.sort_by_key(|a| a.avid_track);

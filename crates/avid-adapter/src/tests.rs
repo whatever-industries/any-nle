@@ -76,6 +76,8 @@ fn fixture(channels: i64) -> (av::SourceProject, index::MediaIndex) {
         offsets: (0..channels).map(|_| Observed::Known(0)).collect(),
         marker_witnesses: vec![],
         originals: vec![],
+        rendered_freeze: false,
+        rendered_gain: None,
     };
     (
         av::SourceProject {
@@ -102,6 +104,8 @@ fn event(
         id: id.into(),
         volume_automation: None,
         picture_extension: None,
+        motion_adapter_phase: None,
+        saved_timewarp: None,
         owner: format!("owner-{id}"),
         event: SeqEvent {
             kind: KIND_SOUND,
@@ -180,8 +184,8 @@ fn source_resize_curves_override_the_cached_static_values() {
         ] },
     });
     e.picture_extension = Some(av::PictureExtension::Resize([
-        av::ResizeKey { frame: 0, position: [-0.15, 0.075], scale: [80.0, 120.0] },
-        av::ResizeKey { frame: 47, position: [0.2, -0.125], scale: [135.0, 65.0] },
+        av::ResizeKey { frame: 0, position: [-0.15, 0.075], scale: [80.0, 120.0], crop: [0.0; 4] },
+        av::ResizeKey { frame: 47, position: [0.2, -0.125], scale: [135.0, 65.0], crop: [0.0; 4] },
     ]));
     f.sequences.push(sequence(vec![e]));
     let out = run(&f, &i);
@@ -619,7 +623,7 @@ fn controlled_original_pcm_and_compressed_clocks_use_physical_streams_without_mx
     for (codec,bits,representation) in [("pcm_s16le",16,"pcm16"),("pcm_s24le",24,"pcm24"),("aac",16,"aac")] {
         let compressed=codec=="aac";let path=dir.join(if compressed{"source.mp4"}else{"source.wav"});std::fs::write(&path,b"synthetic probe witness").unwrap();
         let (mut facts,_)=fixture(2);let m=&mut facts.masters[0];
-        m.originals=(1..=2).map(|channel|Some(av::OriginalTrack{locators:vec![path.to_str().unwrap().into()],descriptor_class:if compressed{"MPGA"}else{"PCMA"}.into(),descriptor_rate:if compressed{46.875}else{48000.0},descriptor_length:96000,channels:Some(2),sample_rate:Some(48000.0),stored_quantization_bits:Some(bits),file_track:Some(channel)})).collect();
+        m.originals=(1..=2).map(|channel|Some(av::OriginalTrack{locators:vec![path.to_str().unwrap().into()],descriptor_class:if compressed{"MPGA"}else{"PCMA"}.into(),descriptor_rate:if compressed{46.875}else{48000.0},descriptor_length:96000,channels:Some(2),sample_rate:Some(48000.0),stored_quantization_bits:Some(bits),file_track:Some(channel),motion_audio_track_start:None})).collect();
         for t in &mut m.master.tracks {t.edit_rate=if compressed{46.875}else{48000.0};t.essence=if compressed{Some(Essence::Other("MPGA".into()))}else{Some(Essence::Sound{sample_rate:48000.,bits,channels:2})};}
         let mut streams=vec![];
         if compressed{streams.push(graph::json::parse(r#"{"index":0,"codec_type":"video","codec_name":"h264","codec_tag_string":"avc1","profile":"High","level":40,"pix_fmt":"yuv420p","width":1920,"height":1080,"avg_frame_rate":"24/1","r_frame_rate":"24/1","field_order":"progressive","sample_aspect_ratio":"1:1"}"#).unwrap());}
@@ -627,7 +631,7 @@ fn controlled_original_pcm_and_compressed_clocks_use_physical_streams_without_mx
         let probe=Value::Obj(vec![("streams".into(),Value::Arr(streams)),("format".into(),Value::Obj(vec![("format_name".into(),Value::Str(if compressed{"mov,mp4,m4a,3gp,3g2,mj2"}else{"wav"}.into()))]))]);
         let mut calls=0;let original=original::OriginalIndex::scan_with(&facts,&Default::default(),|_|{calls+=1;Ok(probe.clone())}).unwrap();assert_eq!(calls,1);
         assert_eq!(original.original_inputs.len(),1);assert_eq!(original.original_inputs[0].revision.len(),64);
-        let out=build_selected(&facts,&Default::default(),"Synthetic",&["Sources".into()],&original).unwrap();assert_eq!(out.graph.media.len(),2);assert_eq!(out.original_inputs,original.original_inputs);
+        let out=build_selected(&facts,&Default::default(),"Synthetic",&["Sources".into()],&original,&HashMap::new()).unwrap();assert_eq!(out.graph.media.len(),2);assert_eq!(out.original_inputs,original.original_inputs);
         if compressed{assert_eq!(original.notes.len(),1);assert!(out.diagnostics.iter().any(|s|s.contains("default")&&s.contains("not observed source color")));}else{assert!(original.notes.is_empty());}
         for (channel,m) in out.graph.media.iter().enumerate(){assert_eq!(m.duration,Rational::integer(2));assert_eq!(m.sample_rate,Some(48000));assert_eq!(m.bits,if compressed{None}else{Some(bits)});let o=m.original.as_ref().unwrap();assert_eq!(o.channel_index,Some(channel as i64));assert_eq!(o.sample_representation.as_deref(),Some(representation));}
         let mut bad=probe.clone();if let Value::Obj(root)=&mut bad{if let Some((_,Value::Arr(rows)))=root.iter_mut().find(|(k,_)|k=="streams"){if let Value::Obj(row)=rows.last_mut().unwrap(){row.iter_mut().find(|(k,_)|k=="channels").unwrap().1=Value::Int(3);}}}

@@ -29,6 +29,15 @@ impl Rate {
             den: den / a,
         })
     }
+    /// Stored record/source span ratio for the two observed automatic adapters.
+    pub fn automatic_adapter_span(source: Self, record: Self) -> Option<(i64, i64)> {
+        match ((source.num, source.den), (record.num, record.den)) {
+            ((24, 1), (24_000, 1001)) => Some((1000, 1001)),
+            ((24_000, 1001), (24, 1)) => Some((1001, 1000)),
+            _ => None,
+        }
+    }
+
     /// The existing observed Avid decimal-rate family; no arbitrary float rounding.
     pub fn from_avid(rate: f64) -> Option<Self> {
         if !rate.is_finite() || rate <= 0.0 || rate > 384_000.0 {
@@ -104,6 +113,10 @@ pub struct SourceMaster {
     pub marker_witnesses: Vec<MasterMarkerWitness>,
     /// Same order as master.tracks; nested FILE locators and raw descriptor facts.
     pub originals: Vec<Option<OriginalTrack>>,
+    /// Picture master selected by a qualified traditional Freeze Frame owner.
+    pub rendered_freeze: bool,
+    /// Upstream precompute identity for a timeline-bound AudioSuite Gain master.
+    pub rendered_gain: Option<crate::io::MobId>,
 }
 /// Saved original-file facts, independent of current path availability or codec admission.
 #[derive(Clone, Debug, PartialEq)]
@@ -117,6 +130,8 @@ pub struct OriginalTrack {
     pub stored_quantization_bits: Option<i64>,
     /// Referenced file-mob track label; not a decoder stream or channel ordinal.
     pub file_track: Option<i64>,
+    /// Evidence for the observed automatic adapter's linked AAC origin.
+    pub motion_audio_track_start: Option<i64>,
 }
 #[derive(Debug)]
 pub struct MasterMarkerWitness {
@@ -161,18 +176,58 @@ pub struct SourceEvent {
     pub reason: Option<String>,
     pub volume_automation: Option<VolumeAutomation>,
     pub picture_extension: Option<PictureExtension>,
+    /// Saved phase for the bounded automatic adapter between 24 and 24000/1001.
+    pub motion_adapter_phase: Option<i64>,
+    /// Visible source frame offsets from the qualified range start for a saved Timewarp map.
+    pub saved_timewarp: Option<Vec<i64>>,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct ResizeKey {
     pub frame: i64,
     pub position: [f64; 2],
     pub scale: [f64; 2],
+    /// Source-space fractions cropped from left, top, right and bottom.
+    pub crop: [f64; 4],
+}
+impl ResizeKey {
+    pub fn has_crop(keys: [Self; 2]) -> bool {
+        keys.iter().any(|key| key.crop != [0.0; 4])
+    }
+}
+/// The saved trim cohort has aligned position and height keys, and independent width timing.
+#[derive(Clone, Copy, Debug)]
+pub struct LinearTrim {
+    pub motion: [LinearTrimKey; 3],
+    pub width: [(i64, f64); 3],
+    pub fixed_width: bool,
+    /// A shared, edit-relative clock for the four source-space crop edges.
+    pub crop: Option<[(i64, [f64; 4]); 3]>,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct LinearTrimKey {
+    pub frame: i64,
+    pub position: [f64; 2],
+    pub height: f64,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum PictureExtension {
     Flip { horizontal: bool, vertical: bool },
     Resize([ResizeKey; 2]),
+    ResizeCrop([ResizeKey; 2]),
+    Warp([ResizeKey; 2]),
+    WarpTrim(LinearTrim),
+    ResizeTrim(LinearTrim),
+    UnsupportedTransform(&'static str),
     Unsupported(&'static str),
+}
+impl PictureExtension {
+    pub fn replaces_static_transform(self) -> bool {
+        self.requires_square_pixels() || matches!(self, Self::UnsupportedTransform(_))
+    }
+
+    pub fn requires_square_pixels(self) -> bool {
+        matches!(self, Self::ResizeCrop(_) | Self::Warp(_) | Self::WarpTrim(_) | Self::ResizeTrim(_))
+    }
 }
 #[derive(Clone, Copy, Debug)]
 pub struct VolumePoint {
@@ -212,10 +267,16 @@ pub struct SourceMarker {
     pub record_frame: Option<i64>,
     pub binding: Binding,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceIssueKind {
+    Route,
+    RouteTiming,
+}
 #[derive(Debug)]
 pub struct SourceIssue {
     pub owner: String,
     pub reason: String,
+    pub issue_kind: SourceIssueKind,
     pub route: Vec<RouteWitness>,
     pub record_start: Observed<i64>,
     pub record_rate: Option<Rate>,
@@ -229,6 +290,7 @@ pub struct SourceSequence {
     /// moved to the explicitly qualified source collections below (not duplicated).
     pub info: SequenceInfo,
     pub rate: Option<Rate>,
+    pub clock: Option<SequenceClock>,
     /// Native input-channel count for each sequence-local `event.combined` group.
     /// Includes unresolved/unsupported inputs that emitted no qualified event.
     /// An absent group witness cannot establish a complete atomic combiner.
@@ -239,6 +301,16 @@ pub struct SourceSequence {
     pub unresolved: Vec<SourceIssue>,
     pub texts: Vec<SourceText>,
     pub group_uses: Vec<SourceGroupUse>,
+}
+
+/// Absolute frame count from the qualified direct primary timecode track.
+/// Sequence-local edit and marker positions do not include this origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequenceClock {
+    pub count: u64,
+    pub rate: Rate,
+    pub display_base: u16,
+    pub track_ordinal: usize,
 }
 
 /// Native group definitions retain every lane's alternatives independently.
@@ -318,7 +390,7 @@ pub struct SourceText {
     pub length: Option<i64>,
     pub rate: Option<Rate>,
     pub reason: Option<String>,
-    /// Selected stored title properties with exact list/owner-role witnesses. These
+    /// Selected stored text properties with exact list/owner-role witnesses. These
     /// are native-only values, not resolved render styles or neutral geometry.
     pub native_properties: Vec<NativeTextProperty>,
     pub native_properties_reason: Option<String>,
@@ -340,6 +412,7 @@ impl SourceSequence {
             id,
             info: SequenceInfo::source_metadata(name, bin, edit_rate, length),
             rate,
+            clock: None,
             combiner_channels: Vec::new(),
             events: Vec::new(),
             transitions: Vec::new(),

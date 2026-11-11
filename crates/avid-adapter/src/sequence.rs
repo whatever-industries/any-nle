@@ -53,6 +53,116 @@ fn binding(b: &av::Binding, map: &HashMap<String, String>) -> SourceBinding {
 pub(super) struct ItemRoutes {
     pub audio: HashSet<i64>,
     pub raster: Option<(i64, i64)>,
+    pub square_pixels: bool,
+    pub motion_picture: Option<Rational>,
+    pub motion_audio: HashMap<i64, (i64, Rational)>,
+    pub timewarp_picture: Option<Rational>,
+}
+
+fn adapter_picture_frame(source_in: i64, phase: i64, record: i128, span_ratio: (i64, i64)) -> i128 {
+    let p = i128::from(phase);
+    let (span, source) = (i128::from(span_ratio.0), i128::from(span_ratio.1));
+    i128::from(source_in) + (p + record) * source / span - p * source / span
+}
+
+fn adapter_audio_in_samples(
+    source_in: i64, phase: i64, track_start: i64, span_ratio: (i64, i64), source_unit: i128,
+) -> i128 {
+    let (span, source) = (i128::from(span_ratio.0), i128::from(span_ratio.1));
+    (i128::from(source_in) + i128::from(track_start)) * source_unit
+        + (i128::from(phase) * source % span) * source_unit / span
+}
+
+fn motion_timing(
+    event: &av::SourceEvent, range: &av::QualifiedRange, phase: i64, item: &ItemRoutes,
+    covering_picture: bool, p: &mut Placement, budget: &mut Budget,
+) -> Result<i64, String> {
+    let picture = item.motion_picture.ok_or("requires qualified linked picture")?;
+    let span_ratio = av::Rate::automatic_adapter_span(range.source_rate, range.record_rate)
+        .ok_or("requires a qualified automatic adapter rate pair")?;
+    if item.motion_audio.len() != 2 { return Err("requires two proven linked mono lanes".into()); }
+    if event.event.combined.is_some()
+        || !event.event.via.is_empty() || event.volume_automation.is_some()
+        || event.picture_extension.is_some() || event.event.picture.is_some()
+        || event.event.animatte.is_some() || event.event.color.is_some()
+    { return Err("requires an unstacked automatic adapter".into()); }
+    if time(range.source_in.checked_add(range.source_length).ok_or("source extent overflow")?, range.source_rate)? > picture {
+        return Err("saved source interval exceeds linked picture".into());
+    }
+    if event.event.kind == KIND_PICTURE {
+        let count = usize::try_from(range.length).map_err(|_|"negative adapter length")?;
+        if !(2..=16_384).contains(&count) { return Err("adapter map length outside bounds".into()); }
+        budget.charge(count.checked_mul(size_of::<i64>()).ok_or("adapter map allocation overflow")?)?;
+        let mut map = Vec::new();
+        map.try_reserve_exact(count).map_err(|_|"adapter map allocation failed")?;
+        for i in 0..count {
+            let f = adapter_picture_frame(range.source_in, phase, i as i128, span_ratio);
+            map.push(i64::try_from(f).map_err(|_|"adapter picture position overflow")?);
+        }
+        p.frame_map = Some(map);
+        return Ok(0);
+    }
+    let (origin, duration) = item.motion_audio.get(&event.event.master_track)
+        .copied().ok_or("linked AAC file-track origin unresolved")?;
+    let source_unit = 48_000 * i128::from(range.source_rate.den) / i128::from(range.source_rate.num);
+    let record_unit = 48_000 * i128::from(range.record_rate.den) / i128::from(range.record_rate.num);
+    let samples = adapter_audio_in_samples(range.source_in, phase, origin, span_ratio, source_unit);
+    let start = Rational::new(samples, 48_000).ok_or("audio origin overflow")?;
+    let media_end = duration.to_units(48_000).ok_or("audio media end is not on the sample grid")?;
+    let target = i128::from(range.length) * record_unit;
+    let playable = (i128::from(media_end) - samples).min(target);
+    let tail = target - playable;
+    if playable <= 0 || tail >= record_unit || (tail > 0 && !covering_picture) {
+        return Err("audio tail needs a qualified source end and covering picture".into());
+    }
+    p.source_in = start;
+    p.duration = Rational::new(playable, 48_000).ok_or("adapter audio extent overflow")?;
+    Ok(tail as i64)
+}
+
+fn apply_saved_timewarp(
+    frames: &[i64], range: &av::QualifiedRange, item: &ItemRoutes,
+    p: &mut Placement, budget: &mut Budget,
+) -> Result<bool, String> {
+    let rate = range.record_rate;
+    let profile = match (rate.num, rate.den, range.length, range.source_length) {
+        (24, 1, 48, 59) => range.source_in >= 0,
+        (24_000, 1001, 1666, 1666) => range.source_in == 0,
+        _ => false,
+    };
+    let end = range.source_in.checked_add(range.source_length).and_then(|n| time(n, rate).ok());
+    if !profile || range.source_rate != rate || i64::try_from(frames.len()).ok() != Some(range.length)
+        || frames.iter().any(|&n| !(0..range.source_length).contains(&n))
+        || end.zip(item.timewarp_picture).is_none_or(|(end, duration)| end > duration)
+    {
+        return Ok(false);
+    }
+    budget.charge(frames.len() * size_of::<i64>())?;
+    let mut map = Vec::new();
+    map.try_reserve_exact(frames.len()).map_err(|_| "Timewarp map allocation failed")?;
+    budget.charge((map.capacity() - frames.len()) * size_of::<i64>())?;
+    // Source range origin is in the same clock, and the verified file offset is zero.
+    map.extend(frames.iter().map(|frame| range.source_in + frame));
+    p.speed = None;
+    p.frame_map = Some(map);
+    Ok(true)
+}
+
+#[cfg(test)]
+#[test]
+fn automatic_adapter_picture_and_sound_use_separate_native_clocks() {
+    let forward = (1000, 1001);
+    let reverse = (1001, 1000);
+    assert_eq!([0, 951, 952, 1101].map(|n| adapter_picture_frame(48, 48, n, forward)),
+        [48, 999, 1001, 1150]);
+    assert_eq!(adapter_picture_frame(48, 0, 952, forward), 1000);
+    assert_eq!(adapter_audio_in_samples(48, 48, 1, forward, 2000), 98_096);
+    assert_eq!(adapter_audio_in_samples(48, 48, 0, forward, 2000), 96_096);
+    assert_eq!([0, 952, 953, 954, 1103].map(|n| adapter_picture_frame(48, 49, n, reverse)),
+        [48, 1000, 1000, 1001, 1150]);
+    let start = adapter_audio_in_samples(48, 49, 1, reverse, 2002);
+    assert_eq!(start, 100_002);
+    assert_eq!(1104 * 2000 - (2_306_304 - start), 1698);
 }
 pub(super) fn append(
     source: &av::SourceSequence,
@@ -136,14 +246,39 @@ pub(super) fn append(
         return Ok(());
     };
     let id = &source.id;
+    let clock = if let (Some(c), Some(mob)) = (source.clock, source.info.mob_id) {
+        const ROUTE: &str = "direct sequence TC1";
+        // Fixed-size UMID text and a usize track ordinal; charge before allocating.
+        budget.charge(96 + 48 + ROUTE.len())?;
+        Some(SourceClock {
+            effective_count: c.count,
+            rate: rational(c.rate),
+            display_base: c.display_base,
+            drop: false,
+            provenance: SourceClockProvenance {
+                origin_count: c.count,
+                source_offset: 0,
+                source_rate: rational(rate),
+                source_package: mob.urn(),
+                timecode_track: format!("TC1/{}", c.track_ordinal),
+                route: ROUTE.into(),
+            },
+        })
+    } else {
+        None
+    };
+    let start = clock
+        .as_ref()
+        .map(|c| c.exact_start().ok_or("qualified sequence clock overflow"))
+        .transpose()?;
     let mut seq = SourceSequence {
             texts: Vec::new(),
         id: id.clone(),
         name: source.info.name.clone(),
         rate: rational(rate),
         frame_size: None,
-        start: None,
-        clock: None,
+        start,
+        clock,
         tracks: vec![],
         placements: vec![],
         transitions: vec![],
@@ -167,11 +302,14 @@ pub(super) fn append(
             av::TextKind::SubCap => "SubCap font, position, appearance, animation and global-style settings remain native-only; the neutral text occurrence carries content and timing",
             av::TextKind::TitlerPlus => "Titler+ appearance, geometry, font resolution, paragraph styling and animation remain native-only; the neutral text occurrence carries content and timing",
         })?;
-        if t.kind == av::TextKind::TitlerPlus {
+        if t.kind == av::TextKind::TitlerPlus
+            || !t.native_properties.is_empty()
+            || t.native_properties_reason.is_some()
+        {
             let mut reservation = Budget { used: budget.used };
             reservation.charge(2048 + t.native_properties_reason.as_ref().map_or(0, String::len))?;
             for p in &t.native_properties { reservation.charge(1024 + p.scope.len() + p.name.len() + p.value.len())?; }
-            sidecar(out, budget, "avid.text", &t.id, title_properties(t))?;
+            sidecar(out, budget, "avid.text", &t.id, text_properties(t))?;
         }
         seq.texts.push(text);
     }
@@ -185,6 +323,15 @@ pub(super) fn append(
         }
     }
     let mut derived_raster: Option<(i64, i64, i64, i64)> = None;
+    let mut adapter_picture_spans = HashSet::new();
+    for event in &source.events {
+        if event.event.kind == KIND_PICTURE {
+            if let (Some(phase), Some(range)) = (event.motion_adapter_phase, &event.range) {
+                budget.charge(2 * size_of::<(avid_reader::io::MobId, i64, i64, i64)>())?;
+                adapter_picture_spans.insert((event.event.master, phase, range.record_start, range.length));
+            }
+        }
+    }
     for event in &source.events {
         let e = &event.event;
         let Some(range) = &event.range else {
@@ -197,12 +344,15 @@ pub(super) fn append(
             ]));
             continue;
         };
+        let timing_aspect = if event.motion_adapter_phase.is_some() || event.saved_timewarp.is_some() {
+            crate::UNQUALIFIED_ROUTE_TIMING
+        } else { "source_route" };
         let Some(candidates) = copies.get(&e.master) else {
             loss(
                 out,
                 budget,
                 id,
-                "source_route",
+                timing_aspect,
                 format!("{}: master clip was not converted", event.id),
             )?;
             continue;
@@ -220,7 +370,7 @@ pub(super) fn append(
                 out,
                 budget,
                 id,
-                "source_route",
+                timing_aspect,
                 format!(
                     "{}: source A{} media unavailable; edit omitted",
                     event.id, e.master_track
@@ -245,7 +395,7 @@ pub(super) fn append(
                     out,
                     budget,
                     id,
-                    "source_route",
+                    timing_aspect,
                     format!(
                         "{}: source picture media unavailable; edit omitted",
                         event.id
@@ -298,6 +448,42 @@ pub(super) fn append(
             transform: None,
             effects: vec![],
         };
+        if let Some(frames) = &event.saved_timewarp {
+            if e.kind != KIND_PICTURE || !e.via.is_empty() {
+                loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING,
+                    format!("V{}: saved Timewarp requires a direct picture edit", e.track))?;
+                continue;
+            }
+            if !apply_saved_timewarp(frames, range, &item_routes[index], &mut p, budget)? {
+                loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING,
+                    format!("V{}: saved Timewarp requires verified progressive 1080p picture at the sequence rate with zero media offset and coverage for the saved source span", e.track))?;
+                continue;
+            }
+        } else if let Some(phase) = event.motion_adapter_phase {
+            let covering = e.kind == KIND_PICTURE
+                || adapter_picture_spans.contains(&(e.master, phase, range.record_start, range.length));
+            let tail = match motion_timing(event, range, phase, &item_routes[index], covering, &mut p, budget) {
+                Ok(tail) => tail,
+                Err(why) => {
+                    let lane = if e.kind == KIND_PICTURE { "V" } else { "A" };
+                    loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING, format!("{lane}{}: {why}", e.track))?;
+                    continue;
+                }
+            };
+            if tail > 0 && range.record_rate == av::Rate::new(24, 1).unwrap() {
+                loss(out, budget, &p.id, "motion_adapter_audio_tail",
+                    format!("A{}: {tail} samples beyond the linked MP4 audio extent render as silence. Avid can emit decoded AAC packet padding within that interval.", e.track))?;
+            }
+            sidecar(out, budget, "avid.motion_adapter", &p.id, obj(vec![
+                ("phase", Value::Int(phase)),
+                ("native_record_frames", Value::Int(range.length)),
+                ("silent_audio_tail_samples", Value::Int(tail)),
+            ]))?;
+        } else if e.kind == KIND_SOUND && item_routes[index].motion_audio.contains_key(&e.master_track) {
+            loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING,
+                format!("A{}: linked AAC file-track origin outside the qualified Motion Adapter route", e.track))?;
+            continue;
+        }
         if let Some(automation) = &event.volume_automation {
             match automation {
                 av::VolumeAutomation::Keys(keys) => {
@@ -318,8 +504,13 @@ pub(super) fn append(
                 }
             }
         }
-        effects::apply(e, raster, &mut p, out, budget)?;
+        // Active curves in the qualified transforms supersede stale inline scalars.
+        let replace_static = event.picture_extension.is_some_and(av::PictureExtension::replaces_static_transform);
+        effects::apply(e, !replace_static, raster, &mut p, out, budget)?;
         if let Some(mut effect) = event.picture_extension {
+            if effect.requires_square_pixels() && !item_routes[index].square_pixels {
+                effect = av::PictureExtension::Unsupported("Animated crop, Warp, or trimmed Resize requires verified square-pixel progressive geometry");
+            }
             if e.picture_nested {
                 effect = av::PictureExtension::Unsupported("nested picture effects require separate qualification");
             }
@@ -340,6 +531,9 @@ pub(super) fn append(
         ];
         if !p.volume_keys.is_empty() {
             receipt.push(("pvol_volume_keys", Value::Bool(true)));
+        }
+        if event.saved_timewarp.is_some() {
+            receipt.push(("saved_timewarp", Value::Bool(true)));
         }
         sidecar(
             out,
@@ -620,7 +814,18 @@ pub(super) fn append(
             ),
             ("route", routes(&issue.route)),
         ]));
-        loss(out, budget, id, "source_route", issue.reason.clone())?;
+        if issue.issue_kind == av::SourceIssueKind::RouteTiming {
+            let lane = if issue.kind == KIND_PICTURE { "V" } else { "A" };
+            loss(
+                out,
+                budget,
+                id,
+                crate::UNQUALIFIED_ROUTE_TIMING,
+                format!("{lane}{}: {}", issue.track, issue.reason),
+            )?;
+        } else {
+            loss(out, budget, id, "source_route", issue.reason.clone())?;
+        }
     }
     let legacy = source
         .info
@@ -844,7 +1049,7 @@ fn raw_sequence(seq: &av::SourceSequence) -> Value {
             ("length", t.length.map(Value::Int).unwrap_or(Value::Null)),
             ("rate", t.rate.map(|r| s(rational(r))).unwrap_or(Value::Null)),
             ("reason", opt_s(t.reason.as_deref())),
-            ("native_properties", title_properties(t)),
+            ("native_properties", text_properties(t)),
         ])).collect())),
         (
             "combiner_channels",
@@ -1014,7 +1219,7 @@ fn raw_sequence(seq: &av::SourceSequence) -> Value {
     if seq.texts.is_empty() { if let Value::Obj(fields) = &mut value {fields.retain(|(key,_)|key!="texts");} }
     value
 }
-fn title_properties(t: &av::SourceText) -> Value {
+fn text_properties(t: &av::SourceText) -> Value {
     obj(vec![
         ("status", s("stored native values with owner/list witnesses; not resolved rendering or neutral geometry")),
         ("reason", opt_s(t.native_properties_reason.as_deref())),

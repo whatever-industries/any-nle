@@ -47,10 +47,46 @@ Implementation, evidence and remaining gates.
       candidate gates and non-overwriting draft-release tooling.
 - [x] A generated H.264/AAC master matches sampled picture and PCM from Premiere's
       native import in a two-second macOS fixture.
-- [ ] Qualify a working native AVB-to-UME project end to end with fresh save/reopen
-      and playback. The supplied long-form MP4 also failed Premiere's direct import.
-- [ ] Qualify original WAV in Premiere and expand linked-original coverage to more
-      descriptors, profiles, legacy AMA and other platforms.
+- [x] **Link picture-only 1080p24 ProRes HQ MOV** (CONV-0054). Use the
+      saved Avid locator with the observed zero-origin timecode track and
+      a verified picture packet grid. The original and generated freeze
+      stayed online after Save As and reopen in Premiere 26.5.2. The
+      linked original matched all 240 direct-import pictures. The
+      generated freeze matched all 120 Avid pictures.
+- [x] Preserve stereo left/right on fresh inserts for the scoped linked AAC bin
+      route. The mapped two-second fixture stayed linked and played after
+      Premiere Save As and reopen. Existing sequence audio keeps its source grouping.
+- [x] Block Premiere conversion before writing when unsupported source rate
+      routing or a recognized automatic Avid Motion Adapter would omit timeline edits.
+      Review names the affected sequence and tracks. A same-rate UME/OP1a control
+      stays online after Premiere Save As and reopen.
+- [x] Translate the qualified automatic 24 fps to 23.976 Motion Adapter on
+      linked H.264/AAC. Premiere Save As and reopen matched the Avid picture cadence
+      and both Direct Out PCM lanes on one trimmed mixed-media sequence.
+      [Scope and refusals](MOTION-ADAPTER-24-TO-23976.md).
+- [x] Translate the qualified automatic 23.976 to 24 Motion Adapter on linked
+      H.264/AAC. Premiere Save As and reopen matched the picture repeat and
+      both PCM lanes within the MP4's declared extent. The conversion reports
+      silence beyond that boundary where Avid can render decoded AAC padding.
+      [Scope and refusals](MOTION-ADAPTER-24-TO-23976.md#automatic-23976-to-24).
+- [ ] Broaden native AVB-to-UME playback qualification with representative saved
+      bins. The supplied long-form MP4 also failed Premiere's direct import.
+- [x] **Read back linked PCM16 and PCM24 WAV in Premiere.** Synthetic stereo
+      writer controls retained exact source trims, left/right samples and fresh
+      insertions after Save As and reopen. In this audio-only control, the
+      encoder began the export at the first occupied edit. The Premiere
+      sequence retained the leading silence.
+- [x] **Saved Avid-linked PCM16 and PCM24 WAV via the job engine.** Two
+      WaveAiff links at 48 kHz retained A1/A2 as separate mono placements. With
+      Avid default pan selected, Premiere matched both 48,000-sample trimmed
+      Direct Out channels after Save As and reopen. Fresh inserts retained
+      both source selectors. Premiere centers new mono clips by default.
+      Explicit clip hard pans matched all 96,000 samples per source channel.
+- [ ] **Align original-file resolution across entry points.** The wizard and
+      saved-job command share original-file verification. Conventional
+      `graph` and `convert` use native media lookup and report these linked
+      WAV file mobs missing. Share the verified route before expanding
+      descriptor, legacy AMA and platform coverage.
 - [x] Remove the identified private diagnostics from reachable GitHub export history.
       The reviewed private export and cleanup evidence are retained.
 - [x] Publish [Any NLE v0.1.0-alpha.1](https://github.com/whatever-industries/any-nle/releases/tag/v0.1.0-alpha.1)
@@ -113,7 +149,7 @@ Implemented fixes, tests and remaining native gates.
       passes and over ten minutes of native looping per sequence, unchanged post-loop
       PCM and a native Avid reference. The measured Avid envelope differs from the
       current Constant Power approximation. User listening, faithful fade mapping
-      and acceptance remain pending; absolute clocks retain the compatibility policy.
+      and acceptance remain pending. See the release checks below for absolute TC1.
       Evidence and limits.
 
 - [x] **Point the app at a whole Avid project folder.** Walk it recursively, select
@@ -303,9 +339,13 @@ Implemented fixes, tests and remaining native gates.
       Read the PVOL volume control lane from inline CTRL points or the qualified
       subframe payload. Preserve the media-relative clock and write editable Premiere
       keys. Premiere read back both four-point controls using synthetic media.
-- [ ] **Extend volume automation qualification.** Reconnect the original Avid
-      test media for an end-to-end render comparison. Compare interpolation and
-      extend coverage to other channel layouts and nested owners as separate cases.
+- [ ] **Match PVOL rendered volume envelopes.** A reopened Premiere
+      control on the verified dry WAV matched the flat Avid export exactly.
+      Inline and subframe keys retained their times. Both keyed renders
+      differed from Avid, including a −6.0 dB versus −6.1 dB plateau and
+      different ramp shapes. Separate native gain and interpolation evidence
+      is needed before changing the mapping. The historical managed-media
+      conversion, additional layouts and nested owners remain open.
 - [ ] Pan keyframes; master-clip pan (Premiere has no master-clip pan).
 
 ## Clip, marker and correction color
@@ -313,7 +353,14 @@ Implemented fixes, tests and remaining native gates.
 - [ ] **Color correction extensions**: keyframes and other Avid tabs (Channels, Levels,
       HSL Hue Offsets, Secondary). The measured HSL Controls (hue, saturation, brightness,
       contrast, gain, gamma, setup) and curves already feed the LUT writer; do not reimplement
-      those as missing formulas. Editable Lumetri controls are on hold below.
+      those as missing formulas. The retained Phase 52 Gain 150 residual reaches 48.825
+      8-bit-equivalent codes on a saturated patch. The current fitted transform and its
+      sampled LUT agree on that patch. A matched eight-patch native control
+      found unclamped YCbCr-derived RGB within 1.06 RGB codes of simple 1.5× gain,
+      including bright patches. RGB PNGs clipped those highlights and matched
+      the clipped prediction within two codes. The new control did not reach the
+      physical YCbCr rails of interest. Isolate the earlier saturation residual
+      before changing the LUT. Editable Lumetri controls are on hold below.
 
 ## Timeline and effects
 
@@ -327,14 +374,27 @@ User's priority tiers to scope converter tasks.
       survive Premiere save/close/reopen. Styling remains an explicit destination-default
       loss; this is not full-media playback or general Unicode qualification.
       [Scope and evidence](CAPTION-TEXT-TRANSLATION-2026-11-08.md).
+- [x] **Retain local SubCap appearance evidence** (CONV-0058). Graph/2
+      preserves explicit FontSize, FONTFACE and ExtraLeading carriers plus
+      opaque synchronization presence. Unqualified appearance receipts report
+      a reason while independently qualified caption text survives.
+- [ ] **SubCap font-size and layout mapping.** The Avid 20 px case omitted the
+      field. Native 40, 50 and 60 px saves stored their displayed integers.
+      Premiere cue-local style overrides survived reopen with unchanged
+      neighboring cues. The direct shared-font mapping missed the two-pixel
+      full two-line block-height gate at 40 px, and line widths differed. Resolve font
+      metrics, line spacing and synchronization before applying source styling.
 - [x] **Current Titler+ static single-flow text → editable Premiere text** (2026-11-08).
       Character and native Flow/Text paragraph carriers are supported separately. Retain
       native appearance values by property-list role; do not use cached `_TTEXT` as text.
-- [ ] **Title appearance:** fixed-box origin/anchor, wrapping, effective font inheritance,
-      metrics, source size/position and style mapping. Reuse AVB-0013's scoped point-text
-      deltas; they are not an absolute fixed-box mapping. Current output uses reported
-      ArialMT/48pt destination defaults. Multiple flows/layers, dynamic modes, mixed text
-      carriers, Classic Title and Titler+ Legacy remain unsupported.
+- [ ] **Title appearance.** A native static fixed-box horizontal move
+      changed only its local position value and shifted the glyphs 318 px.
+      A separate saved-carrier width probe preserved the left edge and wrapped
+      two lines into four in Avid. The current Premiere writer renders all
+      three as the same point text with reported ArialMT/48pt defaults.
+      Qualify a Premiere paragraph box, shared font metrics and anchor
+      before mapping fixed-box appearance. Multiple flows/layers, dynamic
+      modes, mixed carriers, Classic Title and Titler+ Legacy remain unsupported.
 
 - [ ] **Alpha (keyed graphics)** (User 2026-10-15; Avid side: Codex alpha-test intake, provisional,
       KB 5bba92c, AVB-0006/AVB-0012 context). Avid facts: an image imported with alpha becomes a
@@ -358,22 +418,97 @@ User's priority tiers to scope converter tasks.
          Premiere and compared pixel-for-pixel with Avid's TIFFs, as for colour.
       Open: premultiplied sources, other codecs, alpha in video files (ProRes 4444 etc.).
 
-- [ ] **Timewarp source integration.** Resolve the selected editable or generated
-      map, clocks and source offsets using the Avid codex's Timewarp worklist.
-      Start with the retained same-rate, fixed-anchor, zero-phase evidence. The
-      Premiere writer accepts supplied frame maps. Trimmed, offset and mixed-rate
-      inputs, frame blending and optical flow need separate qualification.
+- [x] **Saved Timewarp ramp cadence** (CONV-0051). The reader carries the
+      retained two-key Linear rise/fall and Spline rise profiles as saved
+      picture samples. The Premiere writer uses one editable remap key per frame.
+      On the rewrapped DNx OP1a chart, Premiere 26.5.2 retained the remap keys,
+      curve In/Out points and media links after Save As, close and reopen.
+      All 144 individually exported frames in each sequence matched Avid's frame selections.
+      The Spline rise retained all 35 differences from the Linear rise.
+- [x] **Default Speed Boost and Speed Bump picture timing.** For the two
+      verified 1666-frame 1080p23.976 profiles, evaluate the four saved Position
+      keys and handles and write one Premiere Time Remapping key per frame.
+      After Save As, close and reopen, Premiere 26.5.2 retained the editable
+      keys and DNx OP1a link and played both sequences through to the end.
+      All 3,332 frame selections from the Premiere renders matched the Avid
+      exports at 24000/1001. This fixture qualifies picture cadence.
+- [ ] **Extend Timewarp coverage.** Qualify other durations, modified presets
+      and inherited Avid render settings. Resolve other anchors, editable and
+      generated map authority, exact constant 200% cadence, trims, nonzero media
+      offsets, mixed rates, blending, optical flow and sound separately.
+      Constant full-speed reverse already uses Premiere Reverse Speed.
+- [x] **Traditional Freeze Frame, five-second 1080p24 profile** (CONV-0053). Preserve the
+      generated ProRes HQ picture as a regular Premiere clip on the native
+      media route. The converter checks the saved clip and sequence binding,
+      copies all 120 coded pictures to MOV and excludes the verified zero-only
+      packet beyond the picture span. Premiere 26.5.2 played the five-second
+      sequence after Save As, close and reopen. All 120 rendered pictures
+      matched the held Avid picture. Other durations, field modes, trimmed
+      placements and editable Timewarp holds need separate qualification.
+- [x] **Saved AudioSuite Gain, one- and two-second mono PCM24 at 24 fps**
+      (CONV-0055, CONV-0057).
+      Native media preparation follows the saved Gain render binding and copies
+      its 48,000 or 96,000 playable samples to WAV after verifying the two extra stored
+      samples are zero. The saved render remains separate from PVOL volume and
+      pan. Premiere 26.5.2 matched all 144,000 stereo sample frames of each
+      three-second Avid Direct Out after Save As, close and reopen using the Avid default-pan
+      option. Other render spans, channel layouts and missing caches remain
+      outside this profile.
 - [x] **Linear animated Resize position and scale** (CONV-0041). Convert two
       aligned whole-frame keys on 1920x1080 same-rate edits to editable Premiere
       Motion, including independent X/Y scale. Premiere rendered start, middle,
       and end geometry in the synthetic source control.
-- [ ] **Extend animated Resize and 3D Warp.** Qualify other interpolation modes,
-      additional key shapes, animated crop, promoted Warp, and source trims as
-      separate cases. Track anchor, rotation, and perspective in the Avid codex.
+- [x] **Linear animated 3D Warp Position and Scale** (CONV-0046). Exact
+      promoted control identities and neutral crop/background feed the existing
+      editable Motion writer on an admitted 1080p23.976 picture edit. The
+      synthetic DNx comparison matched the Resize output across all 48 frames
+      and kept the keys after Premiere Save As and reopen.
+- [x] **Linear animated Resize and 3D Warp crop** (CONV-0047). Translate four
+      source-space crop curves alongside position and independent scale to
+      editable Motion. The paired 1080p23.976 synthetic DNx renders matched
+      each other across 48 frames before and after Save As and reopen. Measured
+      edges stayed within one pixel of the retained Avid reference.
+- [x] **Saved Linear 3D Warp keys after head or tail trim** (CONV-0048).
+      Preserve the saved three-key profile, including independent Fixed Width
+      keys outside one visible edge where the source media has the handle.
+      Five Fixed/Elastic cases preserve their editable keys and render after
+      Premiere Save As and reopen. Premiere's own editing rules govern later trims.
+- [x] **Saved Linear Resize keys after head or tail trim** (CONV-0049).
+      Preserve three saved Position and Scale keys, including Fixed and Elastic
+      keys beyond one visible edge when the source media contains them. Both
+      trim rounds and the baseline retain editable keys after Premiere Save As
+      and reopen. All 288 frames preserve visible geometry within one pixel of
+      the Avid reference on the synthetic DNx route.
+- [x] **Saved Linear animated crop on three-key trims** (CONV-0050, CONV-0056).
+      Preserve four editable Motion crop curves on a shared crop clock.
+      Same-rate progressive square-pixel 1080p23.976 only, with a neutral
+      background and source media coverage for every key. Native Avid head and
+      tail trims for Resize and the compact 18-control promoted Warp retained
+      exact bounds and three Elastic keys after Premiere Save As and reopen.
+      Across all 144 active trim frames, visible edges over black were within
+      one pixel of the Avid export. The two untrimmed controls each had two
+      two-pixel left-edge differences at the lowest luma threshold.
+- [ ] **Extend animated Resize and 3D Warp.** Qualify other rates, interpolation,
+      compact Fixed clocks and additional key shapes separately. Track anchor,
+      rotation and perspective in the Avid codex.
 
-- [ ] **AniMatte extensions**: feather, topology changes, several trackers, stabilisation,
-      and Key Out with several shapes. The default Key In/tracked-mask baseline is complete;
-      single-shape inversion and mask opacity are implemented but still need application read-back.
+- [x] **Single-shape AniMatte inversion and opacity in Premiere.** Key In
+      and Key Out at full and half opacity survived Save As and reopen.
+      The 72-frame synthetic comparison verified inside and outside pixels.
+- [ ] **Match partial AniMatte compositing.** The native Avid single-shape
+      Key Out 50% control attenuated the inside and preserved the outside.
+      Premiere's single inverted mask attenuated the outside. A two-mask
+      probe corrected which region is attenuated, and matching the measured
+      midpoint also required changing the sequence-wide blend domain.
+      Keep the current editable approximation scoped until a local solution
+      is verified. Feather, topology changes, multiple trackers and
+      stabilization remain open.
+- [ ] **Luma Key and Chroma Key.** Avid's Luma Key Gain change moved a sharp
+      cutoff on a 16-step grayscale ramp. Premiere reproduced those two
+      sampled splits using paired editable Cutoff and Threshold controls.
+      Qualify the source formula, soft/colored cases and layer ownership
+      before mapping. The installed Avid palette exposed RGBKeyer and
+      SpectraMatte. The exact Chroma Key entry still needs a native fixture.
 - [ ] **Opacity** (Avid opacity/levels, fade-to-black etc.) -> Premiere Opacity (and blend modes
       where Avid has an equivalent); keyframes.
 - [x] **Ordinary two-sided video Dissolve** (CONV-0040). Same-rate cuts with
@@ -389,8 +524,11 @@ User's priority tiers to scope converter tasks.
       Measurements and setup limit.
 - [x] **Flip, Flop, and Flip-Flop** (CONV-0041). Exact Avid IDs map to editable
       Vertical Flip, Horizontal Flip, or both. All three reflected synthetic
-      Premiere frames match the expected pixels. Effect stack ordering remains
-      a separate qualification.
+      Premiere frames match the expected pixels. A native Avid Warp outside
+      Flop control retained both effects and left the asymmetric crop on
+      its original side after reflection of the source. The reverse order
+      still needs native authoring. Keep mixed effect stacks outside the
+      qualified translation scope.
 
 - [ ] Avid Start shown on clips whose MXF timecode is 0 (Alternate Timecode, User decision).
 - [x] **Editable two-camera Groups over native OP1a** (User, 2026-11-08).
@@ -422,6 +560,15 @@ User's priority tiers to scope converter tasks.
       cross-editor semantics are qualified. Track subclips and nests separately
       from the editable Group scope above.
 
+### Adobe After Effects (User, 2026-11-09)
+
+- [ ] **Translate to and from After Effects.** Plan both a source adapter and a
+      destination writer through the neutral graph. Start with a native project
+      containing one composition, linked footage and a trimmed layer. Establish
+      layer timing, frame rate, transform and media identity before choosing the
+      first editor pair to qualify. Both direction menus list After Effects as
+      unavailable until a route is implemented and checked.
+
 ## DaVinci Resolve (User 2026-10-26: bookmark and research)
 
 **Direction decided by the User (2026-10-27): Avid -> Resolve goes straight to Resolve's native
@@ -430,15 +577,117 @@ export, never the route to Resolve: Avid can already export interchange files it
 point of Any NLE is to go further than they do.** Route (1) below is the target; route (2) is
 only for comparing results; route (3) (scripting API) is for test read-back.
 
-- [ ] `knowledge/resolve/` research repository (same finding/provenance/hash rules).
-- [ ] User `.drp` exports, a few at a time: empty project; one bin with one Avid MXF clip; one
-      timeline with that clip on V1 and A1/A2; then markers, colours, gain/pan, bins in bins,
-      transitions, speed, Transform, colour.
-- [ ] `crates/resolve`: `.drp` reader and writer against those fixtures (graph <-> .drp), then
-      `any-nle convert --to resolve OUT.drp`; User import read-back per feature.
+- [x] **Resolve format authority and shared effects audit.** Native archives and
+      findings have a versioned catalog under the workspace Resolve knowledgebase.
+      The [cross-editor audit](SHARED-EFFECTS-AUDIT.md) traces shared and source-specific
+      semantics without changing effect behavior.
+- [x] **Qualify the internal straight-cut writer.** A standalone graph/2 writer
+      emits the bounded 1080p23.976 split edit with exact TC1, one linked
+      DNxHR OP1a item, and two PCM24 mono lanes. Native reopen, re-export and
+      render comparisons passed for the baseline, origin change and source trim.
+      [Profile, evidence and limits](RESOLVE-PROJECT-CORE.md).
+- [x] **Write the bounded editable Group.** The saved A/B/A sequence
+      reopened in Resolve Studio 21.2 with exact cuts and both mono lanes
+      fixed to camera A. A fresh insertion and distinct-signal tests passed.
+      [Scope and audio-envelope comparison](RESOLVE-EDITABLE-GROUPS.md).
+- [x] **Read the bounded Resolve project into graph/2.** The internal reader
+      covers registered timelines, cached linked media, exact clocks and
+      straight cuts, fixed-audio Groups, sequence markers, static X
+      position, bounded static mono clip volume, two-point source-time volume
+      curves and source receipts for default clip fades. [Source profile and limits](RESOLVE-SOURCE-READER.md).
+- [x] **Write the bounded Resolve clip envelopes.** The internal writer
+      recreates bounded static clip volume, default fades, and two-point
+      linear-dB volume automation on qualified direct mono edits.
+      [Writer profile and limits](RESOLVE-PROJECT-CORE.md).
+- [x] **Read and write bounded static Resolve track faders.** The qualified
+      two-mono mixer preserves track level independently of clip volume.
+      Both lanes matched native PCM after Save As and reopen.
+- [x] **Read and write the bounded Resolve main bus fader.** The qualified
+      stereo bus preserves its level independently of track and clip gain.
+      Both mono lanes matched native PCM after Save As and reopen.
+- [x] **Read and write bounded Resolve track mute.** The qualified two-mono
+      mixer and timeline flags agree after Save As and reopen. The muted
+      lane is silent, the enabled lane matches its reference, and all gain
+      settings are preserved. [Scope and evidence](RESOLVE-SOURCE-READER.md).
+- [ ] **Qualify the linked Resolve project foundation.** The internal project
+      writer handles ordered timeline selection, nested media bins and shared
+      original MOV/WAV bindings. Complete Save Project As, fresh insertion and
+      the native render checks in the [linked project profile](RESOLVE-PROJECT-CORE.md#linked-project-profile).
+      Save Project As and native channel remapping require an authorized
+      Resolve UI session. Record mixed-rate qualification independently.
+- [ ] **Qualify editable 24 ↔ 23.976 adaptation in Resolve.** Native default
+      picture cadence differs from the retained Avid phase controls. Author a
+      one-change editable timing control per direction, then verify the full
+      numbered-frame sequence and the independent 48 kHz first sample and tail.
+      See [pending editor checks](RESOLVE-PROJECT-CORE.md#pending-editor-checks).
+- [x] **Compare direct Avid OP-Atom playback in Resolve.** Resolve Studio
+      21.2.0.0006 reopened and played the tested DNxHR LB with two mono PCM24
+      siblings and the picture-only ProRes LT fixture. The DNx pictures and both
+      isolated PCM lanes matched the OP1a control. The ProRes render covered all
+      446 pictures with small pixel differences from the MOV control. See
+      RESOLVE-0014 in the local Resolve knowledgebase.
+- [x] **Qualify the internal direct DNxHR LB OP-Atom writer.** One graph/2
+      split edit links the original picture and two verified mono PCM24
+      siblings. Resolve Studio 21.2.0.0006 preserved both routes and all nine
+      edits after Save Project As and reopen. See the [direct-link profile](RESOLVE-PROJECT-CORE.md#direct-avid-op-atom).
+- [x] **Read the qualified direct DNxHR LB OP-Atom Resolve archive.** The
+      internal reader preserves both mono cache locators, selectors and
+      package identities from the reopened project. See the
+      [reader profile](RESOLVE-SOURCE-READER.md).
+- [x] **Bind direct DNxHR LB OP-Atom automatically from an Avid bin.** The
+      internal Avid probe resolves native media from supplied roots and links
+      both mono siblings by saved track and file package. The split edit
+      retained both assignments after Save Project As and reopen.
+- [x] **Bind multiple direct DNxHR LB OP-Atom clips in one timeline.** The
+      internal Avid probe resolves each clip's own picture and mono siblings.
+      The two-clip test retained all six paths and all nine edits after Resolve
+      Save Project As and reopen. Separate signal renders confirmed each mono
+      route. See the [direct-link profile](RESOLVE-PROJECT-CORE.md#direct-avid-op-atom).
+- [ ] **Extend direct Avid OP-Atom beyond the core profile.** Qualify more
+      media and timeline layouts before product exposure.
+- [ ] **Qualify older Resolve archives as source inputs.** A private version 15
+      production archive supplies a hierarchy, identity and locator comparison.
+      Capture a bounded version 15 structural and render cohort before admitting
+      that format. Version 17 remains the current writer target.
+- [ ] **Widen Resolve source and destination evidence.** Qualify other media
+      and versions, mixed-rate clocks, custom fade curves, portable envelope
+      rendering, other transforms, and independent Group audio before extending support.
+- [ ] **Qualify product exposure separately.** Resolve remains unavailable in
+      the CLI and wizard. Expand media, project structure and version coverage
+      before enabling a route.
 
-Implementation remains open. These research bookmarks date to 2026-10-26.
+Premiere → Resolve and Avid → Resolve are planned primarily for grading
+turnovers. The preferred media menu default is **Link to originals**. Preserve
+saved camera-original locators, source timecode and reel or file identity when
+qualified, and diagnose unresolved relinks. Offer rewrap as a separate choice
+for a verified workflow that needs it, with the **Creates new media.** notice.
+
+### Pinned offline Resolve references
+
+- [drp-format](https://github.com/samuelgursky/davinci-resolve-mcp/tree/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/drp-format)
+  (JavaScript, MIT, `1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048`).
+  The offline package in davinci-resolve-mcp covers DRP/DRT packaging, timeline
+  edits, media relinking, markers, transitions and grades. Use it for format
+  comparisons. Its new-media path uses an H.264 template, and our DNxHR OP1a
+  and editable Group cases need their own native fixtures.
+- [pr2resolve](https://github.com/Ersiter/pr2resolve/tree/61c8c9ec2a76496721718130f250c5b64fccd789)
+  (Python, MIT, `61c8c9ec2a76496721718130f250c5b64fccd789`).
+  Use its [native format notes](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md)
+  to cross-check timeline registration, source trims, media bindings and Fairlight
+  source-channel selection. Its controlled PCM16 tests leave our DNxHR OP1a
+  PCM24 dual-stream and editable Group cases to qualify.
+- [drpkit](https://github.com/higuchiki/drpkit/tree/af3cedc0f40ae2192929158399667b4d28863dd6)
+  (Python, MIT, `af3cedc0f40ae2192929158399667b4d28863dd6`).
+  Use its [field inventory](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/FORMAT.md)
+  for Fairlight mixer and edit read-back, including routing, EQ, dynamics,
+  fades and keyframes. Its template composer is audio-focused.
+
 Review licence and provenance before code adoption.
+
+For broader integration, use the Resolve knowledgebase comparison matrix
+and integration sequence. Start by widening archive, media and clock
+coverage, then expand editable timeline controls and Fairlight on verified
+bindings. Titles, Color and Fusion need distinct rendered controls.
 
 - **Bookmark: storytold/filmcraft PR #670** "Interchange: import DaVinci
   Resolve projects (.drp)" (by nikpottbecker; fork branch `feat/davinci-resolve-drp-import`,
@@ -454,7 +703,6 @@ Review licence and provenance before code adoption.
 - **Other open-source readers found (GitHub code search on the class names):**
   | Project | Language / licence | Scope |
   |---|---|---|
-  | higuchiki/drpkit | Python, MIT | read and edit .drp, read Project.db (2026-10) |
   | hfiguiere/drp-extractor | Rust, MPL-2.0 | parse .drp (2018-2023) |
   | samuelgursky/davinci-resolve-mcp | Python/JS, MIT, ~3.8k stars | Resolve scripting API + offline .drp/DB tools (`drp-timeline-clips.mjs`, `project_db.mjs`) |
   | CiprianSpiridon/davinci-resolve-mcp | Python, MIT | `formats/drp.py`, `formats/drt.py` (.drt timelines) |
@@ -467,9 +715,6 @@ Review licence and provenance before code adoption.
   for comparisons only; (3) Resolve's scripting API (Studio; the free
   edition via the in-app bridge on 21.0.x) for automated read-back in tests, like the Avid API
   item below; samuelgursky/davinci-resolve-mcp is that route.
-- **First steps when picked up:** a Resolve knowledge repo under `knowledge/resolve/` with the
-  same finding/provenance rules; one small User-exported `.drp` per feature (generate-then-confirm);
-  compare 2-3 readers for research; implement the already-decided native `.drp` route.
 
 ## App
 
@@ -484,14 +729,18 @@ Review licence and provenance before code adoption.
       bundled backend converted a small 23.976 Avid split-edit bin. Both sequences
       opened online and played to the end in Premiere 26.5.2. Sampled picture and
       rendered PCM matched the retained reference after save and reopen, including
-      separate checks of both mono lanes. Absolute sequence start remains open below.
+      separate checks of both mono lanes. This release predates the TC1 correction below.
 - [ ] **Next platform check: Windows x64.** Install the published package, run the
       same bin through the wizard and repeat the Premiere checks. Keep the remaining
       platform checks open until they have their own evidence.
-- [ ] **Qualify the exact 23.976 sequence start.** The fixture's Avid TC1 starts at
-      `01:00:00:00`. Premiere displays `00:59:56:09` from the current compatibility
-      origin, including after save and reopen. Preserve the tested relative edit
-      timing while qualifying the absolute clock.
+- [x] **Correct the qualified 23.976 non-drop sequence start in the converter.**
+      For a unique, sequence-spanning primary TC1, write its count at the exact
+      record rate. The split-edit bin now writes the `01:00:00:00` origin
+      (`915372057600000` ticks); relative edit and transition ranges are unchanged.
+      Unknown or unsupported sequence clocks retain the compatibility fallback.
+- [ ] **Read back the corrected zero point in Premiere.** Check both split-edit
+      sequences at the first frame and after save/reopen. The old release's native
+      read-back displayed `00:59:56:09`; it does not qualify the corrected output.
 - [ ] **Extend the wizard for new directions and destination versions.** Reuse the
       direction-specific flow when another route is implemented. Offer a target
       Premiere version choice when the output differs by version. Proxy and
@@ -606,9 +855,9 @@ Retained here with their evidence and limitations; these are no longer active to
       picture-coding identity; both Premiere writers have the observed `apcs` media profile.
       This does not cover all ProRes profiles or solve Premiere's MXF playback issue.
 
-- [x] **Time-remapping writers** (2026-10-20): Rust and Python writers are frame-exact
-      against the tested Avid renders, 192/192 (PRPROJ-0028 / CONV-0028). Reader integration
-      is a separate active item.
+- [x] **Time-remapping writers** (2026-10-20): supplied frame maps reproduced
+      192/192 Avid picture selections in the retained Premiere H.264 exports
+      (PRPROJ-0028 / CONV-0028). The bounded source path is tracked above.
 
 ### More programs: the neutral graph (ADR-0004, User 2026-10-26)
 

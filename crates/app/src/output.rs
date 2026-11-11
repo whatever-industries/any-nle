@@ -73,31 +73,37 @@ pub fn write_snapshot(path: &Path, text: &str) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Count/validate first, then stream the immutable source graph without a value tree.
-/// A disk failure retains the exclusively created partial snapshot and names it.
-pub fn write_source_snapshot(
+pub(crate) struct SnapshotWriteError {
+    pub message: String,
+    pub retained: bool,
+}
+
+/// Validate, then stream the graph. Only errors after exclusive creation retain a partial snapshot.
+pub(crate) fn write_source_snapshot(
     path: &Path,
     graph: &graph::source::SourceGraph,
-) -> Result<(), String> {
-    graph.encoded_len().map_err(|e| e.to_string())?;
+) -> Result<(), SnapshotWriteError> {
+    graph.encoded_len().map_err(|e| SnapshotWriteError {
+        message: e.to_string(),
+        retained: false,
+    })?;
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        .map_err(|e| SnapshotWriteError {
+            message: format!("{}: {e}", path.display()),
+            retained: false,
+        })?;
     let mut out = std::io::BufWriter::new(file);
-    graph.write_json(&mut out).map_err(|e| {
-        format!(
-            "partial source snapshot retained at {}: {e}",
-            path.display()
-        )
-    })?;
-    out.flush().map_err(|e| {
-        format!(
-            "partial source snapshot retained at {}: {e}",
-            path.display()
-        )
-    })
+    graph
+        .write_json(&mut out)
+        .map_err(|e| e.to_string())
+        .and_then(|_| out.flush().map_err(|e| e.to_string()))
+        .map_err(|e| SnapshotWriteError {
+            message: format!("partial source snapshot retained at {}: {e}", path.display()),
+            retained: true,
+        })
 }
 
 #[cfg(test)]
@@ -121,6 +127,13 @@ mod tests {
         // Another producer creates a file after the path checks, before our write.
         fs::write(&graph, b"late file").unwrap();
         assert!(write_snapshot(&graph, "replacement").is_err());
+        let source = graph::source::SourceGraph::from_json_text(
+            r#"{"schema":"anynle.graph/2","project":{"name":"Synthetic snapshot"},
+                "media":[],"items":[],"bins":[],"sequences":[]}"#,
+        )
+        .unwrap();
+        let failure = write_source_snapshot(&graph, &source).err().unwrap();
+        assert!(!failure.retained);
         assert_eq!(fs::read(&graph).unwrap(), b"late file");
         assert!(!project.exists());
         fs::remove_dir_all(dir).unwrap(); // Only inspected, freshly created test files.

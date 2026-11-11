@@ -146,9 +146,11 @@ User-approved central translation hardening and source-graph migration.
 - Legacy graph/1, standalone reader/model JSON and Python oracle remain differential
   interfaces. FCPXML stays on its explicit held legacy profile. Color preview reads
   either source version without timeline preparation.
-- Ordinary clocks retain exact old fallback rules from retained raw tuples. Exact
-  graph/2 clock witnesses do not silently become corrected default Premiere output.
-  The existing opt-in OP1a clock profile preserves its separately scoped cohort.
+- Ordinary media clocks retain the old fallback rules from retained raw tuples.
+  A qualified, direct 23.976 non-drop sequence TC1 sets Premiere's sequence zero
+  point from its frame count and exact edit rate. Other sequence origins retain
+  the compatibility fallback. Edit positions and media timecodes use their own
+  clocks. The opt-in rewrap media clock profile keeps its separately scoped rules.
 - Build and validate one encoded Premiere document before creating media. Plan
   asset names before writes; never rebuild the document or consume another UUID
   stream after media execution. Publish new projects without replacement and report
