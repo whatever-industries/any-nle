@@ -216,6 +216,7 @@ pub(super) fn read(
         ],
     );
     let wav_stereo_pool_route = !item.stream_groups.is_empty();
+    metadata::capture(clip, node, blobs, graph)?;
     graph.items.push(item);
     Ok(Some(Master {
         rate,

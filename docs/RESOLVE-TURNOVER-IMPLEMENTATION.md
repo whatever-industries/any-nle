@@ -45,6 +45,53 @@ the source document. Reviewable omissions require
 failures still block publication. Each input project and media binding is
 checked again before exclusive publication.
 
+## Premiere clip components
+
+For Premiere 27 project version 46, `--graph` includes a
+`premiere.component_parameters` sidecar on each edit with supported, saved
+clip controls. It carries Motion Position, Scale, Scale Width and Uniform
+Scale and the Level parameter of the Internal Volume Mono clip component.
+Parameter IDs are scoped to the Motion owner. Audio Level is identified by
+its parameter slot and carrier within the mono clip-volume owner.
+
+The sidecar keeps the saved component and parameter object IDs, component
+order, value units, CurrentValue, StartKeyframe, and the stored keyframe
+list. Each key retains the exact signed tick, value, interpolation fields
+2 and 3, and the remaining fields in saved order. Missing flags and
+values stay absent from the saved data, represented by null. No default
+component is synthesized. Audio Level stays in Premiere's saved numeric
+domain, distinct from clip gain, track volume and display dB. Position
+stays in Premiere's normalized coordinates.
+
+Capture follows the observed 14-field point and eight-field scalar
+records. Version 46 synthetic turnover checks independently compare the
+receipts with the input XML, including subframe ticks, distinct start and
+current values, and curves with an omitted IsTimeVarying flag. The
+underlying record shapes are pinned to PRPROJ-0030 and PRPROJ-0013.
+The Resolve writer still reports omitted appearance, and publishing with
+those losses requires `--accept-losses`.
+
+### Native Premiere 27 and Resolve mapping trial
+
+A Premiere 27.0.0 build 88 Save As and reopen preserved six online edits at
+24 fps and 1920×1080. A separate Resolve Studio 21.2.0 build 00006
+candidate was built from the captured values, then saved, closed, reopened,
+re-exported and rendered. The trial covers the following cases
+(CONV-0069).
+
+| Control | Result after Resolve reopen |
+|---|---|
+| Static Motion | Position `[0.525, 0.475]` and independent 112.5% width and 87.5% height became Pan 48 px, Tilt 27 px and the same independent zooms. |
+| Two-key Linear Motion | Position and uniform zoom retained their two keys at source frames 5 and 28 on a trimmed edit. Resolve omitted redundant scalar bases for the neutral starting values. The reader recognizes that saved encoding and requires a neutral initial key. |
+| Static mono clip volume | Level mapped to exactly −6 dB using the Premiere Level conversion. Each editor's rendered change was within 0.001 dB of −6 dB relative to its own neutral control. |
+| Animated mono clip volume | The −6 dB and +3 dB keys and their times survived. The rendered ramp differed by up to 0.28 dB at the measured points, so matching endpoint values and timing is insufficient to qualify it. |
+
+The picture comparison covered all 48 decoded frames. Mean absolute
+grayscale difference was at most 0.41 on a 0–255 scale after downsampling
+to 480×270. This is a scoped comparison for the matched canvas, same
+source rate and tested controls. Automatic application of Premiere
+component receipts remains pending in the turnover writer.
+
 ## Capture in graph/2
 
 Resolve archive reading now retains the following scoped facts for future

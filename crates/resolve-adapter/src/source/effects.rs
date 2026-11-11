@@ -47,8 +47,12 @@ pub(super) fn picture_control(
     if !motion[2].is_empty() {
         let mut curves: [Curve; 4] = Default::default();
         let mut all_animated = true;
-        for ((slot, id), curve) in CONTROLS.into_iter().zip(&mut curves) {
-            let Some(keys) = linear_curve(motion[slot], id, false)? else {
+        for (((slot, id), neutral), curve) in CONTROLS
+            .into_iter()
+            .zip([0.0, 0.0, 1.0, 1.0])
+            .zip(&mut curves)
+        {
+            let Some(keys) = linear_curve(motion[slot], id, (neutral, 2))? else {
                 all_animated = false;
                 break;
             };
@@ -61,7 +65,7 @@ pub(super) fn picture_control(
                 };
                 let mut edges: [Curve; 4] = Default::default();
                 for ((slot, id), edge) in CROP.into_iter().zip(&mut edges) {
-                    let Some(keys) = linear_curve(slots[slot], id, true)? else {
+                    let Some(keys) = linear_curve(slots[slot], id, (0.0, 3))? else {
                         return Ok(None);
                     };
                     *edge = keys;
@@ -116,14 +120,13 @@ fn source_crop_slots(crop: &[u8]) -> Result<Option<Vec<&[u8]>>> {
         .filter(|slots| slots.len() == 6 && slots[4..].iter().all(|slot| slot.is_empty())))
 }
 
-fn linear_curve(data: &[u8], id: u64, allow_implicit_zero: bool) -> Result<Option<Curve>> {
+fn linear_curve(data: &[u8], id: u64, implicit_base: (f64, usize)) -> Result<Option<Curve>> {
     let fields = fields(data)?;
     let (actual, base, keys) = match fields.as_slice() {
         [(1, Wire::Int(id)), (3, Wire::Bytes(base)), (10, Wire::Bytes(keys))] =>
             (*id, scalar(base)?, *keys),
-        // Resolve elides the zero-valued crop base when it saves the project.
-        [(1, Wire::Int(id)), (10, Wire::Bytes(keys))] if allow_implicit_zero =>
-            (*id, Some(0.0), *keys),
+        // Native saves omit scalar bases on the observed neutral-start curves.
+        [(1, Wire::Int(id)), (10, Wire::Bytes(keys))] => (*id, None, *keys),
         _ => return Ok(None),
     };
     let Some((header, bytes)) = keys.split_at_checked(4) else {
@@ -149,7 +152,8 @@ fn linear_curve(data: &[u8], id: u64, allow_implicit_zero: bool) -> Result<Optio
     }
     // Resolve's UI can quantize the initial key while retaining a double base.
     let base_matches = if fields.len() == 2 {
-        curve[0].1 == 0.0
+        let (neutral, count) = implicit_base;
+        curve.len() == count && curve[0].1 == neutral
     } else {
         base.is_some_and(|value| (value - curve[0].1).abs() <= 1e-7)
     };
@@ -366,6 +370,46 @@ pub(super) fn report_group_controls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopened_linear_motion_keeps_neutral_start_keys_without_scalar_bases() {
+        let native = concat!(
+            "00000002000000698128b52ffd20c7fd0200a284111ea035e9cf7fdd55f43fde054f5555d1db30ccb1",
+            "ee76c52d18214ea16c3605f7de7befcd7158f66466a6f378d851508950ee92c3b2c0eb82015e0f",
+            "516bcd6090c3bea40b2015090080104d89045eec2afa6baa1480185802060f4018",
+        );
+        let Some(PictureControl::LinearMotion(motion)) =
+            picture_control(native, &mut Blobs::default(), 5, 24, 48).unwrap()
+        else {
+            panic!("expected reopened Motion");
+        };
+        let effect = motion.readback();
+        for (name, neutral, last) in [
+            ("pan", 0.0, 0.05),
+            ("tilt", 0.0, 0.05),
+            ("zoom_x", 1.0, 1.125),
+            ("zoom_y", 1.0, 1.125),
+        ] {
+            let Some(Value::Arr(keys)) = effect.params.get(name) else {
+                panic!("missing {name} keys");
+            };
+            assert_eq!(keys[0], Value::Arr(vec![Value::Int(5), Value::Float(neutral)]));
+            let Value::Arr(end) = &keys[1] else {
+                panic!("missing {name} end key");
+            };
+            assert_eq!(end[0], Value::Int(28));
+            assert!(matches!(end[1], Value::Float(value) if (value - last).abs() < 1e-9));
+        }
+
+        let mut body = crate::binary::unpack(native).unwrap();
+        let first_pan_key = [8, 40, 82, 36, 255, 255, 255, 224, 5, 0, 0, 0, 0, 0, 12, 0];
+        let at = body.windows(first_pan_key.len()).position(|bytes| bytes == first_pan_key).unwrap();
+        body[at + first_pan_key.len()] = 1;
+        let changed = crate::binary::pack(&body).unwrap();
+        assert!(picture_control(&changed, &mut Blobs::default(), 5, 24, 48)
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn reopened_linear_crop_preserves_four_edges_and_requires_a_neutral_base() {

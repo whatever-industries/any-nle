@@ -870,7 +870,7 @@ pub(crate) fn prepare_project(
                 .map(|p| p.id.as_str())
                 .collect();
             if let Some(loss) = graph.losses.iter().find(|l| {
-                if review_caption_omissions.is_some() && crate::turnover::is_creative_loss(l) {
+                if review_caption_omissions.is_some() && crate::turnover::is_reviewable_loss(l) {
                     return false;
                 }
                 if linear_resizes.contains(l.object.as_str())

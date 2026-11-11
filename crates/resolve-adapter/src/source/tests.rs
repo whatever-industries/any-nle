@@ -135,6 +135,7 @@ fn transition_observations_keep_their_owners_after_graph_serialization() {
         name: "Sm2TiTransition".into(),
         id: Some(id.into()),
         text: String::new(),
+        content: 0..0,
         children: [
             ("Name", "Cross Dissolve"),
             ("Start", "86417"),
@@ -147,6 +148,7 @@ fn transition_observations_keep_their_owners_after_graph_serialization() {
             name: name.into(),
             id: None,
             text: value.into(),
+            content: 0..0,
             children: vec![],
         })
         .collect(),

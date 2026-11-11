@@ -1,4 +1,8 @@
 //! Same-rate Premiere straight cuts into the shared Resolve turnover path.
+mod components;
+mod metadata;
+pub(crate) use metadata::LOSS as CLIP_METADATA_LOSS;
+
 use crate::{
     linked::{self, MediaSpec, Profile, ProjectSpec, TimelineSpec},
     media::media_digest,
@@ -192,6 +196,8 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         texts: vec![],
     };
     let mut seen_items = HashMap::new();
+    let capture_components = components::is_current_project(project)?;
+    let mut component_budget = components::Budget::default();
     let mut spec = ProjectSpec {
         root_bin_id: Some("premiere:root".into()),
         timelines: vec![TimelineSpec {
@@ -317,6 +323,19 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                         object: placement_id.clone(),
                         data: Value::Arr(effects),
                     });
+                }
+                if capture_components {
+                    if let Some(saved) = components::capture(
+                        project,
+                        clip,
+                        kind,
+                        &placement_id,
+                        &mut component_budget,
+                    )
+                    .map_err(|error| format!("Premiere component parameters on {placement_id}: {error}"))?
+                    {
+                        graph.sidecars.push(saved);
+                    }
                 }
                 let start = project.start(clip)?.ticks;
                 let end = project.end(clip)?.ticks;
@@ -686,13 +705,10 @@ fn clip_media(
         tree.find1(media_source, "MediaSource/Media")
             .ok_or("missing Premiere media owner")?,
     )?;
-    if Some(media) != project.media_element(source)? || project.item_start_time(source)?.ticks != 0
-    {
-        return Err(
-            "Premiere edit and master media disagree or the item has a nonzero source origin"
-                .into(),
-        );
+    if Some(media) != project.media_element(source)? {
+        return Err("Premiere edit and master media disagree".into());
     }
+    metadata::check_source_origin(tree, media)?;
     let locator = project
         .item_media_path(source)
         .ok_or("Premiere media locator is missing")?;
@@ -700,6 +716,7 @@ fn clip_media(
     if !saved.is_absolute() {
         return Err("Premiere media requires an absolute saved path".into());
     }
+    metadata::check_locators(tree, media, &saved)?;
     Ok((media, saved))
 }
 
@@ -821,6 +838,22 @@ fn bind(
         .to_str()
         .ok_or("invalid saved media locator")?
         .to_owned();
+    let tape = metadata::capture(project, item, media, &item_id, &spec.sha256, graph)?;
+    let clock = matches!(verified.profile, Profile::Mov { quicktime_timecode: true, .. })
+        .then(|| SourceClock {
+            effective_count: 0,
+            rate,
+            display_base: 24,
+            drop: false,
+            provenance: SourceClockProvenance {
+                origin_count: 0,
+                source_offset: 0,
+                source_rate: rate,
+                source_package: item_id.clone(),
+                timecode_track: "QuickTime tmcd".into(),
+                route: "verified original MOV timecode".into(),
+            },
+        });
     let mut item_media = Vec::new();
     for n in 0..channels.unwrap_or(1) {
         let id = format!("{item_id}/media/{n}");
@@ -835,8 +868,8 @@ fn bind(
             sample_rate,
             bits,
             duration,
-            start: None,
-            clock: None,
+            start: clock.as_ref().and_then(SourceClock::exact_start),
+            clock: clock.clone(),
             stream: channel.map(|n| n + 1),
             online: Some(true),
             original: Some(OriginalStream {
@@ -874,7 +907,7 @@ fn bind(
         name,
         media: item_media,
         umid: None,
-        tape: None,
+        tape,
         rate: (kind == StreamKind::Video).then_some(rate),
         color_rgb16: None,
         stream_groups: if channels == Some(2) {

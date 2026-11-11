@@ -5,12 +5,13 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
     io::{Read, Seek, SeekFrom},
+    ops::Range,
     path::Path,
 };
 use zip::ZipArchive;
 
 const MAX_ARCHIVE: u64 = 32 << 20;
-const MAX_EXPANDED: u64 = 64 << 20;
+pub(super) const MAX_EXPANDED: u64 = 64 << 20;
 const MAX_MEMBERS: usize = 1024;
 const MAX_NODES: usize = 50_000;
 const MAX_DEPTH: usize = 96;
@@ -21,6 +22,7 @@ pub(super) struct Node {
     pub id: Option<String>,
     pub text: String,
     pub children: Vec<Node>,
+    pub content: Range<usize>,
 }
 
 impl Node {
@@ -86,7 +88,7 @@ pub(super) fn read(path: &Path) -> Result<BTreeMap<String, Node>> {
     read_zip(file)
 }
 
-fn read_zip(mut input: impl Read + Seek) -> Result<BTreeMap<String, Node>> {
+pub(super) fn checked_zip<R: Read + Seek>(mut input: R) -> Result<ZipArchive<R>> {
     let (member_count, central_start) = directory(&mut input)?;
     let mut archive = ZipArchive::new(input)?;
     // The ZIP library indexes by name. Compare with the on-disk count so an
@@ -97,6 +99,11 @@ fn read_zip(mut input: impl Read + Seek) -> Result<BTreeMap<String, Node>> {
     {
         return Err("duplicate or ambiguous Resolve archive directory".into());
     }
+    Ok(archive)
+}
+
+fn read_zip(input: impl Read + Seek) -> Result<BTreeMap<String, Node>> {
+    let mut archive = checked_zip(input)?;
     let mut seen = HashSet::new();
     let mut members = BTreeMap::new();
     let mut remaining = MAX_EXPANDED;
@@ -104,18 +111,7 @@ fn read_zip(mut input: impl Read + Seek) -> Result<BTreeMap<String, Node>> {
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let name = entry.name().to_owned();
-        if !entry.is_file()
-            || entry.enclosed_name().is_none()
-            || name.len() > 1024
-            || name.contains(['\\', ':', '\0'])
-            || name.split('/').any(|part| matches!(part, "" | "." | ".."))
-            || !seen.insert(name.to_ascii_lowercase())
-        {
-            return Err("unsafe or duplicate Resolve archive member".into());
-        }
-        if entry.size() > remaining {
-            return Err("Resolve archive exceeds expanded size limit".into());
-        }
+        check_member(&entry, &mut seen, remaining)?;
         // Gallery assets are outside the source profile. Count their declared size too.
         if name != "project.xml"
             && !(name.starts_with("MediaPool/") && name.ends_with("/MpFolder.xml"))
@@ -124,22 +120,56 @@ fn read_zip(mut input: impl Read + Seek) -> Result<BTreeMap<String, Node>> {
             remaining -= entry.size();
             continue;
         }
-        let mut xml = String::new();
-        let expected = entry.size();
-        (&mut entry).take(expected + 1).read_to_string(&mut xml)?;
-        if xml.len() as u64 != expected {
-            return Err("Resolve member size differs from ZIP directory".into());
-        }
-        remaining -= expected;
-        let mut lines = xml.lines();
-        if lines.next().is_none_or(|line| !line.starts_with("<?xml "))
-            || lines.next() != Some("<!--DbAppVer=\"21.2.0.0006\" DbPrjVer=\"17\"-->")
-        {
-            return Err("expected Resolve Studio 21.2.0.0006 project XML".into());
-        }
+        let xml = read_member(&mut entry, &mut remaining)?;
+        check_version(&xml)?;
         members.insert(name, parse(&xml, &mut nodes)?);
     }
     Ok(members)
+}
+
+pub(super) fn check_member<R: Read>(
+    entry: &zip::read::ZipFile<'_, R>,
+    seen: &mut HashSet<String>,
+    remaining: u64,
+) -> Result<()> {
+    let name = entry.name();
+    if !entry.is_file()
+        || entry.enclosed_name().is_none()
+        || name.len() > 1024
+        || name.contains(['\\', ':', '\0'])
+        || name.split('/').any(|part| matches!(part, "" | "." | ".."))
+        || !seen.insert(name.to_ascii_lowercase())
+    {
+        return Err("unsafe or duplicate Resolve archive member".into());
+    }
+    if entry.size() > remaining {
+        return Err("Resolve archive exceeds expanded size limit".into());
+    }
+    Ok(())
+}
+
+pub(super) fn read_member<R: Read>(
+    entry: &mut zip::read::ZipFile<'_, R>,
+    remaining: &mut u64,
+) -> Result<String> {
+    let mut xml = String::new();
+    let expected = entry.size();
+    entry.take(expected + 1).read_to_string(&mut xml)?;
+    if xml.len() as u64 != expected {
+        return Err("Resolve member size differs from ZIP directory".into());
+    }
+    *remaining -= expected;
+    Ok(xml)
+}
+
+pub(super) fn check_version(xml: &str) -> Result<()> {
+    let mut lines = xml.lines();
+    if lines.next().is_none_or(|line| !line.starts_with("<?xml "))
+        || lines.next() != Some("<!--DbAppVer=\"21.2.0.0006\" DbPrjVer=\"17\"-->")
+    {
+        return Err("expected Resolve Studio 21.2.0.0006 project XML".into());
+    }
+    Ok(())
 }
 
 fn directory(input: &mut (impl Read + Seek)) -> Result<(usize, u64)> {
@@ -170,13 +200,14 @@ fn directory(input: &mut (impl Read + Seek)) -> Result<(usize, u64)> {
     Ok((count, start))
 }
 
-fn parse(text: &str, total_nodes: &mut usize) -> Result<Node> {
+pub(super) fn parse(text: &str, total_nodes: &mut usize) -> Result<Node> {
     let mut reader = Reader::from_str(text);
     reader.config_mut().expand_empty_elements = true;
     reader.config_mut().check_comments = true;
     let mut stack: Vec<Node> = Vec::new();
     let mut root = None;
     loop {
+        let position = usize::try_from(reader.buffer_position())?;
         match reader.read_event()? {
             Event::Start(tag) => {
                 *total_nodes += 1;
@@ -195,15 +226,18 @@ fn parse(text: &str, total_nodes: &mut usize) -> Result<Node> {
                         id = Some(value.to_ascii_lowercase());
                     }
                 }
+                let content_start = usize::try_from(reader.buffer_position())?;
                 stack.push(Node {
                     name: std::str::from_utf8(tag.name().as_ref())?.into(),
                     id,
                     text: String::new(),
                     children: Vec::new(),
+                    content: content_start..content_start,
                 });
             }
             Event::End(_) => {
-                let node = stack.pop().ok_or("unexpected XML end tag")?;
+                let mut node = stack.pop().ok_or("unexpected XML end tag")?;
+                node.content.end = position;
                 if let Some(parent) = stack.last_mut() {
                     parent.children.push(node);
                 } else if root.replace(node).is_some() {

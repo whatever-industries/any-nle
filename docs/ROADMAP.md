@@ -8,6 +8,21 @@ Reviewed on 2026-11-08. The converter includes the bounded editable Group
 implementation and its native checks. Research references are pinned in
 `research-dependencies.json`.
 
+## Editor-version compatibility
+
+Target current editor versions for new readers, writers, and native qualification.
+Premiere 27 is the current Premiere target. Older files and format notes can
+serve as research controls. Add compatibility for a legacy feature only as a
+rare, feature-specific exception when it was widely used and a current editor
+can still read, render, edit, or carry it forward. Record the current-version
+behavior, the practical value, and the tested limits before expanding scope.
+
+Titler+ Legacy and Lumetri are candidates for such exceptions where current
+editor behavior supports them. AMA links may also qualify when a current Avid
+build still resolves or carries the saved locator. Each exception covers its
+tested feature and format. Broader old project-version support needs its own
+product decision.
+
 ## Declared multichannel media (User, 2026-11-07)
 
 The 7.1 review retains eight-channel Adaptive plus explicit routing; it is not a
@@ -726,12 +741,11 @@ only for comparing results; route (3) (scripting API) is for test read-back.
       route. See the [direct-link profile](RESOLVE-PROJECT-CORE.md#direct-avid-op-atom).
 - [ ] **Extend direct Avid OP-Atom beyond the core profile.** Qualify more
       media and timeline layouts before product exposure.
-- [ ] **Qualify older Resolve archives as source inputs.** A private version 15
-      production archive supplies a hierarchy, identity and locator comparison.
-      Capture a bounded version 15 structural and render cohort before admitting
-      that format. Version 17 remains the current writer target.
-- [ ] **Widen Resolve source and destination evidence.** Qualify other media
-      and versions, mixed-rate clocks, custom fade curves, portable envelope
+- **Older Resolve archive reference.** A private version 15 archive provides a
+  hierarchy, identity and locator comparison. Current source and writer work
+  targets the version 17 profile. See [editor-version compatibility](#editor-version-compatibility).
+- [ ] **Widen Resolve source and destination evidence.** Qualify other media,
+      mixed-rate clocks, custom fade curves, portable envelope
       rendering, other transforms, and independent Group audio before extending support.
 - [ ] **Qualify product exposure separately.** Resolve remains unavailable in
       the CLI and wizard. Expand media, project structure and version coverage
@@ -742,6 +756,28 @@ turnovers. The preferred media menu default is **Link to originals**. Preserve
 saved camera-original locators, source timecode and reel or file identity when
 qualified, and diagnose unresolved relinks. Offer rewrap as a separate choice
 for a verified workflow that needs it, with the **Creates new media.** notice.
+
+- [x] Start the [Premiere and Resolve metadata inventory and crosswalk](PREMIERE-RESOLVE-METADATA.md).
+      Capture Premiere logging and physical identity receipts and the Resolve
+      Media Pool reel-cache observation in graph/2.
+- [x] Add [verified MOV relink for existing Premiere 27 and Resolve projects](VERIFIED-RELINK.md).
+      Explicit saved paths and source filenames drive the move. Duplicate names
+      use embedded reel and source timecode, with optional pre-move checksums.
+- [ ] Qualify metadata and conform in both directions. Prioritize nonzero source
+      timecode, explicit reel ownership, moved originals, duplicate basenames,
+      and physical audio selectors before destination logging. Widen the column
+      census from native exports and verify each destination field after reopen.
+- [x] Preserve saved Premiere 27 Motion position, scale and mono clip volume
+      in the turnover graph (CONV-0068). Keep native ticks, interpolation
+      codes and auxiliary fields on the owning edit. Verified with a
+      synthetic version 46 turnover and retained saved-record evidence.
+      [Graph capture](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-clip-components)
+- [x] Qualify the static and two-key Linear Motion controls and a static
+      −6 dB mono clip-volume control using a Premiere 27 save and a
+      reopened Resolve prototype. [Native trial](RESOLVE-TURNOVER-IMPLEMENTATION.md#native-premiere-27-and-resolve-mapping-trial)
+- [ ] Apply the qualified Motion and static clip-volume mappings during
+      Premiere-to-Resolve turnover. Preserve animated volume as a source
+      receipt and report the omitted ramp until its rendered behavior agrees.
 
 ### Pinned offline turnover references
 
@@ -762,14 +798,22 @@ for a verified workflow that needs it, with the **Creates new media.** notice.
   Use its [field inventory](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/FORMAT.md)
   for Fairlight mixer and edit read-back, including routing, EQ, dynamics,
   fades and keyframes. Its template composer is audio-focused.
-- [PRPROJ-READER](https://github.com/sergeiventurinov/PRPROJ-READER/tree/a51a2a5b1095b8bdead114c812e85132a5eb26e0)
-  (Python, CC0-1.0, Premiere research source SRC-011).
-  Use its object-reference map and Premiere 14.3.2 fixture to compare saved
-  sequence, bin, clip, and keyframe structures. The fixture is a legacy
-  parser control. Current media binding and audio routing require modern
-  Premiere saves with verified originals.
 
 Review licence and provenance before code adoption.
+
+### Closed reference review
+
+- [x] **PRPROJ-READER** (SRC-011, CC0-1.0, `a51a2a5`). The converter's
+      Premiere reader already follows saved object references for bins, clips,
+      media and sequences. Its component reader exposes static values and
+      keyframes in ticks. The internal sequence lister and XML inspector were
+      checked on a Premiere 27 project containing two picture edits, two
+      audio edits, and same-named originals with different paths, reels and
+      source starts. The upstream script's rounded timing, name-based
+      parameter lookup and component instance labels are historical leads.
+      Its Premiere 14.3.2 fixture stays a reference under the
+      [editor-version compatibility policy](#editor-version-compatibility).
+      [Pinned source](https://github.com/sergeiventurinov/PRPROJ-READER/tree/a51a2a5b1095b8bdead114c812e85132a5eb26e0)
 
 For broader integration, use the Resolve knowledgebase comparison matrix
 and integration sequence. Start by widening archive, media and clock

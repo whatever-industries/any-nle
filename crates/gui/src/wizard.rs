@@ -208,6 +208,8 @@ pub struct App {
     ffprobe: Option<PathBuf>,
     close_after_cancel: bool,
     close_confirmation: bool,
+    #[cfg(target_os = "macos")]
+    relink: crate::relink::Relink,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, replay: Option<PathBuf>) -> Self {
@@ -248,6 +250,8 @@ impl App {
             ffprobe: None,
             close_after_cancel: false,
             close_confirmation: false,
+            #[cfg(target_os = "macos")]
+            relink: Default::default(),
         };
         if let Some(path) = replay {
             app.load_job(&path);
@@ -752,6 +756,10 @@ impl App {
             "Choose the Avid source and where to save the Premiere project.",
         );
         Self::card(ui, direction::show);
+        #[cfg(target_os = "macos")]
+        if ui.button("Relink media in an existing project…").clicked() {
+            self.relink.open = true;
+        }
         ui.add_space(8.);
         Self::card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1804,6 +1812,8 @@ impl eframe::App for App {
                 }
             });
         self.help_window(&ctx);
+        #[cfg(target_os = "macos")]
+        self.relink.show(&ctx, self.ffmpeg.as_deref(), self.ffprobe.as_deref());
     }
 }
 fn counted(n: usize, singular: &str, plural: &str) -> String {

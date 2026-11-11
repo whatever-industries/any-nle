@@ -9,6 +9,7 @@ pub mod linked;
 mod media;
 mod prepare;
 mod premiere;
+pub mod relink;
 pub mod source;
 pub mod turnover;
 mod video;

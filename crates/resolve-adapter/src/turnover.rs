@@ -125,11 +125,11 @@ impl Turnover {
         &self.graph
     }
 
-    pub fn creative_losses(&self) -> impl Iterator<Item = &graph::Loss> {
+    pub fn reviewable_losses(&self) -> impl Iterator<Item = &graph::Loss> {
         self.graph
             .losses
             .iter()
-            .filter(|loss| is_creative_loss(loss))
+            .filter(|loss| is_reviewable_loss(loss))
             .chain(&self.caption_omissions)
     }
 
@@ -146,7 +146,7 @@ impl Turnover {
     ) -> Result<crate::Published> {
         check_output(output)?;
         if !accept_losses
-            && (!self.omitted_markers().is_empty() || self.creative_losses().next().is_some())
+            && (!self.omitted_markers().is_empty() || self.reviewable_losses().next().is_some())
         {
             return Err(
                 "review all omitted occurrences and explicitly accept losses before publication"
@@ -174,10 +174,10 @@ impl Turnover {
 
 pub(crate) const PREMIERE_CAPTION_LOSS: &str = "premiere.caption";
 
-pub(crate) fn is_creative_loss(loss: &graph::Loss) -> bool {
+pub(crate) fn is_reviewable_loss(loss: &graph::Loss) -> bool {
     matches!(
         loss.aspect.as_str(),
-        "premiere.appearance" | "premiere.marker"
+        "premiere.appearance" | "premiere.marker" | crate::premiere::CLIP_METADATA_LOSS
     )
 }
 

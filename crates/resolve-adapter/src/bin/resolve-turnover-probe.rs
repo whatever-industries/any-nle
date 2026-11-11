@@ -99,7 +99,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for marker in result.omitted_markers() {
         eprintln!("omitted marker occurrence {marker}");
     }
-    for loss in result.creative_losses() {
+    for loss in result.reviewable_losses() {
         eprintln!("{} ({}): {}", loss.object, loss.aspect, loss.reason);
     }
     if graph {

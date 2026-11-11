@@ -3,6 +3,8 @@
 use anynle_gui::model;
 mod direction;
 mod palette;
+#[cfg(target_os = "macos")]
+mod relink;
 mod storage;
 mod wizard;
 

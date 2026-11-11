@@ -3,9 +3,11 @@ mod atom;
 mod effects;
 mod encoding;
 mod markers;
+mod metadata;
 pub(crate) mod mixer;
 mod multicam;
 mod observations;
+pub(crate) mod relink;
 mod wav;
 mod xml;
 
@@ -506,6 +508,7 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
             ("video_cache_count", Value::Int(start)),
         ],
     );
+    metadata::capture(clip, video, blobs, graph)?;
     graph.items.push(item);
     Ok(Master {
         rate,

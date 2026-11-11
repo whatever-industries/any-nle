@@ -75,20 +75,24 @@ fn ffprobe(tool: &Path, path: &Path) -> Result<Value> {
 }
 
 pub(crate) fn probe_file(tool: &Path, path: &Path, format: &str) -> Result<Value> {
-    let mut child = Command::new(tool)
-        .args([
-            "-v",
-            "error",
-            "-protocol_whitelist",
-            "file,pipe",
+    probe_json(
+        tool,
+        path,
+        &[
             "-f",
             format,
             "-count_packets",
             "-show_streams",
             "-show_format",
-            "-of",
-            "json",
-        ])
+        ],
+    )
+}
+
+pub(crate) fn probe_json(tool: &Path, path: &Path, args: &[&str]) -> Result<Value> {
+    let mut child = Command::new(tool)
+        .args(["-v", "error", "-protocol_whitelist", "file,pipe"])
+        .args(args)
+        .args(["-of", "json"])
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

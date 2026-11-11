@@ -48,6 +48,9 @@ What is planned: [docs/ROADMAP.md](docs/ROADMAP.md). Design: [docs/ARCHITECTURE.
 
 The native Rust wizard (`any-nle-gui`) and `any-nle run --job SETTINGS.json` use one
 inventory/pre-flight/execution engine. Save job settings from Review for CLI replay.
+
+The macOS Project page also offers [verified MOV relinking](docs/VERIFIED-RELINK.md)
+for existing Premiere 27 and Resolve Studio 21.2 projects.
 Changing inputs or choices requires a fresh pre-flight. Conversion never overwrites an
 existing project, receipt or media folder. Packaged builds include verified LGPL-only
 FFmpeg/ffprobe; unbundled CLI use requires external tools.
@@ -134,6 +137,10 @@ The model format is in [`prproj/src/convert/model.rs`](prproj/src/convert/model.
 or reported with a named reason, and output is never overwritten.
 
 ## Contributing
+
+Target current editor versions. The
+[compatibility policy](docs/ROADMAP.md#editor-version-compatibility) describes
+when a widely used legacy feature warrants a narrowly scoped exception.
 
 Only clean-room contributions are accepted. Base format changes on public
 documentation or reproducible observations made with files and tools you are
