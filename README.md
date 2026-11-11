@@ -1,8 +1,12 @@
 # Any NLE
 
-Any NLE converts selected Avid Media Composer bins into native Adobe Premiere
-Pro projects (`.prproj`). The desktop wizard and CLI read Avid bins and link
-or prepare their media without requiring Premiere to be installed.
+Any NLE aims to translate editing projects between Avid Media Composer,
+Adobe Premiere Pro, DaVinci Resolve, Avid Pro Tools, and Adobe After Effects.
+The project also includes an experimental FCPXML export for Final Cut Pro.
+
+The current desktop wizard and CLI convert selected Avid bins to native
+Premiere Pro projects (`.prproj`). They link or prepare the source media
+without requiring Premiere to be installed.
 
 ## Download
 
