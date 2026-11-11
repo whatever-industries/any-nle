@@ -5,6 +5,7 @@ mod encoding;
 mod markers;
 pub(crate) mod mixer;
 mod multicam;
+mod observations;
 mod wav;
 mod xml;
 
@@ -122,7 +123,7 @@ pub fn read(path: &Path) -> Result<SourceGraph> {
                         clip_id,
                         "timeline pool back-reference",
                     )?;
-                    timelines.insert(handle_id, (handle, bin_id));
+                    timelines.insert(handle_id, (handle, clip, bin_id));
                 }
                 "Sm2MpMulticamClip" => {
                     groups.insert(clip_id, clip);
@@ -158,10 +159,10 @@ pub fn read(path: &Path) -> Result<SourceGraph> {
     }
     for entry in registered {
         let handle_id = entry.scalar()?.trim();
-        let (handle, bin_id) = timelines
+        let (handle, clip, bin_id) = timelines
             .remove(handle_id)
             .ok_or("missing or duplicate registered Resolve timeline")?;
-        let sequence = sequence(&mut context, handle, bin_id)?;
+        let sequence = sequence(&mut context, handle, clip, bin_id)?;
         context.graph.sequences.push(sequence);
     }
     if !timelines.is_empty() {
@@ -379,7 +380,8 @@ struct Master {
     path: String,
     size: (i64, i64),
     wav_samples: Option<i64>,
-    wav_stereo_pool_route: bool,
+    stereo_pool_route: bool,
+    split_atom_audio: bool,
 }
 
 fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Master> {
@@ -414,7 +416,8 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
     };
     let clock = clock(id, "BtVideoTime.Timecode", start, rate)?;
     let file_start = clock.exact_start();
-    let clock = (saved_timecode.is_some() || codec != "apch").then_some(clock);
+    let clock =
+        (saved_timecode.is_some() || !matches!(codec.as_str(), "apch" | "avc1")).then_some(clock);
     add_media(
         graph,
         &mut item,
@@ -436,17 +439,38 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
         },
     );
     let mut audio = BTreeMap::new();
+    let mut split_atom_audio = false;
+    let mut stereo_pool_route = false;
     if let Some(embedded) = clip.optional("EmbeddedAudioVec")? {
         let mut entries = embedded.elements()?;
         match (entries.next(), entries.next()) {
             (Some(entry), None) => {
                 let node = entry.entry()?;
                 expect(node, "BtAudioInfo")?;
-                let (audio_path, codec) = cache(node, blobs)?;
+                let (audio_path, audio_codec) = cache(node, blobs)?;
                 same(&audio_path, &path, "audio cache locator")?;
-                audio = audio_media(
-                    clip, node, &codec, &path, start, rate, blobs, graph, &mut item,
-                )?;
+                if codec == "avc1"
+                    && audio_codec == "AAC"
+                    && size == (1920, 1080)
+                    && rate == Rational::integer(24)
+                    && start == 0
+                {
+                    read_avc_stereo(clip, node, &path, length, blobs, graph, &mut item)?;
+                    audio = BTreeMap::from([(0, 0), (1, 1)]);
+                    stereo_pool_route = true;
+                } else {
+                    audio = audio_media(
+                        clip,
+                        node,
+                        &audio_codec,
+                        &path,
+                        start,
+                        rate,
+                        blobs,
+                        graph,
+                        &mut item,
+                    )?;
+                }
             }
             (Some(first), Some(second)) if entries.next().is_none() => {
                 if codec != "dnxhd_lb"
@@ -467,6 +491,7 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
                     graph,
                     &mut item,
                 )?;
+                split_atom_audio = true;
             }
             (None, None) => {}
             _ => return Err("unsupported Resolve audio cache count".into()),
@@ -490,7 +515,8 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
         path,
         size,
         wav_samples: None,
-        wav_stereo_pool_route: false,
+        stereo_pool_route,
+        split_atom_audio,
     })
 }
 
@@ -539,6 +565,76 @@ fn audio_routes(clip: &Node, blobs: &mut Blobs) -> Result<encoding::Map> {
     let nested = pb_bytes(&fields, 1)?.ok_or("missing Resolve pool metadata")?;
     let nested = pb_bytes(nested, 1)?.ok_or("missing Resolve pool routing")?;
     qt(pb_bytes(nested, 5)?.ok_or("missing Resolve virtual audio routes")?)
+}
+
+fn read_avc_stereo(
+    clip: &Node,
+    node: &Node,
+    path: &str,
+    length: i64,
+    blobs: &mut Blobs,
+    graph: &mut SourceGraph,
+    item: &mut SourceItem,
+) -> Result<()> {
+    let tracks = blobs.qt(node.get("TracksBA")?)?;
+    let routes = audio_routes(clip, blobs)?;
+    if !tracks.keys().eq(["0"]) || !routes.keys().eq(["0"]) {
+        return Err("expected one embedded AVC audio track and stereo route".into());
+    }
+    let track = qt(tracks.bytes("0")?)?;
+    let route = qt(routes.bytes("0")?)?;
+    let duration = seconds(length, Rational::integer(24))?;
+    if track.int("NumChannels")? != 2
+        || track.int("IdxTrack")? != 0
+        || track.int("SampleRate")? != 48000
+        || track.int("ChannelLayout")? != 2
+        || track.int("BitDepth")? != 3
+        || track.text("CodecName")? != Some("AAC")
+        || track.real("StartTime")? != 0.0
+        || Some(track.int("Duration")?) != length.checked_mul(2000)
+        || route.int("Type")? != 0
+        || route.text("CodecName")? != Some("AAC")
+        || extent(route.bytes("MediaExtents")?, Rational::integer(24))? != (0, length)
+    {
+        return Err("unqualified embedded AVC stereo sample clock or format".into());
+    }
+    let channels = qt(route.bytes("ChannelVecBA")?)?;
+    if !channels.keys().eq(["0", "1"]) {
+        return Err("incomplete AVC stereo channel routing".into());
+    }
+    for (channel, key) in ["0", "1"].into_iter().enumerate() {
+        let row = qt(channels.bytes(key)?)?;
+        let saved = if row.keys().any(|k| k == "ChannelIdx") {
+            row.int("ChannelIdx")?
+        } else {
+            0
+        };
+        if row.text("MediaRef")? != Some(node.id()?) || saved != channel as i64 {
+            return Err("AVC stereo selector contradicts its cache".into());
+        }
+        let label = channel as i64 + 1;
+        add_media(
+            graph,
+            item,
+            SourceMedia {
+                id: format!("{}/audio/{label}", clip.id()?),
+                kind: StreamKind::Audio,
+                locations: vec![path.into()],
+                codec: Some("aac".into()),
+                frame_size: None,
+                rate: None,
+                sample_rate: Some(48000),
+                bits: None,
+                duration,
+                start: Some(Rational::ZERO),
+                clock: None,
+                stream: Some(label),
+                online: None,
+                original: None,
+            },
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -746,6 +842,7 @@ struct Edit {
 fn sequence<'a>(
     context: &mut Context<'a>,
     handle: &'a Node,
+    pool_clip: &Node,
     bin_id: &str,
 ) -> Result<SourceSequence> {
     let node = handle.one("Sequence")?.entry()?;
@@ -780,6 +877,24 @@ fn sequence<'a>(
         ("record_origin", Value::Int(grid.origin)),
         ("record_length", Value::Int(grid.length)),
     ];
+    let mut marks = Vec::new();
+    for (tag, key) in [
+        ("MarkInVideo", "video_in"),
+        ("MarkOutVideo", "video_out"),
+        ("MarkInAudio", "audio_in"),
+        ("MarkOutAudio", "audio_out"),
+    ] {
+        if let Some(value) = pool_clip.maybe(tag)? {
+            marks.push((key.into(), text(value)));
+        }
+    }
+    if marks.iter().any(|(_, value)| value != &text("")) {
+        fields.push(("saved_timeline_marks", Value::Obj(marks)));
+        loss(
+            &mut context.graph, id, "timeline_marks",
+            "Resolve timeline marks retained in graph; destination mapping is unqualified",
+        );
+    }
     if let Some(ticks) = mixer.main_bus {
         fields.push((mixer::MAIN_BUS_LEVEL, Value::Float(f64::from(ticks) / 10.0)));
         loss(
@@ -838,6 +953,21 @@ fn read_mixer_controls(
         return Ok(MixerControls::default());
     };
     context.blobs.charge(mixer.decoded_bytes())?;
+    if let Some((data, requires_mapping)) = mixer.source_facts() {
+        context.graph.sidecars.push(Sidecar {
+            adapter: "resolve.fairlight".into(),
+            object: out.id.clone(),
+            data,
+        });
+        if requires_mapping {
+            loss(
+                &mut context.graph,
+                &out.id,
+                "fairlight_controls",
+                "Resolve Fairlight state retained in graph; destination mapping is unqualified",
+            );
+        }
+    }
     let faders = mixer.track_faders().unwrap_or_default();
     let main_bus = mixer.main_bus_fader().unwrap_or_default();
     let has_mute_state = flags_muted || mixer.has_mute_state();
@@ -948,6 +1078,12 @@ fn read_tracks<'a>(
             let node = entry.entry()?;
             let id = node.id()?;
             claim(&mut context.ids, id)?;
+            if node.name == "Sm2TiTransition" {
+                observations::transition(
+                    &mut context.graph, node, &out.id, track_id, kind, index, grid,
+                )?;
+                continue;
+            }
             if !supported || !ordinary_item(node, kind, &out.id, &mut context.graph)? {
                 continue;
             }
@@ -973,6 +1109,7 @@ fn read_tracks<'a>(
                         &out.id,
                         master.rate,
                         grid.rate,
+                        &mut context.blobs,
                     )?;
                     continue;
                 }
@@ -1067,11 +1204,11 @@ fn direct(
     graph: &mut SourceGraph,
     blobs: &mut Blobs,
 ) -> Result<Option<Placement>> {
-    if !leaf_matches(master, node, grid, edit, owner, graph)? {
+    if !leaf_matches(master, node, grid, edit, owner, graph, blobs)? {
         return Ok(None);
     }
     let audio = if kind == StreamKind::Audio {
-        let selector = if master.wav_stereo_pool_route {
+        let selector = if master.stereo_pool_route {
             wav::stereo_channel(node, blobs)?
         } else {
             mono(node, blobs, false)?
@@ -1086,7 +1223,7 @@ fn direct(
             );
             return Ok(None);
         };
-        let physical = if master.wav_stereo_pool_route {
+        let physical = if master.stereo_pool_route {
             Some(selector)
         } else {
             master.audio.get(&selector).copied()
@@ -1124,8 +1261,28 @@ fn direct(
     {
         let interpreted = match kind {
             StreamKind::Video if grid.size == (1920, 1080) && master.size == grid.size => {
-                placement.transform = effects::static_pan(filters, blobs)?;
-                placement.transform.is_some()
+                match effects::picture_control(
+                    filters, blobs, edit.source_in, edit.length, master.length,
+                )? {
+                    Some(crate::video::PictureControl::Transform(transform)) => {
+                        placement.transform = Some(transform);
+                        true
+                    }
+                    Some(crate::video::PictureControl::Reflection(reflection)) => {
+                        placement.effects.push(reflection.readback());
+                        true
+                    }
+                    Some(crate::video::PictureControl::ReflectedTransform(transform, reflection)) => {
+                        placement.transform = Some(transform);
+                        placement.effects.push(reflection.readback());
+                        true
+                    }
+                    Some(crate::video::PictureControl::LinearMotion(motion)) => {
+                        placement.effects.push(motion.readback());
+                        true
+                    }
+                    None => false,
+                }
             }
             StreamKind::Audio => match effects::clip_audio(filters, blobs, edit)? {
                 Some(effects::ClipAudio::StaticVolume(db)) => {
@@ -1170,6 +1327,15 @@ fn direct(
             _ => false,
         };
         if !interpreted {
+            if kind == StreamKind::Audio {
+                if let Some(data) = effects::custom_fades(filters, blobs, edit)? {
+                    graph.sidecars.push(Sidecar {
+                        adapter: "resolve.clip_fades".into(),
+                        object: placement.id.clone(),
+                        data,
+                    });
+                }
+            }
             omitted(
                 graph,
                 owner,
@@ -1188,38 +1354,23 @@ fn record_unqualified_timing(
     owner: &str,
     source_rate: Rational,
     record_rate: Rational,
+    blobs: &mut Blobs,
 ) -> Result<()> {
     let id = node.id()?;
-    let timing = Value::Obj(
-        [
-            ("occurrence", text(id)),
-            ("source_rate", text(&source_rate.to_string())),
-            ("record_rate", text(&record_rate.to_string())),
-            ("saved_start", text(node.get("Start")?)),
-            ("saved_duration", text(node.get("Duration")?)),
-            ("saved_in", text(node.get("In")?)),
-            ("saved_time_map", text(node.get("MediaTimemapBA")?)),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.into(), value))
-        .collect(),
-    );
-    if let Some(row) = graph
-        .sidecars
-        .iter_mut()
-        .find(|row| row.adapter == "resolve.timing" && row.object == owner)
-    {
-        let Value::Arr(rows) = &mut row.data else {
-            return Err("invalid accumulated timing receipt".into());
-        };
-        rows.push(timing);
-    } else {
-        graph.sidecars.push(Sidecar {
-            adapter: "resolve.timing".into(),
-            object: owner.into(),
-            data: Value::Arr(vec![timing]),
-        });
+    let mut timing = vec![
+        ("occurrence".into(), text(id)),
+        ("source_rate".into(), text(&source_rate.to_string())),
+        ("record_rate".into(), text(&record_rate.to_string())),
+        ("saved_start".into(), text(node.get("Start")?)),
+        ("saved_duration".into(), text(node.get("Duration")?)),
+        ("saved_in".into(), text(node.get("In")?)),
+    ];
+    let map = node.get("MediaTimemapBA")?;
+    if map.len() <= 8192 {
+        timing.push(("saved_time_map".into(), text(map)));
     }
+    timing.push(("map".into(), observations::time_map(map, blobs)?));
+    observations::append(graph, "resolve.timing", owner, Value::Obj(timing));
     omitted(
         graph,
         owner,
@@ -1237,6 +1388,7 @@ fn leaf_matches(
     edit: Edit,
     owner: &str,
     graph: &mut SourceGraph,
+    blobs: &mut Blobs,
 ) -> Result<bool> {
     let map_matches = match master.wav_samples {
         Some(samples) => wav::identity_timemap(node, samples, master.rate)?,
@@ -1246,7 +1398,7 @@ fn leaf_matches(
         || rate(&hex_bytes(node.get("MediaFrameRate")?)?)? != master.rate
         || !map_matches
     {
-        record_unqualified_timing(graph, node, owner, master.rate, grid.rate)?;
+        record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
         return Ok(false);
     }
     if edit.source_in + edit.length > master.length

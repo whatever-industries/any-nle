@@ -2,8 +2,10 @@
 use super::encoding::qt;
 use crate::Result;
 use flate2::{bufread::ZlibDecoder, write::ZlibEncoder, Compression};
+use graph::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     ops::Range,
 };
@@ -151,6 +153,74 @@ impl Mixer {
         Some([bytes[0] == 1, bytes[4] == 1])
     }
 
+    /// The documented channel table starts at the witnessed fader row.
+    /// Strip IDs bind columns to timeline tracks independently of display names.
+    pub(super) fn source_facts(&self) -> Option<(Value, bool)> {
+        let (track, names) = rows::<2>(&self.model[TRACK_FADERS.start - 12..], true);
+        if track.get(&0x458) != Some(&[0, 1]) || !names || !track.contains_key(&0xdf) {
+            return None;
+        }
+        let (bus, _) = rows::<1>(&self.model[MAIN_BUS_FADER.start - 12..], false);
+        let mut requires_mapping = false;
+        let tracks = (0..2)
+            .map(|col| {
+                let mut fields = vec![("track".into(), Value::Int(col as i64 + 1))];
+                for (id, name, neutral) in [
+                    (0x004, "pan_tenths_percent", 0),
+                    (0x00d, "pan_bypass_code", 0),
+                    (0x011, "solo_code", 0),
+                    (0x019, "pre_dynamics_gain_tenths_db", 0),
+                    (0x01d, "effects_in_code", 0),
+                    (0x400, "output_connected_code", 1),
+                    (0x40b, "output_bus_index", 0),
+                ] {
+                    if let Some(value) = track.get(&id).map(|v| v[col]) {
+                        fields.push((name.into(), Value::Int(i64::from(value))));
+                        requires_mapping |= value != neutral;
+                    }
+                }
+                let raw_processing = track.iter().filter(|(id, _)| {
+                matches!(**id, 0xde..=0x121 | 0x253 | 0x289..=0x28c | 0x334..=0x339 | 0x4be | 0x4c3)
+            }).map(|(id, row)| (format!("0x{id:03x}"), Value::Int(i64::from(row[col])))).collect();
+                fields.push(("eq_dynamics_fields".into(), Value::Obj(raw_processing)));
+                requires_mapping |= [0x10c, 0x114, 0x11d]
+                    .into_iter()
+                    .any(|id| track.get(&id).is_some_and(|row| row[col] != 0));
+                Value::Obj(fields)
+            })
+            .collect();
+        let mut fields = vec![
+            (
+                "provenance".into(),
+                Value::Str("drpkit:af3cedc0 documented record layout".into()),
+            ),
+            ("tracks".into(), Value::Arr(tracks)),
+        ];
+        // The main bus prefix is separate from the track and named bus tables.
+        if self.main_bus_fader().is_some() {
+            let mut main = vec![("index".into(), Value::Int(0))];
+            for (id, name) in [
+                (0x001, "fader_tenths_db"),
+                (0x002, "mute_code"),
+                (0x004, "raw_pan"),
+                (0x019, "pre_dynamics_gain_tenths_db"),
+            ] {
+                if let Some(&[value]) = bus.get(&id) {
+                    main.push((name.into(), Value::Int(i64::from(value))));
+                    requires_mapping |= id != 0x001 && value != 0;
+                }
+            }
+            fields.push(("main_bus".into(), Value::Obj(main)));
+        }
+        // Compare only recognized active controls above. The digest remains a
+        // reference for interpreting additional unmodelled state later.
+        fields.push((
+            "mixer_sha256".into(),
+            Value::Str(hex::encode(Sha256::digest(&self.model))),
+        ));
+        Some((Value::Obj(fields), requires_mapping))
+    }
+
     fn neutral_digest(&self) -> String {
         let mut hash = Sha256::new();
         let mut end = 0;
@@ -216,4 +286,57 @@ pub(crate) fn fader_ticks(db: f64) -> Option<i32> {
 
 pub(crate) fn valid_ticks(ticks: i32) -> bool {
     (-60..=0).contains(&ticks)
+}
+
+/// Channel records are contiguous, but unrelated records within the track
+/// run can have different widths. Only rows matching the owned columns are
+/// collected. The separate bus prefix has fixed width.
+fn rows<const N: usize>(mut bytes: &[u8], mixed_width: bool) -> (BTreeMap<u32, [i32; N]>, bool) {
+    let mut out = BTreeMap::new();
+    let mut names = false;
+    let word = |raw: &[u8]| u32::from_le_bytes(raw.try_into().expect("four bytes"));
+    while let Some(header) = bytes.get(..12) {
+        let id = word(&header[4..8]);
+        let columns = word(&header[8..12]) as usize;
+        if word(&header[..4]) != 1
+            || id > 0xffff
+            || !(1..=4096).contains(&columns)
+            || (!mixed_width && columns != N)
+        {
+            break;
+        }
+        bytes = &bytes[12..];
+        if id == 0xbc {
+            if names || columns != N {
+                break;
+            }
+            for _ in 0..columns {
+                let Some(size) = bytes.get(..4).map(word).filter(|&size| size <= 1_000) else {
+                    return (BTreeMap::new(), false);
+                };
+                let Some(name) = bytes
+                    .get(4..4 + size as usize)
+                    .filter(|name| std::str::from_utf8(name).is_ok())
+                else {
+                    return (BTreeMap::new(), false);
+                };
+                bytes = &bytes[4 + name.len()..];
+            }
+            names = true;
+            continue;
+        }
+        let Some(data) = bytes.get(..4 * columns) else {
+            break;
+        };
+        if columns == N {
+            // The documented first occurrence is the channel setting.
+            out.entry(id).or_insert_with(|| {
+                std::array::from_fn(|col| {
+                    i32::from_le_bytes(data[4 * col..4 * col + 4].try_into().expect("four bytes"))
+                })
+            });
+        }
+        bytes = &bytes[data.len()..];
+    }
+    (out, names)
 }

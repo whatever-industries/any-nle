@@ -23,6 +23,9 @@ pub const UNQUALIFIED_ROUTE_TIMING: &str = "source_route_timing";
 
 pub struct ReadResult {
     pub graph: SourceGraph,
+    /// Saved bin ownership for consumers that assemble destination folders.
+    pub sequence_bins: HashMap<String, usize>,
+    pub group_bins: HashMap<String, usize>,
     /// Exact original bytes pinned before/after stream probing and checked again at read completion.
     pub original_inputs: Vec<av::SourceInput>,
     pub diagnostics: Vec<String>,
@@ -222,7 +225,9 @@ fn verify_motion_mxf<'a>(
 ) -> Result<HashMap<&'a std::path::Path, Option<(Rational, Rational)>>, String> {
     let masters: HashSet<_> = facts.sequences.iter().flat_map(|seq| &seq.events)
         .filter(|e| e.saved_timewarp.is_some()
-            || e.picture_extension.is_some_and(av::PictureExtension::requires_square_pixels))
+            || e.picture_extension.is_some_and(av::PictureExtension::requires_square_pixels)
+            || e.picture_chain.iter().any(|stage| matches!(stage,
+                av::PictureStage::Extension(effect) if effect.requires_square_pixels())))
         .map(|e| e.event.master).collect();
     let mut probed = HashSet::new();
     let mut verified = HashMap::new();
@@ -274,6 +279,8 @@ fn build_selected(
         budget.charge(size_of::<String>() + note.len())?;
     }
     let mut out = ReadResult {
+        sequence_bins: HashMap::new(),
+        group_bins: HashMap::new(),
         original_inputs: originals.original_inputs.clone(),
         graph: SourceGraph {
             multicams: Vec::new(),
@@ -370,6 +377,12 @@ fn build_selected(
         }
     }
     let multicams = multicam::append(&facts.groups, &copies, &mut out, &mut budget)?;
+    for group in &facts.groups {
+        budget.charge(size_of::<(String, usize)>() + group.id.len() + 32)?;
+        if out.group_bins.insert(group.id.clone(), group.bin).is_some() {
+            return Err("duplicate saved Avid Group identity".into());
+        }
+    }
     let media_by_id: HashMap<_, _> = out.graph.media.iter().map(|m| (m.id.as_str(), m)).collect();
     let item_routes: Vec<_> = out
         .graph
@@ -430,7 +443,14 @@ fn build_selected(
         })
         .collect();
     for seq in &facts.sequences {
+        let before = out.graph.sequences.len();
         sequence::append(seq, &copies, &item_routes, &multicams, &mut out, &mut budget)?;
+        if out.graph.sequences.len() > before {
+            budget.charge(size_of::<(String, usize)>() + seq.id.len() + 32)?;
+            if out.sequence_bins.insert(seq.id.clone(), seq.info.bin).is_some() {
+                return Err("duplicate saved Avid sequence identity".into());
+            }
+        }
     }
     out.graph.validate().map_err(|e| e.to_string())?;
     out.graph.encoded_len().map_err(|e| e.to_string())?;

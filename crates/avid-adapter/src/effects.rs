@@ -1,20 +1,40 @@
 use super::*;
+use avid_reader::color::ParamValue;
 use avid_reader::extract::SeqEvent;
-use avid_reader::source::PictureExtension;
+use avid_reader::source::{PictureExtension, PictureStage};
+use sha2::{Digest, Sha256};
+
+const INLINE_EFFECT_BYTES: usize = 4096;
 
 pub(super) fn apply_picture_extension(
     effect: PictureExtension, raster: Option<(i64, i64)>, p: &mut Placement,
     out: &mut ReadResult, budget: &mut Budget,
 ) -> Result<(), String> {
+    let effect = match picture_extension(effect, raster, &mut p.transform, !p.effects.is_empty()) {
+        Ok(effect) => effect,
+        Err(reason) => return loss(out, budget, &p.id, "picture_effect", reason),
+    };
+    budget.value(&effect.params)?;
+    budget.charge(size_of::<Effect>() + effect.kind.len())?;
+    p.effects.push(effect);
+    Ok(())
+}
+
+fn picture_extension(
+    effect: PictureExtension,
+    raster: Option<(i64, i64)>,
+    transform: &mut Option<Transform>,
+    has_effects: bool,
+) -> Result<Effect, &'static str> {
     let (kind, params) = match effect {
         PictureExtension::Unsupported(reason) | PictureExtension::UnsupportedTransform(reason) => {
-            return loss(out, budget, &p.id, "picture_effect", reason);
+            return Err(reason);
         }
-        PictureExtension::Flip { horizontal, vertical } => {
-            if p.transform.is_some() || !p.effects.is_empty() {
-                return loss(out, budget, &p.id, "picture_effect", "Flip with another translated effect requires effect ordering qualification");
+        PictureExtension::Flip { horizontal, vertical, .. } => {
+            if transform.is_some() || has_effects {
+                return Err("Flip with another translated effect requires effect ordering qualification");
             }
-            ("avid.flip", obj(vec![("horizontal", Value::Bool(horizontal)), ("vertical", Value::Bool(vertical))]))
+            return Ok(graph::picture_chain::Reflection { horizontal, vertical }.effect());
         }
         PictureExtension::WarpTrim(trim) | PictureExtension::ResizeTrim(trim) => {
             let resize = matches!(effect, PictureExtension::ResizeTrim(_));
@@ -24,12 +44,12 @@ pub(super) fn apply_picture_extension(
                 (false, true) => "avid.warp_trim_crop_linear",
                 (false, false) => "avid.warp_trim_linear",
             };
-            if raster != Some((1920, 1080)) || p.transform.is_some() || !p.effects.is_empty()
+            if raster != Some((1920, 1080)) || transform.is_some() || has_effects
                 || trim.motion.iter().any(|k| k.position.iter().any(|x| x.abs() > 64.0))
             {
-                return loss(out, budget, &p.id, "picture_effect", "Trimmed picture animation requires qualified 1080p geometry and an isolated effect");
+                return Err("Trimmed picture animation requires qualified 1080p geometry and an isolated effect");
             }
-            p.transform = Some(Transform {
+            *transform = Some(Transform {
                 position: trim.motion[0].position.into(),
                 scale: (trim.width[0].1, trim.motion[0].height),
                 rotation: 0.0,
@@ -64,16 +84,16 @@ pub(super) fn apply_picture_extension(
                 _ => "avid.resize_linear",
             };
             let keyed_crop = matches!(kind, "avid.resize_crop_linear" | "avid.warp_crop_linear");
-            if !p.effects.is_empty() || p.transform.as_ref().is_some_and(|t| t.crop != [0.0; 4]) {
-                return loss(out, budget, &p.id, "picture_effect", "Animated picture motion with crop or another translated effect requires separate qualification");
+            if has_effects || transform.as_ref().is_some_and(|t| t.crop != [0.0; 4]) {
+                return Err("Animated picture motion with crop or another translated effect requires separate qualification");
             }
             if raster != Some((1920, 1080)) {
-                return loss(out, budget, &p.id, "picture_effect", "Animated picture motion is qualified only for 1920x1080 geometry");
+                return Err("Animated picture motion is qualified only for 1920x1080 geometry");
             }
             if keys.iter().any(|k| k.position.iter().any(|x| x.abs() > 64.0)) {
-                return loss(out, budget, &p.id, "picture_effect", "Animated picture position is outside the qualified range");
+                return Err("Animated picture position is outside the qualified range");
             }
-            let transform = p.transform.get_or_insert(Transform {
+            let transform = transform.get_or_insert(Transform {
                 position: (0.0, 0.0), scale: (100.0, 100.0), rotation: 0.0,
                 anchor: (0.0, 0.0), crop: [0.0; 4],
             });
@@ -93,16 +113,79 @@ pub(super) fn apply_picture_extension(
             (kind, obj(vec![("keys", Value::Arr(keys.into()))]))
         }
     };
-    budget.value(&params)?;
-    budget.charge(size_of::<Effect>() + kind.len())?;
-    p.effects.push(Effect { kind: kind.into(), params });
+    Ok(Effect { kind: kind.into(), params })
+}
+
+pub(super) fn apply_picture_chain(
+    chain: &[PictureStage],
+    raster: Option<(i64, i64)>,
+    square_pixels: bool,
+    p: &mut Placement,
+    out: &mut ReadResult,
+    budget: &mut Budget,
+) -> Result<(), String> {
+    let floats = |values: &[f64]| Value::Arr(values.iter().copied().map(Value::Float).collect());
+    let mut stages = Vec::with_capacity(chain.len());
+    let mut losses = Vec::new();
+    for stage in chain {
+        let (effect, transform) = match stage {
+            PictureStage::Static(picture) => {
+                let t = picture.interpret();
+                losses.extend(t.not_converted);
+                let kind = match picture.kind {
+                    avid_reader::transform::Kind::Resize => "avid.resize_static",
+                    avid_reader::transform::Kind::Warp => "avid.warp_static",
+                };
+                (
+                    Effect { kind: kind.into(), params: obj(vec![]) },
+                    Some(Transform {
+                        position: t.position,
+                        scale: t.scale,
+                        rotation: t.rotation,
+                        anchor: t.anchor,
+                        crop: t.crop,
+                    }),
+                )
+            }
+            PictureStage::Extension(extension) => {
+                if extension.requires_square_pixels() && !square_pixels {
+                    return loss(out, budget, &p.id, "picture_effect",
+                        "Nested picture animation requires verified square-pixel progressive geometry");
+                }
+                let mut transform = None;
+                let effect = match picture_extension(*extension, raster, &mut transform, false) {
+                    Ok(effect) => effect,
+                    Err(reason) => return loss(out, budget, &p.id, "picture_effect", reason),
+                };
+                (effect, transform)
+            }
+        };
+        let mut fields = vec![("kind", s(&effect.kind)), ("params", effect.params)];
+        if let Some(t) = transform {
+            fields.push(("transform", obj(vec![
+                ("position", floats(&[t.position.0, t.position.1])),
+                ("scale", floats(&[t.scale.0, t.scale.1])),
+                ("rotation", Value::Float(t.rotation)),
+                ("anchor", floats(&[t.anchor.0, t.anchor.1])),
+                ("crop", floats(&t.crop)),
+            ])));
+        }
+        let stage = obj(fields);
+        budget.value(&stage)?;
+        stages.push(stage);
+    }
+    for reason in losses {
+        loss(out, budget, &p.id, "transform", reason)?;
+    }
+    let kind = "avid.picture_chain";
+    budget.charge(size_of::<Effect>() + kind.len() + size_of::<Value>() + "stages".len())?;
+    p.effects.push(Effect { kind: kind.into(), params: obj(vec![("stages", Value::Arr(stages))]) });
     Ok(())
 }
 
 /// Original owned parser facts. These are opaque witnesses, not additional interpretations.
 pub(super) fn receipt(event: &SeqEvent) -> Value {
     fn params(cc: &avid_reader::color::ColorCorrection) -> Value {
-        use avid_reader::color::ParamValue;
         Value::Arr(
             cc.params
                 .iter()
@@ -113,11 +196,20 @@ pub(super) fn receipt(event: &SeqEvent) -> Value {
                             "value",
                             match value {
                                 ParamValue::Int(n) => obj(vec![("int", Value::Int(*n))]),
-                                ParamValue::Float(n) => obj(vec![("float", raw_float(*n))]),
-                                ParamValue::Bytes(b) => obj(vec![(
-                                    "bytes_hex",
-                                    s(b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
-                                )]),
+                                ParamValue::Float(n) => obj(vec![
+                                    ("float", raw_float(*n)),
+                                    ("float_bits", s(format!("{:016x}", n.to_bits()))),
+                                ]),
+                                ParamValue::Bytes(b) => {
+                                    let mut fields = vec![
+                                        ("byte_count", Value::Int(b.len() as i64)),
+                                        ("sha256", s(hex::encode(Sha256::digest(b)))),
+                                    ];
+                                    if b.len() <= INLINE_EFFECT_BYTES {
+                                        fields.push(("bytes_hex", s(hex::encode_upper(b))));
+                                    }
+                                    obj(fields)
+                                }
                                 ParamValue::Other => {
                                     obj(vec![("uninterpreted", Value::Bool(true))])
                                 }
@@ -258,7 +350,6 @@ pub(super) fn receipt(event: &SeqEvent) -> Value {
     ])
 }
 pub(super) fn reserve_receipt(event: &SeqEvent, budget: &mut Budget) -> Result<(), String> {
-    use avid_reader::color::ParamValue;
     budget.charge(2048)?;
     for cc in event
         .color
@@ -269,9 +360,7 @@ pub(super) fn reserve_receipt(event: &SeqEvent, budget: &mut Budget) -> Result<(
             budget.charge(1024 + id.len())?;
             if let ParamValue::Bytes(b) = v {
                 budget.charge(
-                    b.len()
-                        .checked_mul(2)
-                        .ok_or("raw effect byte budget overflow")?,
+                    if b.len() <= INLINE_EFFECT_BYTES { b.len() * 2 } else { 0 },
                 )?;
             }
         }

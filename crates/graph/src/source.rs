@@ -544,6 +544,16 @@ impl SourceGraph {
                     s.rate,
                     &format!("{w} placement {:?}", p.id),
                 )?;
+                for effect in &p.effects {
+                    if effect.kind == crate::picture_chain::REFLECTION_KIND {
+                        require(
+                            p.video_track.is_some()
+                                && crate::picture_chain::Reflection::from_params(&effect.params).is_some(),
+                            &w,
+                            "reflection needs a picture placement and two boolean axes with at least one enabled",
+                        )?;
+                    }
+                }
             }
             for t in &s.transitions {
                 let tw = format!("{w} transition {:?}", t.id);

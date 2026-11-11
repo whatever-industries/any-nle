@@ -228,6 +228,194 @@ WAV edits. The PCM16/PCM24 measurements match the expected source sample
 positions and destination mix level to within one PCM24 code value when
 that native envelope is included. The converter adds no corrective ramp.
 
+## Combined grading turnover
+
+`resolve-linked-probe` also accepts the pinned direct MXF skeleton as an
+optional seventh argument and the pinned Group skeleton as an eighth
+argument. The internal manifest's optional `atom_media` array holds
+`{bin_id, binding}` records. Each binding uses the direct route's
+`{item_id, siblings}` shape with explicit picture, A1, and A2 file
+identities. A selected Group timeline adds a `group` object with its
+owning `bin_id` and the two `cameras` item IDs in saved angle order.
+Every Group camera needs a verified split MXF binding. The project can
+register one Group timeline at the qualified 23.976 rate. The same pool
+items can supply straight cuts and Group members. The staged reader
+checks original locators and package identities, plus both mono selectors,
+edit ranges, and each saved angle. Publication rechecks all sibling bytes.
+
+The same-build research project reopened at 01:00:00:01 and 01:00:00:00
+with six bins, five media items, and thirteen placements across the two
+timelines. One split MXF master is shared across both timelines. Its
+other footage is a linked ProRes HQ MOV, and the straight-cut audio
+uses linked PCM16 and PCM24 WAV. The Group keeps its editable A/B/A
+picture sequence with both mono lanes on camera A. A picture-only
+selector change survived native reopen and changed precisely the first
+48 frames out of 145. Each isolated audio lane had 290,290 PCM24 sample
+frames. Samples 10,000 onward were identical across the switch and
+within one PCM24 code of the expected sibling samples after the measured
+native stereo-bus gain. The startup envelope differed on A2.
+
+The retained linked MOV/WAV project was saved and reopened through
+Resolve scripting. Fresh PCM16 and PCM24 stereo insertions with explicit
+left/right selectors and nonzero trims also reopened and matched the
+retained isolated references over all 96,096 PCM24 sample frames per lane.
+File > Save Project As is a separate pending UI check.
+
+The Resolve authority revision `24d0bd6dec7ea62e1c406711ce877a354ba42705`
+pins RESOLVE-0004 at
+`11564bb16ace6f62f2c36e2d3fb7e6d4a6068df4314f4e07509391bca80d6fae`,
+RESOLVE-0013 at
+`fefd639ebaa57569a76c5f3b05623008eb29d16d51f8820439028a74e8213508`,
+and RESOLVE-0014 at
+`d9a4130d43cc51c0c59f9e760827443f6231709439de07a293fced65c46c68a3`.
+The private same-build split MXF reference Group archive has SHA-256
+`d3670d1c665f200fd36182090707bc0f504d0e9c1a66069fa517a8d00a3adeb2`.
+
+### Static picture controls
+
+The linked project writer accepts graph/2 static position, independent X/Y
+scale, and four crop edges on same-rate 1920×1080 V1 cuts. Resolve's saved
+vertical position is positive up. Position and crop use frame fractions,
+and scale uses a multiplier in the saved parameter. The graph continues
+to use Y down and scale percent. The bounded profile admits position
+within five percent per axis, scale from 87.5 through 112.5 percent, and
+crop from zero through five percent per edge. A clip that combines
+nonneutral transform and crop requires a separate order control.
+
+The eight single-property controls each matched their reopened native
+reference on all 48 decoded frames. The effect applied to exactly the
+first 24 frames in each case. A separate native left-aligned cross
+dissolve requested 12 frames and saved eight, matching the incoming
+clip's available handle. Avid overlap-to-cut timing and dissolve writing
+remain open.
+
+### Flip, Flop, and Flip-Flop
+
+The linked project writer translates isolated Avid Flip, Flop, and
+Flip-Flop to Resolve's editable Inspector controls. Flip reflects the
+picture vertically, Flop horizontally, and Flip-Flop along both axes.
+The writer reads the exact axis flags from graph/2 and accepts a Resolve
+reader's equivalent receipt. It refuses reflection combined with
+other picture controls or in an unqualified placement.
+
+Same-build Resolve Studio 21.2.0.0006 exports identified two independent
+static boolean slots in the motion section of `EffectFiltersBA`. A
+picture-only, 1080p24 Avid UME control referenced the same MOV and
+36-frame source range in four edits, starting three frames into the
+source. After Save Project As, close and reopen, the four edits retained
+their source link, trims, timing, and Inspector flags. All 144 decoded
+frames matched a reopened native Resolve reference. A separate nested
+Avid effect control refused before publication. The standalone
+straight-cut and Group probes retain their separate admission profiles.
+
+### Linear animated Resize and 3D Warp
+
+The linked project writer converts the qualified two-key Avid Resize and
+promoted 3D Warp pair to editable Inspector Position X/Y and independent
+Zoom X/Y curves. Each axis has two Linear keys at the first and last
+frame of a same-rate, progressive, square-pixel 1920×1080 edit.
+Preparation verifies the first-key transform, neutral crop and other
+geometry, and the physical source span. It adds the source In once to
+each edit-relative key and converts graph Y-down to Resolve Tilt-up.
+The three-key profile and its bounded crop case are covered below.
+Mixed effect stacks need separate qualification.
+
+A native Resolve Studio 21.2.0.0006 save with a three-frame source trim
+put its edit-frame keys 0 and 35 at source frames 3 and 38. The same
+encoding was verified on the retained AVB-0033 Resize and Warp sequences.
+The private test projected their graph onto a compatible ProRes HQ
+derivative of the synthetic chart. Save Project As, close, reopen and
+re-export preserved source frames 24 and 71, all four axis values, and
+the 48-frame edit in both timelines at exact `24000/1001`. Their 48
+decoded frame pairs matched exactly. Compared with the retained Avid
+exports, the sampled chart edges and grid lines across every frame
+agreed within two pixels horizontally and one vertically.
+
+### Three-key Linear Resize and 3D Warp after trimming
+
+The linked writer preserves the saved Position X/Y and Zoom Y clock
+and the separate Zoom X clock on qualified Fixed and Elastic trims.
+It adds the edit's source In to each signed Avid key time and checks
+the result against the verified physical frame count. Keys before the
+visible In and after the visible Out stay editable if the source
+contains them. This preserves the saved motion. Later trims in Resolve
+follow Resolve's editing behavior.
+
+A native Resolve Studio 21.2.0.0006 control kept source frames 3, 20,
+and 38 after trimming to the visible range 6–35. The converted
+23.976 project used the retained nine Resize timelines and five 3D
+Warp timelines with the verified ProRes HQ derivative of the
+synthetic chart. Save Project As, close, and reopen retained the exact
+source ranges and every key, including the two Zoom X keys before the
+second Fixed head Resize. All 468 decoded frames matched the renders
+made before Save As. Resize edges agreed within one pixel of the
+retained native Avid measurements across 288 frames. Warp edges agreed
+within two pixels of the saved Linear curves across 180 frames. The
+retained Warp trim tests have no Avid renders.
+
+### Three-key Linear Resize and 3D Warp with animated crop
+
+The linked writer admits four editable crop edges on the same Elastic
+grid as Position and independent Zoom. The three keys span the first
+through last visible frame. Crop is stored as source raster fractions
+with zero Softness and Retain Image Position off. In that mode Resolve
+applies crop in source space before Position and Zoom. The edit's source
+In is added once to all eight curves. The retained head trims keep their
+12-frame leading gap on the picture-only timeline.
+
+Native Resolve Studio 21.2.0.0006 saves established the crop slots, source
+key clock, and the crop-before-motion order using an asymmetric control.
+The conversion replay used the retained Avid Resize and 3D Warp baselines,
+12-frame head trims and 12-frame tail trims with the verified ProRes HQ
+derivative of the chart. Save Project As, close and reopen preserved all
+six edits and key curves. All 264 decoded frames matched the pre-save
+renders, including both 12-frame black leaders. On the 240 active frames,
+each measured edge agreed with the retained Avid renders within one pixel
+at the primary grayscale threshold and within two across all three
+thresholds. The source-space crop prediction was within two pixels; the
+alternative of applying crop after Zoom missed by up to 66 pixels.
+
+This profile is same-rate square-pixel 1080p with neutral background and
+other controls. Independent crop clocks, Fixed Width with crop, other
+curve modes, and stacks of separate effects remain unqualified.
+
+### Avid UME originals
+
+The internal Avid UME probe reads a saved bin through the same Avid source
+adapter used by the Premiere route. Select the sequence by exact ID or
+unique name. The probe builds Resolve bindings from graph/2 stream and
+channel identities, the saved locator, and the verified original bytes.
+It supports explicit saved-root to current-root mappings for moved files.
+The writer links those files in place.
+
+```text
+resolve-avid-ume-probe BIN SEQUENCE LAYOUT.drp RATE.drp FFPROBE OUTPUT.drp [SAVED_ROOT CURRENT_ROOT ...]
+```
+
+The initial AVC profile is progressive square-pixel 1080p24, H.264 High
+level 4.0 in MOV or MP4, with untagged color or limited-range Rec.709.
+The same-rate edit can be picture-only or use the embedded stereo
+48 kHz AAC-LC as two independent mono lanes. Picture presentation
+timestamps must cover a complete constant grid, including when B frames
+reorder packets. The AAC profile checks the priming packet and declared
+playable sample interval. The existing picture-only ProRes HQ and
+PCM16/PCM24 WAV profiles also use the shared preparation. The source
+sequence requires an exact 24-count non-drop origin and qualified
+source offsets. A picture-only timeline keeps the template's two empty
+mono tracks. Mixed rates, active pan/gain controls, other audio layouts
+and ambiguous source locators need separate qualification.
+
+Resolve Studio 21.2.0.0006 reopened controlled H.264 MOV and MP4 sequences
+from saved synthetic Avid bins with nonzero trims. Both picture-only
+files and files with AAC were exercised. Audio measurements used direct
+Resolve imports with the same mixer settings. The embedded cache uses
+the native AAC container settings and saves the left and right mono
+selectors. The source and destination keep their separate identities.
+The native cache witnesses are pinned by SHA-256
+`f7c438a08f14bc8dea1759b25b5a4499c7dfd239c446c59ec2a47d2b097eba2f`
+and `5e9344f0d9c27ecc4ab60a133833405bfed7530fe13cc0c6662054e6860cb6cc`
+for the untagged and Rec.709 cohorts, respectively.
+
 ## Pending editor checks
 
 When an authorized Resolve UI session is available, use the private

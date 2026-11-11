@@ -104,6 +104,7 @@ fn event(
         id: id.into(),
         volume_automation: None,
         picture_extension: None,
+        picture_chain: Vec::new(),
         motion_adapter_phase: None,
         saved_timewarp: None,
         owner: format!("owner-{id}"),
@@ -159,6 +160,46 @@ fn sequence(events: Vec<av::SourceEvent>) -> av::SourceSequence {
 }
 fn run(f: &av::SourceProject, i: &index::MediaIndex) -> ReadResult {
     build(f, i, "project", &["bin".into()]).unwrap()
+}
+
+#[test]
+fn native_color_receipt_survives_an_unavailable_picture_route() {
+    use avid_reader::color::{ColorCorrection, ParamValue};
+    let (mut facts, index) = fixture(1);
+    let audio = event("audio", 1, 1, 0, 24, None);
+    let mut picture = event("picture", 1, 1, 0, 24, None);
+    picture.event.kind = KIND_PICTURE;
+    picture.event.master = mob(2);
+    let opaque = vec![17; 4097];
+    picture.event.color = Some(ColorCorrection {
+        params: vec![
+            ("scalar".into(), ParamValue::Float(-0.0)),
+            ("payload".into(), ParamValue::Bytes(opaque)),
+        ],
+    });
+    facts.sequences.push(sequence(vec![audio, picture]));
+    let graph = run(&facts, &index).graph;
+    assert_eq!(graph.sequences[0].placements.len(), 1);
+    let saved = graph.to_json_text().unwrap();
+    let reopened = SourceGraph::from_json_text(&saved).unwrap();
+    assert_eq!(graph, reopened);
+    let source = reopened.sidecar("avid.source", &graph.sequences[0].id).unwrap();
+    let Some(Value::Arr(events)) = source.get("native_events") else {
+        panic!("missing native event receipts");
+    };
+    assert_eq!(events[0].get("placement_id"), Some(&s("audio")));
+    assert_eq!(events[1].get("placement_id"), Some(&Value::Null));
+    let Some(Value::Arr(parameters)) = events[1].get("controls").and_then(|v| v.get("color")) else {
+        panic!("missing native color parameters");
+    };
+    assert_eq!(
+        parameters[0].get("value").and_then(|v| v.get("float_bits")),
+        Some(&s("8000000000000000"))
+    );
+    let payload = parameters[1].get("value").unwrap();
+    assert_eq!(payload.get("byte_count"), Some(&Value::Int(4097)));
+    assert!(matches!(payload.get("sha256"), Some(Value::Str(hash)) if hash.len() == 64));
+    assert!(payload.get("bytes_hex").is_none());
 }
 
 #[test]

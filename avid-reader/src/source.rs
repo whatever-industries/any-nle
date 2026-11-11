@@ -176,6 +176,8 @@ pub struct SourceEvent {
     pub reason: Option<String>,
     pub volume_automation: Option<VolumeAutomation>,
     pub picture_extension: Option<PictureExtension>,
+    /// Full-span picture effects in input-to-output order, if the chain is resolved.
+    pub picture_chain: Vec<PictureStage>,
     /// Saved phase for the bounded automatic adapter between 24 and 24000/1001.
     pub motion_adapter_phase: Option<i64>,
     /// Visible source frame offsets from the qualified range start for a saved Timewarp map.
@@ -211,7 +213,7 @@ pub struct LinearTrimKey {
 }
 #[derive(Clone, Copy, Debug)]
 pub enum PictureExtension {
-    Flip { horizontal: bool, vertical: bool },
+    Flip { native_id: &'static str, horizontal: bool, vertical: bool },
     Resize([ResizeKey; 2]),
     ResizeCrop([ResizeKey; 2]),
     Warp([ResizeKey; 2]),
@@ -219,6 +221,11 @@ pub enum PictureExtension {
     ResizeTrim(LinearTrim),
     UnsupportedTransform(&'static str),
     Unsupported(&'static str),
+}
+#[derive(Debug)]
+pub enum PictureStage {
+    Static(std::sync::Arc<crate::transform::PictureEffect>),
+    Extension(PictureExtension),
 }
 impl PictureExtension {
     pub fn replaces_static_transform(self) -> bool {

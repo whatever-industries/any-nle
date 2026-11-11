@@ -353,14 +353,19 @@ Implemented fixes, tests and remaining native gates.
 - [ ] **Color correction extensions**: keyframes and other Avid tabs (Channels, Levels,
       HSL Hue Offsets, Secondary). The measured HSL Controls (hue, saturation, brightness,
       contrast, gain, gamma, setup) and curves already feed the LUT writer; do not reimplement
-      those as missing formulas. The retained Phase 52 Gain 150 residual reaches 48.825
-      8-bit-equivalent codes on a saturated patch. The current fitted transform and its
-      sampled LUT agree on that patch. A matched eight-patch native control
-      found unclamped YCbCr-derived RGB within 1.06 RGB codes of simple 1.5× gain,
-      including bright patches. RGB PNGs clipped those highlights and matched
-      the clipped prediction within two codes. The new control did not reach the
-      physical YCbCr rails of interest. Isolate the earlier saturation residual
-      before changing the LUT. Editable Lumetri controls are on hold below.
+      those as missing formulas. Decoding the retained Phase 52 10-bit 4:2:2
+      source supports a Y′CbCr component limit near the physical code range
+      before RGB clipping on the tested export path. Across the 12 flat
+      patches, this reduces the maximum Gain 150 residual from 48.83 to 1.94
+      8-bit-equivalent RGB codes. Contrast +30 improves from 19.18 to 2.66
+      codes on the same patches. The hue sweep shows the same improvement.
+      A later eight-patch export stayed inside the physical Y′CbCr limits
+      and matched unclamped 1.5× gain within 1.06 RGB codes. Compare a
+      rail-crossing chart in both Y′CbCr and RGB to locate the clipping and
+      distinguish exact bounds before changing the LUT. Clip Low, Clip High,
+      Invert Luma and Invert Chroma have saved parameter mappings and still
+      need renders that vary one control at a time. Editable Lumetri controls
+      are on hold below. [Source packing reference](https://pub.smpte.org/pub/rdd50/rdd50-2019.pdf#page=15).
 
 ## Timeline and effects
 
@@ -526,9 +531,23 @@ User's priority tiers to scope converter tasks.
       Vertical Flip, Horizontal Flip, or both. All three reflected synthetic
       Premiere frames match the expected pixels. A native Avid Warp outside
       Flop control retained both effects and left the asymmetric crop on
-      its original side after reflection of the source. The reverse order
-      still needs native authoring. Keep mixed effect stacks outside the
-      qualified translation scope.
+      its original side after reflection of the source.
+- [x] **Share picture reflection in graph/2.** Avid and Resolve emit one
+      axis-based effect, including the Flop stage inside an ordered chain.
+      The native Avid effect ID stays with the source receipt.
+      [Representation and scope](SOURCE-GRAPH-MIGRATION.md#picture-reflection).
+- [x] **Read simple Avid picture chains into graph/2** (CONV-0065).
+      Preserve the input-to-output order for qualified full-span
+      Flip, Flop, Resize, and 3D Warp stages. The retained Avid
+      Flop-inside-Warp test keeps both effects and Warp's animated crop.
+      [Source scope](SOURCE-GRAPH-MIGRATION.md#nested-avid-picture-effects).
+- [x] **Write bounded ordered picture chains to Premiere and Resolve**
+      (CONV-0066). Reflections can occur on either side of one supported
+      Resize or 3D Warp stage. Native Save As and reopen verified Flop
+      before animated Warp in both editors using the retained Avid control.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#writing-ordered-picture-chains).
+- [ ] **Expand destination picture chains.** Qualify a construction that
+      can apply multiple Motion stages or other effects in saved order.
 
 - [ ] Avid Start shown on clips whose MXF timecode is 0 (Alternate Timecode, User decision).
 - [x] **Editable two-camera Groups over native OP1a** (User, 2026-11-08).
@@ -556,6 +575,10 @@ User's priority tiers to scope converter tasks.
       Folder imports preserve destination bin hierarchy through the shared job path.
       Graph/1 and model/1 remain compatibility interfaces.
       [Current architecture](SOURCE-GRAPH-MIGRATION.md).
+- [x] Preserve exact Avid effect parameter receipts and their placement links,
+      including controls on events without a usable media route. Preserve
+      Premiere caption content and timing as shared text facts, with per-cue
+      Resolve omissions reported during destination review.
 - [ ] Promote color correction and AniMatte to neutral effects when their
       cross-editor semantics are qualified. Track subclips and nests separately
       from the editable Group scope above.
@@ -611,10 +634,68 @@ only for comparing results; route (3) (scripting API) is for test read-back.
       settings are preserved. [Scope and evidence](RESOLVE-SOURCE-READER.md).
 - [ ] **Qualify the linked Resolve project foundation.** The internal project
       writer handles ordered timeline selection, nested media bins and shared
-      original MOV/WAV bindings. Complete Save Project As, fresh insertion and
-      the native render checks in the [linked project profile](RESOLVE-PROJECT-CORE.md#linked-project-profile).
-      Save Project As and native channel remapping require an authorized
-      Resolve UI session. Record mixed-rate qualification independently.
+      original MOV/WAV bindings. Fresh stereo PCM16 and PCM24 insertions
+      matched both reopened reference lanes. Complete the authorized Save
+      Project As checks in the [linked project profile](RESOLVE-PROJECT-CORE.md#pending-editor-checks).
+- [ ] **Qualify the combined Resolve grading turnover.** The internal writer
+      combines direct DNxHR LB OP-Atom, linked MOV/WAV and a fixed-audio Group
+      in one nested project. Scripted reopen, re-export and picture-switch
+      checks passed on Resolve Studio 21.2.0.0006. File > Save Project As
+      remains pending. See the [combined profile](RESOLVE-PROJECT-CORE.md#combined-grading-turnover).
+- [x] **Read and write bounded static Resolve picture controls.** Same-rate
+      1080p position, independent scale, and four crop edges matched eight
+      reopened native controls. See the [static profile](RESOLVE-PROJECT-CORE.md#static-picture-controls).
+- [x] **Translate isolated Flip, Flop, and Flip-Flop in the linked Resolve
+      writer.** The 1080p24 Avid UME control preserved all three editable
+      axis choices after Save Project As and reopen. All 144 decoded frames
+      matched a native Resolve control. Picture effect stacks need separate
+      qualification. [Scope and evidence](RESOLVE-PROJECT-CORE.md#flip-flop-and-flip-flop).
+- [x] **Translate two-key Linear Resize and 3D Warp to Resolve.** The
+      retained 48-frame Avid pair keeps editable position and independent
+      zoom keys after Save Project As and reopen. All decoded Resize and
+      Warp frames match each other. Sampled chart geometry agrees with
+      Avid within two pixels horizontally and one vertically.
+      [Scope and evidence](RESOLVE-PROJECT-CORE.md#linear-animated-resize-and-3d-warp).
+- [x] **Translate three-key Fixed and Elastic Resize and 3D Warp to
+      Resolve.** Four editable curves retain their saved clocks, including
+      keys outside the visible edit with verified source media handles.
+      Save Project As and reopen preserved all 468 decoded frames across
+      the 14 retained cases. [Scope and evidence](RESOLVE-PROJECT-CORE.md#three-key-linear-resize-and-3d-warp-after-trimming).
+- [x] **Translate three-key Elastic Resize and 3D Warp crop to Resolve**
+      (CONV-0064). Four editable source-space crop curves run before Position
+      and Zoom. Reopened control and trim renders preserve the edit ranges,
+      keys, and edges within one pixel of Avid at the primary threshold.
+      [Scope and evidence](RESOLVE-PROJECT-CORE.md#three-key-linear-resize-and-3d-warp-with-animated-crop).
+- [ ] **Extend Resolve crop beyond the shared Elastic grid.** Qualify
+      Fixed Width or separate crop clocks and mixed effect stacks with
+      distinct timing and order controls.
+- [x] **Translate the bounded Avid UME profile internally.** The Avid
+      adapter resolves and verifies originals through graph/2. Resolve
+      links qualified ProRes HQ, PCM WAV and 1080p24 AVC in MOV and MP4.
+      The AVC audio profile preserves two independent mono selections
+      from embedded stereo AAC. See the [UME profile](RESOLVE-PROJECT-CORE.md#avid-ume-originals).
+- [ ] **Widen Avid UME turnover coverage.** Qualify representative production
+      bins, other H.264 profiles and rates, and combined automatic binding
+      of managed Avid media and UME originals.
+- [ ] **Qualify an asymmetric Resolve video dissolve.** The native
+      left-aligned witness saved eight frames from a twelve-frame request
+      with eight incoming handle frames. Qualify graph/2 endpoint and trim
+      projection from a saved Avid control before writing a dissolve.
+- [x] **Implement the internal link-in-place turnovers.** One preparation and
+      publication path handles automatic Avid bindings and the bounded Premiere
+      ProRes HQ MOV/PCM WAV source. The synthetic Premiere control matched the
+      fresh native Resolve edit in picture and isolated PCM.
+      [Inputs and scope](RESOLVE-TURNOVER-IMPLEMENTATION.md).
+- [x] **Capture additional Resolve source fields in graph/2.** Retain
+      transitions, timing maps, Fairlight controls, custom fade points,
+      timeline marks, and clip color codes with their saved owners.
+      [Capture status](RESOLVE-TURNOVER-IMPLEMENTATION.md#capture-in-graph2).
+- [ ] **Qualify a native Premiere source turnover.** Author the same-rate
+      ProRes HQ MOV and PCM WAV project natively in Premiere, including exact
+      source selectors and nonzero trims. Run the package and product route gates.
+      Use the [sequence inventory](RESOLVE-TURNOVER-IMPLEMENTATION.md#inputs-and-review)
+      to select the saved timeline by ObjectUID and check its rate, canvas,
+      start ticks and active track counts before checking the linked media.
 - [ ] **Qualify editable 24 ↔ 23.976 adaptation in Resolve.** Native default
       picture cadence differs from the retained Avid phase controls. Author a
       one-change editable timing control per direction, then verify the full
@@ -662,7 +743,7 @@ saved camera-original locators, source timecode and reel or file identity when
 qualified, and diagnose unresolved relinks. Offer rewrap as a separate choice
 for a verified workflow that needs it, with the **Creates new media.** notice.
 
-### Pinned offline Resolve references
+### Pinned offline turnover references
 
 - [drp-format](https://github.com/samuelgursky/davinci-resolve-mcp/tree/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/drp-format)
   (JavaScript, MIT, `1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048`).
@@ -681,6 +762,12 @@ for a verified workflow that needs it, with the **Creates new media.** notice.
   Use its [field inventory](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/FORMAT.md)
   for Fairlight mixer and edit read-back, including routing, EQ, dynamics,
   fades and keyframes. Its template composer is audio-focused.
+- [PRPROJ-READER](https://github.com/sergeiventurinov/PRPROJ-READER/tree/a51a2a5b1095b8bdead114c812e85132a5eb26e0)
+  (Python, CC0-1.0, Premiere research source SRC-011).
+  Use its object-reference map and Premiere 14.3.2 fixture to compare saved
+  sequence, bin, clip, and keyframe structures. The fixture is a legacy
+  parser control. Current media binding and audio routing require modern
+  Premiere saves with verified originals.
 
 Review licence and provenance before code adoption.
 

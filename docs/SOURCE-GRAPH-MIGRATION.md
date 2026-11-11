@@ -34,6 +34,48 @@ from a bounded native archive profile. Its saved Resolve clocks and channel
 selectors retain their own provenance. Product route qualification remains
 separate from the source adapter.
 
+## Nested Avid picture effects
+
+Graph/2 preserves simple chains of Flip, Flop, Resize, and 3D Warp
+(CONV-0065). The reader follows the saved picture input, including a
+sequence wrapper with one full-span child and zero-length filler. A Warp
+background must be filler across the edit. Each stage shares one
+same-rate picture range. The graph records stages in input-to-output
+order with the existing interpretations of their axes, transforms and
+qualified Linear curves.
+
+The retained Avid control saves Flop as the input to an animated Warp.
+Graph/2 retains both stages and all of Warp's keys. Branches, split
+inputs, and mixed-rate or unsupported wrappers remain outside this
+profile. See the [graph contract](GRAPH-MODEL.md).
+
+### Writing ordered picture chains
+
+Premiere and the internal Resolve writer consume the same ordered stages.
+The current construction supports reflections and up to one qualified
+static or Linear Resize/3D Warp stage on a same-rate, matched 1920×1080
+picture edit. Motion uses a centered anchor and neutral rotation. Repeated
+reflections combine per axis. Unsupported stages or multiple Motion
+stages receive an explicit loss in Premiere or refusal in Resolve.
+
+Premiere applies standard Flip before fixed Motion. When the source puts
+a reflection after Motion, preparation mirrors the position and crop in
+the native Motion controls. Resolve's Inspector crops before Flip and
+then applies Position and Zoom. Preparation mirrors the incoming crop
+edges for a reflection before Motion and mirrors position for a
+reflection after Motion.
+[Adobe effect processing order](https://helpx.adobe.com/premiere/desktop/add-video-effects/types-of-effects/types-of-effects.html)
+
+The retained Avid Flop-before-Warp comparison passed on Premiere 26.5.2
+and Resolve Studio 21.2.0.0006 after Save As, close, and reopen. In
+Premiere all 48 stacked frames held the same measured edges as the
+standalone Warp. The retained Avid comparison frame matched within
+one pixel, and saved Flip and all 21 Warp keys survived. Resolve kept
+all 144 decoded frames identical before and after reopening across the
+stack, standalone Warp, and synthetic reverse-order control. The latter
+matched horizontally reflected Warp edges within one pixel. The two
+orders differed by up to 480 pixels at a visible edge.
+
 ## Compatibility profiles
 
 | Interface | Interpretation |
@@ -196,6 +238,50 @@ omitted; older graph/2 and graph/1 interpretation is preserved. Selected native 
 property roles/list indices remain in `avid.text`, outside neutral rendering semantics.
 Prepared text is a separate typed writer extension; model/1 JSON is unchanged.
 See [scope, native checks and appearance gaps](CAPTION-TEXT-TRANSLATION-2026-11-08.md).
+
+## Source controls and text from additional adapters
+
+The Avid sequence receipt at `avid.source.native_events` retains saved effect
+parameters by native occurrence. `placement_id` names the graph placement
+when one was constructed. A null link leaves the original event and its
+controls inspectable, including when a media route or timing could not be
+qualified. Floating parameters retain the exact 64-bit representation in
+`float_bits`. AVUP payloads have a byte count and SHA-256, with inline
+`bytes_hex` through 4 KiB. The existing interpreted effect values remain
+separate from these observations.
+
+The internal Premiere source reader emits sequence captions as `texts` with
+exact rational record spans and source occurrence IDs. Saved caption text
+and ticks remain in `premiere.captions`. Sequence marker occurrences keep
+bounded native payload receipts in `premiere.markers`. Resolve turnover
+reports the omission of each caption at destination review and requires
+approval for that run. Caption content and timing remain graph facts
+regardless of the Resolve destination's support for writing them.
+
+## Picture reflection
+
+Graph/2 represents a reflection as `picture.reflection` with boolean
+`horizontal` and `vertical` axes. At least one axis must be active. In a
+picture of width W and height H, the active axes reverse sample coordinates
+as x → W − 1 − x or y → H − 1 − y. A reflection leaves the edit span and
+source timing intact. A chain retains the reflection's position relative to
+other picture stages.
+
+Avid's unpromoted single-input Flop, Flip and Flip-Flop select those axes
+with `EFF2_BLEND_FLIP_HORZ`, `EFF2_BLEND_FLIP_VERT` and
+`EFF2_BLEND_FLIP_BOTH`, respectively. The inspected saves share three PRIT
+values and the same decoded FXPS defaults. The saved effect identity remains
+in the placement's `avid.source.native_reflections` receipt. Avid documents
+Grid as a preview guide. Promoted 3D and multi-input records require their
+own interpretation. [Avid Effects Guide](https://resources.avid.com/SupportFiles/attach/Media_Composer/Media_Composer_v2025.x_FX_Guide.pdf).
+
+The Avid reader and Resolve read-back emit the shared effect. Both destination
+adapters accept the prior `avid.flip` and `resolve.flip` spellings. Premiere
+reports a loss for a standalone reflection paired with a separate transform
+when the input does not specify a qualified order. Existing ordered chains
+still preserve the retained Avid Flop inside Warp case. The new encoding
+produced the same saved Premiere filter parameters and Resolve effect bytes
+as the earlier controls.
 
 ## Group source facts follow-up (2026-11-08)
 

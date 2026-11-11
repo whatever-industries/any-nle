@@ -1,6 +1,6 @@
 use super::*;
 mod trim_defaults;
-use crate::source::{PictureExtension, Rate, ResizeKey, SourceEvent, LinearTrim, LinearTrimKey};
+use crate::source::{PictureExtension, PictureStage, Rate, ResizeKey, SourceEvent, LinearTrim, LinearTrimKey};
 
 #[derive(Debug)]
 pub(super) struct Capture {
@@ -8,6 +8,133 @@ pub(super) struct Capture {
     length: Option<i64>,
     rate: Option<Rate>,
     effect: PictureExtension,
+}
+
+#[derive(Debug)]
+pub(super) struct OrderedChain {
+    pub(super) position: i64,
+    pub(super) length: i64,
+    pub(super) rate: Rate,
+    pub(super) stages: Vec<PictureStage>,
+}
+
+/// Verify the native input spine, then reuse the decoded stages from the
+/// postorder program. Resolving to one event alone cannot prove a single input.
+pub(super) fn ordered_chain<'a>(
+    ctx: &Ctx<'a>,
+    mut node: &'a Node,
+    ops: &[Op],
+    before: usize,
+    position: i64,
+) -> Option<OrderedChain> {
+    if node.class != *b"TKFX" {
+        return None;
+    }
+    let [Op::Source(_), remaining @ ..] = ops else { return None };
+    let length = int(node, "length").filter(|n| *n > 0)?;
+    let rate = float(node, "edit_rate").and_then(Rate::from_avid)?;
+    let mut effects = 0;
+    let mut depth = 0;
+    loop {
+        if depth > MAX_NESTING {
+            return None;
+        }
+        if int(node, "media_kind_id") != Some(KIND_PICTURE)
+            || node.get("edit_rate").is_some() && float(node, "edit_rate").and_then(Rate::from_avid) != Some(rate)
+        {
+            return None;
+        }
+        node = match &node.class {
+            b"SCLP" if int(node, "length") == Some(length) => break,
+            b"SEQU" => single_picture_segment(ctx, node, length)?,
+            b"TKFX" if int(node, "length") == Some(length) => {
+                effects += 1;
+                ordered_picture_input(ctx, node, length, rate)?
+            }
+            _ => return None,
+        };
+        depth += 1;
+    }
+    if effects < 2 {
+        return None;
+    }
+
+    let mut stages = Vec::with_capacity(effects);
+    for op in remaining {
+        match op {
+            Op::Picture { before: start, value } if *start == before => {
+                stages.push(PictureStage::Static(value.clone()));
+            }
+            Op::PictureExtension { before: start, capture } if *start == before => {
+                match capture.effect {
+                    PictureExtension::Unsupported(_) | PictureExtension::UnsupportedTransform(_) => return None,
+                    PictureExtension::Flip { .. } => {}
+                    _ => {
+                        // The animation supersedes the inline values of this
+                        // same TKFX. The static operation immediately precedes it.
+                        let Some(PictureStage::Static(_)) = stages.pop() else { return None };
+                    }
+                }
+                stages.push(PictureStage::Extension(capture.effect));
+            }
+            Op::PictureChain { before: start, .. } if *start == before => {}
+            _ => return None,
+        }
+    }
+    (stages.len() == effects).then_some(OrderedChain { position, length, rate, stages })
+}
+
+fn single_picture_segment<'a>(ctx: &Ctx<'a>, sequence: &Node, length: i64) -> Option<&'a Node> {
+    let Value::RefList(children) = sequence.get("components")? else { return None };
+    let mut picture = None;
+    for child in children {
+        let child = ctx.deref(Some(child))?;
+        match int(child, "length")? {
+            0 if child.class == *b"FILL" => {}
+            n if n == length && child.class != *b"FILL" && picture.is_none() => picture = Some(child),
+            _ => return None,
+        }
+    }
+    picture
+}
+
+fn ordered_picture_input<'a>(ctx: &Ctx<'a>, effect: &Node, length: i64, rate: Rate) -> Option<&'a Node> {
+    // Work from the raw list so dangling inputs cannot look like one valid input.
+    let Value::List(tracks) = effect.get("tracks")? else { return None };
+    let input = |track: &Value| {
+        let Value::Node(track) = track else { return None };
+        ctx.deref(track.get("component"))
+    };
+    if float(effect, "edit_rate").and_then(Rate::from_avid) != Some(rate) {
+        return None;
+    }
+    match (effect.get("effect_id")?.as_str()?, tracks.as_slice()) {
+        ("EFF2_BLEND_RESIZE", [picture]) => input(picture),
+        (name, [picture]) if flip(name).is_some() => input(picture),
+        ("EFF2_SBLEND", [background, picture]) => {
+            let (Value::Node(back_track), Value::Node(picture_track)) = (background, picture) else { return None };
+            if (int(back_track, "index"), int(picture_track, "index")) != (Some(1), Some(2)) {
+                return None;
+            }
+            let background = input(background)?;
+            let picture = input(picture)?;
+            let fill_length = |node: &Node| {
+                (node.class == *b"FILL" && int(node, "media_kind_id") == Some(KIND_PICTURE))
+                    .then(|| int(node, "length").filter(|n| *n >= 0)).flatten()
+            };
+            let span = if background.class == *b"SEQU" {
+                let Value::RefList(children) = background.get("components")? else { return None };
+                children.iter().try_fold(0i64, |sum, child| {
+                    sum.checked_add(fill_length(ctx.deref(Some(child))?)?)
+                })?
+            } else {
+                fill_length(background)?
+            };
+            (span == length && int(background, "media_kind_id") == Some(KIND_PICTURE))
+                .then_some(picture)
+        }
+        _ => None,
+    }
 }
 
 impl Capture {
@@ -50,13 +177,13 @@ impl Capture {
 }
 
 pub(super) fn flip(effect: &str) -> Option<PictureExtension> {
-    let (horizontal, vertical) = match effect {
-        "EFF2_BLEND_FLIP_VERT" => (false, true),
-        "EFF2_BLEND_FLIP_HORZ" => (true, false),
-        "EFF2_BLEND_FLIP_BOTH" => (true, true),
-        _ => return None,
-    };
+    let (native_id, horizontal, vertical) = [
+        ("EFF2_BLEND_FLIP_VERT", false, true),
+        ("EFF2_BLEND_FLIP_HORZ", true, false),
+        ("EFF2_BLEND_FLIP_BOTH", true, true),
+    ].into_iter().find(|(id, _, _)| *id == effect)?;
     Some(PictureExtension::Flip {
+        native_id,
         horizontal,
         vertical,
     })

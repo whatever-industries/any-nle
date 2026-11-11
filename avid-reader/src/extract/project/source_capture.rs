@@ -917,12 +917,11 @@ impl Capture {
             if self.primary_timecode_seen {
                 self.clock = None;
             } else if qualified
-                && rate == Rate::new(24000, 1001)
+                && (rate == Rate::new(24000, 1001) || rate == Rate::new(24, 1))
                 && int(component, "fps") == Some(24)
                 && int(component, "flags") == Some(0)
             {
-                // Premiere's 23.976 preset displays a 24-count non-drop
-                // clock. Different rates, DF and wrapped counts are unqualified.
+                // Both exact rates use a 24-count non-drop clock in this profile.
                 if let Some(count) = int(component, "start").filter(|n| (0..24 * 60 * 60 * 24).contains(n)) {
                     self.clock = rate.map(|rate| SequenceClock {
                         count: count as u64,
@@ -1151,6 +1150,10 @@ impl Capture {
                 if first_shared(&self.budget, key) {
                     cost = color_cost(&value.params);
                 }
+            }
+            Op::PictureChain { chain, .. } => {
+                // Static stages share picture payloads already charged by Op::Picture.
+                cost = chain.stages.capacity() * size_of::<PictureStage>();
             }
             Op::Matte { value, .. } => {
                 let key = Arc::as_ptr(value) as usize;
@@ -1837,6 +1840,7 @@ fn finish_source(
                         reason: None,
                         volume_automation: None,
                         picture_extension: None,
+                        picture_chain: Vec::new(),
                         motion_adapter_phase: fact.motion_adapter_phase,
                         saved_timewarp: fact.saved_timewarp.take(),
                     });
@@ -1881,6 +1885,7 @@ fn finish_source(
             }
             Op::Color { before, value } => {
                 for e in &mut events[starts[before]..] {
+                    e.picture_chain.clear();
                     if !charge(&capture.budget, color_cost(&value)) {
                         break;
                     }
@@ -1889,6 +1894,7 @@ fn finish_source(
             }
             Op::Picture { before, value } => {
                 for e in &mut events[starts[before]..] {
+                    e.picture_chain.clear();
                     if e.event.picture.is_some() {
                         e.event.picture_nested = true;
                     } else {
@@ -1903,7 +1909,21 @@ fn finish_source(
                 let produced = &mut events[starts[before]..];
                 let single = produced.len() == 1;
                 for event in produced {
+                    event.picture_chain.clear();
                     event.picture_extension = Some(picture.resolve(single, event));
+                }
+            }
+            Op::PictureChain { before, chain } => {
+                let [event] = &mut events[starts[before]..] else { continue };
+                if event.event.via.is_empty() && event.event.speed.is_none()
+                    && event.motion_adapter_phase.is_none() && event.saved_timewarp.is_none()
+                    && event.range.as_ref().is_some_and(|range| {
+                        range.record_start == chain.position && range.length == chain.length
+                            && range.record_rate == chain.rate && range.source_rate == chain.rate
+                            && range.source_length == chain.length
+                    })
+                {
+                    event.picture_chain = chain.stages;
                 }
             }
             Op::Matte {
@@ -1913,6 +1933,7 @@ fn finish_source(
             } => {
                 let produced = events.len() - starts[before];
                 for e in &mut events[starts[before]..] {
+                    e.picture_chain.clear();
                     if produced == 1 && e.event.length == length && e.event.animatte.is_none() {
                         if !charge(&capture.budget, matte_cost(&value)) {
                             break;

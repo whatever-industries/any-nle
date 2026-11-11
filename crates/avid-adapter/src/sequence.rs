@@ -84,6 +84,7 @@ fn motion_timing(
     if event.event.combined.is_some()
         || !event.event.via.is_empty() || event.volume_automation.is_some()
         || event.picture_extension.is_some() || event.event.picture.is_some()
+        || !event.picture_chain.is_empty()
         || event.event.animatte.is_some() || event.event.color.is_some()
     { return Err("requires an unstacked automatic adapter".into()); }
     if time(range.source_in.checked_add(range.source_length).ok_or("source extent overflow")?, range.source_rate)? > picture {
@@ -504,17 +505,22 @@ pub(super) fn append(
                 }
             }
         }
-        // Active curves in the qualified transforms supersede stale inline scalars.
-        let replace_static = event.picture_extension.is_some_and(av::PictureExtension::replaces_static_transform);
-        effects::apply(e, !replace_static, raster, &mut p, out, budget)?;
-        if let Some(mut effect) = event.picture_extension {
-            if effect.requires_square_pixels() && !item_routes[index].square_pixels {
-                effect = av::PictureExtension::Unsupported("Animated crop, Warp, or trimmed Resize requires verified square-pixel progressive geometry");
+        if event.picture_chain.is_empty() {
+            // Active curves in the qualified transforms supersede stale inline scalars.
+            let replace_static = event.picture_extension.is_some_and(av::PictureExtension::replaces_static_transform);
+            effects::apply(e, !replace_static, raster, &mut p, out, budget)?;
+            if let Some(mut effect) = event.picture_extension {
+                if effect.requires_square_pixels() && !item_routes[index].square_pixels {
+                    effect = av::PictureExtension::Unsupported("Animated crop, Warp, or trimmed Resize requires verified square-pixel progressive geometry");
+                }
+                if e.picture_nested {
+                    effect = av::PictureExtension::Unsupported("nested picture effects require separate qualification");
+                }
+                effects::apply_picture_extension(effect, raster, &mut p, out, budget)?;
             }
-            if e.picture_nested {
-                effect = av::PictureExtension::Unsupported("nested picture effects require separate qualification");
-            }
-            effects::apply_picture_extension(effect, raster, &mut p, out, budget)?;
+        } else {
+            effects::apply_picture_chain(&event.picture_chain, raster,
+                item_routes[index].square_pixels, &mut p, out, budget)?;
         }
         let mut receipt = vec![
             ("owner", s(&event.owner)),
@@ -534,6 +540,25 @@ pub(super) fn append(
         }
         if event.saved_timewarp.is_some() {
             receipt.push(("saved_timewarp", Value::Bool(true)));
+        }
+        let reflection = |stage, native_id| {
+            obj(vec![("stage", Value::Int(stage as i64)), ("effect_id", s(native_id))])
+        };
+        let reflections: Vec<_> = if event.picture_chain.is_empty() {
+            match event.picture_extension {
+                Some(av::PictureExtension::Flip { native_id, .. }) => vec![reflection(0, native_id)],
+                _ => vec![],
+            }
+        } else {
+            event.picture_chain.iter().enumerate().filter_map(|(index, stage)| {
+                let av::PictureStage::Extension(av::PictureExtension::Flip { native_id, .. }) = stage else {
+                    return None;
+                };
+                Some(reflection(index, native_id))
+            }).collect()
+        };
+        if !reflections.is_empty() {
+            receipt.push(("native_reflections", Value::Arr(reflections)));
         }
         sidecar(
             out,
@@ -857,6 +882,7 @@ pub(super) fn append(
             obj(vec![
                 ("id", s(&e.id)),
                 ("owner", s(&e.owner)),
+                ("placement_id", opt_s(map.get(&e.id).map(String::as_str))),
                 ("master", s(e.event.master.urn())),
                 ("kind", Value::Int(e.event.kind)),
                 ("track", Value::Int(e.event.track)),

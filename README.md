@@ -120,10 +120,12 @@ Native corpus qualification uses separate fixtures.
 
 ## Resolve development
 
-The internal Resolve tools can read selected projects and write experimental
-projects. The verified Avid path links 1080p23.976 DNxHR LB OP-Atom picture and
-two independent mono MXFs per clip in a straight-cut timeline. Resolve conversion
-is still a development feature. [Scope and verification](docs/RESOLVE-PROJECT-CORE.md)
+The internal Resolve tools read selected projects and write editable Resolve
+projects from bounded Avid and Premiere inputs. They link supported originals
+in place. The development tools cover selected Avid OP-Atom and UME media,
+editable Groups with fixed audio, and a Premiere straight-cut profile using
+ProRes MOV and PCM WAV. Resolve conversion is a development feature.
+[Scope and verification](docs/RESOLVE-TURNOVER-IMPLEMENTATION.md).
 
 The model format is in [`prproj/src/convert/model.rs`](prproj/src/convert/model.rs) and
 [`src/avid2prproj/model.py`](src/avid2prproj/model.py) (example:

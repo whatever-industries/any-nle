@@ -8,6 +8,8 @@ const TEMPLATE_24: &str = "e2a3a1ad16be932947914d866b3c8bb49b549ffd5869a06a9fc9e
 const MEDIA_DONOR: &str = "MediaPool/Master/002_Linked/000_Audio/MpFolder.xml";
 const TIMELINE_DONOR: &str = "SeqContainer/93a83077-933a-4ed8-9595-e12534b57e18.xml";
 const PRORES_REC709: &str = "80087810027002789e01800166880132980100d80100";
+const AVC_UNTAGGED: &str = "80089403100228108801329001d080a006980100d80100";
+const AVC_REC709: &str = "80089403100228107002789e018001668801329001d080a006980100d80100";
 
 pub fn publish_linked(
     prepared: &PreparedProject,
@@ -15,21 +17,122 @@ pub fn publish_linked(
     profile_template: &Path,
     output: &Path,
 ) -> Result<Published> {
+    publish_turnover(
+        prepared,
+        layout_template,
+        profile_template,
+        None,
+        None,
+        output,
+    )
+}
+
+pub fn publish_turnover(
+    prepared: &PreparedProject,
+    layout_template: &Path,
+    profile_template: &Path,
+    atom_template: Option<&Path>,
+    group_template: Option<&Path>,
+    output: &Path,
+) -> Result<Published> {
+    publish_turnover_checked(
+        prepared,
+        layout_template,
+        profile_template,
+        atom_template,
+        group_template,
+        output,
+        || Ok(()),
+    )
+}
+
+pub(crate) fn publish_turnover_checked(
+    prepared: &PreparedProject,
+    layout_template: &Path,
+    profile_template: &Path,
+    atom_template: Option<&Path>,
+    group_template: Option<&Path>,
+    output: &Path,
+    recheck: impl FnOnce() -> Result<()>,
+) -> Result<Published> {
     check_output(output)?;
-    let layout = load_skeleton(layout_template, TEMPLATE_23976, 13)?;
-    let profile = if prepared.rate == Rational::integer(24) {
-        load_skeleton(profile_template, TEMPLATE_24, 10)?
-    } else {
-        load_skeleton(profile_template, TEMPLATE_23976, 13)?
-    };
-    let (members, identities) = build(prepared, &layout, &profile)?;
+    let (members, identities) = assemble_turnover(
+        prepared,
+        layout_template,
+        profile_template,
+        atom_template,
+        group_template,
+    )?;
     write_checked_archive(members, output, |stage| {
         verify_stage(prepared, &identities, stage)?;
         for media in &prepared.media {
             media.recheck()?;
         }
-        Ok(())
+        recheck()
     })
+}
+
+fn assemble_turnover(
+    prepared: &PreparedProject,
+    layout_template: &Path,
+    profile_template: &Path,
+    atom_template: Option<&Path>,
+    group_template: Option<&Path>,
+) -> Result<(Members, Identities)> {
+    let template = |role: &str, path: &Path, hash: &str, count| -> Result<Members> {
+        load_skeleton(path, hash, count)
+            .map_err(|error| format!("Resolve {role} template {}: {error}", path.display()).into())
+    };
+    let layout = template("layout", layout_template, TEMPLATE_23976, 13)?;
+    let profile = if prepared.rate == Rational::integer(24) {
+        template("profile", profile_template, TEMPLATE_24, 10)?
+    } else {
+        template("profile", profile_template, TEMPLATE_23976, 13)?
+    };
+    let atom_donor = if prepared
+        .media
+        .iter()
+        .any(|m| matches!(m.profile, Profile::Atom(_)))
+    {
+        let path = atom_template.ok_or("split MXF project requires its pinned media template")?;
+        let members = template("split MXF", path, SKELETON_SHA256, 6)?;
+        Some(block(member(&members, SOURCE)?, "Sm2MpVideoClip")?)
+    } else {
+        None
+    };
+    build(
+        prepared,
+        &layout,
+        &profile,
+        atom_donor.as_deref(),
+        group_template,
+    )
+}
+
+pub(crate) fn review_turnover(
+    prepared: &PreparedProject,
+    templates: &crate::turnover::Templates,
+    output: &Path,
+) -> Result<()> {
+    check_output(output)?;
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !std::fs::metadata(parent)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        return Err("project output must have an existing parent directory".into());
+    }
+    assemble_turnover(
+        prepared,
+        &templates.layout,
+        &templates.profile,
+        templates.atom.as_deref(),
+        templates.group.as_deref(),
+    )?;
+    Ok(())
 }
 
 fn member<'a>(members: &'a Members, path: &str) -> Result<&'a str> {
@@ -132,7 +235,7 @@ fn prefix_name(item: &mut String, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn clip_cache(media: &Media, video: bool) -> Result<String> {
+fn clip_cache(media: &Media, codec: &[u8], video: bool) -> Result<String> {
     let folder = utf8_path(media.path.parent().ok_or("missing linked media parent")?)?;
     let file = media
         .path
@@ -142,7 +245,7 @@ fn clip_cache(media: &Media, video: bool) -> Result<String> {
     let mut data = Vec::new();
     pb_bytes(1, folder.as_bytes(), &mut data);
     pb_bytes(2, file.as_bytes(), &mut data);
-    pb_bytes(5, if video { b"apch" } else { b"Linear PCM" }, &mut data);
+    pb_bytes(5, codec, &mut data);
     if video {
         pb_bytes(6, file.as_bytes(), &mut data);
         pb_bytes(7, uid().as_bytes(), &mut data);
@@ -152,6 +255,7 @@ fn clip_cache(media: &Media, video: bool) -> Result<String> {
         media.profile,
         Profile::Mov {
             quicktime_timecode: false,
+            h264: false,
             ..
         }
     ) {
@@ -159,8 +263,85 @@ fn clip_cache(media: &Media, video: bool) -> Result<String> {
     }
     pb_int(15, 8, &mut data);
     pb_int(16, 100, &mut data);
-    pb_int(18, if video { 16384 } else { 32768 }, &mut data);
+    pb_int(
+        18,
+        if video || codec == b"AAC" {
+            16384
+        } else {
+            32768
+        },
+        &mut data,
+    );
     pack(&data)
+}
+
+fn embedded_aac(item: &mut String, source: &str, media: &Media, frames: i64) -> Result<()> {
+    let donor = named(source, "Sm2MpAudioClip", "Signals-24.wav")?;
+    let base = block(&donor, "BtAudioInfo")?;
+    let id = uid();
+    let samples = frames * 2000;
+    let track = qt(&[
+        ("UniqueId", Text(&uid())),
+        ("StartTime", Double(0.0)),
+        ("SampleRate", Uint(48000)),
+        ("NumChannels", Int(2)),
+        ("IdxTrack", Int(0)),
+        ("Duration", Long(samples)),
+        ("DbType", Text("BtAudioTrack")),
+        ("CodecName", Text("AAC")),
+        ("ChannelLayout", Int(2)),
+        ("BitDepth", Uint(3)),
+    ]);
+    let audio = bind_audio(
+        &base,
+        &id,
+        &clip_cache(media, b"AAC", false)?,
+        &qt(&[("0", Bytes(&track))]),
+    )?;
+    container_field(
+        item,
+        "EmbeddedAudioVec",
+        &format!("<Element>{audio}</Element>"),
+    )?;
+    let mono_left = mono_selector(0, false)?;
+    let mono_right = mono_selector(1, false)?;
+    set(
+        item,
+        "VirtualAudioTracksBA",
+        &hex::encode(qt(&[("1", Bytes(&mono_right)), ("0", Bytes(&mono_left))])),
+    )?;
+    let left = qt(&[("MediaRef", Text(&id))]);
+    let right = qt(&[("MediaRef", Text(&id)), ("ChannelIdx", Int(1))]);
+    let channels = qt(&[("1", Bytes(&right)), ("0", Bytes(&left))]);
+    let range = extent(0.0, samples as f64 / 48000.0);
+    let route = qt(&[
+        ("Type", Uint(0)),
+        ("MediaExtents", Bytes(&range)),
+        ("CodecName", Text("AAC")),
+        ("ChannelVecBA", Bytes(&channels)),
+    ]);
+    let routes = qt(&[("0", Bytes(&route))]);
+    replace_fields(item, |data| {
+        replace_bytes(&data, 1, |a| {
+            replace_bytes(a, 1, |b| {
+                crate::binary::rewrite_bytes(b, 5, |_| Ok(Some(routes)))
+            })
+        })
+    })
+}
+
+fn mono_selector(channel: usize, atom: bool) -> Result<Vec<u8>> {
+    let mut channels = [0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0x40, 1];
+    let index = u8::try_from(channel + 1)?;
+    if atom {
+        channels[10] = 0x40 * index;
+    } else {
+        channels[11] = index;
+    }
+    Ok(qt(&[
+        ("ChannelsBA", Bytes(&channels)),
+        ("AudioType", Int(1)),
+    ]))
 }
 
 fn replace_fields(
@@ -182,15 +363,25 @@ fn pool_item(
     media: &Media,
     bin: &str,
     project_rate: Rational,
+    atom_donor: Option<&str>,
 ) -> Result<(String, String)> {
-    let donor = match media.profile {
+    let donor = match &media.profile {
         Profile::Mov { .. } => named(source, "Sm2MpVideoClip", "Counter-23976.mov")?,
         Profile::Wav { bits, channels, .. } => {
             let name = format!(
                 "{}-{bits}.wav",
-                if channels == 1 { "Mono" } else { "Signals" }
+                if *channels == 1 { "Mono" } else { "Signals" }
             );
             named(source, "Sm2MpAudioClip", &name)?
+        }
+        Profile::Atom(binding) => {
+            let donor = atom_donor.ok_or("missing split MXF template")?;
+            let id = uid();
+            let (folder, file) = media_path_parts(&binding.path)?;
+            let mut item = bind_pool_item(donor, binding, folder, file, &id)?;
+            set(&mut item, "MpFolder", bin)?;
+            prefix_name(&mut item, &media.name)?;
+            return Ok((id, item));
         }
     };
     let ids = new_ids(&donor)?;
@@ -198,25 +389,51 @@ fn pool_item(
     let id = dbid(&item)?.to_owned();
     set(&mut item, "MpFolder", bin)?;
     prefix_name(&mut item, &media.name)?;
-    match media.profile {
+    match &media.profile {
         Profile::Mov {
             rate,
             frames,
             tagged_rec709,
+            h264,
+            aac,
             ..
         } => {
             let old = block(&item, "BtVideoInfo")?;
             let mut video = old.clone();
-            set(&mut video, "Clip", &clip_cache(media, true)?)?;
+            set(
+                &mut video,
+                "Clip",
+                &clip_cache(media, if *h264 { b"avc1" } else { b"apch" }, true)?,
+            )?;
             let timing = qt(&[
                 ("UniqueId", Text(&uid())),
                 ("StartFrame", Int(0)),
-                ("NumFrames", Int(i32::try_from(frames)?)),
-                ("FrameRate", Bytes(&rate_bytes(rate))),
+                ("NumFrames", Int(i32::try_from(*frames)?)),
+                ("FrameRate", Bytes(&rate_bytes(*rate))),
                 ("DbType", Text("BtVideoTime")),
             ]);
             set(&mut video, "Time", &hex::encode(timing))?;
-            if tagged_rec709 {
+            if *h264 {
+                let mut resolution = [0; 16];
+                resolution[..8].copy_from_slice(&1920u64.to_be_bytes());
+                resolution[8..].copy_from_slice(&1080u64.to_be_bytes());
+                let geometry = qt(&[
+                    ("UniqueId", Text(&uid())),
+                    ("Resolution", Bytes(&resolution)),
+                    ("FrameSize", Int(3126784)),
+                    ("DbType", Text("BtGeometry")),
+                ]);
+                set(&mut video, "Geometry", &hex::encode(geometry))?;
+                set(
+                    &mut video,
+                    "Radiometry",
+                    if *tagged_rec709 {
+                        AVC_REC709
+                    } else {
+                        AVC_UNTAGGED
+                    },
+                )?;
+            } else if *tagged_rec709 {
                 set(&mut video, "Radiometry", PRORES_REC709)?;
             }
             let metadata = qt(&[
@@ -225,6 +442,9 @@ fn pool_item(
             ]);
             set(&mut video, "VideoMetadata", &hex::encode(metadata))?;
             replace_once(&mut item, &old, &video)?;
+            if *aac {
+                embedded_aac(&mut item, source, media, *frames)?;
+            }
         }
         Profile::Wav {
             samples,
@@ -234,20 +454,24 @@ fn pool_item(
             let old = block(&item, "BtAudioInfo")?;
             let mut audio = old.clone();
             let audio_id = dbid(&audio)?.to_owned();
-            let depth = if bits == 16 { 1 } else { 2 };
-            set(&mut audio, "Clip", &clip_cache(media, false)?)?;
+            let depth = if *bits == 16 { 1 } else { 2 };
+            set(
+                &mut audio,
+                "Clip",
+                &clip_cache(media, b"Linear PCM", false)?,
+            )?;
             let mut track = vec![
                 ("UniqueId", Text(&audio_id)),
                 ("StartTime", Double(0.0)),
                 ("SampleRate", Uint(48000)),
-                ("NumChannels", Int(channels as i32)),
+                ("NumChannels", Int(*channels as i32)),
                 ("IdxTrack", Int(0)),
-                ("Duration", Long(samples)),
+                ("Duration", Long(*samples)),
                 ("DbType", Text("BtAudioTrack")),
                 ("CodecName", Text("Linear PCM")),
             ];
             if depth == 2 {
-                track.push(("ChannelLayout", Int(channels as i32)));
+                track.push(("ChannelLayout", Int(*channels as i32)));
             }
             track.push(("BitDepth", Uint(depth)));
             set(
@@ -258,14 +482,14 @@ fn pool_item(
             replace_once(&mut item, &old, &audio)?;
             let left = qt(&[("MediaRef", Text(&audio_id))]);
             let right = qt(&[("MediaRef", Text(&audio_id)), ("ChannelIdx", Int(1))]);
-            let channels_map = if channels == 2 {
+            let channels_map = if *channels == 2 {
                 qt(&[("1", Bytes(&right)), ("0", Bytes(&left))])
             } else {
                 qt(&[("0", Bytes(&left))])
             };
-            let bounds = extent(0.0, samples as f64 / 48000.0);
+            let bounds = extent(0.0, *samples as f64 / 48000.0);
             let mut route = Vec::new();
-            if channels == 2 {
+            if *channels == 2 {
                 route.push(("Type", Uint(0)));
             }
             route.extend([
@@ -285,6 +509,7 @@ fn pool_item(
                 })
             })?;
         }
+        Profile::Atom(_) => return Err("unexpected split MXF template profile".into()),
     }
     Ok((id, item))
 }
@@ -380,27 +605,38 @@ fn write_timeline(
             )?;
             set(&mut clip, "In", &edit.source_in.to_string())?;
             set(&mut clip, "Duration", &edit.length.to_string())?;
-            let end = match source.profile {
+            if let Some(video) = &edit.video {
+                set(&mut clip, "EffectFiltersBA", &video.encoded)?;
+            }
+            let atom = match &source.profile {
+                Profile::Atom(binding) => Some(binding),
+                _ => None,
+            };
+            let end = match &source.profile {
                 Profile::Mov { frames, .. } => (frames - 1) as f64 / fps(rate),
                 Profile::Wav { samples, .. } => {
                     (samples - samples_per_frame(rate)) as f64 / 48000.0
+                }
+                Profile::Atom(binding) => {
+                    set(
+                        &mut clip,
+                        "MediaStartTime",
+                        &seconds(binding.timecode_frames).to_string(),
+                    )?;
+                    seconds(binding.frames - 1)
                 }
             };
             let mut map = vec![2];
             map.extend_from_slice(&end.to_be_bytes());
             set(&mut clip, "MediaTimemapBA", &hex::encode(map))?;
             if let Some(channel) = edit.channel {
-                let mut channels = [0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0x40, 1];
-                channels[11] = u8::try_from(channel + 1)?;
+                let selector = if atom.is_some() { channel } else { 0 };
                 set(
                     &mut clip,
                     "VirtualAudioTrackBA",
-                    &hex::encode(qt(&[
-                        ("ChannelsBA", Bytes(&channels)),
-                        ("AudioType", Int(1)),
-                    ])),
+                    &hex::encode(mono_selector(channel, atom.is_some())?),
                 )?;
-                set(&mut clip, "MediaTrackIdx", "0")?;
+                set(&mut clip, "MediaTrackIdx", &selector.to_string())?;
             }
             if list.len().saturating_add(clip.len()).saturating_add(32) as u64 > MAX_XML {
                 return Err("timeline XML exceeds its construction budget".into());
@@ -459,12 +695,15 @@ struct Identities {
     bins: Vec<String>,
     media: Vec<String>,
     sequences: Vec<String>,
+    group: Option<String>,
 }
 
 fn build(
     p: &PreparedProject,
     layout: &Members,
     profile: &Members,
+    atom_donor: Option<&str>,
+    group_template: Option<&Path>,
 ) -> Result<(Members, Identities)> {
     let root = member(profile, POOL)?;
     let root_id = dbid(root)?.to_owned();
@@ -478,7 +717,7 @@ fn build(
     let timeline_donor = named(member(layout, POOL)?, "Sm2MpTimelineClip", "Linked A")?;
     let container_donor = member(layout, TIMELINE_DONOR)?;
     for media in &p.media {
-        let (id, item) = pool_item(donor, media, &bin_ids[media.bin], p.rate)?;
+        let (id, item) = pool_item(donor, media, &bin_ids[media.bin], p.rate, atom_donor)?;
         remaining_xml = remaining_xml
             .checked_sub(item.len() + 19)
             .ok_or("media XML exceeds its construction budget")?;
@@ -488,11 +727,39 @@ fn build(
     let mut members = Members::new();
     let mut handles = String::new();
     let mut sequence_ids = Vec::new();
+    let mut group_id = None;
     let mut project = member(profile, PROJECT)?.to_owned();
     set(&mut project, "ProjectName", &xml(&p.name))?;
     set(&mut project, "CurrentTimelineIndex", "0")?;
     container_field(&mut project, "LocableBlobSet", "")?;
     for timeline in &p.timelines {
+        if let Some(group) = &timeline.group {
+            let built = super::group::build_turnover_group(
+                &group.prepared,
+                group_template.ok_or("Group project requires its pinned Group template")?,
+                &bin_ids[group.bin],
+                &bin_ids[timeline.bin],
+                group.cameras.map(|index| media_ids[index].as_str()),
+            )?;
+            let added = built.pool.len()
+                + built.timeline.len()
+                + 38
+                + built.containers.values().map(String::len).sum::<usize>();
+            remaining_xml = remaining_xml
+                .checked_sub(added)
+                .ok_or("Group XML exceeds its construction budget")?;
+            children[group.bin].push_str(&format!("<Element>{}</Element>", built.pool));
+            children[timeline.bin].push_str(&format!("<Element>{}</Element>", built.timeline));
+            handles.push_str(&format!("<Element>{}</Element>", built.handle));
+            sequence_ids.push(built.sequence);
+            group_id = Some(built.id);
+            for (name, contents) in built.containers {
+                if members.insert(name, contents).is_some() {
+                    return Err("Group sequence container identity collision".into());
+                }
+            }
+            continue;
+        }
         let (handle, sequence, container_id, pool, container) = write_timeline(
             timeline,
             p.rate,
@@ -509,7 +776,12 @@ fn build(
         handles.push_str(&format!("<Element>{handle}</Element>"));
         markers::write(&mut project, &sequence, &timeline.markers)?;
         sequence_ids.push(sequence);
-        members.insert(format!("SeqContainer/{container_id}.xml"), container);
+        if members
+            .insert(format!("SeqContainer/{container_id}.xml"), container)
+            .is_some()
+        {
+            return Err("sequence container identity collision".into());
+        }
     }
     container_field(&mut project, "TimelineHandleVec", &handles)?;
     members.insert(PROJECT.into(), project);
@@ -562,6 +834,7 @@ fn build(
             bins: bin_ids,
             media: media_ids,
             sequences: sequence_ids,
+            group: group_id,
         },
     ))
 }
@@ -599,8 +872,94 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             return Err("generated Resolve bin ownership differs from preparation".into());
         }
     }
+    for (media, id) in p.media.iter().zip(&ids.media) {
+        if let Profile::Mov {
+            h264: true,
+            rate,
+            frames,
+            aac,
+            ..
+        } = &media.profile
+        {
+            let item = graph
+                .items
+                .iter()
+                .find(|item| item.id == *id)
+                .ok_or("generated AVC media item absent")?;
+            let duration = Rational::new(
+                i128::from(*frames) * i128::from(rate.den()),
+                rate.num().into(),
+            )
+            .ok_or("generated AVC duration overflow")?;
+            let file = utf8_path(&media.path)?;
+            let expected = if *aac {
+                [Some("avc1"), Some("aac"), Some("aac")]
+            } else {
+                [Some("avc1"), None, None]
+            };
+            let mut streams = item.media.iter();
+            for codec in expected.into_iter().flatten() {
+                let saved = streams
+                    .next()
+                    .and_then(|link| graph.media.iter().find(|row| row.id == link.media))
+                    .ok_or("generated AVC media stream absent")?;
+                if saved.locations.as_slice() != [file]
+                    || saved.duration != duration
+                    || saved.codec.as_deref() != Some(codec)
+                {
+                    return Err(
+                        "generated AVC source clock or locator differs from preparation".into(),
+                    );
+                }
+            }
+            if streams.next().is_some() {
+                return Err("generated AVC media has an unexpected stream".into());
+            }
+        }
+        let Profile::Atom(binding) = &media.profile else {
+            continue;
+        };
+        let files = binding
+            .atom
+            .as_ref()
+            .ok_or("split MXF verification absent")?;
+        let item = graph
+            .items
+            .iter()
+            .find(|item| item.id == *id)
+            .ok_or("generated split MXF item missing")?;
+        if item.umid.as_deref() != Some(&hex::encode_upper(files.master_package))
+            || item.media.len() != files.files.len()
+        {
+            return Err("generated split MXF master identity differs from preparation".into());
+        }
+        let start = Rational::new(i128::from(binding.timecode_frames) * 1001, 24000);
+        for (index, file) in files.files.iter().enumerate() {
+            let stream_id = if index == 0 {
+                format!("{id}/video")
+            } else {
+                format!("{id}/audio/{index}")
+            };
+            let stream = graph.media.iter().find(|row| row.id == stream_id);
+            let receipt = graph.sidecar("resolve.source", &stream_id);
+            let file_path = utf8_path(&file.path)?;
+            if !item.media.iter().any(|link| link.media == stream_id)
+                || !stream.is_some_and(|row| {
+                    row.locations.as_slice() == [file_path] && row.start == start
+                })
+                || receipt.and_then(|fields| fields.get("saved_file_package"))
+                    != Some(&Value::Str(hex::encode_upper(file.package)))
+            {
+                return Err("generated split MXF file identity differs from preparation".into());
+            }
+        }
+    }
     for (index, (timeline, read)) in p.timelines.iter().zip(&graph.sequences).enumerate() {
-        let count = timeline.lanes.iter().map(Vec::len).sum::<usize>();
+        let count = if let Some(group) = &timeline.group {
+            group.prepared.lanes.iter().map(Vec::len).sum::<usize>()
+        } else {
+            timeline.lanes.iter().map(Vec::len).sum::<usize>()
+        };
         let folder = graph
             .sidecar("resolve.source", &read.id)
             .and_then(|r| r.get("bin_id"));
@@ -620,6 +979,70 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             )
             .into());
         }
+        if let Some(group) = &timeline.group {
+            let id = ids
+                .group
+                .as_deref()
+                .ok_or("generated Group identity absent")?;
+            if graph.multicams.len() != 1
+                || graph.multicams[0].id != id
+                || graph.multicams[0].name != group.prepared.group_name
+            {
+                return Err("generated Group definition differs from preparation".into());
+            }
+            let uses: Vec<_> = graph
+                .multicam_uses
+                .iter()
+                .filter(|u| u.sequence == read.id)
+                .collect();
+            if uses.len() != count {
+                return Err("generated Group use count differs from preparation".into());
+            }
+            for (lane, edits) in group.prepared.lanes.iter().enumerate() {
+                let kind = if lane == 0 {
+                    graph::StreamKind::Video
+                } else {
+                    graph::StreamKind::Audio
+                };
+                let track = lane.max(1) as i64;
+                let native = uses.iter().filter(|u| u.kind == kind && u.track == track);
+                for (saved, wanted) in native.zip(edits) {
+                    let frame = |time| crate::prepare::frames_on(time, p.rate);
+                    let [placement] = saved.binding.placements.as_slice() else {
+                        return Err("generated Group use lacks one leaf placement".into());
+                    };
+                    let leaf = read
+                        .placements
+                        .iter()
+                        .find(|p| &p.id == placement)
+                        .ok_or("generated Group leaf placement absent")?;
+                    if saved.candidates.as_slice() != [id]
+                        || saved.selected != Some(wanted.camera as i64)
+                        || saved.source_in.map(frame).transpose()? != Some(wanted.edit.source_in)
+                        || frame(leaf.record_start)? != wanted.edit.start
+                        || frame(leaf.source_in)?
+                            != wanted.edit.source_in - group.prepared.offsets[wanted.camera]
+                        || frame(leaf.duration)? != wanted.edit.length
+                        || leaf.item != ids.media[group.cameras[wanted.camera]]
+                        || (lane != 0 && leaf.audio_streams.as_slice() != [lane as i64])
+                    {
+                        return Err(
+                            "generated Group angle, range or channel differs from preparation"
+                                .into(),
+                        );
+                    }
+                }
+                if uses
+                    .iter()
+                    .filter(|u| u.kind == kind && u.track == track)
+                    .count()
+                    != edits.len()
+                {
+                    return Err("generated Group lane count differs from preparation".into());
+                }
+            }
+            continue;
+        }
         for (lane, expected) in timeline.lanes.iter().enumerate() {
             let actual = read.placements.iter().filter(|edit| match lane {
                 0 => edit.video_track == Some(1),
@@ -631,6 +1054,7 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                     || frame(edit.record_start)? != wanted.start
                     || frame(edit.source_in)? != wanted.source_in
                     || frame(edit.duration)? != wanted.length
+                    || !crate::video::matches_readback(edit, wanted.video.as_ref())
                     || !edit
                         .audio_streams
                         .iter()

@@ -41,8 +41,24 @@ use retains the original range and any gap or unresolved binding.
 Sequence markers preserve relative position, duration, title and note.
 Blue, Red and Lavender have native color witnesses. Other saved color bits
 and custom data remain in a Resolve receipt. Clip-owned marker clocks are
-unqualified. Static X position is limited to the witnessed pure transform
-on equal 1920×1080 source and timeline rasters, with no other saved controls.
+unqualified. Bounded static position, independent scale, crop, and
+isolated horizontal and vertical reflections use the witnessed controls
+on equal 1920×1080 source and timeline rasters. A reflection is read as
+a `resolve.flip` effect with both axis flags. The witnessed two- and
+three-key Linear Position and independent Zoom profiles are read as
+`resolve.motion_linear` with source-frame keys, native position
+fractions (Tilt positive up), and Zoom multipliers. Three-key curves
+retain points outside the visible edit within the saved media extent.
+The three-key crop profile adds `crop_left`, `crop_top`, `crop_right`,
+and `crop_bottom` source-frame curves as raster fractions. All eight
+curves share the visible edit's Elastic grid. Softness and Retain Image
+Position must be off. A missing crop scalar base represents zero only
+when its first saved key is zero.
+Within the ordered picture chain profile, a reflected static control is
+read as its native Transform and `resolve.flip` axes. The bounded native
+animated shape carries `horizontal_flip` and `vertical_flip` in
+`resolve.motion_linear` alongside the saved curves. These describe the
+Inspector fields on Resolve's clock and geometry.
 Static clip volume on a direct mono edit is read as a per-placement dB
 value from −6 through +3 for the witnessed single-control shape. The
 bounded two-point volume curve preserves exact item-source times and dB

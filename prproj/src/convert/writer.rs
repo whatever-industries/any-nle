@@ -594,7 +594,7 @@ struct Writer<'a> {
     multicam_items: Vec<ItemId>,
     multicam_uses: HashMap<(usize, usize), &'a super::multicam::PreparedMulticamUse>,
     video_dissolves: HashMap<usize, Vec<&'a PreparedVideoDissolve>>,
-    picture_effects: HashMap<(usize, usize), PictureEffect>,
+    picture_effects: HashMap<(usize, usize), (PictureEffect, [bool; 2])>,
 }
 
 /// Index of `file` (a reference into `clip.audio`) by identity (Python `id(a)`).
@@ -1090,7 +1090,8 @@ impl Writer<'_> {
         let mut dissolve_items = HashMap::new();
         for (i, e) in seq.events.iter().enumerate() {
             let group_use = self.multicam_uses.get(&(sequence_index, i)).copied();
-            let picture_effect = self.picture_effects.get(&(sequence_index, i)).copied();
+            let prepared_picture = self.picture_effects.get(&(sequence_index, i)).copied();
+            let picture_effect = prepared_picture.map(|(effect, _)| effect);
             let (kind, mut payload) = self.placement[&e.clip].clone();
             let own: Vec<&Marker> =
                 seq.markers.iter().filter(|m| m.owner == "edit" && m.event == Some(i as i64) && !m.inherited).collect();
@@ -1397,7 +1398,12 @@ impl Writer<'_> {
                     ));
                 }
             }
-            if let Some(PictureEffect::Flip { horizontal, vertical }) = picture_effect {
+            let [horizontal, vertical] = match prepared_picture {
+                Some((PictureEffect::Flip { horizontal, vertical }, _)) => [horizontal, vertical],
+                Some((_, axes)) => axes,
+                None => [false; 2],
+            };
+            if horizontal || vertical {
                 for &t in &placed {
                     if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
                         apply_flip(&mut self.project, t, horizontal, vertical)?;
@@ -1810,7 +1816,8 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         multicam_items: Vec::new(),
         multicam_uses: model.multicam_uses.iter().map(|u| ((u.sequence,u.event),u)).collect(),
         video_dissolves,
-        picture_effects: model.picture_effects.iter().map(|e| ((e.sequence, e.event), e.effect)).collect(),
+        picture_effects: model.picture_effects.iter()
+            .map(|e| ((e.sequence, e.event), (e.effect, e.reflection_before_motion))).collect(),
     };
     // Borrow component names rather than cloning every complete prefix. This
     // index is linear in the validated references, including repeated paths.

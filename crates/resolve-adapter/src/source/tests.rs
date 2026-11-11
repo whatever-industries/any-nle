@@ -114,3 +114,62 @@ fn broken_registration_and_bin_parent_are_rejected() {
         .to_string()
         .contains("child bin registration contradicts"));
 }
+
+#[test]
+fn transition_observations_keep_their_owners_after_graph_serialization() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("synthetic.drp");
+    build(&path, HANDLE, ROOT);
+    let mut graph = read(&path).unwrap();
+    let mut second = graph.sequences[0].clone();
+    second.id = "another-sequence".into();
+    second.clock.as_mut().unwrap().provenance.source_package = second.id.clone();
+    graph.sequences.push(second);
+    let grid = Grid {
+        rate: crate::prepare::rate(),
+        origin: 86_400,
+        length: 60,
+        size: (1920, 1080),
+    };
+    let make = |id: &str, alignment: &str| Node {
+        name: "Sm2TiTransition".into(),
+        id: Some(id.into()),
+        text: String::new(),
+        children: [
+            ("Name", "Cross Dissolve"),
+            ("Start", "86417"),
+            ("Duration", "8"),
+            ("AlignmentType", alignment),
+            ("Position", "2"),
+        ]
+        .into_iter()
+        .map(|(name, value)| Node {
+            name: name.into(),
+            id: None,
+            text: value.into(),
+            children: vec![],
+        })
+        .collect(),
+    };
+    for (sequence, track, id, alignment) in [
+        (SEQUENCE, "track-a", "transition-a", "3"),
+        ("another-sequence", "track-b", "transition-b", "1"),
+    ] {
+        observations::transition(
+            &mut graph, &make(id, alignment), sequence, track, StreamKind::Video, 1, grid,
+        ).unwrap();
+    }
+    let mut serialized = Vec::new();
+    graph.write_json(&mut serialized).unwrap();
+    let reopened = SourceGraph::from_json_text(std::str::from_utf8(&serialized).unwrap()).unwrap();
+    for (sequence, alignment) in [(SEQUENCE, "3"), ("another-sequence", "1")] {
+        let Some(Value::Arr(rows)) = reopened.sidecar("resolve.transitions", sequence) else {
+            panic!("missing transition receipt");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("alignment_type"), Some(&text(alignment)));
+        assert_eq!(rows[0].get("position"), Some(&text("2")));
+    }
+    assert!(reopened.sequences.iter().all(|s| s.transitions.is_empty()));
+    assert_eq!(reopened.losses.len(), 2);
+}

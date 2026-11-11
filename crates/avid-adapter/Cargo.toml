@@ -10,3 +10,5 @@ name = "avid_adapter"
 [dependencies]
 avid-reader = { path = "../../avid-reader" }
 anynle-graph = { path = "../graph" }
+hex = "0.4"
+sha2 = "0.10"

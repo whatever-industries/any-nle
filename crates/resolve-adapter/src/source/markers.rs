@@ -22,9 +22,33 @@ pub(super) fn read(project: &Node, graph: &mut SourceGraph, blobs: &mut Blobs) -
         .enumerate()
         .map(|(i, sequence)| (sequence.id.clone(), i))
         .collect();
+    let placements: HashSet<_> = graph.sequences.iter().flat_map(|s| {
+        s.placements.iter().map(|placement| placement.id.clone())
+    }).collect();
     let mut seen = HashSet::new();
+    let mut colors = HashSet::new();
     for entry in set.elements()? {
         let node = entry.entry()?;
+        if node.name == "Sm2TiItemLockableBlob" {
+            let owner = node.get("BlobOwner")?;
+            if placements.contains(owner) {
+                if let Some(code) = clip_color(node, blobs)? {
+                    if !colors.insert(owner) {
+                        return Err("duplicate Resolve clip label owner".into());
+                    }
+                    graph.sidecars.push(Sidecar {
+                        adapter: "resolve.clip_label".into(),
+                        object: owner.into(),
+                        data: Value::Obj(vec![
+                            ("saved_code".into(), Value::Int(code)),
+                            ("provenance".into(), text("drpkit:af3cedc0 and pr2resolve:61c8c9ec")),
+                        ]),
+                    });
+                    loss(graph, owner, "clip_label", "Resolve clip label retained in graph; destination mapping is unqualified");
+                }
+            }
+            continue;
+        }
         if node.name != "Sm2SequenceLockableBlob" {
             continue;
         }
@@ -96,6 +120,18 @@ pub(super) fn read(project: &Node, graph: &mut SourceGraph, blobs: &mut Blobs) -
         }
     }
     Ok(())
+}
+
+fn clip_color(node: &Node, blobs: &mut Blobs) -> Result<Option<i64>> {
+    let encoded = node.get("FieldsBlob")?;
+    let Ok(map) = blobs.qt(encoded) else { return Ok(None) };
+    let Ok(data) = map.bytes("BlobData") else { return Ok(None) };
+    // Only this exact record is identified as a clip label. Other lockable
+    // item state can use a different encoding or a different protobuf.
+    let [0, 0, 0x27, 0x11, 0, 0, 0, 3, 0x80, 0x28, code] = data else {
+        return Ok(None);
+    };
+    Ok(((2..=32).contains(code) && code % 2 == 0).then_some(i64::from(*code)))
 }
 
 fn decode<'a>(

@@ -225,7 +225,8 @@ pub(super) fn read(
         path,
         size: (0, 0),
         wav_samples: Some(samples),
-        wav_stereo_pool_route,
+        stereo_pool_route: wav_stereo_pool_route,
+        split_atom_audio: false,
     }))
 }
 

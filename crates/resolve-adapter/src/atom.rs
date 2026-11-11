@@ -19,19 +19,19 @@ use std::{
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AtomBindingSpec {
-    item_id: String,
+    pub(crate) item_id: String,
     // Ordered by graph lane: picture, A1, A2. Physical indexes are per file.
-    siblings: [SiblingSpec; 3],
+    pub(crate) siblings: [SiblingSpec; 3],
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SiblingSpec {
-    path: PathBuf,
-    sha256: String,
-    media_id: String,
-    index: usize,
-    channel: Option<usize>,
+pub(crate) struct SiblingSpec {
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: String,
+    pub(crate) media_id: String,
+    pub(crate) index: usize,
+    pub(crate) channel: Option<usize>,
 }
 
 pub(crate) struct AtomInput {

@@ -21,7 +21,8 @@ mod group;
 mod linked;
 mod markers;
 pub use group::publish_group;
-pub use linked::publish_linked;
+pub(crate) use linked::{publish_turnover_checked, review_turnover};
+pub use linked::{publish_linked, publish_turnover};
 
 const MAX_ARCHIVE: u64 = 1 << 20;
 const MAX_XML: u64 = 8 << 20;

@@ -299,6 +299,21 @@ fn picture_effects_follow_the_bound_video_edit_and_its_source_clock() {
     assert_eq!((effect.sequence, effect.event), p.ownership[&id]);
     assert_eq!(effect.effect, PictureEffect::Flip { horizontal: true, vertical: false });
 
+    let reflection = graph::picture_chain::Reflection { horizontal: true, vertical: false }.effect();
+    let mut shared = g.clone();
+    let placement = shared.sequences[0].placements.iter_mut().find(|p| p.id == id).unwrap();
+    placement.effects = vec![reflection];
+    let shared_prepared = prepare(&shared, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(shared_prepared.picture_effects[0].effect, effect.effect);
+    shared.sequences[0].placements.iter_mut().find(|p| p.id == id).unwrap().transform =
+        Some(graph::Transform {
+            position: (0.05, 0.0), scale: (100.0, 100.0), rotation: 0.0,
+            anchor: (0.0, 0.0), crop: [0.0; 4],
+        });
+    let combined = prepare(&shared, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(combined.picture_effects.is_empty());
+    assert!(combined.losses.iter().any(|loss| loss.object == id && loss.aspect == "picture_effect"));
+
     let placement = g.sequences[0].placements.iter_mut().find(|p| p.id == id).unwrap();
     let unit = prproj::convert::model::TICKS_PER_SECOND;
     let source = placement.source_in.to_units(unit).unwrap();
@@ -320,6 +335,53 @@ fn picture_effects_follow_the_bound_video_edit_and_its_source_clock() {
     let PictureEffect::Resize(keys) = p.picture_effects[0].effect else { panic!("expected Linear Resize") };
     assert_eq!(keys.map(|k| k.ticks), [source, source + last_frame * (unit / 24)]);
     assert_eq!(keys[1].scale, [125.0, 100.0]);
+}
+
+#[test]
+fn ordered_picture_chain_projects_reflection_on_the_correct_side_of_motion() {
+    use prproj::convert::prepared::PictureEffect;
+    let mut g = fixture();
+    let flip = v(vec![
+        ("kind", Value::Str("avid.flip".into())),
+        ("params", v(vec![("horizontal", Value::Bool(true)), ("vertical", Value::Bool(false))])),
+    ]);
+    let pair = |a, b| Value::Arr(vec![Value::Float(a), Value::Float(b)]);
+    let motion = v(vec![
+        ("kind", Value::Str("avid.warp_static".into())),
+        ("params", v(vec![])),
+        ("transform", v(vec![
+            ("position", pair(0.05, -0.02)),
+            ("scale", pair(90.0, 110.0)),
+            ("anchor", pair(0.0, 0.0)),
+            ("rotation", Value::Float(0.0)),
+            ("crop", Value::Arr([0.01, 0.02, 0.04, 0.03].into_iter().map(Value::Float).collect())),
+        ])),
+    ]);
+    let id = g.sequences[0].placements.iter().find(|p| p.video_track.is_some()).unwrap().id.clone();
+    for (stages, x, edges) in [
+        (vec![flip.clone(), motion.clone()], 0.05, [0.01, 0.02, 0.04, 0.03]),
+        (vec![motion.clone(), flip.clone()], -0.05, [0.04, 0.02, 0.01, 0.03]),
+    ] {
+        let p = g.sequences[0].placements.iter_mut().find(|p| p.id == id).unwrap();
+        p.effects = vec![graph::Effect {
+            kind: graph::picture_chain::KIND.into(),
+            params: v(vec![("stages", Value::Arr(stages))]),
+        }];
+        let prepared = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+        let [effect] = prepared.picture_effects.as_slice() else { panic!("expected one chain") };
+        assert_eq!(effect.effect, PictureEffect::StaticMotion);
+        assert_eq!(effect.reflection_before_motion, [true, false]);
+        let transform = prepared.model.sequences[effect.sequence].events[effect.event].transform.as_ref().unwrap();
+        assert_eq!(transform.position, (x, -0.02));
+        assert_eq!(transform.crop, edges);
+    }
+    let p = g.sequences[0].placements.iter_mut().find(|p| p.id == id).unwrap();
+    p.effects[0].params = v(vec![("stages", Value::Arr(vec![flip, motion.clone(), motion]))]);
+    let prepared = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(prepared.picture_effects.is_empty());
+    assert!(prepared.losses.iter().any(|l| l.object == id && l.reason.contains("more than one Motion")));
+    let (seq, event) = prepared.ownership[&id];
+    assert!(prepared.model.sequences[seq].events[event].transform.is_none());
 }
 
 #[test]

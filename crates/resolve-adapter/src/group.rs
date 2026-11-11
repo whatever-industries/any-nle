@@ -10,7 +10,7 @@ use graph::{
     source::{MulticamAlternative, SourceGraph},
     StreamKind,
 };
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 pub struct PreparedGroup {
     pub(crate) project_name: String,
@@ -19,7 +19,7 @@ pub struct PreparedGroup {
     pub(crate) origin: i64,
     pub(crate) end: i64,
     pub(crate) length: i64,
-    pub(crate) cameras: [VerifiedBinding; 2],
+    pub(crate) cameras: [Arc<VerifiedBinding>; 2],
     pub(crate) offsets: [i64; 2],
     pub(crate) lanes: [Vec<GroupEdit>; 3],
     notices: Vec<String>,
@@ -79,6 +79,22 @@ pub fn prepare_group(
     if cameras.iter().any(|camera| camera.atom.is_some()) {
         return Err("direct OP-Atom is outside the qualified Resolve Group profile".into());
     }
+    prepare_bound_group(
+        graph,
+        sequence_id,
+        canvas,
+        explicit_origin,
+        cameras.map(Arc::new),
+    )
+}
+
+pub(crate) fn prepare_bound_group(
+    graph: &SourceGraph,
+    sequence_id: &str,
+    canvas: (u16, u16),
+    explicit_origin: Option<i64>,
+    cameras: [Arc<VerifiedBinding>; 2],
+) -> Result<PreparedGroup> {
     graph.validate()?;
     let sequence = graph
         .sequences

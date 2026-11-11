@@ -377,6 +377,7 @@ enum Op {
     Color { before: usize, value: Arc<ColorCorrection> },
     Picture { before: usize, value: Arc<PictureEffect> },
     PictureExtension { before: usize, capture: picture_extension::Capture },
+    PictureChain { before: usize, chain: picture_extension::OrderedChain },
     Matte { before: usize, length: i64, value: Arc<AniMatteData> },
     Combined { before: usize, group: usize, channel: usize },
 }
@@ -454,7 +455,7 @@ impl PendingSequence {
                         }
                     }
                 }
-                Op::PictureExtension { .. } => {}
+                Op::PictureExtension { .. } | Op::PictureChain { .. } => {}
                 Op::Matte { before, length, value } => {
                     let produced = info.events.len() - starts[before];
                     for e in &mut info.events[starts[before]..] {
@@ -502,12 +503,20 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
         });
     }
     fn component(&mut self, c: &'a Node, position: i64, via: &[String], depth: usize) {
+        let before = self.ops.len();
         if let Some(source) = &mut self.source {
             if source.failed() { return; }
             source.enter(self.ctx, c, position, self.kind, self.track, self.ops.len());
             if source.failed() { return; }
         }
         self.component_inner(c, position, via, depth);
+        if self.source.as_ref().is_some_and(|s| !s.failed()) && self.kind == KIND_PICTURE
+            && matches!(self.ops.last(), Some(Op::Picture { before: start, .. } | Op::PictureExtension { before: start, .. }) if *start == before)
+        {
+            if let Some(chain) = picture_extension::ordered_chain(self.ctx, c, &self.ops[before..], before, position) {
+                self.push_op(Op::PictureChain { before, chain });
+            }
+        }
         if let Some(source) = &mut self.source { source.account_ops(self.ops); source.leave(self.ops.len()); }
     }
     fn component_inner(&mut self, c: &'a Node, position: i64, via: &[String], depth: usize) {
@@ -835,8 +844,10 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     _ => None,
                 };
                 if self.source.is_some() && self.kind == KIND_PICTURE {
-                    if let [input] = inputs.as_slice() {
-                        if let Some(flip) = picture_extension::flip(&effect) {
+                    if let (Some(Value::List(tracks)), [input]) =
+                        (c.get("tracks"), inputs.as_slice())
+                    {
+                        if let Some(flip) = picture_extension::flip(&effect).filter(|_| tracks.len() == 1) {
                             let before = self.ops.len();
                             self.component(input, position, via, depth + 1);
                             self.push_op(Op::PictureExtension {
@@ -1619,6 +1630,54 @@ mod tests {
         let inputs=source_inputs(files.len());let refs:Vec<_>=files.iter().collect();
         crate::source::extract_source_files(&inputs,&refs,crate::source::SourceLimits::default()).unwrap()
     }
+
+    #[test]
+    fn source_picture_chain_keeps_input_order_and_rejects_an_unresolved_second_input() {
+        use crate::source::{PictureExtension, PictureStage};
+
+        fn reflection(f: &mut AvbFile, effect: &str, inputs: &[u32]) -> u32 {
+            let mut n = node(*b"TKFX", "TrackEffect");
+            n.put("length", Value::Int(10));
+            n.put("edit_rate", Value::Float(25.0));
+            n.put("media_kind_id", Value::Int(KIND_PICTURE));
+            n.put("effect_id", Value::Str(effect.into()));
+            n.put("tracks", Value::List(inputs.iter().map(|&input| {
+                let mut track = node([0; 4], "Track");
+                track.put("component", Value::Ref(input));
+                Value::Node(Box::new(track))
+            }).collect()));
+            add(f, n)
+        }
+
+        let mut f = file();
+        let leaf = source(&mut f, id(1), KIND_PICTURE, 1, 7, 10);
+        let inner = reflection(&mut f, "EFF2_BLEND_FLIP_HORZ", &[leaf]);
+        let wrapped = segments(&mut f, KIND_PICTURE, &[inner]);
+        let middle = reflection(&mut f, "EFF2_BLEND_FLIP_VERT", &[wrapped]);
+        let outer = reflection(&mut f, "EFF2_BLEND_FLIP_BOTH", &[middle]);
+        let incomplete = reflection(&mut f, "EFF2_BLEND_FLIP_BOTH", &[middle, 1000]);
+        mob(&mut f, id(2), "Chain", MOB_COMPOSITION, 0, &[(1, outer)]);
+        mob(&mut f, id(3), "Unresolved input", MOB_COMPOSITION, 0, &[(1, incomplete)]);
+        mob(&mut f, id(1), "Master", MOB_MASTER, 0, &[]);
+
+        let out = source_project(&[f]);
+        let [positive, negative] = out.sequences.as_slice() else { panic!("expected two sequences") };
+        let [edit] = positive.events.as_slice() else { panic!("expected one edit") };
+        assert_eq!(edit.range.as_ref().map(|r| (r.record_start, r.source_in, r.length)), Some((0, 7, 10)));
+        let axes = edit.picture_chain.iter().map(|stage| match stage {
+            PictureStage::Extension(PictureExtension::Flip { horizontal, vertical, .. }) =>
+                (*horizontal, *vertical),
+            _ => panic!("expected a reflection"),
+        }).collect::<Vec<_>>();
+        assert_eq!(axes, [(true, false), (false, true), (true, true)]);
+
+        // The older flattened walk drops the missing track reference. A single
+        // surviving media edit is insufficient evidence for an ordered chain.
+        let [edit] = negative.events.as_slice() else { panic!("expected the surviving edit") };
+        assert!(edit.picture_chain.is_empty());
+        assert!(matches!(edit.picture_extension, Some(PictureExtension::Unsupported(_))));
+    }
+
     fn timeline(f:&mut AvbFile,kind:i64,components:&[u32])->u32{
         let mut sequence=node(*b"SEQU","Sequence");
         sequence.put("media_kind_id",Value::Int(kind));
@@ -1676,13 +1735,15 @@ mod tests {
 
     #[test]
     fn sequence_clock_requires_a_unique_direct_tc1_with_the_exact_record_rate() {
-        for (label, rate, length, flags, duplicate, known) in [
-            (1, 23.976, 100, 0, false, true),
-            (2, 23.976, 100, 0, false, false),
-            (1, 24.0, 100, 0, false, false),
-            (1, 23.976, 99, 0, false, false),
-            (1, 23.976, 100, 1, false, false),
-            (1, 23.976, 100, 0, true, false),
+        for (record_rate, label, rate, length, flags, duplicate, known) in [
+            (23.976, 1, 23.976, 100, 0, false, true),
+            (23.976, 2, 23.976, 100, 0, false, false),
+            (23.976, 1, 24.0, 100, 0, false, false),
+            (24.0, 1, 24.0, 100, 0, false, true),
+            (24.0, 1, 23.976, 100, 0, false, false),
+            (23.976, 1, 23.976, 99, 0, false, false),
+            (23.976, 1, 23.976, 100, 1, false, false),
+            (23.976, 1, 23.976, 100, 0, true, false),
         ] {
             let mut f = file();
             let tc = marked_timecode(&mut f, *b"TCCP", Some(rate), length, None);
@@ -1701,14 +1762,14 @@ mod tests {
             let m = mob(&mut f, id(3), "TC1", MOB_COMPOSITION, 0, &tracks);
             let Object::Decoded(m) = f.objects[m as usize].as_mut().unwrap() else { unreachable!() };
             m.fields.retain(|(k, _)| *k != "edit_rate");
-            m.put("edit_rate", Value::Float(23.976));
+            m.put("edit_rate", Value::Float(record_rate));
 
             let out = source_project(&[f]);
             assert_eq!(
                 out.sequences[0].clock,
                 known.then(|| crate::source::SequenceClock {
                     count: 86400,
-                    rate: crate::source::Rate::new(24000, 1001).unwrap(),
+                    rate: crate::source::Rate::from_avid(record_rate).unwrap(),
                     display_base: 24,
                     track_ordinal: 1,
                 })

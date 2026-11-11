@@ -588,7 +588,19 @@ pub(crate) fn check_plain(p: &graph::Placement) -> Result<()> {
     check_placement(p, false)
 }
 
+pub(crate) fn check_linked_placement(p: &graph::Placement) -> Result<()> {
+    check_placement_profile(p, false, p.video_track == Some(1))
+}
+
 fn check_placement(p: &graph::Placement, allow_audio_controls: bool) -> Result<()> {
+    check_placement_profile(p, allow_audio_controls, false)
+}
+
+fn check_placement_profile(
+    p: &graph::Placement,
+    allow_audio_controls: bool,
+    allow_picture_controls: bool,
+) -> Result<()> {
     if p.gain_db != 0.0
         || (!allow_audio_controls && (p.volume_db.is_some() || !p.volume_keys.is_empty()))
         || !p.track_gains_db.is_empty()
@@ -596,8 +608,7 @@ fn check_placement(p: &graph::Placement, allow_audio_controls: bool) -> Result<(
         || !p.grouped_audio.is_empty()
         || p.speed.is_some()
         || p.frame_map.is_some()
-        || p.transform.is_some()
-        || !p.effects.is_empty()
+        || (!allow_picture_controls && (p.transform.is_some() || !p.effects.is_empty()))
     {
         return Err(format!("unsupported Resolve placement semantics at {}", p.id).into());
     }

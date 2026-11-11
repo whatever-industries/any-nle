@@ -11,6 +11,7 @@
 //! and duplicate IDs are errors.
 
 pub mod json;
+pub mod picture_chain;
 pub mod time;
 pub mod source;
 mod validation;

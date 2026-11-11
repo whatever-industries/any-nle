@@ -58,7 +58,7 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
                     }
                     continue;
                 };
-                if !leaf_matches(master, item, grid, edit, id, &mut context.graph)? {
+                if !leaf_matches(master, item, grid, edit, id, &mut context.graph, &mut context.blobs)? {
                     continue;
                 }
                 if entries.len() == 1
@@ -220,7 +220,7 @@ fn group_audio_member(
         && fields.int("AudioType")? == 0
         && fields.bytes("ChannelsBA")? == [0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0x40, 1, 0, 0, 0x80, 1]
         && master.audio.get(&0) == Some(&0)
-        && master.audio.get(&1) == Some(&1))
+        && master.audio.get(&1) == Some(&i64::from(!master.split_atom_audio)))
 }
 
 fn group_audio_routes(clip: &Node, blobs: &mut Blobs) -> Result<bool> {

@@ -69,6 +69,14 @@ In that initial implementation, the only change outside `crates/` was `impl From
 | Native data | `sidecars[]`: adapter, object ID and data. They are never portable meaning. Today: `avid` (Mob ID, bin columns, start/aux timecodes, Source File/Path) and `premiere` (`time_display`). |
 | Pair policy | Not in the graph. `bridge::to_graph` returns model/1's `Options` beside the graph. |
 
+In graph/2 an Avid picture chain is a single `avid.picture_chain` effect.
+Its `params.stages` array runs from the picture input to the output.
+Each stage carries its `kind`, `params`, and a `transform` when the stage
+has one. The transform uses the same units as a placement transform.
+For Flop inside 3D Warp, the first stage reflects the picture and the
+second stage carries Warp's transform and saved curves. The placement
+has no separate transform to apply to the chain.
+
 ## Acceptance (the contract's first step): passed 2026-10-26
 
 `crates/bridge/tests/round_trip.rs` runs every model in `examples/` and the golden corpus

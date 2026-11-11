@@ -6,7 +6,7 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{ChildStdout, Command, Stdio},
     time::UNIX_EPOCH,
 };
 
@@ -117,6 +117,119 @@ pub(crate) fn verify_mov_packet_grid(
     path: &Path,
     frame_count: i64,
     ticks_per_frame: i64,
+    reordered: bool,
+) -> Result<()> {
+    if ticks_per_frame <= 0 || frame_count <= 0 {
+        return Err("invalid MOV picture packet grid".into());
+    }
+    if reordered && frame_count > 1_000_000 {
+        return Err("AVC packet grid exceeds its inspection limit".into());
+    }
+    inspect_movie_packets(
+        tool,
+        path,
+        "v:0",
+        "packet=pts,dts,duration",
+        "csv=p=0",
+        |output| {
+            let mut row = String::new();
+            let mut seen = if reordered {
+                vec![false; frame_count as usize]
+            } else {
+                vec![]
+            };
+            let mut previous_dts: Option<i64> = None;
+            for index in 0..frame_count {
+                let pts = index
+                    .checked_mul(ticks_per_frame)
+                    .ok_or("MOV packet clock overflow")?;
+                row.clear();
+                (&mut *output).take(96).read_line(&mut row)?;
+                let mut fields = row.trim_end().split(',').map(str::parse::<i64>);
+                let valid = if !row.ends_with('\n') {
+                    false
+                } else if reordered {
+                    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                        (Some(Ok(p)), Some(Ok(d)), Some(Ok(n)), None)
+                            if p >= 0
+                                && p % ticks_per_frame == 0
+                                && n == ticks_per_frame
+                                && previous_dts.is_none_or(|old| old.checked_add(n) == Some(d)) =>
+                        {
+                            previous_dts = Some(d);
+                            usize::try_from(p / ticks_per_frame)
+                                .ok()
+                                .and_then(|i| seen.get_mut(i))
+                                .is_some_and(|slot| !std::mem::replace(slot, true))
+                        }
+                        _ => false,
+                    }
+                } else {
+                    fields.eq([Ok(pts), Ok(pts), Ok(ticks_per_frame)])
+                };
+                if !valid {
+                    return Err(format!(
+                        "non-constant or incomplete MOV packet clock at frame {index}"
+                    )
+                    .into());
+                }
+            }
+            if !output.fill_buf()?.is_empty() {
+                return Err("MOV packet count exceeds declared picture duration".into());
+            }
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn verify_aac_packet_grid(tool: &Path, path: &Path, samples: i64) -> Result<()> {
+    if !(1..=2_000_000_000).contains(&samples) {
+        return Err("invalid or over-budget AAC sample extent".into());
+    }
+    inspect_movie_packets(
+        tool,
+        path,
+        "a:0",
+        "packet=pts,dts,duration:packet_side_data=skip_samples,discard_padding",
+        "compact=p=0:nk=1",
+        |output| {
+            let mut row = String::new();
+            (&mut *output).take(96).read_line(&mut row)?;
+            if row.trim_end() != "-1024|-1024|1024|1024|0" {
+                return Err("expected one AAC priming packet with 1024 skipped samples".into());
+            }
+            for sample in (0..samples).step_by(1024) {
+                row.clear();
+                (&mut *output).take(96).read_line(&mut row)?;
+                if !row.ends_with('\n')
+                    || !row.trim_end().split('|').map(str::parse::<i64>).eq([
+                        Ok(sample),
+                        Ok(sample),
+                        Ok((samples - sample).min(1024)),
+                    ])
+                {
+                    return Err(
+                        "AAC packets disagree with the declared playable sample interval".into(),
+                    );
+                }
+            }
+            if !output.fill_buf()?.is_empty() {
+                return Err(
+                    "AAC packet count exceeds its declared playable sample interval".into(),
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+fn inspect_movie_packets(
+    tool: &Path,
+    path: &Path,
+    stream: &str,
+    entries: &str,
+    format: &str,
+    inspect: impl FnOnce(&mut BufReader<ChildStdout>) -> Result<()>,
 ) -> Result<()> {
     let mut child = Command::new(tool)
         .args([
@@ -127,46 +240,20 @@ pub(crate) fn verify_mov_packet_grid(
             "-f",
             "mov",
             "-select_streams",
-            "v:0",
+            stream,
             "-show_entries",
-            "packet=pts,dts,duration",
+            entries,
             "-of",
-            "csv=p=0",
+            format,
         ])
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let mut check = || -> Result<()> {
-        let mut output =
-            BufReader::new(child.stdout.take().ok_or("missing MOV packet inspection")?);
-        let mut row = String::new();
-        for index in 0..frame_count {
-            let pts = index
-                .checked_mul(ticks_per_frame)
-                .ok_or("MOV packet clock overflow")?;
-            row.clear();
-            (&mut output).take(96).read_line(&mut row)?;
-            if !row.ends_with('\n')
-                || !row.trim_end().split(',').map(str::parse::<i64>).eq([
-                    Ok(pts),
-                    Ok(pts),
-                    Ok(ticks_per_frame),
-                ])
-            {
-                return Err(format!(
-                    "non-constant or incomplete MOV packet clock at frame {index}"
-                )
-                .into());
-            }
-        }
-        if !output.fill_buf()?.is_empty() {
-            return Err("MOV packet count exceeds declared picture duration".into());
-        }
-        Ok(())
-    };
-    let result = check();
+    let result = inspect(&mut BufReader::new(
+        child.stdout.take().ok_or("missing MOV packet inspection")?,
+    ));
     if result.is_err() {
         let _ = child.kill();
     }

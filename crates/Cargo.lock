@@ -191,6 +191,8 @@ version = "0.1.0"
 dependencies = [
  "anynle-graph",
  "avid-reader",
+ "hex",
+ "sha2",
 ]
 
 [[package]]
@@ -257,6 +259,7 @@ dependencies = [
  "avid-reader",
  "flate2",
  "hex",
+ "prproj",
  "quick-xml",
  "regex",
  "serde",

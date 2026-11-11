@@ -185,6 +185,7 @@ impl TrimmedMotion {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PictureEffect {
     Flip { horizontal: bool, vertical: bool },
+    StaticMotion,
     Resize([MotionKey; 2]),
     TrimmedWarp(TrimmedMotion),
     TrimmedResize(TrimmedMotion),
@@ -195,6 +196,7 @@ pub struct PreparedPictureEffect {
     pub sequence: usize,
     pub event: usize,
     pub effect: PictureEffect,
+    pub reflection_before_motion: [bool; 2],
 }
 
 pub(super) fn validate_picture_effects(effects: &[PreparedPictureEffect], sequences: &[Sequence]) -> Result<(), ModelError> {
@@ -207,10 +209,20 @@ pub(super) fn validate_picture_effects(effects: &[PreparedPictureEffect], sequen
         if event.video_track.is_none() || !owners.insert((p.sequence, p.event)) {
             return Err(fail("picture effect needs one unique picture edit"));
         }
+        if p.reflection_before_motion != [false; 2] && matches!(p.effect, PictureEffect::Flip { .. }) {
+            return Err(fail("a reflection before Motion needs a Motion stage"));
+        }
         match p.effect {
             PictureEffect::Flip { horizontal, vertical }
                 if (horizontal || vertical) && event.transform.is_none()
                     && event.matte.is_none() && event.color_correction.is_none() => {}
+            PictureEffect::StaticMotion if event.transform.as_ref().is_some_and(|t|
+                t.anchor == (0.0, 0.0) && t.rotation == 0.0
+                && t.scale.0 > 0.0 && t.scale.1 > 0.0
+                && t.crop.iter().all(|v| (0.0..1.0).contains(v))
+                && t.crop[0] + t.crop[2] < 1.0 && t.crop[1] + t.crop[3] < 1.0)
+                && event.matte.is_none() && event.color_correction.is_none()
+                && event.speed_ratio.is_none() && event.time_remap.is_none() => {}
             PictureEffect::Resize(keys) => {
                 check_rate(sequence.rate, "Resize sequence rate")?;
                 let frame = ticks_per_unit(sequence.rate);

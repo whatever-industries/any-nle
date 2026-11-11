@@ -145,6 +145,7 @@ fn loss(out: &mut Vec<Loss>, object: &str, aspect: &str, reason: impl Into<Strin
 struct Routes {
     video: Option<Option<Rational>>,
     video_rate: Option<Rational>,
+    video_raster: Option<(i64, i64)>,
     video_duration: Option<Rational>,
     audio: HashMap<i64, Option<Rational>>,
     first_audio: Option<i64>,
@@ -758,6 +759,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         let mut r = Routes {
             video: None,
             video_rate: None,
+            video_raster: None,
             video_duration: None,
             audio: HashMap::new(),
             first_audio: None,
@@ -768,6 +770,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 StreamKind::Video => {
                     r.video = Some(im.source_offset);
                     r.video_rate = m.rate;
+                    r.video_raster = m.frame_size;
                     r.video_duration = Some(m.duration);
                 }
                 StreamKind::Audio => {
@@ -1154,9 +1157,22 @@ fn prepare_sequence(
         let mut cc = None;
         let mut matte = None;
         let mut picture = None;
+        let mut chain_transform = None;
+        let mut reflection_before_motion = [false; 2];
         let mut replace_transform = false;
         for e in &p.effects {
             match e.kind.as_str() {
+                graph::picture_chain::KIND => {
+                    if p.effects.len() != 1 || p.transform.is_some() {
+                        return Err(error(format!("ordered picture chain needs one exclusive picture effect at {}", p.id)));
+                    }
+                    let full_span = tr.start == p.record_start && tr.end == add(p.record_start, p.duration)?;
+                    let same_rate = route.video_rate == Some(s.rate);
+                    (chain_transform, picture, reflection_before_motion) = picture::prepare_chain(
+                        p, e, full_span, same_rate, unit, route.video_duration,
+                        route.video_raster == Some((1920, 1080)) && frame_size == (1920, 1080), losses,
+                    )?;
+                }
                 "avid.color_correction" if cc.is_none() => {
                     cc = Some(bridge::color_correction_from(
                         &e.params,
@@ -1169,7 +1185,21 @@ fn prepare_sequence(
                         source_losses(&facts.losses, &p.id, "matte"),
                     )?)
                 }
-                "avid.flip" | "avid.resize_linear" | "avid.warp_linear"
+                kind if graph::picture_chain::Reflection::is_effect_kind(kind) && picture.is_none() => {
+                    let axes = graph::picture_chain::Reflection::from_params(&e.params)
+                        .filter(|_| p.video_track.is_some())
+                        .ok_or_else(|| error(format!("invalid reflection effect for {}", p.id)))?;
+                    if kind != "avid.flip" && (p.transform.is_some() || p.effects.len() != 1) {
+                        loss(losses, &p.id, "picture_effect",
+                            "Reflection with another picture control requires a qualified effect order");
+                    } else {
+                        picture = Some(prproj::convert::prepared::PictureEffect::Flip {
+                            horizontal: axes.horizontal,
+                            vertical: axes.vertical,
+                        });
+                    }
+                }
+                "avid.resize_linear" | "avid.warp_linear"
                 | "avid.resize_crop_linear" | "avid.warp_crop_linear" | "avid.warp_trim_linear"
                 | "avid.resize_trim_linear" | "avid.resize_trim_crop_linear" | "avid.warp_trim_crop_linear" if picture.is_none() => {
                     let keyed_crop = matches!(e.kind.as_str(), "avid.resize_crop_linear" | "avid.warp_crop_linear");
@@ -1187,7 +1217,7 @@ fn prepare_sequence(
                     }
                     let full_span = tr.start == p.record_start && tr.end == add(p.record_start, p.duration)?;
                     let same_rate = route.video_rate == Some(s.rate);
-                    picture = picture::prepare(p, e, full_span, same_rate, unit, route.video_duration, losses)?;
+                    picture = picture::prepare(p, &e.kind, &e.params, full_span, same_rate, unit, route.video_duration, losses)?;
                 }
                 _ => loss(
                     losses,
@@ -1201,7 +1231,7 @@ fn prepare_sequence(
             }
         }
         if let Some(effect) = picture {
-            picture_edits.push((p.id.as_str(), effect));
+            picture_edits.push((p.id.as_str(), effect, reflection_before_motion));
         }
         raw.push((
             p.id.as_str(),
@@ -1239,7 +1269,8 @@ fn prepare_sequence(
                 time_remap: p.frame_map.clone(),
                 color_correction: cc,
                 matte,
-                transform: p.transform.as_ref().filter(|_| !replace_transform || picture.is_some()).map(|t| Transform {
+                transform: chain_transform.as_ref().or_else(|| p.transform.as_ref()
+                    .filter(|_| !replace_transform || picture.is_some())).map(|t| Transform {
                     position: t.position,
                     scale: t.scale,
                     rotation: t.rotation,
@@ -1325,9 +1356,9 @@ fn prepare_sequence(
             before_cut: ticks(t.cut_offset, "dissolve offset")?,
         });
     }
-    for (id, effect) in picture_edits {
+    for (id, effect, reflection_before_motion) in picture_edits {
         picture_effects.push(prproj::convert::prepared::PreparedPictureEffect {
-            sequence: si, event: ownership[id].1, effect,
+            sequence: si, event: ownership[id].1, effect, reflection_before_motion,
         });
     }
     let mut markers = Vec::new();

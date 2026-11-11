@@ -299,3 +299,83 @@ fn build_group(p: &PreparedGroup, mut m: Members) -> Result<Members> {
     }
     Ok(m)
 }
+
+pub(super) struct TurnoverGroup {
+    pub(super) id: String,
+    pub(super) pool: String,
+    pub(super) timeline: String,
+    pub(super) handle: String,
+    pub(super) sequence: String,
+    pub(super) containers: Members,
+}
+
+pub(super) fn build_turnover_group(
+    p: &PreparedGroup,
+    skeleton: &Path,
+    group_bin: &str,
+    timeline_bin: &str,
+    media_ids: [&str; 2],
+) -> Result<TurnoverGroup> {
+    let mut m = load_skeleton(skeleton, GROUP_SKELETON, 7)?;
+    let pool = m.remove(POOL).ok_or("missing Group pool")?;
+    let cameras = m.remove(CAMERA_BIN).ok_or("missing camera bin")?;
+    let mut group = block(&pool, "Sm2MpMulticamClip")?;
+    let mut timeline = block(&pool, "Sm2MpTimelineClip")?;
+    let group_seq = block(&group, "Sm2Sequence")?;
+    let timeline_seq = block(&timeline, "Sm2Sequence")?;
+    let sequence = dbid(&timeline_seq)?.to_owned();
+    let inner = sequence_member(&m, dbid(&group_seq)?, 4)?;
+    let outer = sequence_member(&m, &sequence, 3)?;
+    if inner == outer {
+        return Err("Group and timeline container alias".into());
+    }
+    let id = update_group_pool(p, &mut group)?;
+    set(&mut group, "MpFolder", group_bin)?;
+    set(&mut timeline, "MpFolder", timeline_bin)?;
+    at_head(
+        &mut timeline,
+        "<PTZRPreset>",
+        "Name",
+        &xml(&p.sequence_name),
+    )?;
+    let old_handle = block(&timeline, "Sm2Timeline")?;
+    let mut handle = old_handle.clone();
+    at_head(&mut handle, "<Sequence>", "Name", &xml(&p.sequence_name))?;
+    let handle_id = dbid(&handle)?.to_owned();
+    replace_once(&mut timeline, &old_handle, &handle)?;
+    set(
+        &mut timeline,
+        "MediaExtents",
+        &hex::encode(extent(
+            seconds(p.origin),
+            seconds(p.end) - seconds(p.origin),
+        )),
+    )?;
+    set(&mut timeline, "CurPlayheadPosition", "0")?;
+    let pattern = Regex::new(r"(?s)<Sm2MpVideoClip [^>]+>.*?</Sm2MpVideoClip>")?;
+    let old_media: [String; 2] = pattern
+        .find_iter(&cameras)
+        .map(|item| dbid(item.as_str()).map(str::to_owned))
+        .collect::<Result<Vec<_>>>()?
+        .try_into()
+        .map_err(|_| "expected two synthetic camera masters")?;
+    let inner_xml = write_inner(
+        p,
+        m.remove(&inner).ok_or("missing Group container")?,
+        &old_media,
+        &media_ids.map(str::to_owned),
+    )?;
+    let outer_xml = write_outer(
+        p,
+        m.remove(&outer).ok_or("missing timeline container")?,
+        &id,
+    )?;
+    Ok(TurnoverGroup {
+        id,
+        pool: group,
+        timeline,
+        handle: handle_id,
+        sequence,
+        containers: Members::from([(inner, inner_xml), (outer, outer_xml)]),
+    })
+}
