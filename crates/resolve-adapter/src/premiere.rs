@@ -1,5 +1,6 @@
 //! Same-rate Premiere straight cuts into the shared Resolve turnover path.
 mod components;
+mod controls;
 mod metadata;
 pub(crate) use metadata::LOSS as CLIP_METADATA_LOSS;
 
@@ -311,31 +312,13 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                     }
                     effects.push(Value::Str(name));
                 }
-                if !effects.is_empty() || !native.selection_components.is_empty() {
-                    graph.losses.push(Loss {
-                        object: placement_id.clone(),
-                        aspect: "premiere.appearance".into(),
-                        reason: "Premiere clip components are omitted from the straight-cut output"
-                            .into(),
-                    });
+                let has_components = !effects.is_empty() || !native.selection_components.is_empty();
+                if has_components {
                     graph.sidecars.push(Sidecar {
                         adapter: "premiere.components".into(),
                         object: placement_id.clone(),
                         data: Value::Arr(effects),
                     });
-                }
-                if capture_components {
-                    if let Some(saved) = components::capture(
-                        project,
-                        clip,
-                        kind,
-                        &placement_id,
-                        &mut component_budget,
-                    )
-                    .map_err(|error| format!("Premiere component parameters on {placement_id}: {error}"))?
-                    {
-                        graph.sidecars.push(saved);
-                    }
                 }
                 let start = project.start(clip)?.ticks;
                 let end = project.end(clip)?.ticks;
@@ -356,6 +339,50 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                         "Premiere record/source ranges require whole, equal frame spans".into(),
                     );
                 }
+                let mut mapped = false;
+                let mut transform = None;
+                let mut volume_db = None;
+                let mut picture_effects = Vec::new();
+                if capture_components {
+                    if let Some(saved) = components::capture(
+                        project,
+                        clip,
+                        kind,
+                        &placement_id,
+                        &mut component_budget,
+                    )
+                    .map_err(|error| format!("Premiere component parameters on {placement_id}: {error}"))?
+                    {
+                        if let Some(control) = controls::interpret(
+                            project,
+                            clip,
+                            kind,
+                            &saved.data,
+                            source_in,
+                            source_out,
+                            frame_ticks,
+                        )? {
+                            match control {
+                                controls::ClipControl::StaticMotion(motion) => {
+                                    transform = Some(motion);
+                                }
+                                controls::ClipControl::MonoVolume(db) => volume_db = Some(db),
+                                controls::ClipControl::LinearMotion(keys) => picture_effects
+                                    .push(graph::picture_motion::linear_effect(keys)),
+                            }
+                            mapped = true;
+                        }
+                        graph.sidecars.push(saved);
+                    }
+                }
+                if has_components && !mapped {
+                    graph.losses.push(Loss {
+                        object: placement_id.clone(),
+                        aspect: "premiere.appearance".into(),
+                        reason: "Premiere clip components are omitted from the Resolve turnover"
+                            .into(),
+                    });
+                }
                 out.placements.push(Placement {
                     id: placement_id,
                     item: binding.item_id.clone(),
@@ -367,14 +394,14 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                     audio_streams: channel.map(|ch| vec![ch as i64 + 1]).unwrap_or_default(),
                     grouped_audio: vec![],
                     gain_db: 0.0,
-                    volume_db: None,
+                    volume_db,
                     volume_keys: vec![],
                     track_gains_db: vec![],
                     track_pans: vec![],
                     speed: None,
                     frame_map: None,
-                    transform: None,
-                    effects: vec![],
+                    transform,
+                    effects: picture_effects,
                 });
             }
         }

@@ -1,6 +1,9 @@
 //! Preparation for the bounded, linked-media project qualification harness.
+pub(crate) mod mixer;
+
 use crate::{
     atom::{verify_atom_binding, AtomBindingSpec},
+    dissolve,
     group::prepare_bound_group,
     media::{media_digest, probe_file, StreamSelector},
     prepare::{
@@ -200,6 +203,7 @@ pub(crate) struct Edit {
     pub(crate) source_in: i64,
     pub(crate) length: i64,
     pub(crate) video: Option<crate::video::PreparedVideo>,
+    pub(crate) volume: Option<f64>,
 }
 
 pub(crate) struct Timeline {
@@ -210,6 +214,8 @@ pub(crate) struct Timeline {
     pub(crate) lanes: [Vec<Edit>; 3],
     pub(crate) markers: Vec<PreparedMarker>,
     pub(crate) group: Option<GroupTimeline>,
+    pub(crate) mixer: Option<mixer::DirectMixer>,
+    pub(crate) dissolve: Option<dissolve::Dissolve>,
 }
 
 pub(crate) struct GroupTimeline {
@@ -224,10 +230,16 @@ pub struct PreparedProject {
     pub(crate) bins: Vec<Bin>,
     pub(crate) media: Vec<Media>,
     pub(crate) timelines: Vec<Timeline>,
+    pub(crate) active_timeline_index: usize,
+    omitted_active_timeline: Option<String>,
     pub(crate) omitted_markers: Vec<String>,
 }
 
 impl PreparedProject {
+    pub fn omitted_active_timeline(&self) -> Option<&str> {
+        self.omitted_active_timeline.as_deref()
+    }
+
     pub fn omitted_markers(&self) -> &[String] {
         &self.omitted_markers
     }
@@ -843,6 +855,8 @@ pub(crate) fn prepare_project(
                         length: prepared.end - prepared.origin,
                         lanes: Default::default(),
                         markers: vec![],
+                        mixer: None,
+                        dissolve: None,
                         group: Some(GroupTimeline {
                             bin: group_bin,
                             cameras: [a, b],
@@ -861,6 +875,13 @@ pub(crate) fn prepare_project(
                     "Group timeline requires explicit verified camera and bin bindings".into(),
                 );
             }
+            let mixer = mixer::DirectMixer::prepare(graph, sequence)?;
+            let dissolve = dissolve::prepare(graph, sequence)?;
+            if mixer.is_some() && picture_only {
+                return Err(
+                    "direct Fairlight mixer requires audio on the selected timeline".into(),
+                );
+            }
             let placement_ids: HashSet<_> =
                 sequence.placements.iter().map(|p| p.id.as_str()).collect();
             let linear_resizes: HashSet<_> = sequence
@@ -870,6 +891,12 @@ pub(crate) fn prepare_project(
                 .map(|p| p.id.as_str())
                 .collect();
             if let Some(loss) = graph.losses.iter().find(|l| {
+                if mixer.is_some() && mixer::DirectMixer::recover(l, &sequence.id) {
+                    return false;
+                }
+                if dissolve.as_ref().is_some_and(|d| d.recover(l, &sequence.id)) {
+                    return false;
+                }
                 if review_caption_omissions.is_some() && crate::turnover::is_reviewable_loss(l) {
                     return false;
                 }
@@ -958,14 +985,30 @@ pub(crate) fn prepare_project(
                         format!("{}: edit exceeds the physical playable range", edit.id).into(),
                     );
                 }
+                let volume = match edit.volume_db {
+                    Some(db)
+                        if matches!(&media[*media_index].profile, Profile::Wav { .. })
+                            && crate::audio::VOLUME_DB.contains(&db) =>
+                    {
+                        (db != 0.0).then_some(db)
+                    }
+                    Some(_) => {
+                        return Err(
+                            format!("{}: unsupported Resolve linked clip volume", edit.id).into(),
+                        );
+                    }
+                    None => None,
+                };
+                let video = crate::video::prepare(edit, sequence.rate, source_in, length, available)
+                    .map_err(|e| format!("{}: {e}", edit.id))?;
                 lanes[lane].push(Edit {
                     media: *media_index,
                     channel,
                     start,
                     source_in,
                     length,
-                    video: crate::video::prepare(edit, source_in, length, available)
-                        .map_err(|e| format!("{}: {e}", edit.id))?,
+                    video,
+                    volume,
                 });
             }
             let mut duration = None;
@@ -1010,6 +1053,8 @@ pub(crate) fn prepare_project(
                     lanes,
                     markers,
                     group: None,
+                    mixer,
+                    dissolve,
                 },
                 omitted,
             ))
@@ -1032,12 +1077,32 @@ pub(crate) fn prepare_project(
                 .map(|m| m.owner_occurrence.clone()),
         );
     }
+    let mut selections = graph
+        .bins
+        .iter()
+        .filter(|bin| bin.parent.is_none())
+        .filter_map(|bin| graph.sidecar(crate::source::ACTIVE_TIMELINE_ADAPTER, &bin.id));
+    let active = match (selections.next(), selections.next()) {
+        (Some(receipt), None) => match receipt.get("sequence_id") {
+            Some(Value::Str(id))
+                if receipt.get("unavailable_reason") == Some(&Value::Null)
+                    && graph.sequences.iter().any(|sequence| sequence.id == *id) =>
+            {
+                Some(id)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let selected = active.and_then(|id| spec.timelines.iter().position(|row| row.id == *id));
     Ok(PreparedProject {
         name: checked_name(&graph.project.name)?,
         rate: project_rate.ok_or("missing project rate")?,
         bins,
         media,
         timelines,
+        active_timeline_index: selected.unwrap_or(0),
+        omitted_active_timeline: active.filter(|_| selected.is_none()).cloned(),
         omitted_markers,
     })
 }

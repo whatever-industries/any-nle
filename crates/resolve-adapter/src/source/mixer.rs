@@ -2,21 +2,42 @@
 use super::encoding::qt;
 use crate::Result;
 use flate2::{bufread::ZlibDecoder, write::ZlibEncoder, Compression};
-use graph::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
     io::{Read, Write},
     ops::Range,
 };
 
 const FIELD_TAG: &[u8] = b"\0\0\0\x1e\0F\0L\0S\0t\0u\0d\0i\0o\0M\0o\0d\0e\0l\0B\0A\0\0\0\x0c\0";
-const MODEL_SIZES: [usize; 2] = [364_028, 364_088];
+const MAX_MODEL_BYTES: usize = 1024 * 1024;
 const TRACK_FADERS: Range<usize> = 203_093..203_101;
 const TRACK_MUTES: [Range<usize>; 2] = [203_113..203_121, 203_133..203_141];
 const TRACK_MUTE_HEADER: [u8; 12] = [1, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0];
 const MAIN_BUS_FADER: Range<usize> = 235_340..235_344;
 const SKELETON: &str = "5bfebb8fa74dacf3d8185bfe459d719b4824cf3ba623d11c9d873a2cace5adb8";
+// Fingerprints with only the qualified control cells neutralized.
+const DIRECT_ONE: &[&str] = &[
+    SKELETON,
+    "a3b176b7e9dc4ba936b2efe909b975775004cfc2e9508f6681addeb2d638bdcf",
+    "46ac7ad463f934d2456732b1a8f086eb79d129db1176b43e2551753466fbbf07",
+];
+const DIRECT_TWO: &str = "00765117a479b3e6469ce7a35f66c7befb8e5981d3baa4969f08e47815abed11";
+const DIRECT_TWO_FAIRLIGHT_SAVE: &str =
+    "83d76c19c40bbb9d75afb2bea828387fb364303b8da9885fd4eaf5185582650c";
+const DIRECT_PAN: usize = 203_173;
+const DIRECT_ROUTE: usize = 211_685;
+const TWO_BUS_SHIFT: usize = 8;
+const BUS_2_FADER: usize = 235_352;
+const BUS_2_MUTE: usize = 235_372;
+const BUS_2_MUTE_MIRROR: usize = 235_392;
+
+pub(crate) const FAIRLIGHT_ADAPTER: &str = "resolve.fairlight";
+pub(crate) const DIRECT_PROFILE: &str = "direct_mono_stereo_profile";
+pub(crate) const FAIRLIGHT_LOSS: (&str, &str) = (
+    "fairlight_controls",
+    "Resolve Fairlight state retained in graph; destination mapping is unqualified",
+);
+
 const NATIVE_CONTROL: &str = "07df7b43d05ef9564fd6cf69e1b911eb9b3884c65d5c1f86aa7bde797aad5f35";
 const NATIVE_BUS_CONTROL: &str = "dcf061b1178e516baf8157cba488fb260a37e77b653b914e649fa7df1b06c060";
 
@@ -77,7 +98,7 @@ impl Mixer {
             .get(..4)
             .ok_or("missing Fairlight mixer expanded length")?;
         let size = u32::from_be_bytes(size.try_into()?) as usize;
-        if !MODEL_SIZES.contains(&size) {
+        if !(MAIN_BUS_FADER.end..=MAX_MODEL_BYTES).contains(&size) {
             return Ok(None);
         }
         if qt(&fields)?.bytes("FLStudioModelBA")? != data {
@@ -133,9 +154,10 @@ impl Mixer {
     }
 
     pub(crate) fn has_mute_state(&self) -> bool {
-        TRACK_MUTES
-            .iter()
-            .any(|range| self.model[range.clone()] != [0; 8])
+        TRACK_MUTES.iter().any(|range| {
+            self.model[range.start - TRACK_MUTE_HEADER.len()..range.start] == TRACK_MUTE_HEADER
+                && self.model[range.clone()] != [0; 8]
+        })
     }
 
     pub(crate) fn track_mutes(&self) -> Option<[bool; 2]> {
@@ -153,83 +175,33 @@ impl Mixer {
         Some([bytes[0] == 1, bytes[4] == 1])
     }
 
-    /// The documented channel table starts at the witnessed fader row.
-    /// Strip IDs bind columns to timeline tracks independently of display names.
-    pub(super) fn source_facts(&self) -> Option<(Value, bool)> {
-        let (track, names) = rows::<2>(&self.model[TRACK_FADERS.start - 12..], true);
-        if track.get(&0x458) != Some(&[0, 1]) || !names || !track.contains_key(&0xdf) {
-            return None;
-        }
-        let (bus, _) = rows::<1>(&self.model[MAIN_BUS_FADER.start - 12..], false);
-        let mut requires_mapping = false;
-        let tracks = (0..2)
-            .map(|col| {
-                let mut fields = vec![("track".into(), Value::Int(col as i64 + 1))];
-                for (id, name, neutral) in [
-                    (0x004, "pan_tenths_percent", 0),
-                    (0x00d, "pan_bypass_code", 0),
-                    (0x011, "solo_code", 0),
-                    (0x019, "pre_dynamics_gain_tenths_db", 0),
-                    (0x01d, "effects_in_code", 0),
-                    (0x400, "output_connected_code", 1),
-                    (0x40b, "output_bus_index", 0),
-                ] {
-                    if let Some(value) = track.get(&id).map(|v| v[col]) {
-                        fields.push((name.into(), Value::Int(i64::from(value))));
-                        requires_mapping |= value != neutral;
-                    }
-                }
-                let raw_processing = track.iter().filter(|(id, _)| {
-                matches!(**id, 0xde..=0x121 | 0x253 | 0x289..=0x28c | 0x334..=0x339 | 0x4be | 0x4c3)
-            }).map(|(id, row)| (format!("0x{id:03x}"), Value::Int(i64::from(row[col])))).collect();
-                fields.push(("eq_dynamics_fields".into(), Value::Obj(raw_processing)));
-                requires_mapping |= [0x10c, 0x114, 0x11d]
-                    .into_iter()
-                    .any(|id| track.get(&id).is_some_and(|row| row[col] != 0));
-                Value::Obj(fields)
-            })
-            .collect();
-        let mut fields = vec![
-            (
-                "provenance".into(),
-                Value::Str("drpkit:af3cedc0 documented record layout".into()),
-            ),
-            ("tracks".into(), Value::Arr(tracks)),
-        ];
-        // The main bus prefix is separate from the track and named bus tables.
-        if self.main_bus_fader().is_some() {
-            let mut main = vec![("index".into(), Value::Int(0))];
-            for (id, name) in [
-                (0x001, "fader_tenths_db"),
-                (0x002, "mute_code"),
-                (0x004, "raw_pan"),
-                (0x019, "pre_dynamics_gain_tenths_db"),
-            ] {
-                if let Some(&[value]) = bus.get(&id) {
-                    main.push((name.into(), Value::Int(i64::from(value))));
-                    requires_mapping |= id != 0x001 && value != 0;
-                }
+    pub(super) fn source_facts(
+        &self,
+        tracks: &[i64],
+        typed_gain_mute: bool,
+    ) -> Option<(graph::Value, bool)> {
+        let (mut facts, active) = super::fairlight::mixer(&self.model, tracks, typed_gain_mute)?;
+        if active {
+            if let (graph::Value::Obj(fields), Some(buses)) = (&mut facts, self.direct_profile()) {
+                fields.push((DIRECT_PROFILE.into(), graph::Value::Int(buses)));
             }
-            fields.push(("main_bus".into(), Value::Obj(main)));
         }
-        // Compare only recognized active controls above. The digest remains a
-        // reference for interpreting additional unmodelled state later.
-        fields.push((
-            "mixer_sha256".into(),
-            Value::Str(hex::encode(Sha256::digest(&self.model))),
-        ));
-        Some((Value::Obj(fields), requires_mapping))
+        Some((facts, active))
     }
 
     fn neutral_digest(&self) -> String {
-        let mut hash = Sha256::new();
-        let mut end = 0;
-        for field in [
+        self.digest_with_neutral_cells([
             TRACK_FADERS,
             TRACK_MUTES[0].clone(),
             TRACK_MUTES[1].clone(),
             MAIN_BUS_FADER,
-        ] {
+        ])
+    }
+
+    fn digest_with_neutral_cells(&self, cells: impl IntoIterator<Item = Range<usize>>) -> String {
+        let mut hash = Sha256::new();
+        let mut end = 0;
+        for field in cells {
             hash.update(&self.model[end..field.start]);
             hash.update(&[0; 8][..field.len()]);
             end = field.end;
@@ -244,6 +216,78 @@ impl Mixer {
             self.neutral_digest().as_str(),
             SKELETON | NATIVE_CONTROL | NATIVE_BUS_CONTROL
         )
+    }
+
+    fn direct_profile(&self) -> Option<i64> {
+        if matches!(self.model.len(), 364_028 | 364_088 | 364_092) {
+            let digest = self.digest_with_neutral_cells(direct_track_cells(0));
+            return DIRECT_ONE.contains(&digest.as_str()).then_some(1);
+        }
+        // Saving on the Fairlight page adds 40 bytes before the control tables
+        // in the observed project. Both layouts have an independent fingerprint.
+        let (offset, expected) = match self.model.len() {
+            365_437 => (0, DIRECT_TWO),
+            365_477 => (40, DIRECT_TWO_FAIRLIGHT_SAVE),
+            _ => return None,
+        };
+        let [gain, mute, mirror] = bus_2_cells(offset);
+        if self.model[mute.clone()] != self.model[mirror.clone()] {
+            return None;
+        }
+        let cells = direct_track_cells(TWO_BUS_SHIFT + offset)
+            .into_iter()
+            .chain([gain, mute, mirror]);
+        (self.digest_with_neutral_cells(cells) == expected).then_some(2)
+    }
+
+    pub(crate) fn write_direct(
+        mut self,
+        two_bus_donor: Option<&Mixer>,
+        mixer: crate::linked::mixer::DirectMixer,
+    ) -> Result<String> {
+        if self.direct_profile() != Some(1) || !self.cells_are_neutral(direct_track_cells(0)) {
+            return Err("expected a qualified neutral one-bus Fairlight template".into());
+        }
+        let shift = if mixer.buses == 2 {
+            let donor = two_bus_donor.ok_or("missing pinned two-bus Fairlight template")?;
+            let cells = direct_track_cells(TWO_BUS_SHIFT)
+                .into_iter()
+                .chain(bus_2_cells(0));
+            if donor.model.len() != 365_437
+                || donor.direct_profile() != Some(2)
+                || !donor.cells_are_neutral(cells)
+            {
+                return Err("expected a qualified neutral two-bus Fairlight template".into());
+            }
+            self.model.clone_from(&donor.model);
+            TWO_BUS_SHIFT
+        } else {
+            0
+        };
+        for (cells, values) in direct_track_cells(shift)
+            .into_iter()
+            .zip([mixer.pan, mixer.output])
+        {
+            for (slot, value) in self.model[cells].chunks_exact_mut(4).zip(values) {
+                slot.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        if mixer.buses == 2 {
+            let mute = i32::from(mixer.bus_2_muted);
+            for (cell, value) in bus_2_cells(0)
+                .into_iter()
+                .zip([mixer.bus_2_gain, mute, mute])
+            {
+                self.model[cell].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        self.encode()
+    }
+
+    fn cells_are_neutral(&self, cells: impl IntoIterator<Item = Range<usize>>) -> bool {
+        cells
+            .into_iter()
+            .all(|cell| self.model[cell].iter().all(|&byte| byte == 0))
     }
 
     pub(crate) fn write(
@@ -268,6 +312,10 @@ impl Mixer {
                 slot.copy_from_slice(&i32::from(mute).to_le_bytes());
             }
         }
+        self.encode()
+    }
+
+    fn encode(mut self) -> Result<String> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&self.model)?;
         let compressed = encoder.finish()?;
@@ -279,6 +327,14 @@ impl Mixer {
     }
 }
 
+fn direct_track_cells(shift: usize) -> [Range<usize>; 2] {
+    [DIRECT_PAN, DIRECT_ROUTE].map(|start| start + shift..start + shift + 8)
+}
+
+fn bus_2_cells(shift: usize) -> [Range<usize>; 3] {
+    [BUS_2_FADER, BUS_2_MUTE, BUS_2_MUTE_MIRROR].map(|start| start + shift..start + shift + 4)
+}
+
 pub(crate) fn fader_ticks(db: f64) -> Option<i32> {
     let ticks = (db * 10.0).round() as i32;
     (valid_ticks(ticks) && f64::from(ticks) / 10.0 == db).then_some(ticks)
@@ -286,57 +342,4 @@ pub(crate) fn fader_ticks(db: f64) -> Option<i32> {
 
 pub(crate) fn valid_ticks(ticks: i32) -> bool {
     (-60..=0).contains(&ticks)
-}
-
-/// Channel records are contiguous, but unrelated records within the track
-/// run can have different widths. Only rows matching the owned columns are
-/// collected. The separate bus prefix has fixed width.
-fn rows<const N: usize>(mut bytes: &[u8], mixed_width: bool) -> (BTreeMap<u32, [i32; N]>, bool) {
-    let mut out = BTreeMap::new();
-    let mut names = false;
-    let word = |raw: &[u8]| u32::from_le_bytes(raw.try_into().expect("four bytes"));
-    while let Some(header) = bytes.get(..12) {
-        let id = word(&header[4..8]);
-        let columns = word(&header[8..12]) as usize;
-        if word(&header[..4]) != 1
-            || id > 0xffff
-            || !(1..=4096).contains(&columns)
-            || (!mixed_width && columns != N)
-        {
-            break;
-        }
-        bytes = &bytes[12..];
-        if id == 0xbc {
-            if names || columns != N {
-                break;
-            }
-            for _ in 0..columns {
-                let Some(size) = bytes.get(..4).map(word).filter(|&size| size <= 1_000) else {
-                    return (BTreeMap::new(), false);
-                };
-                let Some(name) = bytes
-                    .get(4..4 + size as usize)
-                    .filter(|name| std::str::from_utf8(name).is_ok())
-                else {
-                    return (BTreeMap::new(), false);
-                };
-                bytes = &bytes[4 + name.len()..];
-            }
-            names = true;
-            continue;
-        }
-        let Some(data) = bytes.get(..4 * columns) else {
-            break;
-        };
-        if columns == N {
-            // The documented first occurrence is the channel setting.
-            out.entry(id).or_insert_with(|| {
-                std::array::from_fn(|col| {
-                    i32::from_le_bytes(data[4 * col..4 * col + 4].try_into().expect("four bytes"))
-                })
-            });
-        }
-        bytes = &bytes[data.len()..];
-    }
-    (out, names)
 }

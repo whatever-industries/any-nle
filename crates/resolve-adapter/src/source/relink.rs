@@ -75,7 +75,7 @@ impl Document {
         let mut patches = BTreeMap::new();
         let mut pool_ids = HashSet::new();
 
-        for folder in folders(&nodes, project, &mut blobs)? {
+        for (folder, _) in folders(&nodes, project, &mut blobs)? {
             let name = names.get(folder.id()?).ok_or("missing Resolve bin XML")?;
             for entry in folder.one("MediaVec")?.elements()? {
                 let clip = entry.entry()?;

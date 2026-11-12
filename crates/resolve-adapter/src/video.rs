@@ -5,7 +5,7 @@ use crate::{
     binary::{pack, pb_bytes, pb_int},
     Result,
 };
-use graph::{Effect, Placement, Transform};
+use graph::{picture_motion, Effect, Placement, Rational, Transform};
 use graph::picture_chain::{Chain, Reflection as Axes};
 
 pub(crate) struct PreparedVideo {
@@ -72,25 +72,23 @@ impl Reflection {
 
 pub(crate) fn prepare(
     placement: &Placement,
+    rate: Rational,
     source_in: i64,
     length: i64,
     available: i64,
 ) -> Result<Option<PreparedVideo>> {
     match (&placement.transform, placement.effects.as_slice()) {
         (None, []) => Ok(None),
-        (Some(transform), []) => Ok(encode(transform)?.map(|encoded| {
-            let mut transform = transform.clone();
-            transform.scale = (
-                (transform.scale.0 / 100.0) * 100.0,
-                (transform.scale.1 / 100.0) * 100.0,
-            );
-            PreparedVideo {
-                encoded,
-                readback: PictureControl::Transform(transform),
-            }
-        })),
+        (Some(transform), []) => prepare_static(transform.clone()),
         (Some(transform), [effect]) if motion::is_avid_linear(&effect.kind) => {
             let motion = motion::LinearMotion::from_avid(&effect.kind, &effect.params, transform, source_in, length, available)?;
+            Ok(Some(PreparedVideo {
+                encoded: motion.encode()?,
+                readback: PictureControl::LinearMotion(motion),
+            }))
+        }
+        (None, [effect]) if effect.kind == picture_motion::LINEAR_KIND => {
+            let motion = motion::LinearMotion::from_graph(effect, rate, source_in, length, available)?;
             Ok(Some(PreparedVideo {
                 encoded: motion.encode()?,
                 readback: PictureControl::LinearMotion(motion),
@@ -108,6 +106,19 @@ pub(crate) fn prepare(
         }
         _ => Err("Resolve picture effect stack order is unqualified".into()),
     }
+}
+
+fn prepare_static(mut transform: Transform) -> Result<Option<PreparedVideo>> {
+    Ok(encode(&transform)?.map(|encoded| {
+        transform.scale = (
+            (transform.scale.0 / 100.0) * 100.0,
+            (transform.scale.1 / 100.0) * 100.0,
+        );
+        PreparedVideo {
+            encoded,
+            readback: PictureControl::Transform(transform),
+        }
+    }))
 }
 
 fn prepare_chain(effect: &Effect, source_in: i64, length: i64, available: i64) -> Result<Option<PreparedVideo>> {

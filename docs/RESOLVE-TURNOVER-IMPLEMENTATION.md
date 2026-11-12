@@ -34,7 +34,7 @@ two tracks with a neutral stereo mix. Source and record ranges must agree.
 Premiere source bins retain panel ownership and stable IDs. Captions keep
 their content, lane and exact record span in graph/2. Native sequence marker
 payloads retain their owning sequence and occurrence in the source receipt.
-Review reports caption, marker and component omissions by occurrence.
+Review reports caption, marker and unsupported component omissions by occurrence.
 
 Both jobs supply `ffprobe`, `templates`, and `output`. The templates are
 the existing hash-pinned layout and rate profile, plus the applicable Atom
@@ -68,8 +68,35 @@ records. Version 46 synthetic turnover checks independently compare the
 receipts with the input XML, including subframe ticks, distinct start and
 current values, and curves with an omitted IsTimeVarying flag. The
 underlying record shapes are pinned to PRPROJ-0030 and PRPROJ-0013.
-The Resolve writer still reports omitted appearance, and publishing with
-those losses requires `--accept-losses`.
+The source reader puts qualified static Motion in the edit's graph/2
+`transform` and static mono Level in `volume_db`. Resolve preparation
+reads those fields from the saved graph and verified media bindings.
+Static Motion requires a matched 1920×1080 square-pixel clip, neutral
+anchor, rotation, anti-flicker and crop, and scale between 87.5% and
+112.5%. Static mono Level maps to −6 through +3 dB in exact tenths with
+neutral clip mute. Resolve writes it on an independent PCM WAV lane.
+The original Premiere component values remain in the sidecar.
+
+Qualified two-key Linear Motion travels as `picture.motion_linear` in
+graph/2. The reader converts the saved ticks to exact item-source seconds
+and retains Linear interpolation. This profile requires uniform scale, a
+neutral first key, and both Position and Scale keys on the first and last
+visible source frame. Resolve preparation checks the keys on the verified
+source frame grid. Other appearance remains a per-edit loss and requires
+`--accept-losses`.
+
+An offline static-only variant of the retained Premiere 27 save matched
+the baseline turnover and the replay from saved graph/2 and media
+bindings. All six edits matched on archive read-back and had identical
+effect payloads. The replay also matched after removing the native
+component receipts.
+
+The Linear Motion replay kept the retained Premiere save's two picture
+controls and static volume. A disposable copy cleared the unrelated
+animated volume and logging omissions for the strict linked probe. Its
+saved graph produced matching timeline read-back and effect bytes across
+all six edits. The Resolve archive held Linear keys on all four Motion
+axes at source frames 5 and 28.
 
 ### Native Premiere 27 and Resolve mapping trial
 
@@ -89,8 +116,16 @@ re-exported and rendered. The trial covers the following cases
 The picture comparison covered all 48 decoded frames. Mean absolute
 grayscale difference was at most 0.41 on a 0–255 scale after downsampling
 to 480×270. This is a scoped comparison for the matched canvas, same
-source rate and tested controls. Automatic application of Premiere
-component receipts remains pending in the turnover writer.
+source rate and tested controls.
+
+The turnover job subsequently applied the three qualified controls
+directly to the saved Premiere 27 project. In Resolve 21.2.0 build 00006,
+Save Project As, close and reopen preserved all six online edits, their
+source trims and the 01:00:00:01 origin. All 48 decoded frames matched the
+earlier Resolve control exactly. The stereo PCM24 render matched the
+native −6 dB control for the first edit and the neutral control for the
+second, sample for sample across 96,000 frames. Review reported the
+animated volume ramp and the existing clip metadata omissions.
 
 ## Capture in graph/2
 
@@ -99,9 +134,10 @@ destination mappings.
 
 | Graph location | Saved facts | Destination status |
 |---|---|---|
-| `resolve.transitions`, sequence | Occurrence, track identity, saved start and duration, and separate alignment and position codes | Endpoint and handle mapping pending |
+| `resolve.transitions`, sequence | Occurrence, track identity, saved start and duration, and separate alignment and position codes | The internal linked DRP path reads and writes the [qualified eight-frame V1 Cross Dissolve](RESOLVE-DRP-FORMAT-CLOSEOUT.md#qualified-left-aligned-cross-dissolve). Cross-editor and other alignment mappings remain open. |
 | `resolve.timing`, sequence | Timing evidence, compact extents, and recognized time-map points, explicit zero flags and saved handles | Cadence and audio treatment pending |
-| `resolve.fairlight`, sequence | Track columns identified by strip ID, pan, bypass, solo, pre-gain, output assignment and raw EQ/dynamics controls | Baseline fader and mute mappings remain scoped. Additional controls are source facts |
+| `resolve.fairlight`, sequence | Track and bus columns identified by strip ID, pan, bypass, solo, gain, output assignment, EQ/dynamics fields and bounded plug-in records | The [drpkit closeout](RESOLVE-DRPKIT-CLOSEOUT.md) records static mono pan, direct routing, and Bus 2 gain and mute in the linked turnover profile. |
+| `resolve.clip_fairlight`, placement | Keyed Voice Isolation and Dialogue Leveler records with saved identity, flags and normalized parameters | Source capture only |
 | `resolve.clip_fades`, placement | Clip-edge lengths and custom fade points in percent and tenths of a dB | Custom curve interpolation and writing pending |
 | `resolve.source`, sequence | Native video and audio mark fields | Writing pending |
 | `resolve.clip_label`, placement | Saved clip color code from the item lockable blob | Destination palette mapping pending |

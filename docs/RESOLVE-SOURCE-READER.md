@@ -20,7 +20,15 @@ WAV become separate logical channels while the pool's stereo group remains
 a source fact. The ProRes HQ cache without saved timecode has no invented
 timecode-track witness. Each registered timeline receipt includes its
 owning `bin_id`. Child-folder registration is cross-checked against the
-archive hierarchy. Mixed-rate or nonidentity timing outside the admitted
+archive hierarchy. Graph/2 lists parents before their children and preserves
+each parent's saved sibling order by UUID. The parent's `resolve.bin_order`
+receipt records whether the order came from `fields_blob` or the
+`archive_path` fallback. When the numbered paths give a complete order,
+`archive_order_matches` shows whether they agree with the saved list.
+The saved list controls sibling order when both sources agree on membership
+but differ on order. An absent or empty folder blob can retain path order
+with an unknown saved order. Malformed or contradictory child lists still
+fail. Mixed-rate or nonidentity timing outside the admitted
 profile retains occurrence data on a `resolve.timing` owner receipt and
 reports the omitted placement.
 
@@ -81,6 +89,95 @@ timeline flags and both mixer rows must agree. The track and its edits
 remain present, with clip volume, track level and bus level independent.
 Recognized but unqualified mixer settings or conflicting mute fields
 receive scoped losses that block an internal Resolve write.
+
+## Saved active timeline
+
+The DRP reader resolves the zero-based `CurrentTimelineIndex` through
+`TimelineHandleVec`. The Media Pool root owns a `resolve.active_timeline`
+receipt with `saved_index`, `sequence_id`, and `unavailable_reason`. A
+missing, malformed, ambiguous, or out-of-range selection keeps the graph
+readable and leaves the sequence ID unset. DRT exports do not supply a
+project selection receipt.
+
+The retained `Native-mono-23976.drp` registers Linked B at index 2. An
+independent walk of the archive's handle and sequence records confirmed
+that UUID. The [linked writer checks](RESOLVE-PROJECT-CORE.md#saved-active-timeline)
+verify selection remapping, including duplicate names and subset exports.
+
+## Compare saved timelines and blobs
+
+```text
+resolve-source-probe --diff LEFT LEFT_TIMELINE_ID RIGHT RIGHT_TIMELINE_ID OUTPUT.json
+resolve-source-probe --diff-blob LEFT LEFT_OBJECT_ID RIGHT RIGHT_OBJECT_ID FIELD OUTPUT.json
+```
+
+Use exact sequence IDs from the DRP reader or qualified DRT graph output.
+The timeline report compares clocks, canvas, track layout, edit ranges,
+saved media timing and locators, physical audio selectors, timeline
+markers, picture controls, clip volume and the qualified Cross Dissolve.
+It pairs shared edit IDs of the same kind first, then unique slots by track
+and exact record start. An edit that moves and receives a new ID appears
+as a removal and an addition. Audio selectors use zero-based audio cache
+track and channel indexes. Media locators are the saved paths.
+
+The report records `different` for a confirmed change, `inconclusive`
+when unresolved facts prevent a match, and `match` when the compared facts
+agree. A report can contain both differences and gaps. For a DRT that
+falls outside the graph profile, use `--inspect-drt` to see the saved
+observations. Completed comparisons return exit status zero.
+
+For blob comparison, select an exact object UUID from each archive and
+choose `FieldsBlob` or `EffectFiltersBA`. The report distinguishes a
+missing field from an empty field and gives byte counts, SHA-256, and up
+to 64 changed positional ranges with 16-byte previews. A length change
+can shift subsequent offsets. Both commands publish a new report
+exclusively.
+
+The same-timeline [DRT and DRP](RESOLVE-DRT-CLOSEOUT.md#native-comparison)
+matched on timeline content with rewritten IDs. Their dissolve effect
+payloads matched, and their saved transition envelopes differed in three
+byte ranges. The retained [straight-cut and dissolve controls](RESOLVE-DRP-FORMAT-CLOSEOUT.md)
+reported just the added transition. The replay also covered a one-frame
+source trim, switched WAV channels, duplicate names, ambiguous slots and
+unresolved bindings. Native archives and reports remain in private local
+evidence.
+
+## Inventory saved effects
+
+```text
+resolve-source-probe --inventory-effects INPUT OUTPUT.json
+resolve-source-probe --diff-blob LEFT LEFT_OBJECT_ID RIGHT RIGHT_OBJECT_ID EffectFiltersBA OUTPUT.json
+```
+
+The inventory walks the saved picture and audio tracks in a bounded native
+DRP or DRT archive. Each nonempty clip or transition `EffectFiltersBA`
+record gives the sequence and container IDs, track kind and one-based
+index, object UUID and class, decoded byte count, and SHA-256. The sequence
+ID comes from the track and remains visible without project registration.
+
+Recognition comes from the existing source reader. `recognized` means the
+reader interpreted that occurrence's saved controls. `unqualified` means
+it encountered the payload without qualifying its controls. `not_evaluated`
+means the reader could not assess that occurrence. The report preserves
+the saved payload facts when graph interpretation fails and includes the
+graph error and any available DRT gap details.
+
+Copy a row's `selector.object_id` into the appropriate side of
+`--diff-blob` and use its `selector.field`. Select the left and right
+objects separately because Resolve can rewrite UUIDs. Payload errors and
+duplicate or missing UUIDs leave the row visible without a selector.
+For valid hex over the 64 KiB field limit the report gives the saved byte
+count. Output uses exclusive publication.
+
+The retained straight cut has zero effects, the native Cross Dissolve has
+one recognized effect, and the reflection and gain controls report their
+recognized picture and audio effects. The unqualified picture control
+remains visible by UUID. The paired [native DRT and DRP](RESOLVE-DRT-CLOSEOUT.md#native-comparison)
+give different dissolve UUIDs and identical 66-byte effect payloads.
+Using the two selectors produces a matching `--diff-blob` report.
+The incomplete DRT controls still list the dissolve when graph export is
+refused. The offline replay also covers invalid hex, over-limit fields,
+duplicate UUIDs and field tags, malformed archives, and output collisions.
 
 ## Bounds and validation
 

@@ -4,6 +4,7 @@ mod atom;
 mod audio;
 mod avid;
 mod binary;
+mod dissolve;
 mod group;
 pub mod linked;
 mod media;
@@ -14,7 +15,10 @@ pub mod source;
 pub mod turnover;
 mod video;
 
-pub use archive::{publish, publish_group, publish_linked, publish_turnover, Published};
+pub use archive::{
+    publish, publish_group, publish_linked, publish_linked_with_templates, publish_turnover,
+    Published,
+};
 pub use atom::{verify_atom_binding, AtomBindingSpec};
 pub use avid::{convert_avid_atom, convert_avid_ume, prepare_avid_turnover, AvidAtomConversion};
 pub use group::{prepare_group, PreparedGroup};

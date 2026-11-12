@@ -589,7 +589,10 @@ pub(crate) fn check_plain(p: &graph::Placement) -> Result<()> {
 }
 
 pub(crate) fn check_linked_placement(p: &graph::Placement) -> Result<()> {
-    check_placement_profile(p, false, p.video_track == Some(1))
+    let static_mono = p.video_track.is_none()
+        && matches!(p.audio_tracks.as_slice(), [1 | 2])
+        && p.volume_keys.is_empty();
+    check_placement_profile(p, static_mono, p.video_track == Some(1))
 }
 
 fn check_placement(p: &graph::Placement, allow_audio_controls: bool) -> Result<()> {

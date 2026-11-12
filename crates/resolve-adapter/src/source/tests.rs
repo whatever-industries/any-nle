@@ -29,6 +29,7 @@ fn build_with_child_registration(path: &Path, handle: &str, child_parent: &str, 
         r#"<SM_Project DbId="{PROJECT}">
         <ProjectVersion>17</ProjectVersion><ProjectName>Fixture &amp; test</ProjectName>
         <TimelineHandleVec><Element>{handle}</Element></TimelineHandleVec>
+        <CurrentTimelineIndex>0</CurrentTimelineIndex>
         <MediaPool><Sm2MediaPool DbId="{POOL}"><FieldsBlob>{fields}</FieldsBlob></Sm2MediaPool></MediaPool>
         </SM_Project>"#
     );
@@ -77,6 +78,14 @@ fn saved_project_identity_and_exact_clock_round_trip() {
     let timeline = &graph.sequences[0];
     assert_eq!(timeline.id, SEQUENCE);
     assert_eq!(
+        graph.sidecar(ACTIVE_TIMELINE_ADAPTER, ROOT),
+        Some(&Value::Obj(vec![
+            ("saved_index".into(), Value::Int(0)),
+            ("sequence_id".into(), text(SEQUENCE)),
+            ("unavailable_reason".into(), Value::Null),
+        ]))
+    );
+    assert_eq!(
         graph
             .sidecar(ADAPTER, SEQUENCE)
             .and_then(|row| row.get("bin_id")),
@@ -95,6 +104,56 @@ fn saved_project_identity_and_exact_clock_round_trip() {
     let mut repeated = Vec::new();
     read(&path).unwrap().write_json(&mut repeated).unwrap();
     assert_eq!(json, repeated);
+}
+
+#[test]
+fn sibling_order_follows_numeric_keys_in_the_saved_map() {
+    let mut nodes = 0;
+    let pool_fields = hex::encode(encode_qt(&[("RootFolderRef", Qt::Text(ROOT))]));
+    let project = xml::parse(
+        &format!(
+            r#"<SM_Project><MediaPool><Sm2MediaPool DbId="{POOL}"><FieldsBlob>{pool_fields}</FieldsBlob></Sm2MediaPool></MediaPool></SM_Project>"#
+        ),
+        &mut nodes,
+    )
+    .unwrap();
+    let mut members = BTreeMap::new();
+    let ids: Vec<_> = (100..111).map(|n| uuid::Uuid::from_u128(n).to_string()).collect();
+    for (ordinal, id) in ids.iter().enumerate() {
+        let path = format!("MediaPool/Master/{ordinal:03}_Duplicate/MpFolder.xml");
+        let node = xml::parse(
+            &format!(r#"<Sm2MpFolder DbId="{id}"><MediaPool>{POOL}</MediaPool><MpFolder>{ROOT}</MpFolder></Sm2MpFolder>"#),
+            &mut nodes,
+        )
+        .unwrap();
+        members.insert(path, node);
+    }
+    let keys: Vec<_> = (0..ids.len()).map(|ordinal| ordinal.to_string()).collect();
+    let rows: Vec<_> = keys
+        .iter()
+        .zip(ids.iter().rev())
+        .map(|(key, id)| (key.as_str(), Qt::Text(id)))
+        .collect();
+    let mut body = Vec::new();
+    crate::binary::pb_bytes(2, &encode_qt(&rows), &mut body);
+    let fields = crate::binary::pack(&body).unwrap();
+    members.insert(
+        ROOT_FOLDER.into(),
+        xml::parse(
+            &format!(r#"<Sm2MpFolder DbId="{ROOT}"><MediaPool>{POOL}</MediaPool><FieldsBlob>{fields}</FieldsBlob></Sm2MpFolder>"#),
+            &mut nodes,
+        )
+        .unwrap(),
+    );
+
+    let ordered = folders(&members, &project, &mut Blobs::default()).unwrap();
+    assert_eq!(ordered[0].0.id().unwrap(), ROOT);
+    assert!(matches!(
+        ordered[0].1,
+        Some(BinOrder::Saved { archive_matches: Some(false) })
+    ));
+    assert!(ordered.iter().skip(1).map(|(node, _)| node.id().unwrap())
+        .eq(ids.iter().rev().map(String::as_str)));
 }
 
 #[test]
@@ -158,7 +217,7 @@ fn transition_observations_keep_their_owners_after_graph_serialization() {
         ("another-sequence", "track-b", "transition-b", "1"),
     ] {
         observations::transition(
-            &mut graph, &make(id, alignment), sequence, track, StreamKind::Video, 1, grid,
+            &mut graph, &make(id, alignment), sequence, track, StreamKind::Video, 1, grid, [None; 2], false,
         ).unwrap();
     }
     let mut serialized = Vec::new();

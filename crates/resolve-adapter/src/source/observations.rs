@@ -1,11 +1,12 @@
 //! Bounded source facts whose destination behavior is still unqualified.
 use super::{encoding, omitted, text, Grid, Node};
-use crate::Result;
+use crate::{dissolve, Result};
 use graph::{source::SourceGraph, Sidecar, StreamKind, Value};
 use sha2::{Digest, Sha256};
 
-/// Preserve the on-disk codes independently. The native video witness has
-/// different AlignmentType and Position values, so neither implies the cut.
+/// Preserve the native codes independently and attach endpoint evidence for the
+/// qualified profile only when the saved item order and ranges agree.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn transition(
     graph: &mut SourceGraph,
     node: &Node,
@@ -14,8 +15,19 @@ pub(super) fn transition(
     kind: StreamKind,
     index: i64,
     grid: Grid,
+    neighbors: [Option<&Node>; 2],
+    timeline_export: bool,
 ) -> Result<()> {
     let id = node.id()?;
+    let qualified = if kind == StreamKind::Video
+        && index == 1
+        && grid.rate == crate::prepare::rate()
+        && grid.size == (1920, 1080)
+    {
+        left_dissolve(node, neighbors, grid, timeline_export)?
+    } else {
+        None
+    };
     let mut fields = vec![
         ("id", text(id)),
         ("native_track_id", text(track_id)),
@@ -31,7 +43,14 @@ pub(super) fn transition(
         ("track_rate_numerator", Value::Int(grid.rate.num())),
         ("track_rate_denominator", Value::Int(grid.rate.den())),
         ("timeline_origin_frames", Value::Int(grid.origin)),
-        ("interpretation", text("saved_fields_only")),
+        (
+            "interpretation",
+            text(if qualified.is_some() {
+                dissolve::INTERPRETATION
+            } else {
+                "saved_fields_only"
+            }),
+        ),
     ];
     for (tag, field) in [
         ("PrettyType", "type_label"),
@@ -56,9 +75,16 @@ pub(super) fn transition(
             fields.push((field, Value::Str(hex::encode(Sha256::digest(bytes)))));
         }
     }
+    if let Some((cut, outgoing, incoming)) = qualified {
+        fields.extend([
+            ("cut_frames", Value::Int(cut)),
+            ("outgoing", text(outgoing)),
+            ("incoming", text(incoming)),
+        ]);
+    }
     append(
         graph,
-        "resolve.transitions",
+        dissolve::ADAPTER,
         sequence,
         Value::Obj(
             fields
@@ -72,9 +98,80 @@ pub(super) fn transition(
         sequence,
         id,
         "transition",
-        "Resolve transition fields retained; cut and handle mapping are unqualified",
+        if timeline_export && qualified.is_some() {
+            dissolve::TIMELINE_EXPORT_LOSS
+        } else {
+            dissolve::LOSS
+        },
     );
     Ok(())
+}
+
+fn left_dissolve<'a>(
+    node: &Node,
+    neighbors: [Option<&'a Node>; 2],
+    grid: Grid,
+    timeline_export: bool,
+) -> Result<Option<(i64, &'a str, &'a str)>> {
+    let [Some(left), Some(right)] = neighbors else {
+        return Ok(None);
+    };
+    if left.name != "Sm2TiVideoClip" || right.name != "Sm2TiVideoClip" {
+        return Ok(None);
+    }
+    for (field, expected) in [
+        ("PrettyType", dissolve::TYPE),
+        ("AlignmentType", dissolve::ALIGNMENT),
+        ("Position", dissolve::POSITION),
+        ("Duration", "8"),
+        ("Flags", "0"),
+        ("WasDisbanded", "false"),
+        ("PriorityIndex", "0"),
+    ] {
+        if node.maybe(field)? != Some(expected) {
+            return Ok(None);
+        }
+    }
+    for field in ["LinkedItemSync", "MarkersBA", "ImportExportMetadataBA"] {
+        if node.maybe(field)?.is_some_and(|value| !value.is_empty()) {
+            return Ok(None);
+        }
+    }
+    if node.maybe("EffectFiltersBA")? != Some(dissolve::EFFECT)
+        || !node
+            .maybe("FieldsBlob")?
+            .is_some_and(if timeline_export {
+                dissolve::timeline_export_fields_match
+            } else {
+                dissolve::native_fields_match
+            })
+    {
+        return Ok(None);
+    }
+    let number = |node: &Node, key| -> Result<Option<i64>> {
+        Ok(node.maybe(key)?.and_then(|s| s.parse().ok()))
+    };
+    let (Some(start), Some(left_start), Some(left_length), Some(cut), Some(incoming_in)) = (
+        number(node, "Start")?,
+        number(left, "Start")?,
+        number(left, "Duration")?,
+        number(right, "Start")?,
+        number(right, "In")?,
+    ) else {
+        return Ok(None);
+    };
+    if start < grid.origin
+        || left_length < dissolve::DURATION
+        || incoming_in < dissolve::DURATION
+        || start.checked_add(dissolve::DURATION) != Some(cut)
+        || left_start.checked_add(left_length) != Some(cut)
+    {
+        return Ok(None);
+    }
+    let Some(relative) = cut.checked_sub(grid.origin) else {
+        return Ok(None);
+    };
+    Ok(Some((relative, left.id()?, right.id()?)))
 }
 
 pub(super) fn append(graph: &mut SourceGraph, adapter: &str, owner: &str, value: Value) {

@@ -202,9 +202,36 @@ The saved WAV import frame basis is separate from its physical sample count.
 Archive generation builds timeline registration, nested bin relationships,
 per-timeline containers, media references and marker ownership. A folder's
 child list in its compressed FieldsBlob must agree with the XML parentage
-and archive paths. The reader now checks those relationships. An initial
+and archive paths on membership. The linked writer uses graph/2 sibling
+order for both the child list and numbered paths. Before publication it
+checks both against the prepared UUIDs, including a saved-list witness
+for every parent with children. An initial
 candidate lacking the child lists passed the older reader but lost nested
 media on native import. It is retained privately as a failed control.
+
+An offline control reversed only the saved ordinals of two same-named bins
+under a nested parent. The reader followed the UUID order in the blob and
+reported the path disagreement. The writer emitted the reversed order in
+both places and retained each timeline and media assignment. Resolve UI
+sorting remains a separate observation.
+
+### Saved active timeline
+
+The linked writer remaps the saved sequence UUID to its zero-based index
+in the selected export order. If the saved timeline was omitted, the
+linked probe reports its UUID and the writer selects the first exported
+timeline. Graphs without a resolved selection also select the first.
+Before publication, the reader must resolve the staged archive's index
+to the expected generated UUID.
+
+An offline variant of the retained duplicate-name project selected its
+second timeline. Both exports preserved that timeline and its bin
+assignment, at index 1 in original order and index 0 in reverse order.
+A subset export reported the omitted UUID and selected its first timeline.
+Missing, malformed, duplicate and out-of-range index fields kept the
+project readable. Resolve UI reopen remains a separate check.
+
+### Archive validation and limits
 
 The writer reads its staged output through the source reader and compares
 the prepared identities, ownership, ranges and channel selections before
@@ -286,8 +313,9 @@ The eight single-property controls each matched their reopened native
 reference on all 48 decoded frames. The effect applied to exactly the
 first 24 frames in each case. A separate native left-aligned cross
 dissolve requested 12 frames and saved eight, matching the incoming
-clip's available handle. Avid overlap-to-cut timing and dissolve writing
-remain open.
+clip's available handle. The internal writer now round-trips that
+[Resolve profile](RESOLVE-DRP-FORMAT-CLOSEOUT.md#qualified-left-aligned-cross-dissolve).
+Avid overlap-to-cut timing remains open.
 
 ### Flip, Flop, and Flip-Flop
 

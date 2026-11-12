@@ -1,10 +1,16 @@
 //! Construct a project from prepared bin, media and timeline records.
 use super::*;
-use crate::linked::{samples_per_frame, Media, PreparedProject, Profile, Timeline};
+use crate::dissolve::{self, Dissolve};
+use crate::{
+    linked::{mixer::DirectMixer, samples_per_frame, Media, PreparedProject, Profile, Timeline},
+    turnover::Templates,
+};
 use graph::{Rational, Value};
 
 const TEMPLATE_23976: &str = "4b2895fa6827801bce87bff7f657dae6454f7011459b689d1983bb11a017ccfc";
 const TEMPLATE_24: &str = "e2a3a1ad16be932947914d866b3c8bb49b549ffd5869a06a9fc9eb576bf21bf5";
+const TWO_BUS_TEMPLATE: &str = "51e9255ae6fed4f82b7a297531a7fab0bff8353153bfe39e7f797bb7296570cf";
+const TWO_BUS_FOLDER: &str = "MediaPool/Master/000_Originals/MpFolder.xml";
 const MEDIA_DONOR: &str = "MediaPool/Master/002_Linked/000_Audio/MpFolder.xml";
 const TIMELINE_DONOR: &str = "SeqContainer/93a83077-933a-4ed8-9595-e12534b57e18.xml";
 const PRORES_REC709: &str = "80087810027002789e01800166880132980100d80100";
@@ -35,34 +41,35 @@ pub fn publish_turnover(
     group_template: Option<&Path>,
     output: &Path,
 ) -> Result<Published> {
-    publish_turnover_checked(
+    publish_linked_with_templates(
         prepared,
-        layout_template,
-        profile_template,
-        atom_template,
-        group_template,
+        &Templates {
+            layout: layout_template.into(),
+            profile: profile_template.into(),
+            atom: atom_template.map(Path::to_owned),
+            group: group_template.map(Path::to_owned),
+            fairlight: None,
+        },
         output,
-        || Ok(()),
     )
+}
+
+pub fn publish_linked_with_templates(
+    prepared: &PreparedProject,
+    templates: &Templates,
+    output: &Path,
+) -> Result<Published> {
+    publish_turnover_checked(prepared, templates, output, || Ok(()))
 }
 
 pub(crate) fn publish_turnover_checked(
     prepared: &PreparedProject,
-    layout_template: &Path,
-    profile_template: &Path,
-    atom_template: Option<&Path>,
-    group_template: Option<&Path>,
+    templates: &Templates,
     output: &Path,
     recheck: impl FnOnce() -> Result<()>,
 ) -> Result<Published> {
     check_output(output)?;
-    let (members, identities) = assemble_turnover(
-        prepared,
-        layout_template,
-        profile_template,
-        atom_template,
-        group_template,
-    )?;
+    let (members, identities) = assemble_turnover(prepared, templates)?;
     write_checked_archive(members, output, |stage| {
         verify_stage(prepared, &identities, stage)?;
         for media in &prepared.media {
@@ -74,29 +81,47 @@ pub(crate) fn publish_turnover_checked(
 
 fn assemble_turnover(
     prepared: &PreparedProject,
-    layout_template: &Path,
-    profile_template: &Path,
-    atom_template: Option<&Path>,
-    group_template: Option<&Path>,
+    templates: &Templates,
 ) -> Result<(Members, Identities)> {
     let template = |role: &str, path: &Path, hash: &str, count| -> Result<Members> {
         load_skeleton(path, hash, count)
             .map_err(|error| format!("Resolve {role} template {}: {error}", path.display()).into())
     };
-    let layout = template("layout", layout_template, TEMPLATE_23976, 13)?;
+    let layout = template("layout", &templates.layout, TEMPLATE_23976, 13)?;
     let profile = if prepared.rate == Rational::integer(24) {
-        template("profile", profile_template, TEMPLATE_24, 10)?
+        template("profile", &templates.profile, TEMPLATE_24, 10)?
     } else {
-        template("profile", profile_template, TEMPLATE_23976, 13)?
+        template("profile", &templates.profile, TEMPLATE_23976, 13)?
     };
     let atom_donor = if prepared
         .media
         .iter()
         .any(|m| matches!(m.profile, Profile::Atom(_)))
     {
-        let path = atom_template.ok_or("split MXF project requires its pinned media template")?;
+        let path = templates
+            .atom
+            .as_deref()
+            .ok_or("split MXF project requires its pinned media template")?;
         let members = template("split MXF", path, SKELETON_SHA256, 6)?;
         Some(block(member(&members, SOURCE)?, "Sm2MpVideoClip")?)
+    } else {
+        None
+    };
+    let fairlight = if prepared
+        .timelines
+        .iter()
+        .any(|row| row.mixer.is_some_and(|m| m.buses == 2))
+    {
+        let path = templates
+            .fairlight
+            .as_deref()
+            .ok_or("missing pinned two-bus Fairlight template")?;
+        let donor = template("two-bus Fairlight", path, TWO_BUS_TEMPLATE, 7)?;
+        let sequence = block(member(&donor, TWO_BUS_FOLDER)?, "Sm2Sequence")?;
+        Some(
+            Mixer::decode(&sequence_fields(&sequence)?)?
+                .ok_or("missing persisted Fairlight model in the pinned template")?,
+        )
     } else {
         None
     };
@@ -105,7 +130,8 @@ fn assemble_turnover(
         &layout,
         &profile,
         atom_donor.as_deref(),
-        group_template,
+        templates.group.as_deref(),
+        fairlight.as_ref(),
     )
 }
 
@@ -125,13 +151,7 @@ pub(crate) fn review_turnover(
     {
         return Err("project output must have an existing parent directory".into());
     }
-    assemble_turnover(
-        prepared,
-        &templates.layout,
-        &templates.profile,
-        templates.atom.as_deref(),
-        templates.group.as_deref(),
-    )?;
+    assemble_turnover(prepared, templates)?;
     Ok(())
 }
 
@@ -514,23 +534,35 @@ fn pool_item(
     Ok((id, item))
 }
 
+fn sequence_fields(sequence: &str) -> Result<String> {
+    let end = sequence
+        .find("<UniqueSequenceId>")
+        .ok_or("missing sequence identity")?;
+    tag(&sequence[..end], "FieldsBlob")
+}
+
+struct TimelineDonors<'a> {
+    pool: &'a str,
+    container: &'a str,
+    fairlight: Option<&'a Mixer>,
+}
+
 fn write_timeline(
     timeline: &Timeline,
     rate: Rational,
     bin: &str,
     media: &[Media],
     media_ids: &[String],
-    pool_donor: &str,
-    container_donor: &str,
+    donors: &TimelineDonors<'_>,
 ) -> Result<(String, String, String, String, String)> {
-    let mut ids = new_ids(pool_donor)?;
-    for (old, new) in new_ids(container_donor)? {
+    let mut ids = new_ids(donors.pool)?;
+    for (old, new) in new_ids(donors.container)? {
         if ids.insert(old, new).is_some() {
             return Err("colliding timeline template identities".into());
         }
     }
-    let mut pool = remap(pool_donor.to_owned(), &ids);
-    let mut container = remap(container_donor.to_owned(), &ids);
+    let mut pool = remap(donors.pool.to_owned(), &ids);
+    let mut container = remap(donors.container.to_owned(), &ids);
     set(&mut pool, "MpFolder", bin)?;
     set(&mut pool, "CurPlayheadPosition", "0")?;
     prefix_name(&mut pool, &timeline.name)?;
@@ -561,7 +593,14 @@ fn write_timeline(
         .find("<UniqueSequenceId>")
         .ok_or("missing sequence identity")?;
     let mut fields_head = sequence[..fields_end].to_owned();
-    let fields = tag(&fields_head, "FieldsBlob")?;
+    let fields = sequence_fields(&sequence)?;
+    let fields = if let Some(mixer) = timeline.mixer {
+        Mixer::decode(&fields)?
+            .ok_or("missing qualified Fairlight mixer in timeline template")?
+            .write_direct(donors.fairlight, mixer)?
+    } else {
+        fields
+    };
     set(
         &mut fields_head,
         "FieldsBlob",
@@ -590,6 +629,13 @@ fn write_timeline(
         .to_owned();
         let mut list = String::from("<Items>");
         for edit in &timeline.lanes[lane] {
+            if let Some(dissolve) = timeline
+                .dissolve
+                .as_ref()
+                .filter(|dissolve| lane == 0 && edit.start == dissolve.cut)
+            {
+                write_dissolve(&mut list, timeline.origin, dissolve);
+            }
             let source = &media[edit.media];
             let mut clip = base.clone();
             let old_id = dbid(&clip)?.to_owned();
@@ -607,6 +653,10 @@ fn write_timeline(
             set(&mut clip, "Duration", &edit.length.to_string())?;
             if let Some(video) = &edit.video {
                 set(&mut clip, "EffectFiltersBA", &video.encoded)?;
+            }
+            if let Some(db) = edit.volume {
+                let envelope = crate::audio::Envelope::StaticVolume(db);
+                set(&mut clip, "EffectFiltersBA", &envelope.encode()?)?;
             }
             let atom = match &source.profile {
                 Profile::Atom(binding) => Some(binding),
@@ -657,6 +707,37 @@ fn write_timeline(
     ))
 }
 
+fn write_dissolve(list: &mut String, origin: i64, transition: &Dissolve) {
+    use std::fmt::Write as _;
+    // The saved record is between the two clips. Its range ends at the cut;
+    // the incoming clip's saved Start, In and Duration remain its visible edit.
+    let start = origin + transition.cut - dissolve::DURATION;
+    write!(
+        list,
+        concat!(
+            "<Element><Sm2TiTransition DbId=\"{id}\">",
+            "<FieldsBlob>{fields}</FieldsBlob><PrettyType>{kind}</PrettyType>",
+            "<Name>Transition</Name><Start>{start}</Start><Duration>{duration}</Duration>",
+            "<LinkedItemSync/><WasDisbanded>false</WasDisbanded><MarkersBA/>",
+            "<UiMemento>0</UiMemento><Flags>0</Flags><PriorityIndex>0</PriorityIndex>",
+            "<EffectFiltersBA>{effect}</EffectFiltersBA><ImportExportMetadataBA/>",
+            "<RenderTextEnabled>true</RenderTextEnabled><RenderTextGanged>true</RenderTextGanged>",
+            "<RenderTextPrefixed>true</RenderTextPrefixed>",
+            "<AlignmentType>{alignment}</AlignmentType><Position>{position}</Position>",
+            "</Sm2TiTransition></Element>"
+        ),
+        id = uid(),
+        fields = dissolve::FIELDS,
+        kind = dissolve::TYPE,
+        start = start,
+        duration = dissolve::DURATION,
+        effect = dissolve::EFFECT,
+        alignment = dissolve::ALIGNMENT,
+        position = dissolve::POSITION,
+    )
+    .expect("writing to a String cannot fail");
+}
+
 fn folder_path(index: usize, project: &PreparedProject) -> Result<String> {
     let mut path = Vec::new();
     let mut current = index;
@@ -704,6 +785,7 @@ fn build(
     profile: &Members,
     atom_donor: Option<&str>,
     group_template: Option<&Path>,
+    fairlight: Option<&Mixer>,
 ) -> Result<(Members, Identities)> {
     let root = member(profile, POOL)?;
     let root_id = dbid(root)?.to_owned();
@@ -715,7 +797,11 @@ fn build(
     let mut remaining_xml = MAX_XML as usize;
     let donor = member(layout, MEDIA_DONOR)?;
     let timeline_donor = named(member(layout, POOL)?, "Sm2MpTimelineClip", "Linked A")?;
-    let container_donor = member(layout, TIMELINE_DONOR)?;
+    let donors = TimelineDonors {
+        pool: &timeline_donor,
+        container: member(layout, TIMELINE_DONOR)?,
+        fairlight,
+    };
     for media in &p.media {
         let (id, item) = pool_item(donor, media, &bin_ids[media.bin], p.rate, atom_donor)?;
         remaining_xml = remaining_xml
@@ -730,7 +816,11 @@ fn build(
     let mut group_id = None;
     let mut project = member(profile, PROJECT)?.to_owned();
     set(&mut project, "ProjectName", &xml(&p.name))?;
-    set(&mut project, "CurrentTimelineIndex", "0")?;
+    set(
+        &mut project,
+        "CurrentTimelineIndex",
+        &p.active_timeline_index.to_string(),
+    )?;
     container_field(&mut project, "LocableBlobSet", "")?;
     for timeline in &p.timelines {
         if let Some(group) = &timeline.group {
@@ -766,8 +856,7 @@ fn build(
             &bin_ids[timeline.bin],
             &p.media,
             &media_ids,
-            &timeline_donor,
-            container_donor,
+            &donors,
         )?;
         remaining_xml = remaining_xml
             .checked_sub(pool.len() + container.len() + 19)
@@ -844,7 +933,39 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
     if graph.sequences.len() != p.timelines.len()
         || graph.items.len() != p.media.len()
         || graph.bins.len() != p.bins.len()
-        || !graph.losses.is_empty()
+    {
+        return Err("generated Resolve reference counts differ from preparation".into());
+    }
+    let active = graph
+        .sidecar(crate::source::ACTIVE_TIMELINE_ADAPTER, &ids.bins[0])
+        .ok_or("generated Resolve active timeline receipt missing")?;
+    let expected_index = Value::Int(i64::try_from(p.active_timeline_index)?);
+    let expected_id = &ids.sequences[p.active_timeline_index];
+    if active.get("saved_index") != Some(&expected_index)
+        || !matches!(active.get("sequence_id"), Some(Value::Str(id)) if id == expected_id)
+        || active.get("unavailable_reason") != Some(&Value::Null)
+    {
+        return Err("generated Resolve active timeline differs from preparation".into());
+    }
+    let mut dissolves = Vec::with_capacity(p.timelines.len());
+    for (timeline, read) in p.timelines.iter().zip(&graph.sequences) {
+        let saved = dissolve::prepare(&graph, read)?;
+        let cut = |dissolve: &Dissolve| dissolve.cut;
+        if saved.as_ref().map(cut) != timeline.dissolve.as_ref().map(cut) {
+            return Err("generated Resolve dissolve differs from preparation".into());
+        }
+        dissolves.push(saved);
+    }
+    if graph.losses.iter().any(|loss| {
+        !p.timelines
+            .iter()
+            .zip(&graph.sequences)
+            .zip(&dissolves)
+            .any(|((timeline, read), dissolve)| {
+                timeline.mixer.is_some() && DirectMixer::recover(loss, &read.id)
+                    || dissolve.as_ref().is_some_and(|d| d.recover(loss, &read.id))
+            })
+    })
     {
         return Err(format!(
             "generated Resolve reference graph differs from prepared project: {:?}",
@@ -870,6 +991,26 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             || !actual.items.iter().eq(expected_items)
         {
             return Err("generated Resolve bin ownership differs from preparation".into());
+        }
+        let expected_children = p
+            .bins
+            .iter()
+            .zip(&ids.bins)
+            .filter(|(child, _)| child.parent == Some(index))
+            .map(|(_, id)| id);
+        let actual_children = graph
+            .bins
+            .iter()
+            .filter(|child| child.parent.as_ref() == Some(&actual.id))
+            .map(|child| &child.id);
+        let has_children = expected_children.clone().next().is_some();
+        let order = graph.sidecar(crate::source::BIN_ORDER_ADAPTER, &actual.id);
+        let saved_order = order.is_some_and(|fields| {
+            matches!(fields.get("source"), Some(Value::Str(source)) if source == "fields_blob")
+                && fields.get("archive_order_matches") == Some(&Value::Bool(true))
+        });
+        if !actual_children.eq(expected_children) || (has_children && !saved_order) {
+            return Err("generated Resolve child bin order differs from preparation".into());
         }
     }
     for (media, id) in p.media.iter().zip(&ids.media) {
@@ -979,6 +1120,11 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             )
             .into());
         }
+        if DirectMixer::prepare(&graph, read)? != timeline.mixer {
+            return Err(
+                format!("generated Fairlight mixer disagrees with {}", timeline.name).into(),
+            );
+        }
         if let Some(group) = &timeline.group {
             let id = ids
                 .group
@@ -1055,6 +1201,8 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                     || frame(edit.source_in)? != wanted.source_in
                     || frame(edit.duration)? != wanted.length
                     || !crate::video::matches_readback(edit, wanted.video.as_ref())
+                    || edit.volume_db != wanted.volume
+                    || !edit.volume_keys.is_empty()
                     || !edit
                         .audio_streams
                         .iter()

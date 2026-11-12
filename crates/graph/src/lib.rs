@@ -12,6 +12,7 @@
 
 pub mod json;
 pub mod picture_chain;
+pub mod picture_motion;
 pub mod time;
 pub mod source;
 mod validation;

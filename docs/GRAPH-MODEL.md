@@ -77,6 +77,13 @@ For Flop inside 3D Warp, the first stage reflects the picture and the
 second stage carries Warp's transform and saved curves. The placement
 has no separate transform to apply to the chain.
 
+The graph/2 `picture.motion_linear` effect carries two ordered keys on a
+standalone picture placement. Its clock is `item_source` and its
+interpolation is `linear`. Each key stores an exact rational second
+in `at`, X and Y frame fractions from center in `position` (right and
+down are positive), and uniform `scale_percent`. Destination preparation
+checks whether the key times and geometry fit its qualified edit profile.
+
 ## Acceptance (the contract's first step): passed 2026-10-26
 
 `crates/bridge/tests/round_trip.rs` runs every model in `examples/` and the golden corpus

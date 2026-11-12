@@ -692,10 +692,14 @@ only for comparing results; route (3) (scripting API) is for test read-back.
 - [ ] **Widen Avid UME turnover coverage.** Qualify representative production
       bins, other H.264 profiles and rates, and combined automatic binding
       of managed Avid media and UME originals.
-- [ ] **Qualify an asymmetric Resolve video dissolve.** The native
-      left-aligned witness saved eight frames from a twelve-frame request
-      with eight incoming handle frames. Qualify graph/2 endpoint and trim
-      projection from a saved Avid control before writing a dissolve.
+- [x] **Qualify an eight-frame left-aligned Resolve Cross Dissolve.**
+      The internal Resolve → graph/2 → DRP path preserved the editable
+      transition after Save As and reopen. Picture matched the native
+      dissolve and both isolated PCM lanes matched the straight cut.
+      [Native trial](RESOLVE-DRP-FORMAT-CLOSEOUT.md#qualified-left-aligned-cross-dissolve)
+- [ ] Qualify Avid and Premiere dissolve endpoint and handle mapping.
+      Use saved source-editor controls and native Resolve renders for
+      each additional alignment or transition type.
 - [x] **Implement the internal link-in-place turnovers.** One preparation and
       publication path handles automatic Avid bindings and the bounded Premiere
       ProRes HQ MOV/PCM WAV source. The synthetic Premiere control matched the
@@ -775,34 +779,81 @@ for a verified workflow that needs it, with the **Creates new media.** notice.
 - [x] Qualify the static and two-key Linear Motion controls and a static
       −6 dB mono clip-volume control using a Premiere 27 save and a
       reopened Resolve prototype. [Native trial](RESOLVE-TURNOVER-IMPLEMENTATION.md#native-premiere-27-and-resolve-mapping-trial)
-- [ ] Apply the qualified Motion and static clip-volume mappings during
-      Premiere-to-Resolve turnover. Preserve animated volume as a source
-      receipt and report the omitted ramp until its rendered behavior agrees.
-
-### Pinned offline turnover references
-
-- [drp-format](https://github.com/samuelgursky/davinci-resolve-mcp/tree/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/drp-format)
-  (JavaScript, MIT, `1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048`).
-  The offline package in davinci-resolve-mcp covers DRP/DRT packaging, timeline
-  edits, media relinking, markers, transitions and grades. Use it for format
-  comparisons. Its new-media path uses an H.264 template, and our DNxHR OP1a
-  and editable Group cases need their own native fixtures.
-- [pr2resolve](https://github.com/Ersiter/pr2resolve/tree/61c8c9ec2a76496721718130f250c5b64fccd789)
-  (Python, MIT, `61c8c9ec2a76496721718130f250c5b64fccd789`).
-  Use its [native format notes](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md)
-  to cross-check timeline registration, source trims, media bindings and Fairlight
-  source-channel selection. Its controlled PCM16 tests leave our DNxHR OP1a
-  PCM24 dual-stream and editable Group cases to qualify.
-- [drpkit](https://github.com/higuchiki/drpkit/tree/af3cedc0f40ae2192929158399667b4d28863dd6)
-  (Python, MIT, `af3cedc0f40ae2192929158399667b4d28863dd6`).
-  Use its [field inventory](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/FORMAT.md)
-  for Fairlight mixer and edit read-back, including routing, EQ, dynamics,
-  fades and keyframes. Its template composer is audio-focused.
-
-Review licence and provenance before code adoption.
+- [x] Apply qualified Motion and static mono clip volume during
+      Premiere-to-Resolve turnover. Verify both after Save As and reopen.
+      [Native trial](RESOLVE-TURNOVER-IMPLEMENTATION.md#native-premiere-27-and-resolve-mapping-trial)
+- [ ] Qualify animated clip volume against rendered Premiere and Resolve
+      audio. Preserve the source receipt and report the omitted ramp.
 
 ### Closed reference review
 
+- [x] **davinci-project-repair saved timeline selection** (`cbfcf62`).
+      The DRP reader retains the active sequence UUID and the linked writer
+      remaps it after timeline reordering. Offline checks covered duplicate
+      names, distinct bin assignments, and the first-timeline fallback.
+      Resolve UI reopen remains pending. Database repair stays outside the
+      converter. [Reader and archive checks](RESOLVE-SOURCE-READER.md#saved-active-timeline)
+      · [Pinned upstream notes](https://github.com/LucaL1fe/davinci-project-repair/blob/cbfcf6218d00a3c5a3f8b13bd90361affdb1e7ae/README.md#the-root-cause)
+- [x] **sqsolve archive and bin-order review** (`c47316e`). The Resolve
+      reader carries the saved sibling UUID order through graph/2. The
+      linked writer verifies that order in the written child lists and
+      numbered paths. An offline round trip preserved two same-named
+      nested bins and their distinct timeline assignments after an
+      ordinal swap. [Reader behavior](RESOLVE-SOURCE-READER.md)
+      · [Writer and verification](RESOLVE-PROJECT-CORE.md#linked-project-profile)
+      · [Pinned sqsolve exporter](https://github.com/donutinit/sqsolve/blob/c47316e87e603c70b41316900c5da497967a97db/internal/drp/export.go#L222)
+- [x] **DaVinci Resolve DRP Toolkit** (`aadefac4`). The existing timeline
+      diff covers the comparison lead. The internal probe inventories
+      saved timeline effects with exact selectors for byte comparison
+      and retains payload facts when graph interpretation fails. The
+      retained DRT and DRP dissolve selectors produced a matching blob
+      comparison. Effect stripping by size and Dolby Vision tag clearing
+      remain upstream reference leads. [Inventory and checks](RESOLVE-SOURCE-READER.md#inventory-saved-effects)
+      · [Pinned rescue code](https://github.com/koosoli/DaVinci-Resolve-DRP-Toolkit/blob/aadefac4810de59249b8a1980be459b136d5f412/drp_toolkit/plugins/rescue.py)
+      · [Pinned downgrade code](https://github.com/koosoli/DaVinci-Resolve-DRP-Toolkit/blob/aadefac4810de59249b8a1980be459b136d5f412/drp_toolkit/plugins/downgrade.py)
+- [x] **drpEditor comparison workflow** (`c5bec571`). The internal
+      Resolve probe compares selected DRP and qualified DRT timelines and
+      reports saved blob byte ranges by exact object ID. The retained
+      cross-format pair matched on timeline content despite rewritten IDs
+      and a changed envelope. The straight-cut control isolated one added
+      dissolve. [Probe and checks](RESOLVE-SOURCE-READER.md#compare-saved-timelines-and-blobs)
+      · [Pinned drpEditor workflow](https://github.com/theRealAi/drpEditor/blob/c5bec57146507741f9f70fd16622d4f302ab5865/docs/reverse_engineering.md)
+      · [Pinned DRP Toolkit comparison](https://github.com/koosoli/DaVinci-Resolve-DRP-Toolkit/blob/aadefac4810de59249b8a1980be459b136d5f412/drp_toolkit/plugins/diff.py)
+- [x] **CiprianSpiridon/davinci-resolve-mcp DRT format review** (Python,
+      MIT, `9f2537e5`). Qualified an internal Resolve 21.2 timeline
+      inspector and a bounded graph/2 export from a native `.drt`. The
+      eight-frame dissolve, ranged marker, four edits and both mono lanes
+      survived native import, Save Project As and reopen. Missing witnesses
+      remain visible in inspection and block graph export. This closes the
+      DRT reference review; DRT authoring and product exposure remain open.
+      [Evidence, commands and remaining scope](RESOLVE-DRT-CLOSEOUT.md)
+- [x] **drp-format** (JavaScript, MIT, `1e2bf034`). The review covers
+      archive structure, media caches, editorial operations, transitions,
+      markers and grade authoring. The editable V1 Cross Dissolve is
+      qualified in the internal DRP path. DRT authoring, compounds, retiming,
+      generators, Text+, and DRX have separate native test recipes.
+      [Coverage and trial](RESOLVE-DRP-FORMAT-CLOSEOUT.md)
+- [x] **pr2resolve** (Python, MIT, `61c8c9e`). Reviewed its timeline and bin
+      registration, source and record clocks, trims, media and audio channel
+      bindings, Motion, and marker encoding against the existing turnover
+      profiles. Static and two-key Linear Premiere Motion and static mono
+      volume now pass through the turnover job and match the retained
+      Resolve renders after Save As and reopen. Track locks, clip labels,
+      marks, retiming, subtitle output and grade equivalence remain
+      feature work. The positive speed maps are reference cases for the
+      retiming tests, and the upstream Lumetri formulas are approximations.
+      [Pinned native format notes](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md)
+- [x] **drpkit** (MIT, `af3cedc0`). The source review covers Fairlight
+      channel and bus tables, EQ and dynamics rows, built-in and insert FX
+      records, clip controls, and the limits of the audio-only composer.
+      The internal turnover writer preserves qualified static mono pan and
+      direct routing to one or two persisted stereo buses. A1 hard left
+      on Bus 1 and A2 centered on Bus 2 passed Save As, reopen, and both
+      PCM comparisons. Bus 2 static gain from −6 to 0 dB and mute are
+      supported in the same profile. Separate −6 dB and mute tests
+      matched both stereo references after reopen. Nonneutral processing
+      and wider routing are pending.
+      [Coverage and trial](RESOLVE-DRPKIT-CLOSEOUT.md)
 - [x] **PRPROJ-READER** (SRC-011, CC0-1.0, `a51a2a5`). The converter's
       Premiere reader already follows saved object references for bins, clips,
       media and sequences. Its component reader exposes static values and
@@ -820,6 +871,14 @@ and integration sequence. Start by widening archive, media and clock
 coverage, then expand editable timeline controls and Fairlight on verified
 bindings. Titles, Color and Fusion need distinct rendered controls.
 
+- [x] Apply static mono track pan and direct routing to persisted stereo buses
+      during Resolve preparation. Verify both outputs after reopen.
+- [x] Qualify Bus 2 static gain and mute with separate native saves and PCM.
+- [ ] Qualify a one-band EQ control and a compressor threshold/ratio pair
+      with separate native saves and PCM.
+- [ ] Scope plug-in bypass, track and plug-in automation, custom fade
+      interpolation, and additional dynamics laws with one-change native controls.
+
 - **Bookmark: storytold/filmcraft PR #670** "Interchange: import DaVinci
   Resolve projects (.drp)" (by nikpottbecker; fork branch `feat/davinci-resolve-drp-import`,
   `crates/interchange/src/drp/` ~1,900 lines Rust). States clean-room: layout read off Resolve
@@ -836,10 +895,10 @@ bindings. Titles, Color and Fusion need distinct rendered controls.
   |---|---|---|
   | hfiguiere/drp-extractor | Rust, MPL-2.0 | parse .drp (2018-2023) |
   | samuelgursky/davinci-resolve-mcp | Python/JS, MIT, ~3.8k stars | Resolve scripting API + offline .drp/DB tools (`drp-timeline-clips.mjs`, `project_db.mjs`) |
-  | CiprianSpiridon/davinci-resolve-mcp | Python, MIT | `formats/drp.py`, `formats/drt.py` (.drt timelines) |
-  | koosoli/DaVinci-Resolve-DRP-Toolkit | Python, GPL-3.0 | analyse/compare/downgrade .drp (read only for us) |
-  | donutinit/sqsolve | Go, AGPL-3.0 | project-library server, `internal/drp/export.go` (read only for us) |
-  | LucaL1fe/davinci-project-repair | JS, MIT | repairs a corrupted UI-state blob in the project DB |
+  | CiprianSpiridon/davinci-resolve-mcp | Python, MIT | `formats/drt.py` reviewed; [native DRT reader scope](RESOLVE-DRT-CLOSEOUT.md) |
+  | koosoli/DaVinci-Resolve-DRP-Toolkit | Python, GPL-3.0 | [Comparison and effect inventory reviewed](RESOLVE-SOURCE-READER.md#inventory-saved-effects) |
+  | donutinit/sqsolve | Go, AGPL-3.0 | [Archive and bin order reviewed](#closed-reference-review) |
+  | LucaL1fe/davinci-project-repair | MIT | [Saved timeline selection reviewed](#closed-reference-review) |
 - **Routes to evaluate:** (1) native `.drp` read/write (most fidelity, undocumented, version
   drift 19 -> 20 -> 21); (2) Resolve's own interchange imports (FCPXML, FCP7 XML, AAF, EDL, OTIO):
   FCPXML is an optional export, and further FCPXML work is on hold; these imports may be used

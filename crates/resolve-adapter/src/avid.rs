@@ -45,10 +45,13 @@ pub fn convert_avid_ume(
     let prepared = crate::linked::prepare(&read.graph, spec, &options.ffprobe)?;
     let result = crate::archive::publish_turnover_checked(
         &prepared,
-        layout,
-        profile,
-        None,
-        None,
+        &crate::turnover::Templates {
+            layout: layout.into(),
+            profile: profile.into(),
+            atom: None,
+            group: None,
+            fairlight: None,
+        },
         output,
         || {
             if media_digest(&source.path)? != revision {

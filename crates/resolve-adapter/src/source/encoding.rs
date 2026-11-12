@@ -3,7 +3,7 @@ use crate::{binary::take_varint, Result};
 use graph::Rational;
 use std::collections::BTreeMap;
 
-const MAX_BLOB: usize = 1 << 16;
+pub(super) const MAX_BLOB: usize = 1 << 16;
 
 #[derive(Default)]
 pub(super) struct Blobs(usize);

@@ -1,13 +1,18 @@
 //! Standalone source interpretation of the qualified Resolve archive profile.
 mod atom;
+pub mod compare;
+pub mod drt;
 mod effects;
 mod encoding;
+mod fairlight;
+pub mod inventory;
 mod markers;
 mod metadata;
 pub(crate) mod mixer;
 mod multicam;
 mod observations;
 pub(crate) mod relink;
+mod report;
 mod wav;
 mod xml;
 
@@ -32,11 +37,25 @@ use xml::Node;
 
 const ROOT_FOLDER: &str = "MediaPool/Master/MpFolder.xml";
 pub(crate) const ADAPTER: &str = "resolve.source";
+pub(crate) const BIN_ORDER_ADAPTER: &str = "resolve.bin_order";
+pub(crate) const ACTIVE_TIMELINE_ADAPTER: &str = "resolve.active_timeline";
 pub(crate) const CLOCK_ROUTE: &str = "Resolve archive clock";
 
 /// Read an exported .drp without opening media or making application calls.
 pub fn read(path: &Path) -> Result<SourceGraph> {
     let members = xml::read(path)?;
+    read_members(&members, false)
+}
+
+fn archive_is_drt(path: &Path) -> Result<bool> {
+    match path.extension() {
+        Some(ext) if ext.eq_ignore_ascii_case("drt") => Ok(true),
+        Some(ext) if ext.eq_ignore_ascii_case("drp") => Ok(false),
+        _ => Err("expected a Resolve .drp or .drt archive".into()),
+    }
+}
+
+fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<SourceGraph> {
     let mut blobs = Blobs::default();
     let project = members
         .get("project.xml")
@@ -45,8 +64,8 @@ pub fn read(path: &Path) -> Result<SourceGraph> {
     if project.get("ProjectVersion")? != "17" {
         return Err("unsupported Resolve project version".into());
     }
-    let folders = folders(&members, project, &mut blobs)?;
-    let containers = containers(&members)?;
+    let folders = folders(members, project, &mut blobs)?;
+    let containers = containers(members)?;
     let mut graph = SourceGraph {
         project: Project {
             name: project.get("ProjectName")?.into(),
@@ -67,9 +86,16 @@ pub fn read(path: &Path) -> Result<SourceGraph> {
     let mut ids = HashSet::new();
     claim(&mut ids, project.id()?)?;
     claim(&mut ids, project.one("MediaPool")?.entry()?.id()?)?;
-    for folder in folders {
+    for (folder, order) in folders {
         let bin_id = folder.id()?;
         claim(&mut ids, bin_id)?;
+        if let Some(order) = order {
+            graph.sidecars.push(Sidecar {
+                adapter: BIN_ORDER_ADAPTER.into(),
+                object: bin_id.into(),
+                data: order.receipt(),
+            });
+        }
         let mut bin = Bin {
             id: bin_id.into(),
             name: folder.get("Name")?.into(),
@@ -152,6 +178,7 @@ pub fn read(path: &Path) -> Result<SourceGraph> {
         blobs,
         graph,
         used_containers: HashSet::new(),
+        inspect_drt,
     };
     // Definitions are independent of the order in which outer timelines use them.
     let groups: BTreeMap<_, _> = groups.into_iter().collect();
@@ -173,9 +200,42 @@ pub fn read(path: &Path) -> Result<SourceGraph> {
     if context.used_containers.len() != context.containers.len() {
         return Err("Resolve archive contains an unregistered sequence container".into());
     }
+    if !inspect_drt {
+        let root = members.get(ROOT_FOLDER).ok_or("missing Resolve root bin")?;
+        context.graph.sidecars.push(Sidecar {
+            adapter: ACTIVE_TIMELINE_ADAPTER.into(),
+            object: root.id()?.into(),
+            data: active_timeline_receipt(project, &context.graph.sequences),
+        });
+    }
     markers::read(project, &mut context.graph, &mut context.blobs)?;
     context.graph.validate()?;
     Ok(context.graph)
+}
+
+fn active_timeline_receipt(project: &Node, sequences: &[SourceSequence]) -> Value {
+    let index = match project.optional("CurrentTimelineIndex") {
+        Err(_) => Err("ambiguous"),
+        Ok(None) => Err("missing"),
+        Ok(Some(node)) => node
+            .scalar()
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .ok_or("malformed"),
+    };
+    // Sequences have already been resolved in TimelineHandleVec order.
+    let (saved_index, sequence_id, reason) = match index {
+        Ok(index) => match usize::try_from(index).ok().and_then(|i| sequences.get(i)) {
+            Some(sequence) => (Value::Int(index), text(&sequence.id), Value::Null),
+            None => (Value::Int(index), Value::Null, text("out_of_range")),
+        },
+        Err(reason) => (Value::Null, Value::Null, text(reason)),
+    };
+    Value::Obj(vec![
+        ("saved_index".into(), saved_index),
+        ("sequence_id".into(), sequence_id),
+        ("unavailable_reason".into(), reason),
+    ])
 }
 
 struct Context<'a> {
@@ -185,6 +245,7 @@ struct Context<'a> {
     ids: HashSet<&'a str>,
     pool_items: HashSet<&'a str>,
     used_containers: HashSet<&'a str>,
+    inspect_drt: bool,
     blobs: Blobs,
     graph: SourceGraph,
 }
@@ -251,11 +312,32 @@ fn text(s: &str) -> Value {
     Value::Str(s.into())
 }
 
+enum BinOrder {
+    Saved { archive_matches: Option<bool> },
+    ArchivePath,
+}
+
+impl BinOrder {
+    fn receipt(self) -> Value {
+        let (source, archive_matches) = match self {
+            Self::Saved { archive_matches } => ("fields_blob", archive_matches),
+            Self::ArchivePath => ("archive_path", None),
+        };
+        Value::Obj(vec![
+            ("source".into(), text(source)),
+            (
+                "archive_order_matches".into(),
+                archive_matches.map_or(Value::Null, Value::Bool),
+            ),
+        ])
+    }
+}
+
 fn folders<'a>(
     members: &'a BTreeMap<String, Node>,
     project: &Node,
     blobs: &mut Blobs,
-) -> Result<Vec<&'a Node>> {
+) -> Result<Vec<(&'a Node, Option<BinOrder>)>> {
     let root = members.get(ROOT_FOLDER).ok_or("missing Resolve root bin")?;
     let pool = project.one("MediaPool")?.entry()?;
     expect(pool, "Sm2MediaPool")?;
@@ -268,15 +350,15 @@ fn folders<'a>(
         root.id()?,
         "root bin identity",
     )?;
-    let mut ordered = Vec::new();
     let mut seen = HashMap::new();
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
     // BTreeMap ordering can place children before their parents.
     let mut entries: Vec<_> = members
         .iter()
         .filter(|(name, _)| name.starts_with("MediaPool/"))
         .collect();
     entries.sort_by_key(|(name, _)| name.matches('/').count());
-    for (name, folder) in entries {
+    for &(name, folder) in &entries {
         expect(folder, "Sm2MpFolder")?;
         same(folder.get("MediaPool")?, pool_id, "bin media pool")?;
         let id = folder.id()?;
@@ -287,52 +369,95 @@ fn folders<'a>(
         let expected_parent = directory.rsplit_once('/').map(|(parent, _)| parent);
         match parent {
             None if name == ROOT_FOLDER => {}
-            Some(parent) if seen.get(parent).copied() == expected_parent => {}
+            Some(parent)
+                if seen
+                    .get(parent)
+                    .is_some_and(|&(path, _)| Some(path) == expected_parent) =>
+            {
+                children.entry(parent).or_default().push(id);
+            }
             _ => return Err("missing or contradictory Resolve bin parent".into()),
         }
-        if seen.insert(id, directory).is_some() {
+        if seen.insert(id, (directory, folder)).is_some() {
             return Err("duplicate Resolve bin identity".into());
         }
-        ordered.push(folder);
     }
-    let mut children: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for folder in &ordered {
-        if let Some(parent) = folder.maybe("MpFolder")?.filter(|s| !s.is_empty()) {
-            children.entry(parent).or_default().insert(folder.id()?);
-        }
-    }
-    for folder in &ordered {
+    let mut orders = HashMap::new();
+    for (_, folder) in entries {
+        let id = folder.id()?;
+        let siblings = children.get_mut(id);
         let Some(fields) = folder
             .maybe("FieldsBlob")?
             .filter(|value| !value.is_empty())
         else {
+            if siblings.is_some() {
+                orders.insert(id, BinOrder::ArchivePath);
+            }
             continue;
         };
         let fields = blobs.envelope(fields)?;
-        let mut listed = HashSet::new();
         if let Some(encoded) = pb_bytes(&fields, 2)? {
             let map = qt(encoded)?;
             let count = map.keys().count();
+            let mut listed = HashSet::new();
+            let mut saved = vec![""; count];
             for key in map.keys() {
                 let index: usize = key.parse()?;
-                if index >= count
-                    || index.to_string() != key
-                    || !listed.insert(map.text(key)?.ok_or("missing Resolve child bin identity")?)
-                {
+                let child = map.text(key)?.ok_or("missing Resolve child bin identity")?;
+                if index >= count || index.to_string() != key || !listed.insert(child) {
                     return Err("ambiguous Resolve child bin registration".into());
                 }
+                saved[index] = child;
             }
-            if children
-                .get(folder.id()?)
-                .map_or(!listed.is_empty(), |expected| expected != &listed)
+            let expected = siblings.as_deref().map(Vec::as_slice).unwrap_or_default();
+            if expected.len() != listed.len() || expected.iter().any(|child| !listed.contains(child))
             {
                 return Err("Resolve child bin registration contradicts the archive paths".into());
             }
-        } else if children.contains_key(folder.id()?) {
+            if let Some(siblings) = siblings {
+                // Use the archive-owned UUID slices once membership is proven.
+                let mut numbered: Vec<_> = siblings
+                    .iter()
+                    .filter_map(|&child| {
+                        let (path, _) = seen[child];
+                        Some((folder_path_ordinal(path)?, child))
+                    })
+                    .collect();
+                numbered.sort_unstable();
+                let archive_matches = (numbered.len() == saved.len()
+                    && !numbered.windows(2).any(|pair| pair[0].0 == pair[1].0))
+                    .then(|| numbered.iter().map(|&(_, child)| child).eq(saved.iter().copied()));
+                *siblings = saved
+                    .iter()
+                    .map(|&child| *seen.get_key_value(child).expect("verified child identity").0)
+                    .collect();
+                orders.insert(id, BinOrder::Saved { archive_matches });
+            }
+        } else if siblings.is_some() {
             return Err("missing Resolve child bin registration".into());
         }
     }
+
+    // A breadth-first walk keeps every parent earlier than its children.
+    let mut queue = vec![root.id()?];
+    let mut ordered = Vec::with_capacity(seen.len());
+    let mut cursor = 0;
+    while let Some(&id) = queue.get(cursor) {
+        ordered.push((seen[id].1, orders.remove(id)));
+        if let Some(siblings) = children.remove(id) {
+            queue.extend(siblings);
+        }
+        cursor += 1;
+    }
     Ok(ordered)
+}
+
+fn folder_path_ordinal(path: &str) -> Option<usize> {
+    let (ordinal, _) = path.rsplit('/').next()?.split_once('_')?;
+    if ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    ordinal.parse().ok()
 }
 
 fn containers(members: &BTreeMap<String, Node>) -> Result<HashMap<&str, &Node>> {
@@ -936,11 +1061,17 @@ fn read_mixer_controls(
     out: &mut SourceSequence,
     track_flags: Option<[bool; 2]>,
 ) -> Result<MixerControls> {
-    if out.tracks.iter().map(|t| (t.kind, t.index)).ne([
+    let typed_mixer_profile = out.tracks.iter().map(|t| (t.kind, t.index)).eq([
         (StreamKind::Video, 1),
         (StreamKind::Audio, 1),
         (StreamKind::Audio, 2),
-    ]) {
+    ]);
+    let tracks: Vec<_> = out
+        .tracks
+        .iter()
+        .filter_map(|track| (track.kind == StreamKind::Audio).then_some(track.index))
+        .collect();
+    if tracks.is_empty() {
         return Ok(MixerControls::default());
     }
     let mixer = node
@@ -956,9 +1087,10 @@ fn read_mixer_controls(
         return Ok(MixerControls::default());
     };
     context.blobs.charge(mixer.decoded_bytes())?;
-    if let Some((data, requires_mapping)) = mixer.source_facts() {
+    let typed_gain_mute = typed_mixer_profile && mixer.qualified();
+    if let Some((data, requires_mapping)) = mixer.source_facts(&tracks, typed_gain_mute) {
         context.graph.sidecars.push(Sidecar {
-            adapter: "resolve.fairlight".into(),
+            adapter: mixer::FAIRLIGHT_ADAPTER.into(),
             object: out.id.clone(),
             data,
         });
@@ -966,10 +1098,13 @@ fn read_mixer_controls(
             loss(
                 &mut context.graph,
                 &out.id,
-                "fairlight_controls",
-                "Resolve Fairlight state retained in graph; destination mapping is unqualified",
+                mixer::FAIRLIGHT_LOSS.0,
+                mixer::FAIRLIGHT_LOSS.1,
             );
         }
+    }
+    if !typed_mixer_profile {
+        return Ok(MixerControls::default());
     }
     let faders = mixer.track_faders().unwrap_or_default();
     let main_bus = mixer.main_bus_fader().unwrap_or_default();
@@ -978,7 +1113,7 @@ fn read_mixer_controls(
         return Ok(MixerControls::default());
     }
     let mutes = mixer.track_mutes();
-    if !mixer.qualified()
+    if !typed_gain_mute
         || (has_mute_state && (mutes.is_none() || mutes != track_flags))
         || !faders.into_iter().all(mixer::valid_ticks)
         || !mixer::valid_ticks(main_bus)
@@ -1077,18 +1212,58 @@ fn read_tracks<'a>(
                 "unqualified Resolve track state or layout",
             );
         }
-        for entry in track.one("Items")?.elements()? {
+        let mut entries = track.one("Items")?.elements()?.peekable();
+        let mut previous = None;
+        while let Some(entry) = entries.next() {
             let node = entry.entry()?;
+            let before = previous.replace(node);
             let id = node.id()?;
             claim(&mut context.ids, id)?;
             if node.name == "Sm2TiTransition" {
                 observations::transition(
-                    &mut context.graph, node, &out.id, track_id, kind, index, grid,
+                    &mut context.graph,
+                    node,
+                    &out.id,
+                    track_id,
+                    kind,
+                    index,
+                    grid,
+                    [
+                        before,
+                        entries.peek().map(|entry| entry.entry()).transpose()?,
+                    ],
+                    context.inspect_drt,
                 )?;
                 continue;
             }
             if !supported || !ordinary_item(node, kind, &out.id, &mut context.graph)? {
                 continue;
+            }
+            if context.inspect_drt {
+                let mut missing = Vec::new();
+                for field in [
+                    "Start",
+                    "Duration",
+                    "In",
+                    "MediaRef",
+                    "MediaFrameRate",
+                    "MediaStartTime",
+                    "MediaTimemapBA",
+                ] {
+                    if node.maybe(field)?.is_none_or(|value| field != "In" && value.is_empty()) {
+                        missing.push(field);
+                    }
+                }
+                if !missing.is_empty() {
+                    omitted(
+                        &mut context.graph,
+                        &out.id,
+                        id,
+                        "placement",
+                        &format!("missing saved Resolve fields: {}", missing.join(", ")),
+                    );
+                    continue;
+                }
             }
             let target = node.get("MediaRef")?;
             if let Some(group) = context.groups.get(target) {
@@ -1120,6 +1295,20 @@ fn read_tracks<'a>(
                     node,
                     kind == StreamKind::Audio && master.wav_samples.is_some(),
                 )?;
+                if context.inspect_drt
+                    && kind == StreamKind::Audio
+                    && (node.maybe("VirtualAudioTrackBA")?.is_none_or(str::is_empty)
+                        || node.maybe("MediaTrackIdx")?.is_none_or(str::is_empty))
+                {
+                    omitted(
+                        &mut context.graph,
+                        &out.id,
+                        id,
+                        "audio_routing",
+                        "missing saved Resolve audio selector",
+                    );
+                    continue;
+                }
                 if let Some(p) = direct(
                     master,
                     node,
@@ -1140,6 +1329,14 @@ fn read_tracks<'a>(
                     id,
                     "media",
                     "edit refers to an unsupported Resolve pool item",
+                );
+            } else if context.inspect_drt {
+                omitted(
+                    &mut context.graph,
+                    &out.id,
+                    id,
+                    "media",
+                    "missing Resolve pool record",
                 );
             } else {
                 return Err("unresolved Resolve placement media reference".into());
@@ -1258,6 +1455,19 @@ fn direct(
         track,
         audio,
     )?;
+    if kind == StreamKind::Audio {
+        if let Some(saved) = node.maybe("FieldsBlob")?.filter(|saved| !saved.is_empty()) {
+            if let Some(data) = fairlight::clip_plugins(saved, blobs)? {
+                graph.sidecars.push(Sidecar {
+                    adapter: "resolve.clip_fairlight".into(),
+                    object: placement.id.clone(),
+                    data,
+                });
+                loss(graph, &placement.id, "clip_fairlight",
+                     "Resolve clip plug-in state retained in graph; destination mapping is unqualified");
+            }
+        }
+    }
     if let Some(filters) = node
         .maybe("EffectFiltersBA")?
         .filter(|value| !value.is_empty())

@@ -16,6 +16,7 @@ pub struct Templates {
     pub profile: PathBuf,
     pub atom: Option<PathBuf>,
     pub group: Option<PathBuf>,
+    pub fairlight: Option<PathBuf>,
 }
 
 /// Internal saved-job contract for the two experimental Resolve routes.
@@ -153,22 +154,14 @@ impl Turnover {
                     .into(),
             );
         }
-        publish_turnover_checked(
-            &self.prepared,
-            &templates.layout,
-            &templates.profile,
-            templates.atom.as_deref(),
-            templates.group.as_deref(),
-            output,
-            || {
-                for (path, revision) in &self.inputs {
-                    if media_digest(path)? != *revision {
-                        return Err(format!("source project changed: {}", path.display()).into());
-                    }
+        publish_turnover_checked(&self.prepared, templates, output, || {
+            for (path, revision) in &self.inputs {
+                if media_digest(path)? != *revision {
+                    return Err(format!("source project changed: {}", path.display()).into());
                 }
-                Ok(())
-            },
-        )
+            }
+            Ok(())
+        })
     }
 }
 

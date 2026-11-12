@@ -553,6 +553,16 @@ impl SourceGraph {
                             "reflection needs a picture placement and two boolean axes with at least one enabled",
                         )?;
                     }
+                    if effect.kind == crate::picture_motion::LINEAR_KIND {
+                        require(
+                            p.video_track.is_some()
+                                && p.transform.is_none()
+                                && p.effects.len() == 1
+                                && crate::picture_motion::read_linear(effect).is_some(),
+                            &w,
+                            "Linear Motion needs a standalone picture effect with two ordered item-source keys",
+                        )?;
+                    }
                 }
             }
             for t in &s.transitions {
@@ -1914,6 +1924,36 @@ mod tests {
         g.validate().unwrap();
         g.sequences[0].placements[1].audio_tracks = vec![1];
         refuses_all(&g, "exactly one lane");
+    }
+    #[test]
+    fn linear_picture_keys_round_trip_on_the_item_source_clock() {
+        use crate::picture_motion::{linear_effect, read_linear, MotionKey};
+        let mut g = example();
+        let keys = [
+            MotionKey {
+                at: Rational::new(1001, 4800).unwrap(),
+                position: (0.0, 0.0),
+                scale_percent: 100.0,
+            },
+            MotionKey {
+                at: Rational::new(7007, 6000).unwrap(),
+                position: (0.05, -0.025),
+                scale_percent: 112.5,
+            },
+        ];
+        g.sequences[0].placements[0].effects = vec![linear_effect(keys)];
+        let text = g.to_json_text().unwrap();
+        let decoded = SourceGraph::from_json_text(&text).unwrap();
+        assert_eq!(decoded, g);
+        assert_eq!(
+            read_linear(&decoded.sequences[0].placements[0].effects[0]),
+            Some(keys),
+        );
+
+        let mut reversed = keys;
+        reversed.reverse();
+        g.sequences[0].placements[0].effects = vec![linear_effect(reversed)];
+        refuses_all(&g, "two ordered item-source keys");
     }
     #[test]
     fn resolved_single_pair_covers_the_whole_transition_interval() {

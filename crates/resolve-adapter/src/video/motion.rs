@@ -1,7 +1,7 @@
 //! Linear keys on Inspector position, independent zoom, and source crop axes.
 use super::{pack, parameter, pb_bytes, section, Reflection, CROP, SCALE_X, SCALE_Y, X, Y};
-use crate::Result;
-use graph::{Effect, Loss, Transform, Value};
+use crate::{prepare::frames_on, Result};
+use graph::{picture_motion, Effect, Loss, Rational, Transform, Value};
 
 pub(crate) const KEY_FLAGS: u32 = 0x000c_0000;
 pub(crate) const CONTROLS: [(usize, u64); 4] = [X, Y, SCALE_X, SCALE_Y];
@@ -63,6 +63,42 @@ fn pair(value: &Value, key: &str) -> Option<(f64, f64)> {
 }
 
 impl LinearMotion {
+    pub(crate) fn from_graph(
+        effect: &Effect,
+        rate: Rational,
+        source_in: i64,
+        length: i64,
+        available: i64,
+    ) -> Result<Self> {
+        let [first, last] = picture_motion::read_linear(effect).ok_or(BAD_MOTION)?;
+        if first.position != (0.0, 0.0)
+            || first.scale_percent != 100.0
+            || !(-0.05..=0.05).contains(&last.position.0)
+            || !(-0.05..=0.05).contains(&last.position.1)
+            || !(87.5..=112.5).contains(&last.scale_percent)
+        {
+            return Err(BAD_MOTION.into());
+        }
+        let start = u32::try_from(frames_on(first.at, rate)?)?;
+        let end = u32::try_from(frames_on(last.at, rate)?)?;
+        let zoom = vec![(start, 1.0), (end, last.scale_percent / 100.0)];
+        let curves = [
+            vec![(start, 0.0), (end, last.position.0)],
+            vec![(start, 0.0), (end, -last.position.1)],
+            zoom.clone(),
+            zoom,
+        ];
+        Self::from_saved(
+            curves,
+            None,
+            Reflection::default(),
+            source_in,
+            length,
+            available,
+        )
+        .ok_or_else(|| BAD_MOTION.into())
+    }
+
     pub(crate) fn from_avid(
         kind: &str,
         params: &Value,
@@ -447,4 +483,35 @@ fn key_range(source_in: i64, length: i64) -> Option<(u32, u32)> {
         u32::try_from(source_in).ok()?,
         u32::try_from(source_in.checked_add(length - 1)?).ok()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graph::picture_motion::{linear_effect, MotionKey};
+
+    #[test]
+    fn resolve_linear_keys_use_the_exact_fractional_source_frame_grid() {
+        let rate = Rational::new(24_000, 1001).unwrap();
+        let mut keys = [
+            MotionKey {
+                at: Rational::new(1001, 4800).unwrap(),
+                position: (0.0, 0.0),
+                scale_percent: 100.0,
+            },
+            MotionKey {
+                at: Rational::new(7007, 6000).unwrap(),
+                position: (0.05, -0.025),
+                scale_percent: 112.5,
+            },
+        ];
+        let motion = LinearMotion::from_graph(&linear_effect(keys), rate, 5, 24, 29).unwrap();
+        assert_eq!(motion.curves[0], [(5, 0.0), (28, 0.05)]);
+        assert_eq!(motion.curves[1], [(5, 0.0), (28, 0.025)]);
+        assert_eq!(motion.curves[2], [(5, 1.0), (28, 1.125)]);
+        assert_eq!(motion.curves[2], motion.curves[3]);
+
+        keys[1].at = Rational::new(7, 6).unwrap(); // Frame 28 at 24, between frames at 24000/1001.
+        assert!(LinearMotion::from_graph(&linear_effect(keys), rate, 5, 24, 29).is_err());
+    }
 }

@@ -218,7 +218,7 @@ fn capture_parameter(
     Ok(())
 }
 
-fn field<'a>(tree: &'a Tree, node: NodeId, tag: &str) -> Result<Option<&'a str>> {
+pub(super) fn field<'a>(tree: &'a Tree, node: NodeId, tag: &str) -> Result<Option<&'a str>> {
     let mut matches = tree
         .children(node)
         .iter()
