@@ -377,14 +377,16 @@ Implemented fixes, tests and remaining native gates.
       A later eight-patch export stayed inside the physical Y′CbCr limits
       and matched unclamped 1.5× gain within 1.06 RGB codes. Compare a
       rail-crossing chart in both Y′CbCr and RGB to locate the clipping and
-      distinguish exact bounds before changing the LUT. A separate static
-      HSL Master matrix verified that Clip Low/High clamp Y′ to their selected
-      codes after luma inversion, leaving chroma intact. Luma inversion
-      reflects about the legal-range midpoint; chroma inversion reflects Cb
-      and Cr about neutral and matches Hue 180 on the tested patches.
-      Fractional thresholds, exact higher-bit-depth behavior and the full
-      processing order still need evidence before changing the LUT. Editable Lumetri controls
-      are on hold below. [Source packing reference](https://pub.smpte.org/pub/rdd50/rdd50-2019.pdf#page=15).
+      distinguish exact bounds before changing the LUT. The static 10-bit
+      HSL Master matrix retained adjacent code values and measured default
+      Clip Low/High endpoints of 64/940, fractional endpoints of 321/763,
+      and a half-code case of 323/762. Clipping followed luma inversion
+      and followed Gain in separate combined controls. Legal-range luma
+      inversion gave 1004 minus the input code; chroma inversion and Hue
+      180 reflected Cb and Cr around neutral within one code. Verify the
+      remaining out-of-range behavior and an end-to-end destination
+      pipeline before changing the LUT. Editable Lumetri controls are on
+      hold below. [Source packing reference](https://pub.smpte.org/pub/rdd50/rdd50-2019.pdf#page=15).
 
 ## Timeline and effects
 
@@ -423,8 +425,9 @@ User's priority tiers to scope converter tasks.
 - [ ] **Alpha (keyed graphics)** (User 2026-10-15; Avid side: Codex alpha-test intake, provisional,
       KB 5bba92c, AVB-0006/AVB-0012 context). Avid facts: an image imported with alpha becomes a
       Matte Key clip (composition usage 3, EFF2_2DMATTE): track 2 = fill, track 3 = matte, as
-      separate MXFs; "Ignore" gives a plain clip. Polarity is in the source's import settings
-      (_IGNOREALPHA, _INVERTALPHA), not in the Matte Key parameters. Measured on a straight-alpha
+      separate MXFs; "Ignore" gives a plain clip. The saved source import
+      settings (_IGNOREALPHA, _INVERTALPHA) predict polarity for these
+      original imports, whose Matte Key parameters match. Measured on a straight-alpha
       PNG: "Invert on import (white = opaque)" -> opacity = a; "Do not invert (black = opaque)" ->
       opacity = 1 - a; ordinary straight-alpha blending (MAE ~0.3 codes).
       Plan:
@@ -434,9 +437,12 @@ User's priority tiers to scope converter tasks.
          linking) with Interpret Footage alpha set from Avid: Invert-on-import -> Premiere
          default; Do-not-invert -> Invert Alpha; Ignore -> Ignore Alpha (py_premiere writes
          these interpretation fields).
-      3. Fallback when the original is missing: fill MXF with the matte MXF as a Track Matte
-         Key (luma) in a small build, polarity from Avid. Needs: which essence each MXF holds
-         (Codex: RSET routing open) and a Premiere Track Matte Key sample (storage unknown).
+      3. Fallback when the original is missing: resolve the saved fill and
+         matte representations by file-package identity. In the retained
+         DNxUncompressed test, each matte has separate `y208` and `rl08`
+         representations with opposite stored polarity. The `y208`
+         luma spans codes 0–255. Qualify which representation a destination
+         can use and how to apply its polarity and the saved effect controls.
       4. Wizard option: "Keyed graphics: link original file / rebuild from Avid matte".
       5. Test: the Alpha Test fixture (black/white backgrounds, 3 modes + control) rebuilt in
          Premiere and compared pixel-for-pixel with Avid's TIFFs, as for colour.
@@ -515,6 +521,18 @@ User's priority tiers to scope converter tasks.
 - [ ] **Extend animated Resize and 3D Warp.** Qualify other rates, interpolation,
       compact Fixed clocks and additional key shapes separately. Track anchor,
       rotation and perspective in the Avid codex.
+- [ ] **Projective 3D Warp geometry.** The installed renderer uses a
+      separate perspective projection after the model transform, followed by
+      Target translation and scaling. A destination mapping needs a
+      source-space crop and projective transform with the same order.
+      Qualify combined Target, Perspective and Axis on a numbered chart,
+      plus a clipping case, before extending either destination.
+- [ ] **3D Warp compositing.** Qualify Full Key foreground opacity and
+      background selection on contrasting picture layers. Then compare a
+      plain border, soft crop edge, shadow, and the Internal and FG Only
+      Defocus modes. The renderer sends these to different operations.
+      Preserve separate key-mode identities and test the saved output
+      before admitting an editable mapping.
 
 - [x] **Single-shape AniMatte inversion and opacity in Premiere.** Key In
       and Key Out at full and half opacity survived Save As and reopen.
@@ -525,20 +543,84 @@ User's priority tiers to scope converter tasks.
       probe corrected which region is attenuated, and matching the measured
       midpoint also required changing the sequence-wide blend domain.
       Keep the current editable approximation scoped until a local solution
-      is verified. Feather, topology changes, multiple trackers and
-      stabilization remain open.
+      is verified. Avid's shape renderer applies separate horizontal and
+      vertical feather amounts before a Bias-dependent matte threshold.
+      Compare an unequal feather pair and Bias 0, 50, and 100 on a native
+      matte before mapping to a destination. Topology changes, multiple
+      trackers and stabilization remain open.
 - [ ] **Luma Key and Chroma Key.** Avid's Luma Key Gain change moved a sharp
       cutoff on a 16-step grayscale ramp. Premiere reproduced those two
       sampled splits using paired editable Cutoff and Threshold controls.
-      Qualify the source formula, soft/colored cases and layer ownership
-      before mapping. The installed Avid palette exposed RGBKeyer and
-      SpectraMatte. The exact Chroma Key entry still needs a native fixture.
+      A later 10-bit Avid matrix matched the tested static hard, soft,
+      colored-center and partial-opacity composites within one code.
+      Show Alpha displays foreground rejection, blended over the lower
+      layer at partial opacity. Qualify destination blend and layer
+      ownership before mapping. The installed Avid palette exposed
+      RGBKeyer and SpectraMatte. The exact Chroma Key entry still needs
+      a native fixture.
+- [ ] **SpectraMatte.** The standalone effect and 3D Warp's SpectraMatte
+      mode share the core chroma and spill control IDs. The retained
+      promotion saves the key center in different color coordinates.
+      Before mapping to a destination keyer, compare a native hue sweep
+      with Tolerance changed and a separate spill-only control. Measure
+      foreground color and alpha separately.
 - [ ] **Opacity** (Avid opacity/levels, fade-to-black etc.) -> Premiere Opacity (and blend modes
-      where Avid has an equivalent); keyframes.
+      where Avid has an equivalent); keyframes. Superimpose is available under
+      Filters → Blend. The installed renderer reads a 0–100 foreground
+      level and sends it to the mixer as a 0–1 factor. Verify the saved
+      foreground and background roles and compare 0%, 50%, and 100% native
+      renders before choosing a destination blend model.
+- [ ] **Picture-in-Picture.** The installed Avid renderer shares transform
+      and crop evaluators with Resize. Picture-in-Picture registers a second
+      picture input and reads a separate Foreground Level. Qualify a saved
+      two-layer effect with nonneutral position, crop and opacity before
+      mapping its foreground controls and background ownership.
+- [ ] **Avid Pan & Zoom.** The effect references an external still and
+      calculates a source viewport from its raster, aspect, zoom, and
+      position. The placeholder supplies the Video background. Qualify
+      the saved path and a static target render first. Position follows
+      a separate velocity and path calculation, so qualify animation
+      with uneven key spacing before writing editable destination keys.
+- [ ] **Shape Blur and Mosaic.** The installed Paint renderer scales the
+      shape's horizontal and vertical strengths separately. Blur uses a
+      filtered image, while Mosaic samples and repeats a source pixel per
+      tile. Test an offset rectangle over an asymmetric chart to verify
+      native shape ownership, tile phase, and the visible blur kernel before
+      mapping the standalone effects or Paint modes.
+- [ ] **Color Effect style.** Posterize and Solarize have separate control
+      identities and lookup tables. The traced renderer applies Solarize
+      before Posterize when both are active. Qualify saved controls and
+      compare an 8-bit ramp and a 10-bit ramp before choosing a mapping.
 - [x] **Ordinary two-sided video Dissolve** (CONV-0040). Same-rate cuts with
       qualified source handles become editable Premiere Cross Dissolve (Legacy)
       transitions at the original window and cut offset. A synthetic asymmetric
       control rendered in Premiere and kept both endpoint references on save.
+- [ ] **Film Dissolve.** The saved foreground level curve can match an
+      ordinary Dissolve. Avid's Film Dissolve renderer remaps the evaluated
+      level through an 11-point curve before mixing. Compare a matched native
+      render pair to qualify the frame sampling and blend space, then check
+      whether the destination can express the curve.
+- [ ] **Film Fade.** Saved Avid occurrences identify `EFF2_BLEND_DISSOLVE_LIN`.
+      The installed renderer uses a distinct 11-point opacity curve. At 50%
+      Foreground Level it sends 20.24% opacity to the mixer. Qualify fade-in
+      and fade-out against matched black and picture references, measuring
+      frame sampling and blend space before choosing a destination mapping.
+- [ ] **Dip to Color.** The Avid renderer selects one picture input on each
+      side of 50% Level and reaches full color blend at 50%. Its Background
+      Color path uses the saved luminance as HSV Value. Verify a nonblack
+      native save and render, including source order, color and transition
+      sampling, before choosing a destination mapping.
+- [ ] **Right to Left Push.** Native Avid occurrences label
+      `EFF2_BLEND_PUSH_RIGHT` Right to Left. The installed renderer uses the
+      saved foreground level to move both pictures left, with the incoming
+      picture entering from the right. Verify frame sampling, border behavior
+      and a matching destination render before admitting it to conversion.
+- [ ] **Horizontal Edge Wipe.** Saved Avid transitions identify
+      `EFF2_BLEND_WIPE_HORZ` and retain Foreground Level keys at −1 and 24 in
+      a 24-frame window. Both installed renderer architectures dispatch
+      SMPTE pattern 1, a left-to-right reveal. Compare a neutral-border
+      native render and one width and softness variant to establish exact
+      seam sampling and border behavior before mapping it to a destination.
 - [ ] **Video transition fidelity and audio fade curves.** Compare ordinary
       Dissolve with a native Avid render and qualify additional video identities
       and control values. Other qualified video transitions retain the cut approximation. The native
@@ -610,13 +692,16 @@ User's priority tiers to scope converter tasks.
       layer timing, frame rate, transform and media identity before choosing the
       first editor pair to qualify. Add After Effects to the direction menus
       when a route is ready to use.
-- [ ] **EffectCraft AEP reference review.**
-      [storytold/effectcraft#1869](https://github.com/storytold/effectcraft/pull/1869)
-      describes `.aep` and `.aepx` import and `.aep` export. The PR closed
-      without a merge. Use its [pinned format notes](https://github.com/storytold/effectcraft/blob/b3900c70cce9b40a3e10f0e94c773427dddd1f5f/docs/aep-format.md)
-      to guide comparisons for composition and layer timing, footage
-      references, keyframes, and conversion losses against our own After
-      Effects saves.
+- [x] **EffectCraft AEP reference intake.** Reviewed the pinned format,
+      importer and exporter notes from PR #1869. A bounded binary inspector
+      checked exact composition and layer clocks, project item identities
+      and saved footage paths in nine retained binary fixtures. Five paired
+      AEP and AEPX saves produce the same inspected records. One-change saves
+      also verify explicit static 2D AV transforms and their stored units.
+      [Scope and next native checks](AFTER-EFFECTS-REFERENCE.md)
+- [ ] Qualify the first After Effects graph adapter with a native linked
+      footage save. Test source identity and placement independently, then
+      add static transform controls before animated properties.
 
 ## DaVinci Resolve (User 2026-10-26: bookmark and research)
 
@@ -813,6 +898,18 @@ the **Creates new media.** notice.
 
 ### Completed reference reviews and their scope
 
+- [x] **diop/davinci-resolve-api timeline read-back** (`a75fd3d`). Reviewed
+      the community API guide against the installed Resolve 21.2 scripting
+      reference. The internal native probe reads the current project's
+      timeline ranges and track states. Two saved controls agree with the
+      archive reader. [Native timeline read-back](RESOLVE-SOURCE-READER.md#read-back-a-timeline-in-resolve)
+
+- [x] **drp-extractor archive intake** (`b43a358`). The upstream prototype
+      locates `project.xml`. The internal archive inspector now reports
+      version, timeline registrations and member inventory before graph
+      admission. Verified retained version 15 and 17 projects and a
+      standalone DRT. [Archive inspection](RESOLVE-SOURCE-READER.md#inspect-archive-and-version-metadata)
+
 - [x] **Samuel Gursky Resolve MCP offline conform verification** (`1e2bf034`).
       The internal probe compares saved V1 source frames around cuts and
       can check the corresponding frames in supplied renders. The retained
@@ -958,10 +1055,13 @@ for the exact read, write, reopen and render scope.
 - [x] Preserve independent pan bypass on the qualified two-mono, one-stereo-bus
       Resolve profile. The saved pan values and reopened PCM match a one-change
       archive control. [Pan bypass](RESOLVE-DRPKIT-CLOSEOUT.md#mono-track-pan-bypass)
-- [ ] Qualify track solo independently of mute and routing. Two saved
-      rows share item ID `0x011`; only the first affected the tested mix.
-      Verify an Inspector or mixer change, multiple soloed tracks, and
-      interactions with mute and routing before expanding the writer.
+- [x] Preserve Fairlight track solo on the qualified two-mono,
+      one-stereo-bus layout. The linked writer preserves either or both
+      selected strips and their existing pan. The secondary `0x011` row
+      remains a raw observation. [Reopen and PCM checks](RESOLVE-DRPKIT-CLOSEOUT.md#mono-track-solo)
+- [ ] Author a native solo control in the Fairlight mixer and check
+      combinations with mute and multiple output buses before widening
+      the writer profile.
 - [x] Qualify Bus 2 static gain and mute with separate native saves and PCM.
 - [x] **Editable Fairlight track processing.** Round-trip the default
       band 3 bell gain and compressor enable, threshold and saved ratio
@@ -1020,7 +1120,7 @@ for the exact read, write, reopen and render scope.
 - **Other open-source readers found (GitHub code search on the class names):**
   | Project | Language / licence | Scope |
   |---|---|---|
-  | hfiguiere/drp-extractor | Rust, MPL-2.0 | parse .drp (2018-2023) |
+  | hfiguiere/drp-extractor | Rust, MPL-2.0 | [Archive intake reviewed](RESOLVE-SOURCE-READER.md#inspect-archive-and-version-metadata) |
   | samuelgursky/davinci-resolve-mcp | Python/JS, MIT | [Offline conform verification reviewed](RESOLVE-SOURCE-READER.md#check-conform-at-v1-cuts) |
   | CiprianSpiridon/davinci-resolve-mcp | Python, MIT | `formats/drt.py` reviewed; [native DRT reader scope](RESOLVE-DRT-CLOSEOUT.md) |
   | koosoli/DaVinci-Resolve-DRP-Toolkit | Python, GPL-3.0 | [Comparison and effect inventory reviewed](RESOLVE-SOURCE-READER.md#inventory-saved-effects) |

@@ -13,6 +13,7 @@ pub(crate) struct DirectMixer {
     pub(crate) buses: i64,
     pub(crate) pan: [i32; 2],
     pub(crate) pan_bypassed: [bool; 2],
+    pub(crate) soloed: [bool; 2],
     pub(crate) output: [i32; 2],
     pub(crate) bus_2_gain: i32,
     pub(crate) bus_2_muted: bool,
@@ -461,6 +462,7 @@ impl DirectMixer {
         if mixer.buses == 1
             && mixer.pan == [0; 2]
             && mixer.pan_bypassed == [false; 2]
+            && mixer.soloed == [false; 2]
             && mixer.processing == [StripProcessing::DEFAULT; 2]
             && mixer.bus_processing == [StripProcessing::DEFAULT; 2]
             && mixer.bus_pre_gain == [0; 2]
@@ -537,11 +539,24 @@ impl DirectMixer {
         }
         let mut pan = [0; 2];
         let mut pan_bypassed = [false; 2];
+        let mut soloed = [false; 2];
         let mut output = [0; 2];
         for (column, row) in tracks.iter().enumerate() {
             let position = number(row, "pan_tenths_percent")?;
             let bus = number(row, "output_bus_index")?;
             let bypass = number(row, "pan_bypass_code")?;
+            soloed[column] = match row.get("solo_code") {
+                None | Some(Value::Int(0)) => false,
+                Some(Value::Int(1)) if buses == 1 => true,
+                _ => return Err("unsupported direct Fairlight track solo".into()),
+            };
+            if row
+                .get("unresolved_channel_fields")
+                .and_then(|fields| fields.get("0x011_second"))
+                .is_some_and(|raw| raw != &Value::Int(0))
+            {
+                return Err("unsupported secondary Fairlight solo row".into());
+            }
             if number(row, "track")? != column as i64 + 1
                 || number(row, "strip_id")? != column as i64
                 || number(row, "channel_index")? != 0
@@ -549,14 +564,7 @@ impl DirectMixer {
                 || number(row, "output_connected_code")? != 1
                 || number(row, "fader_tenths_db")? != 0
                 || number(row, "mute_code")? != 0
-                || !neutral_when_present(
-                    row,
-                    &[
-                        "solo_code",
-                        "pre_dynamics_gain_tenths_db",
-                        "effects_in_code",
-                    ],
-                )
+                || !neutral_when_present(row, &["pre_dynamics_gain_tenths_db", "effects_in_code"])
                 || !(-1000..=1000).contains(&position)
                 || !(0..buses).contains(&bus)
             {
@@ -583,6 +591,7 @@ impl DirectMixer {
             buses,
             pan,
             pan_bypassed,
+            soloed,
             output,
             bus_2_gain,
             bus_2_muted,
@@ -926,6 +935,29 @@ mod tests {
         assert_eq!(mixer.pan_bypassed, [true, false]);
         assert_eq!(mixer.pan, [-1000, 500]);
         saved["tracks"][0]["pan_bypass_code"] = json!(2);
+        assert!(prepare(saved).is_err());
+    }
+
+    #[test]
+    fn solo_selects_each_mono_strip_without_changing_pan_or_routing() {
+        let mut saved = receipt();
+        saved["tracks"][1]["solo_code"] = json!(1);
+        assert!(prepare(saved.clone()).is_err());
+        saved[DIRECT_PROFILE] = json!(1);
+        saved["buses"].as_array_mut().unwrap().truncate(1);
+        saved["tracks"][1]["output_bus_index"] = json!(0);
+        for (a1, a2) in [(0, 1), (1, 0), (1, 1)] {
+            saved["tracks"][0]["solo_code"] = json!(a1);
+            saved["tracks"][1]["solo_code"] = json!(a2);
+            let mixer = prepare(saved.clone()).unwrap();
+            assert_eq!(mixer.soloed, [a1 == 1, a2 == 1]);
+            assert_eq!(mixer.pan, [-1000, 500]);
+            assert_eq!(mixer.output, [0, 0]);
+        }
+        saved["tracks"][0]["unresolved_channel_fields"] = json!({"0x011_second": 1});
+        assert!(prepare(saved.clone()).is_err());
+        saved["tracks"][0]["unresolved_channel_fields"]["0x011_second"] = json!(0);
+        saved["tracks"][0]["solo_code"] = json!(2);
         assert!(prepare(saved).is_err());
     }
 

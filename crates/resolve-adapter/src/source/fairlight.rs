@@ -18,6 +18,7 @@ const MAX_TABLE_BYTES: usize = 32 * 1024;
 
 struct Table<'a> {
     rows: BTreeMap<u32, &'a [u8]>,
+    secondary_solo: Option<&'a [u8]>,
     columns: usize,
     names: Option<Vec<&'a str>>,
 }
@@ -45,6 +46,7 @@ fn table(mut bytes: &[u8], mixed_width: bool) -> Option<Table<'_>> {
     bytes = &bytes[..bytes.len().min(MAX_TABLE_BYTES)];
     let mut out = Table {
         rows: BTreeMap::new(),
+        secondary_solo: None,
         columns,
         names: None,
     };
@@ -80,6 +82,9 @@ fn table(mut bytes: &[u8], mixed_width: bool) -> Option<Table<'_>> {
         if width == columns {
             if id == 0x458 && out.rows.get(&id).is_some_and(|old| *old != data) {
                 return None;
+            }
+            if id == 0x11 && out.rows.contains_key(&id) && out.secondary_solo.is_none() {
+                out.secondary_solo = Some(data);
             }
             out.rows.entry(id).or_insert(data);
         }
@@ -331,6 +336,13 @@ pub(super) fn mixer(data: &[u8], tracks: &[i64], typed_gain_mute: bool) -> Optio
                     &format!("0x{id:03x}"),
                     table.value(id, col),
                 );
+            }
+            if let Some(raw) = table
+                .secondary_solo
+                .map(|row| signed(&row[4 * col..4 * col + 4]))
+            {
+                observations.push(("0x011_second".into(), Value::Int(i64::from(raw))));
+                active |= raw != 0;
             }
             out.push(("unresolved_channel_fields".into(), Value::Obj(observations)));
             active |= processing(&table, col, &mut out);

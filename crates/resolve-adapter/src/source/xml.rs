@@ -77,6 +77,10 @@ impl Node {
 }
 
 pub(super) fn read(path: &Path) -> Result<BTreeMap<String, Node>> {
+    read_zip(open_file(path)?)
+}
+
+pub(super) fn open_file(path: &Path) -> Result<File> {
     if !std::fs::metadata(path)?.is_file() {
         return Err("expected a regular Resolve archive".into());
     }
@@ -85,7 +89,7 @@ pub(super) fn read(path: &Path) -> Result<BTreeMap<String, Node>> {
     if !meta.is_file() || meta.len() > MAX_ARCHIVE {
         return Err("expected a regular Resolve archive no larger than 32 MiB".into());
     }
-    read_zip(file)
+    Ok(file)
 }
 
 pub(super) fn checked_zip<R: Read + Seek>(mut input: R) -> Result<ZipArchive<R>> {

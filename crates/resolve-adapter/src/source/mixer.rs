@@ -39,6 +39,7 @@ const DIRECT_TWO_FAIRLIGHT_SAVE: &str =
     "83d76c19c40bbb9d75afb2bea828387fb364303b8da9885fd4eaf5185582650c";
 const DIRECT_PAN: usize = 203_173;
 const DIRECT_PAN_BYPASS: usize = 203_393;
+const DIRECT_SOLO: usize = 203_473;
 const DIRECT_ROUTE: usize = 211_685;
 const TWO_BUS_SHIFT: usize = 8;
 const BUS_2_FADER: usize = 235_352;
@@ -473,11 +474,18 @@ impl Mixer {
         let [pan, route] = direct_track_cells(shift);
         let mut cells = vec![(pan, [0; 8])];
         if buses == 1 {
-            let row = DIRECT_PAN_BYPASS;
-            if self.model.get(row - 12..row)? != [1u32, 0x0d, 2].map(u32::to_le_bytes).concat() {
+            for (row, id) in [(DIRECT_PAN_BYPASS, 0x0du32), (DIRECT_SOLO, 0x11)] {
+                if self.model.get(row - 12..row)? != [1, id, 2].map(u32::to_le_bytes).concat() {
+                    return None;
+                }
+                cells.push((row..row + 8, [0; 8]));
+            }
+            if !self.model[DIRECT_SOLO..DIRECT_SOLO + 8]
+                .chunks_exact(4)
+                .all(|slot| matches!(slot, [0 | 1, 0, 0, 0]))
+            {
                 return None;
             }
-            cells.push((row..row + 8, [0; 8]));
         }
         let mut profile = DirectProfile::neutral(buses);
         for (index, (row, default)) in PROCESSING_ROWS
@@ -557,9 +565,10 @@ impl Mixer {
         mixer: crate::linked::mixer::DirectMixer,
     ) -> Result<String> {
         if self.direct_profile() != Some(DirectProfile::neutral(1))
-            || !self.cells_are_neutral(
-                direct_track_cells(0).into_iter().chain([DIRECT_PAN_BYPASS..DIRECT_PAN_BYPASS + 8]),
-            )
+            || !self.cells_are_neutral(direct_track_cells(0).into_iter().chain([
+                DIRECT_PAN_BYPASS..DIRECT_PAN_BYPASS + 8,
+                DIRECT_SOLO..DIRECT_SOLO + 8,
+            ]))
         {
             return Err("expected a qualified neutral one-bus Fairlight template".into());
         }
@@ -588,11 +597,13 @@ impl Mixer {
             }
         }
         if mixer.buses == 1 {
-            for (slot, bypassed) in self.model[DIRECT_PAN_BYPASS..DIRECT_PAN_BYPASS + 8]
-                .chunks_exact_mut(4)
-                .zip(mixer.pan_bypassed)
-            {
-                slot.copy_from_slice(&i32::from(bypassed).to_le_bytes());
+            for (row, flags) in [
+                (DIRECT_PAN_BYPASS, mixer.pan_bypassed),
+                (DIRECT_SOLO, mixer.soloed),
+            ] {
+                for (slot, enabled) in self.model[row..row + 8].chunks_exact_mut(4).zip(flags) {
+                    slot.copy_from_slice(&i32::from(enabled).to_le_bytes());
+                }
             }
         }
         let [a1, a2] = mixer.processing.map(StripProcessing::cells);

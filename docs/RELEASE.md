@@ -17,7 +17,10 @@ verified bundle.
 
 ## Reproduce a candidate
 
-Use Rust 1.95.0 and the committed lockfile. `packaging/ffmpeg.json` pins the source
+Use Rust 1.95.0 and the committed lockfile. If several Rust installations are on
+your PATH, put the rustup shims first and set `RUSTUP_TOOLCHAIN=1.95.0` before
+running the scripts. Check `rustc --version` and `cargo --version` in that shell.
+`packaging/ffmpeg.json` pins the source
 archive and configuration; `scripts/release/build_ffmpeg.py` checks the archive
 hash before building. No installed FFmpeg is copied. GPL, nonfree and version3
 components, external autodetection and networking are disabled. The only input
@@ -71,20 +74,17 @@ a missing redistribution dependency silently.
 
 ## Separate gates
 
-The public profile uses synthetic tests only. It explicitly selects graph (at
-least 27), Avid adapter (at least 24), mapping (2), GUI model (6), inventory (7),
-job engine (8), backend resolver (2) and seven named app checks (all app suites use
-`--lib`), plus the writer's own-manifest `original_media` (3) and
-`destination_layout` (6) synthetic integration suites (at least 92 Rust checks
-total), plus
-at least two synthetic backend codec cases on every architecture. It rejects empty,
-failed, ignored or skipped selected suites. Adding a selected test can increase a
-denominator; reducing the profile requires review. It does not run the withheld
-private corpus or claim full converter qualification.
+The public profile uses synthetic tests only. It covers the graph, Avid adapter,
+mapping, GUI model, inventory, job engine, backend resolution, media preparation,
+writer and reader cancellation. `scripts/public_acceptance.py` defines the
+required test counts and platform exclusions. It rejects empty, failed, ignored
+or skipped selected suites. Each architecture also runs the bundled backend
+against synthetic picture and PCM. Full converter qualification uses the
+separate private corpus.
 
 The full private acceptance manifest and native application evidence remain local.
-The private repository export excludes private regression dumps from every revision;
-see PRIVATE-GITHUB.md. Never push unfiltered source history.
+The filtered GitHub export excludes private regression dumps from every revision.
+The pre-push guard binds the reviewed export to its source revision.
 The release owner must separately review every reachable remote ref/history, logs,
 compressed fixtures, package assets and provenance against a private token
 inventory, then bind the reviewed full acceptance/privacy receipt by SHA256.
@@ -102,17 +102,24 @@ matches always fail. This does not claim that malformed gzip was expanded.
 This scanner is a component of the full privacy review, not proof that unknown
 private material is absent.
 
-## Stage and publish
+## Build, stage and publish
 
-The manual `Native release candidate` workflow defaults to staging a draft. It
-requires the retained private-gate receipt SHA256 and the reviewed filtered export
+Use `build_only=true` and `publish=false` in the manual `Native release candidate`
+workflow to verify a new commit against the current version. This uploads six
+workflow artifacts and leaves existing releases and tags in place. With
+`build_only=false`, the workflow stages a draft by default. Both modes require
+the retained private-gate receipt SHA256 and the reviewed filtered export
 commit SHA. The latter must equal both the checkout HEAD and workflow event SHA,
 so an attestation for a different source cannot be dispatched accidentally. The
 private receipt remains an owner attestation; its contents are retained privately.
-The workflow builds all six architectures,
+One job downloads and verifies the pinned FFmpeg source archive. All six jobs
+build from that verified archive. The workflow
 verifies package extraction against the audited stage, checks executable target
 headers and runs the packaged CLI/backend. Its aggregate gate checks all six
 receipts bind identical source and private receipt, then checks every asset hash.
+Native checks also verify the packaged launcher icon on each platform.
+If the artwork changes, regenerate the committed resources with
+`scripts/release/make_icons.py` before building.
 The candidate artifacts retain evidence for seven days; release assets retain
 provenance and checksums.
 

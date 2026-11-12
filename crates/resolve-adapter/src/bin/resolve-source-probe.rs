@@ -39,6 +39,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 source::inventory::write_effects(Path::new(input), file)
             })
         }
+        [mode, input, output] if mode == "--inspect-archive" => {
+            publish(Path::new(output), |file| {
+                source::inventory::write_archive(Path::new(input), file)
+            })
+        }
         [mode, left, left_id, right, right_id, output] if mode == "--diff" => {
             let (left_id, right_id) = (text(left_id)?, text(right_id)?);
             publish(Path::new(output), |file| {
@@ -67,7 +72,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let graph = source::read(input)?;
             publish(Path::new(output), |file| Ok(graph.write_json(file)?))
         }
-        _ => Err("usage: resolve-source-probe INPUT.drp OUTPUT.graph.json\n       resolve-source-probe --inspect-drt INPUT.drt OUTPUT.json\n       resolve-source-probe --graph-drt INPUT.drt OUTPUT.graph.json\n       resolve-source-probe --diff LEFT LEFT_TIMELINE_ID RIGHT RIGHT_TIMELINE_ID OUTPUT.json\n       resolve-source-probe --diff-blob LEFT LEFT_OBJECT_ID RIGHT RIGHT_OBJECT_ID FIELD OUTPUT.json\n       resolve-source-probe --inventory-effects INPUT OUTPUT.json\n       resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj\n       resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json [--moves MOVES.json [--checksums MANIFEST.json]] [--renders REFERENCE.mov CANDIDATE.mov FFMPEG FFPROBE]".into()),
+        _ => Err("usage: resolve-source-probe INPUT.drp OUTPUT.graph.json\n       resolve-source-probe --inspect-archive INPUT OUTPUT.json\n       resolve-source-probe --inspect-drt INPUT.drt OUTPUT.json\n       resolve-source-probe --graph-drt INPUT.drt OUTPUT.graph.json\n       resolve-source-probe --diff LEFT LEFT_TIMELINE_ID RIGHT RIGHT_TIMELINE_ID OUTPUT.json\n       resolve-source-probe --diff-blob LEFT LEFT_OBJECT_ID RIGHT RIGHT_OBJECT_ID FIELD OUTPUT.json\n       resolve-source-probe --inventory-effects INPUT OUTPUT.json\n       resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj\n       resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json [--moves MOVES.json [--checksums MANIFEST.json]] [--renders REFERENCE.mov CANDIDATE.mov FFMPEG FFPROBE]".into()),
     }
 }
 

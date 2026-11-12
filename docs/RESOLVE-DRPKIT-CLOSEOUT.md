@@ -6,7 +6,7 @@ The Fairlight review pins [drpkit `af3cedc0`](https://github.com/higuchiki/drpki
 
 | drpkit area | Graph/2 read | Write and qualification |
 |---|---|---|
-| Mixer faders, mute, pre-gain, pan, pan bypass, solo, Effects In, and output assignment | `resolve.fairlight` holds named integer controls, including fader and pre-gain in tenths of a dB, pan in tenths of a percent, connection code and zero-based output bus index. Rows bind to saved strip IDs, with an explicit channel index for a continuation. Optional channel names are descriptive. | Existing two-mono fader and mute writer profiles remain scoped. The turnover writer preserves qualified static mono pan and direct stereo bus assignment, and pan bypass on the one-bus profile. |
+| Mixer faders, mute, pre-gain, pan, pan bypass, solo, Effects In, and output assignment | `resolve.fairlight` holds named integer controls, including fader and pre-gain in tenths of a dB, pan in tenths of a percent, connection code and zero-based output bus index. Rows bind to saved strip IDs, with an explicit channel index for a continuation. Optional channel names are descriptive. | Existing two-mono fader and mute writer profiles remain scoped. The turnover writer preserves qualified static mono pan and direct stereo bus assignment, with pan bypass and track solo on the one-bus profile. |
 | Bus prefix and bus processing | Fader, mute, pre-gain, channel count, strip ID, outgoing routing cells, EQ and dynamics are bus-owned. Bus pan, bypass and solo are retained as raw codes. The first bus keeps the existing `main_bus` receipt. | The turnover profile preserves Bus 2 gain and mute. The main bus fader has a separate qualified profile. |
 | Processing order and six EQ bands | Order and master enable codes, per-band enable and type codes, frequency in Hz, gain in tenths of a dB, slope and range codes, raw Q and knob. Original EQ and dynamics row IDs and integer values remain available. | A paired EQ save must vary frequency, gain and Q independently. Confirm the frequency knob and range updates before writing. Keep the partially calibrated Q law in research. |
 | Compressor, expander/gate and limiter | Named raw controls and documented units where established. Stored knob encodings, expander mode and partially calibrated thresholds stay raw. | Test one compressor threshold/ratio pair with controlled audio levels, then timing laws and gate modes. A decoded knob law alone does not qualify processing equivalence. |
@@ -66,8 +66,25 @@ existing graph/2 receipt and verifies both on staged read-back. The
 writer's A1-bypassed archive matched the corresponding reopened archive
 control sample for sample and kept all 48 picture frames unchanged.
 Nonbinary values and active bypass on two-bus layouts remain unsupported.
-Solo is separate: in the test mixer only the first of two `0x011` rows
-affected the mix. The second row's meaning remains open.
+
+## Mono track solo
+
+In the qualified two-mono, one-stereo-bus layout, the first two-column
+`0x011` row controls solo by strip. The second row is retained as
+`unresolved_channel_fields.0x011_second`. Changing the second row alone
+left the tested mix unchanged. Its role in other mixer states remains open.
+The linked writer accepts binary solo values in the first row and requires
+the remaining mixer fingerprint, including the neutral second row, to match.
+
+One-change archive controls for A1, A2, and both tracks were imported, saved,
+closed, and reopened in Resolve Studio 21.2.0 build 00006. They went through
+the saved graph/2 and linked writer, and all three generated archives were
+reopened and rendered again. A single solo kept its channel and silenced the
+other. Both solos kept both channels. In each case the written archive matched
+both control PCM lanes sample for sample over 96,000 stereo frames and all
+48 decoded picture frames. Read-back also preserved the saved pan and mute.
+The controls came from one-row archive edits. Mixer UI authoring, solo with
+active mute, and wider or multiple-bus routing remain separate tests.
 
 ## Turnover writer qualification
 

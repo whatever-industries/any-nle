@@ -1,4 +1,4 @@
-//! Saved timeline effect payloads, independent of graph admission.
+//! Saved archive and timeline effect facts, independent of graph admission.
 use super::{
     archive_is_drt, drt, encoding, expect, read_members, report, tracks, xml, Node, ADAPTER,
 };
@@ -13,6 +13,110 @@ use std::{
 };
 
 const FIELD: &str = "EffectFiltersBA";
+
+#[derive(Serialize)]
+struct ArchiveMember {
+    path: String,
+    kind: &'static str,
+    expanded_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct VersionHeader<'a> {
+    app_version: &'a str,
+    project_version: u32,
+}
+
+fn version_header(xml: &str) -> Option<VersionHeader<'_>> {
+    let mut lines = xml.lines();
+    if !lines.next()?.starts_with("<?xml ") {
+        return None;
+    }
+    let (app_version, project_version) = lines
+        .next()?
+        .strip_prefix("<!--DbAppVer=\"")?
+        .strip_suffix("\"-->")?
+        .split_once("\" DbPrjVer=\"")?;
+    if !app_version
+        .split('.')
+        .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(VersionHeader {
+        app_version,
+        project_version: project_version.parse().ok()?,
+    })
+}
+
+/// Inspect the directory and project metadata without admitting an edit graph.
+pub fn write_archive(path: &Path, writer: &mut impl Write) -> Result<()> {
+    let timeline_export = archive_is_drt(path)?;
+    let mut zip = xml::checked_zip(xml::open_file(path)?)?;
+    let mut seen = HashSet::new();
+    let mut remaining = xml::MAX_EXPANDED;
+    let mut members = Vec::with_capacity(zip.len());
+    let mut project_xml = None;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        xml::check_member(&entry, &mut seen, remaining)?;
+        let path = entry.name().to_owned();
+        let size = entry.size();
+        let kind = if path == "project.xml" {
+            project_xml = Some(xml::read_member(&mut entry, &mut remaining)?);
+            "project"
+        } else {
+            remaining -= size;
+            if path.starts_with("MediaPool/") && path.ends_with("/MpFolder.xml") {
+                "media_pool"
+            } else if path.starts_with("SeqContainer/") && path.ends_with(".xml") {
+                "sequence_container"
+            } else {
+                "other"
+            }
+        };
+        members.push(ArchiveMember {
+            path,
+            kind,
+            expanded_bytes: size,
+        });
+    }
+    if project_xml.is_none() && !timeline_export {
+        return Err("missing Resolve project.xml".into());
+    }
+    members.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    let mut metadata = None;
+    if let Some(xml) = project_xml.as_deref() {
+        let node = xml::parse(xml, &mut 0)?;
+        expect(&node, "SM_Project")?;
+        let project_version = node
+            .maybe("ProjectVersion")?
+            .map(str::parse::<u32>)
+            .transpose()?;
+        let registrations = node
+            .optional("TimelineHandleVec")?
+            .map(|handles| handles.elements().map(Iterator::count))
+            .transpose()?;
+        let header = version_header(xml);
+        let versions_agree = header
+            .as_ref()
+            .zip(project_version)
+            .map(|(header, version)| header.project_version == version);
+        metadata = Some(serde_json::json!({
+            "header": header, "project_version": project_version,
+            "versions_agree": versions_agree, "registered_timeline_count": registrations,
+        }));
+    }
+    report::write(
+        writer,
+        &serde_json::json!({
+            "schema": "anynle.resolve-archive-inventory/1",
+            "archive_kind": if timeline_export { "drt" } else { "drp" },
+            "project": metadata,
+            "members": members,
+        }),
+    )
+}
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -296,5 +400,43 @@ fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     match value.get(key)? {
         Value::Str(s) => Some(s),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use std::fs::File;
+    use zip::{write::SimpleFileOptions, ZipWriter};
+
+    #[test]
+    fn inventory_reports_saved_versions_and_registration_count_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.drp");
+        let mut zip = ZipWriter::new(File::create(&path).unwrap());
+        for (name, bytes) in [
+            (
+                "project.xml",
+                "<?xml version=\"1.0\"?>\n<!--DbAppVer=\"20.3.0.0010\" DbPrjVer=\"15\"-->\n\
+                 <SM_Project><ProjectVersion>16</ProjectVersion><TimelineHandleVec>\
+                 <Element>one</Element></TimelineHandleVec></SM_Project>",
+            ),
+            ("SeqContainer/b.xml", "<Other/>"),
+            ("SeqContainer/a.xml", "<Other/>"),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(bytes.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        let mut output = Vec::new();
+        write_archive(&path, &mut output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["project"]["header"]["project_version"], 15);
+        assert_eq!(parsed["project"]["project_version"], 16);
+        assert_eq!(parsed["project"]["versions_agree"], false);
+        assert_eq!(parsed["project"]["registered_timeline_count"], 1);
+        assert_eq!(parsed["members"][0]["path"], "SeqContainer/a.xml");
+        assert_eq!(parsed["members"][1]["kind"], "sequence_container");
+        assert!(super::super::read(&path).is_err());
     }
 }

@@ -138,6 +138,46 @@ remain present, with clip volume, track level and bus level independent.
 Recognized but unqualified mixer settings or conflicting mute fields
 receive scoped losses that block an internal Resolve write.
 
+## Read back a timeline in Resolve
+
+With Resolve already running and its installed Python scripting module on
+`PYTHONPATH`, run `python3 scripts/resolve_native_readback.py` for the active
+timeline. Use `--timeline-index N` to query a one-based timeline index in the
+current project. The command prints the version, record bounds, track states,
+and item ranges. It uses the API's subframe-precision record queries and reports
+the API source bounds and IDs as returned.
+
+The pinned community guide describes the timeline and item queries. Resolve
+21.2's installed reference uses `GetItemListInTrack` for enumeration and
+documents the subframe arguments and source frame accessors used here.
+[diop/davinci-resolve-api](https://github.com/diop/davinci-resolve-api/blob/a75fd3d22a921cd1a749dbb36bb9e1ae6f5ce781/docs/README.md)
+
+On two retained 24 fps controls, active and indexed queries returned the
+same ranges. The API matched graph/2 on the nonzero timeline origin, six
+placements per project, trims and durations, plus A2 mute and lock on one
+control and V1 disable and lock on the other. Keep API IDs and archived
+sequence IDs separate when comparing across imports.
+
+## Inspect archive and version metadata
+
+`resolve-source-probe --inspect-archive INPUT OUTPUT.json` reads the bounded
+DRP or DRT directory and, when present, parses `project.xml`. It reports
+the saved version header, the separate project version field, whether they
+agree, the timeline registration count, and sorted member paths with
+declared expanded sizes. It does not parse the remaining member payloads
+or make a graph. A DRT may report a missing project record.
+
+The pinned [drp-extractor reference](https://github.com/hfiguiere/drp-extractor/tree/b43a358325f2eb0a3f034c8f431e75de5c96bd89)
+locates the Resolve 14 project XML in the archive. Its project, media pool
+and sequence reader bodies are placeholders at this revision. The probe
+uses the converter's existing bounds, directory and XML checks.
+
+A retained Resolve 20.3 archive reported project version 15, 44 registered
+timelines, and 89 sequence container members. The two counts describe
+different saved structures. A Resolve 21.2 archive reported version 17
+and four of each. The existing graph path still refuses the version 15
+archive. Reports can contain private archive member paths.
+
 ## Saved active timeline
 
 The DRP reader resolves the zero-based `CurrentTimelineIndex` through
