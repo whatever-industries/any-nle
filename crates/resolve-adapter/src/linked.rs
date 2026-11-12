@@ -3,6 +3,8 @@ pub(crate) mod mixer;
 
 use crate::{
     atom::{verify_atom_binding, AtomBindingSpec},
+    audio::{self, Envelope},
+    clip_label::ClipLabel,
     dissolve,
     group::prepare_bound_group,
     media::{media_digest, probe_file, StreamSelector},
@@ -203,7 +205,10 @@ pub(crate) struct Edit {
     pub(crate) source_in: i64,
     pub(crate) length: i64,
     pub(crate) video: Option<crate::video::PreparedVideo>,
-    pub(crate) volume: Option<f64>,
+    pub(crate) envelope: Option<Envelope>,
+    pub(crate) label: Option<ClipLabel>,
+    pub(crate) speed: Option<crate::retime::PictureSpeed>,
+    pub(crate) grade: Option<(f32, String)>,
 }
 
 pub(crate) struct Timeline {
@@ -211,11 +216,18 @@ pub(crate) struct Timeline {
     pub(crate) name: String,
     pub(crate) origin: i64,
     pub(crate) length: i64,
-    pub(crate) lanes: [Vec<Edit>; 3],
+    // V1, A1, A2, V2, A3. The original three slots retain their archive ordering.
+    pub(crate) lanes: [Vec<Edit>; 5],
     pub(crate) markers: Vec<PreparedMarker>,
+    pub(crate) marks: Option<crate::timeline_marks::TimelineMarks>,
+    pub(crate) track_state: Option<crate::track_state::TrackState>,
     pub(crate) group: Option<GroupTimeline>,
     pub(crate) mixer: Option<mixer::DirectMixer>,
     pub(crate) dissolve: Option<dissolve::Dissolve>,
+    pub(crate) captions: Vec<crate::captions::Caption>,
+    pub(crate) solid: Option<crate::generator::Solid>,
+    pub(crate) compound: bool,
+    pub(crate) nests: Vec<crate::nests::Use>,
 }
 
 pub(crate) struct GroupTimeline {
@@ -236,6 +248,10 @@ pub struct PreparedProject {
 }
 
 impl PreparedProject {
+    pub(crate) fn writes_caption(&self, id: &str) -> bool {
+        self.timelines.iter().flat_map(|timeline| &timeline.captions).any(|cue| cue.id == id)
+    }
+
     pub fn omitted_active_timeline(&self) -> Option<&str> {
         self.omitted_active_timeline.as_deref()
     }
@@ -467,7 +483,7 @@ fn supported_rate(rate: Rational) -> bool {
     matches!((rate.num(), rate.den()), (24, 1) | (24000, 1001))
 }
 
-fn check_stream(
+pub(crate) fn check_stream(
     source: &SourceMedia,
     selector: &StreamSelector,
     media: &Media,
@@ -597,6 +613,8 @@ pub(crate) fn prepare_project(
     {
         return Err("linked project exceeds timeline, media or bin limits".into());
     }
+    let nests = crate::nests::plan(graph, &spec.timelines)?;
+    let nested_children: HashSet<_> = nests.iter().flatten().map(|usage| usage.child).collect();
     let mut bins = vec![Bin {
         parent: None,
         name: "Master".into(),
@@ -768,7 +786,7 @@ pub(crate) fn prepare_project(
             scoped_media.extend(binding.streams.iter().map(|s| s.media_id.as_str()));
         }
     }
-    for row in &spec.timelines {
+    for (row_index, row) in spec.timelines.iter().enumerate() {
         let sequence = graph
             .sequences
             .iter()
@@ -780,16 +798,35 @@ pub(crate) fn prepare_project(
                 || sequence.frame_size.is_some_and(|size| size != (1920, 1080))
                 || !supported_rate(sequence.rate)
                 || project_rate.is_some_and(|rate| rate != sequence.rate)
-                || !sequence.transitions.is_empty()
-                || sequence.texts.iter().any(|text| {
-                    text.kind != graph::source::TextKind::Caption
-                        || !reviewable_captions.contains(text.id.as_str())
-                })
+                || sequence.texts.iter().any(|text| text.kind != graph::source::TextKind::Caption)
             {
                 return Err("unqualified canvas, mixed project rates, duplicate selection or timeline topology".into());
             }
-            let picture_only = sequence.tracks.len() == 1;
-            if (!picture_only && sequence.tracks.len() != 3)
+            let compound = crate::nests::compound(graph, &sequence.id);
+            let uses = &nests[row_index];
+            let nest_member = !uses.is_empty() || nested_children.contains(&row_index);
+            let shape = |kind, index| sequence.tracks.iter().any(|t|
+                t.kind == kind && t.index == index && t.level_db.is_none());
+            if nest_member && (!shape(StreamKind::Video, 1)
+                || !(sequence.tracks.len() == 1 && !compound
+                    || sequence.tracks.len() == 3 && !compound
+                        && shape(StreamKind::Audio, 1) && shape(StreamKind::Audio, 2)
+                    || sequence.tracks.len() == 2 && compound && shape(StreamKind::Audio, 1))
+                || sequence.placements.iter().any(|p| p.video_track != Some(1)
+                    || !p.audio_tracks.is_empty() || !p.grouped_audio.is_empty())
+                || !sequence.texts.is_empty() || !sequence.transitions.is_empty()
+                || graph.sidecar(crate::dissolve::ADAPTER, &sequence.id).is_some()
+                || graph.sidecar(crate::generator::ADAPTER, &sequence.id).is_some()
+                || (compound && !sequence.markers.is_empty()))
+            {
+                return Err("Resolve nesting requires a picture-only V1 parent and children".into());
+            }
+            let second_picture = sequence.tracks.iter().any(|track|
+                track.kind == StreamKind::Video && track.index == 2 && track.level_db.is_none());
+            let track_count = sequence.tracks.len() - usize::from(second_picture);
+            let picture_only = nest_member || track_count == 1;
+            let third_mono = track_count == 4 && second_picture && sequence.rate == Rational::integer(24);
+            if (!picture_only && track_count != 3 && !third_mono)
                 || [
                     (StreamKind::Video, 1),
                     (StreamKind::Audio, 1),
@@ -803,8 +840,10 @@ pub(crate) fn prepare_project(
                         .iter()
                         .any(|t| t.kind == kind && t.index == index && t.level_db.is_none())
                 })
+                || (third_mono && !sequence.tracks.iter().any(|track|
+                    track.kind == StreamKind::Audio && track.index == 3 && track.level_db.is_none()))
             {
-                return Err("expected V1 and two neutral independent mono tracks".into());
+                return Err("expected a qualified Resolve picture and independent mono track layout".into());
             }
             let bin = *bin_ids
                 .get(row.bin_id.as_str())
@@ -819,6 +858,11 @@ pub(crate) fn prepare_project(
             }
             let origin = check_origin(sequence)?;
             if let Some(group) = &row.group {
+                if second_picture || !sequence.texts.is_empty() || !sequence.transitions.is_empty()
+                    || graph.sidecar(crate::generator::ADAPTER, &sequence.id).is_some()
+                {
+                    return Err("subtitle tracks and transitions on Group timelines are unqualified".into());
+                }
                 if group_written || sequence.rate != rate() {
                     return Err("project supports one same-rate split MXF Group timeline".into());
                 }
@@ -855,8 +899,14 @@ pub(crate) fn prepare_project(
                         length: prepared.end - prepared.origin,
                         lanes: Default::default(),
                         markers: vec![],
+                        marks: None,
+                        track_state: None,
                         mixer: None,
                         dissolve: None,
+                        captions: vec![],
+                        solid: None,
+                        compound: false,
+                        nests: vec![],
                         group: Some(GroupTimeline {
                             bin: group_bin,
                             cameras: [a, b],
@@ -876,8 +926,20 @@ pub(crate) fn prepare_project(
                 );
             }
             let mixer = mixer::DirectMixer::prepare(graph, sequence)?;
+            let track_state = crate::track_state::TrackState::prepare(graph, sequence)?;
+            if track_state.is_some() && (picture_only || compound || second_picture || third_mono) {
+                return Err("Resolve track names and locks require a registered V1/A1/A2 timeline".into());
+            }
             let dissolve = dissolve::prepare(graph, sequence)?;
-            if mixer.is_some() && picture_only {
+            let source_dissolve = dissolve::from_source(sequence)?;
+            let solid = crate::generator::prepare(graph, sequence)?;
+            if solid.is_some() && !picture_only {
+                return Err("Solid Color requires a picture-only linked project timeline".into());
+            }
+            if dissolve.is_some() && source_dissolve.is_some() {
+                return Err("conflicting Resolve and cross-editor transition facts".into());
+            }
+            if mixer.is_some() && (picture_only || third_mono) {
                 return Err(
                     "direct Fairlight mixer requires audio on the selected timeline".into(),
                 );
@@ -890,11 +952,252 @@ pub(crate) fn prepare_project(
                 .filter(|p| matches!(p.effects.as_slice(), [effect] if effect.kind == "avid.resize_linear"))
                 .map(|p| p.id.as_str())
                 .collect();
+            let mut recovered_audio = HashMap::new();
+            let mut recovered_labels = HashSet::new();
+            let mut lanes: [Vec<Edit>; 5] = Default::default();
+            for edit in &sequence.placements {
+                check_linked_placement(edit).map_err(|e| format!("{}: {e}", edit.id))?;
+                let (media_index, selectors) = selected
+                    .get(edit.item.as_str())
+                    .ok_or_else(|| format!("no verified file binding for item {}", edit.item))?;
+                let (lane, channel) = match (
+                    edit.video_track,
+                    edit.audio_tracks.as_slice(),
+                    edit.audio_streams.as_slice(),
+                    &media[*media_index].profile,
+                ) {
+                    (Some(1), [], [], Profile::Mov { rate, .. }) if *rate == sequence.rate => {
+                        (0, None)
+                    }
+                    (Some(2), [], [], Profile::Mov { rate, .. })
+                        if second_picture && *rate == sequence.rate => (3, None),
+                    (None, [lane @ (1 | 2)], [label], Profile::Wav { .. }) => (
+                        *lane as usize,
+                        selectors.get(&Some(*label)).copied().flatten(),
+                    ),
+                    (None, [3], [label], Profile::Wav { .. }) if third_mono => (
+                        4, selectors.get(&Some(*label)).copied().flatten(),
+                    ),
+                    (
+                        None,
+                        [lane @ (1 | 2)],
+                        [label],
+                        Profile::Mov {
+                            rate, aac: true, ..
+                        },
+                    ) if *rate == sequence.rate => (
+                        *lane as usize,
+                        selectors.get(&Some(*label)).copied().flatten(),
+                    ),
+                    (Some(1), [], [], Profile::Atom(_)) if sequence.rate == rate() => (0, None),
+                    (None, [lane @ (1 | 2)], [label @ (1 | 2)], Profile::Atom(_))
+                        if sequence.rate == rate() && lane == label =>
+                    {
+                        (*lane as usize, Some((*label - 1) as usize))
+                    }
+                    _ => {
+                        return Err(
+                            format!("{}: unsupported mixed rate or lane routing", edit.id).into(),
+                        )
+                    }
+                };
+                if (matches!(lane, 1 | 2 | 4) && channel.is_none()) || lanes[lane].len() == MAX_EDITS_PER_LANE {
+                    return Err(format!(
+                        "{}: unresolved physical channel or edit count limit",
+                        edit.id
+                    )
+                    .into());
+                }
+                let mut start = frames_on(edit.record_start, sequence.rate)?;
+                let mut source_in = frames_on(edit.source_in, sequence.rate)?;
+                let mut length = frames_on(edit.duration, sequence.rate)?;
+                if let Some(dissolve) = source_dissolve.as_ref().filter(|dissolve| dissolve.incoming == edit.id) {
+                    let preroll = dissolve.prepared.before;
+                    start = start.checked_add(preroll).ok_or("dissolve start overflow")?;
+                    source_in = source_in.checked_add(preroll).ok_or("dissolve source in overflow")?;
+                    length -= preroll;
+                }
+                if let Some(dissolve) = source_dissolve.as_ref().filter(|dissolve| dissolve.outgoing == edit.id) {
+                    length -= crate::dissolve::DURATION - dissolve.prepared.before;
+                }
+                let speed = crate::retime::PictureSpeed::prepare(edit, sequence.rate, length)
+                    .map_err(|e| format!("{}: {e}", edit.id))?;
+                let source_length = speed.map(|speed| speed.source_length(length)).transpose()?.unwrap_or(length);
+                let end = source_in
+                    .checked_add(source_length)
+                    .ok_or("source range overflow")?;
+                let available = match &media[*media_index].profile {
+                    Profile::Mov { frames, .. } => *frames,
+                    Profile::Wav { samples, .. } => samples / samples_per_frame(sequence.rate),
+                    Profile::Atom(binding) => binding.frames,
+                };
+                if length <= 0 || end > available {
+                    return Err(
+                        format!("{}: edit exceeds the physical playable range", edit.id).into(),
+                    );
+                }
+                let envelope = if matches!(lane, 1 | 2 | 4) {
+                    if graph.sidecar(audio::UNQUALIFIED_FADE_ADAPTER, &edit.id).is_some() {
+                        return Err(format!("{}: unqualified Resolve clip fade points", edit.id).into());
+                    }
+                    let receipt = graph.sidecar(crate::source::ADAPTER, &edit.id);
+                    if (receipt.is_some() || edit.volume_db.is_some() || !edit.volume_keys.is_empty())
+                        && !matches!(&media[*media_index].profile, Profile::Wav { .. })
+                    {
+                        return Err(format!("{}: clip envelopes require a verified WAV source", edit.id).into());
+                    }
+                    if (receipt.is_some() || !edit.volume_keys.is_empty())
+                        && (sequence.rate.num(), sequence.rate.den()) != (24, 1)
+                    {
+                        return Err(format!("{}: linked fades and volume keys require 24 fps", edit.id).into());
+                    }
+                    let envelope = audio::prepare(edit, source_in, length, sequence.rate, receipt)?;
+                    if let Some(loss) = envelope.and_then(Envelope::recovered_loss) {
+                        recovered_audio.insert(edit.id.as_str(), loss);
+                    }
+                    envelope.filter(|control| *control != Envelope::static_volume(0.0))
+                } else {
+                    None
+                };
+                let video = crate::video::prepare(edit, sequence.rate, source_in, length, available)
+                    .map_err(|e| format!("{}: {e}", edit.id))?;
+                let grade = crate::grade::prepare(graph, &edit.id)?;
+                let label = ClipLabel::prepare(graph, &edit.id)?;
+                if label.is_some() {
+                    recovered_labels.insert(edit.id.as_str());
+                }
+                if grade.is_some() && lane != 0 {
+                    return Err("Resolve primary gain must belong to a V1 picture edit".into());
+                }
+                lanes[lane].push(Edit {
+                    media: *media_index,
+                    channel,
+                    start,
+                    source_in,
+                    length,
+                    video,
+                    envelope,
+                    label,
+                    speed,
+                    grade,
+                });
+            }
+            let mut duration = None;
+            let base_lanes: &[usize] = if picture_only { &[0] } else if third_mono { &[0, 1, 2, 4] } else { &[0, 1, 2] };
+            for &index in base_lanes {
+                let lane = &mut lanes[index];
+                lane.sort_by_key(|e| e.start);
+                // The retained picture-only trims can begin with Avid filler.
+                // Keep that gap at record time without shifting clip-local keys.
+                let mut ranges: Vec<_> = lane.iter().map(|edit| (edit.start, edit.length)).collect();
+                if index == 0 {
+                    ranges.extend(uses.iter().map(|usage| (usage.start, usage.length)));
+                    ranges.sort_unstable_by_key(|range| range.0);
+                    if ranges.len() > MAX_EDITS_PER_LANE {
+                        return Err("linked V1 exceeds the edit count limit".into());
+                    }
+                }
+                let mut end = if picture_only {
+                    ranges.first().map_or(0, |range| range.0)
+                } else {
+                    0
+                };
+                for (start, length) in ranges {
+                    if start != end {
+                        return Err("linked project requires contiguous nonoverlapping cuts and nests".into());
+                    }
+                    end = end.checked_add(length).ok_or("record range overflow")?;
+                }
+                if let Some(solid) = &solid {
+                    if solid.start != end || end == 0 {
+                        return Err("Solid Color must follow the linked picture span".into());
+                    }
+                    end = end.checked_add(solid.duration).ok_or("Solid Color range overflow")?;
+                }
+                if end == 0 || duration.is_some_and(|v| v != end) {
+                    return Err(
+                        "picture and two mono lanes must cover the same record extent".into(),
+                    );
+                }
+                duration = Some(end);
+            }
+            if let Some(fade) = dissolve.as_ref().filter(|fade| fade.audio) {
+                let adjacent = lanes[1].windows(2).find(|pair| pair[1].start == fade.cut);
+                let Some([left, right]) = adjacent else {
+                    return Err("missing prepared A1 crossfade endpoints".into());
+                };
+                let (Profile::Wav { samples, .. }, Profile::Wav { .. }) =
+                    (&media[left.media].profile, &media[right.media].profile)
+                else {
+                    return Err("A1 crossfade requires two verified WAV channels".into());
+                };
+                if left.source_in.checked_add(left.length)
+                    .and_then(|end| end.checked_add(dissolve::DURATION - fade.before))
+                    .is_none_or(|end| end > samples / samples_per_frame(sequence.rate))
+                    || right.source_in < fade.before
+                {
+                    return Err("A1 crossfade exceeds physical source handles".into());
+                }
+            }
+            if picture_only && (!lanes[1].is_empty() || !lanes[2].is_empty()) {
+                return Err("picture-only timeline contains audio placements".into());
+            }
+            let length = duration.ok_or("empty linked project timeline")?;
+            if nest_member {
+                let receipt = graph.sidecar(crate::source::ADAPTER, &sequence.id)
+                    .ok_or("missing saved Resolve nesting extent")?;
+                if crate::nests::int(receipt, "record_length") != Some(length)
+                    || crate::nests::int(receipt, "record_origin") != Some(origin)
+                {
+                    return Err("prepared nesting extent disagrees with the saved Resolve sequence".into());
+                }
+            }
+            if second_picture {
+                if lanes[3].is_empty() {
+                    return Err("the linked V2 profile requires at least one picture edit".into());
+                }
+                lanes[3].sort_by_key(|edit| edit.start);
+                let mut end = 0;
+                for edit in &lanes[3] {
+                    if edit.start < end {
+                        return Err("linked V2 edits overlap on their own track".into());
+                    }
+                    end = edit.start.checked_add(edit.length)
+                        .filter(|end| *end <= length).ok_or("linked V2 exceeds the V1 extent")?;
+                }
+            }
+            if origin.checked_add(length).is_none_or(|end| end >= DAY) {
+                return Err("timeline extends beyond the supported day".into());
+            }
+            let marks = crate::timeline_marks::TimelineMarks::prepare(graph, &sequence.id, length)?;
+            if compound && marks.is_some() {
+                return Err("Resolve timeline marks require a registered timeline".into());
+            }
             if let Some(loss) = graph.losses.iter().find(|l| {
+                if track_state.is_some() && crate::track_state::TrackState::recover(l, &sequence.id) {
+                    return false;
+                }
+                if marks.is_some() && crate::timeline_marks::TimelineMarks::recover(l, &sequence.id) {
+                    return false;
+                }
+                if recovered_audio
+                    .get(l.object.as_str())
+                    .is_some_and(|(aspect, reason)| l.aspect == *aspect && l.reason == *reason)
+                {
+                    return false;
+                }
+                if recovered_labels.contains(l.object.as_str()) && ClipLabel::recover(l) {
+                    return false;
+                }
                 if mixer.is_some() && mixer::DirectMixer::recover(l, &sequence.id) {
                     return false;
                 }
                 if dissolve.as_ref().is_some_and(|d| d.recover(l, &sequence.id)) {
+                    return false;
+                }
+                if crate::nests::recover(l, &sequence.id, uses)
+                    || crate::nests::recover_empty_stereo(graph, l, &sequence.id)
+                {
                     return false;
                 }
                 if review_caption_omissions.is_some() && crate::turnover::is_reviewable_loss(l) {
@@ -920,130 +1223,27 @@ pub(crate) fn prepare_project(
                 )
                 .into());
             }
-            let mut lanes: [Vec<Edit>; 3] = Default::default();
-            for edit in &sequence.placements {
-                check_linked_placement(edit).map_err(|e| format!("{}: {e}", edit.id))?;
-                let (media_index, selectors) = selected
-                    .get(edit.item.as_str())
-                    .ok_or_else(|| format!("no verified file binding for item {}", edit.item))?;
-                let (lane, channel) = match (
-                    edit.video_track,
-                    edit.audio_tracks.as_slice(),
-                    edit.audio_streams.as_slice(),
-                    &media[*media_index].profile,
-                ) {
-                    (Some(1), [], [], Profile::Mov { rate, .. }) if *rate == sequence.rate => {
-                        (0, None)
+            let (markers, omitted) = prepare_markers(graph, sequence, length)?;
+            let mut captions = Vec::new();
+            let mut caption_track = None;
+            for text in &sequence.texts {
+                match crate::captions::prepare(text, sequence.rate, length) {
+                    Ok(cue) => {
+                        // Avid reports the V-track index of the SubCap effect.
+                        // Resolve owns subtitles on an independent track.
+                        if caption_track.replace(text.track).is_some_and(|track| track != text.track) {
+                            return Err(format!("{}: Resolve supports one source caption track", text.id).into());
+                        }
+                        captions.push(cue);
                     }
-                    (None, [lane @ (1 | 2)], [label], Profile::Wav { .. }) => (
-                        *lane as usize,
-                        selectors.get(&Some(*label)).copied().flatten(),
-                    ),
-                    (
-                        None,
-                        [lane @ (1 | 2)],
-                        [label],
-                        Profile::Mov {
-                            rate, aac: true, ..
-                        },
-                    ) if *rate == sequence.rate => (
-                        *lane as usize,
-                        selectors.get(&Some(*label)).copied().flatten(),
-                    ),
-                    (Some(1), [], [], Profile::Atom(_)) if sequence.rate == rate() => (0, None),
-                    (None, [lane @ (1 | 2)], [label @ (1 | 2)], Profile::Atom(_))
-                        if sequence.rate == rate() && lane == label =>
-                    {
-                        (*lane as usize, Some((*label - 1) as usize))
-                    }
-                    _ => {
-                        return Err(
-                            format!("{}: unsupported mixed rate or lane routing", edit.id).into(),
-                        )
-                    }
-                };
-                if (lane != 0 && channel.is_none()) || lanes[lane].len() == MAX_EDITS_PER_LANE {
-                    return Err(format!(
-                        "{}: unresolved physical channel or edit count limit",
-                        edit.id
-                    )
-                    .into());
+                    Err(_) if reviewable_captions.contains(text.id.as_str()) => {}
+                    Err(error) => return Err(error),
                 }
-                let start = frames_on(edit.record_start, sequence.rate)?;
-                let source_in = frames_on(edit.source_in, sequence.rate)?;
-                let length = frames_on(edit.duration, sequence.rate)?;
-                let end = source_in
-                    .checked_add(length)
-                    .ok_or("source range overflow")?;
-                let available = match &media[*media_index].profile {
-                    Profile::Mov { frames, .. } => *frames,
-                    Profile::Wav { samples, .. } => samples / samples_per_frame(sequence.rate),
-                    Profile::Atom(binding) => binding.frames,
-                };
-                if length <= 0 || end > available {
-                    return Err(
-                        format!("{}: edit exceeds the physical playable range", edit.id).into(),
-                    );
-                }
-                let volume = match edit.volume_db {
-                    Some(db)
-                        if matches!(&media[*media_index].profile, Profile::Wav { .. })
-                            && crate::audio::VOLUME_DB.contains(&db) =>
-                    {
-                        (db != 0.0).then_some(db)
-                    }
-                    Some(_) => {
-                        return Err(
-                            format!("{}: unsupported Resolve linked clip volume", edit.id).into(),
-                        );
-                    }
-                    None => None,
-                };
-                let video = crate::video::prepare(edit, sequence.rate, source_in, length, available)
-                    .map_err(|e| format!("{}: {e}", edit.id))?;
-                lanes[lane].push(Edit {
-                    media: *media_index,
-                    channel,
-                    start,
-                    source_in,
-                    length,
-                    video,
-                    volume,
-                });
             }
-            let mut duration = None;
-            for lane in lanes.iter_mut().take(if picture_only { 1 } else { 3 }) {
-                lane.sort_by_key(|e| e.start);
-                // The retained picture-only trims can begin with Avid filler.
-                // Keep that gap at record time without shifting clip-local keys.
-                let mut end = if picture_only {
-                    lane.first().map_or(0, |edit| edit.start)
-                } else {
-                    0
-                };
-                for edit in lane {
-                    if edit.start != end {
-                        return Err("linked project requires contiguous nonoverlapping cuts".into());
-                    }
-                    end = end
-                        .checked_add(edit.length)
-                        .ok_or("record range overflow")?;
-                }
-                if end == 0 || duration.is_some_and(|v| v != end) {
-                    return Err(
-                        "picture and two mono lanes must cover the same record extent".into(),
-                    );
-                }
-                duration = Some(end);
+            captions.sort_by_key(|cue| cue.start);
+            if let Some(pair) = captions.windows(2).find(|pair| pair[0].start + pair[0].length > pair[1].start) {
+                return Err(format!("overlapping Resolve captions {} and {}", pair[0].id, pair[1].id).into());
             }
-            if picture_only && (!lanes[1].is_empty() || !lanes[2].is_empty()) {
-                return Err("picture-only timeline contains audio placements".into());
-            }
-            let length = duration.ok_or("empty linked project timeline")?;
-            if origin.checked_add(length).is_none_or(|end| end >= DAY) {
-                return Err("timeline extends beyond the supported day".into());
-            }
-            let (markers, omitted) = prepare_markers(sequence, length);
             Ok((
                 Timeline {
                     bin,
@@ -1052,9 +1252,15 @@ pub(crate) fn prepare_project(
                     length,
                     lanes,
                     markers,
+                    marks,
+                    track_state,
                     group: None,
                     mixer,
-                    dissolve,
+                    dissolve: dissolve.or_else(|| source_dissolve.map(|value| value.prepared)),
+                    captions,
+                    solid,
+                    compound,
+                    nests: uses.clone(),
                 },
                 omitted,
             ))
@@ -1094,7 +1300,17 @@ pub(crate) fn prepare_project(
         },
         _ => None,
     };
-    let selected = active.and_then(|id| spec.timelines.iter().position(|row| row.id == *id));
+    for usage in timelines.iter().flat_map(|row| &row.nests) {
+        let child = &timelines[usage.child];
+        if child.origin != usage.origin || child.length != usage.child_length
+            || child.compound != (usage.kind == crate::nests::Kind::Compound)
+        {
+            return Err(format!("Resolve nest {}: prepared child extent disagrees with the saved trim", usage.id).into());
+        }
+    }
+    let selected = active.and_then(|id| spec.timelines.iter().zip(&timelines)
+        .filter(|(_, timeline)| !timeline.compound)
+        .position(|(row, _)| row.id == *id));
     Ok(PreparedProject {
         name: checked_name(&graph.project.name)?,
         rate: project_rate.ok_or("missing project rate")?,

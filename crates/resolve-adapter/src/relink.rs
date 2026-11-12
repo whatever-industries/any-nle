@@ -330,6 +330,37 @@ pub fn read_moves(path: &Path) -> Result<Vec<Move>> {
     plan(path)
 }
 
+pub(crate) struct VerifiedMoves {
+    pub(crate) destinations: Destinations,
+    stamps: BTreeMap<String, FileStamp>,
+}
+
+impl VerifiedMoves {
+    pub(crate) fn recheck(&self) -> Result<()> {
+        recheck(&self.stamps)
+    }
+}
+
+pub(crate) fn resolve_project_bytes(path: &Path) -> Result<Vec<u8>> {
+    if !path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("drp"))
+    {
+        return Err("move verification requires a reference and candidate DRP".into());
+    }
+    bounded(path, MAX_PROJECT)
+}
+
+pub(crate) fn verify_resolve_moves(
+    bytes: &[u8],
+    requested: &[Move],
+    ffprobe: &Path,
+    manifest: Option<&Path>,
+) -> Result<VerifiedMoves> {
+    let document = Document::Resolve(resolve::Document::read(bytes)?);
+    verify_moves(&document, &sha256(bytes), requested, ffprobe, manifest)
+}
+
 /// Write a new project using explicit locator moves. Optional checksums must
 /// have been captured from the known-good originals before relocation.
 pub fn apply(
@@ -346,17 +377,41 @@ pub fn apply(
     let bytes = bounded(input, MAX_PROJECT)?;
     let digest = sha256(&bytes);
     let document = Document::read(input, &bytes)?;
+    let verified = verify_moves(&document, &digest, requested, ffprobe, manifest)?;
+    let expected_paths: Paths = verified.destinations.values().cloned().collect();
+    publish(
+        &output,
+        |file| document.write(&output, &verified.destinations, file),
+        |stage| {
+            let staged = Document::read(&output, &bounded(stage, MAX_PROJECT)?)?;
+            if staged.paths() != &expected_paths {
+                return Err("staged project did not retain the verified media bindings".into());
+            }
+            verify_project(input, &digest)?;
+            verified.recheck()
+        },
+    )
+}
+
+fn verify_moves(
+    document: &Document,
+    digest: &str,
+    requested: &[Move],
+    ffprobe: &Path,
+    manifest: Option<&Path>,
+) -> Result<VerifiedMoves> {
     let paths = document.paths();
     checked_paths(paths)?;
     let moves = bindings(paths, requested)?;
     let trusted = manifest
-        .map(|path| checksums(path, &digest, paths))
+        .map(|path| checksums(path, digest, paths))
         .transpose()?;
-    let expected_paths: Paths = moves.values().cloned().collect();
     let mut stamps = BTreeMap::new();
     let mut basenames: HashMap<_, Vec<_>> = HashMap::new();
     for (path, target) in &moves {
-        stamps.insert(target.clone(), media_stamp(target)?);
+        let stamp = media_stamp(target)
+            .map_err(|error| format!("could not verify media at {target}: {error}"))?;
+        stamps.insert(target.clone(), stamp);
         basenames
             .entry(original_path(path)?.file_name().ok_or("missing basename")?)
             .or_default()
@@ -407,18 +462,10 @@ pub fn apply(
             }
         }
     }
-    publish(
-        &output,
-        |file| document.write(&output, &moves, file),
-        |stage| {
-            let staged = Document::read(&output, &bounded(stage, MAX_PROJECT)?)?;
-            if staged.paths() != &expected_paths {
-                return Err("staged project did not retain the verified media bindings".into());
-            }
-            verify_project(input, &digest)?;
-            recheck(&stamps)
-        },
-    )
+    Ok(VerifiedMoves {
+        destinations: moves,
+        stamps,
+    })
 }
 
 fn checksums(path: &Path, project_sha: &str, paths: &Paths) -> Result<BTreeMap<String, String>> {

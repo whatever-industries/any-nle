@@ -53,7 +53,7 @@ fn check_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_graph(path: &Path) -> Result<SourceGraph> {
+pub(super) fn read_graph(path: &Path) -> Result<SourceGraph> {
     if archive_is_drt(path)? {
         drt::inspect(path)?.into_graph()
     } else {
@@ -334,7 +334,7 @@ fn report_losses(
 ) {
     for loss in &t.losses {
         let signature = (loss.aspect.as_str(), loss.reason.as_str());
-        if matches!(signature, audio::KEY_LOSS | audio::FADE_LOSS)
+        if matches!(signature, audio::KEY_LOSS | audio::FADE_LOSS | audio::CUSTOM_FADE_LOSS | audio::KEYED_FADE_LOSS)
             || transition.is_some_and(|value| value.recover(loss, &t.seq.id))
         {
             continue;
@@ -585,6 +585,8 @@ fn volume(t: &Timeline<'_>, p: &Placement) -> Json {
         "fade_out_frames",
         "fade_clock",
         "fade_shape",
+        "fade_in_point",
+        "fade_out_point",
     ];
     json!({"gain_db":p.gain_db, "level_db":p.volume_db,
         "keys":p.volume_keys.iter().map(|k| json!({"at":exact(k.at),"db":k.db})).collect::<Vec<_>>(),
@@ -637,8 +639,8 @@ fn compare_transition(
     };
     let summary = |value: Option<dissolve::Dissolve>| {
         value.map_or(Json::Null, |d| {
-            json!({"kind":dissolve::TYPE, "track":1, "cut_frames":d.cut,
-            "duration_frames":dissolve::DURATION, "alignment":dissolve::ALIGNMENT})
+            json!({"kind":d.type_label(), "track":1, "cut_frames":d.cut,
+            "duration_frames":dissolve::DURATION, "alignment":d.alignment()})
         })
     };
     let both = a.is_some() && b.is_some();

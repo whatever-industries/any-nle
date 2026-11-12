@@ -1,6 +1,7 @@
 //! Standalone source interpretation of the qualified Resolve archive profile.
 mod atom;
 pub mod compare;
+pub mod conform;
 pub mod drt;
 mod effects;
 mod encoding;
@@ -11,13 +12,14 @@ mod metadata;
 pub(crate) mod mixer;
 mod multicam;
 mod observations;
+mod title;
 pub(crate) mod relink;
 mod report;
 mod wav;
 mod xml;
 
 use crate::{
-    audio::{FADE_LOSS, KEY_LOSS},
+    audio::Volume,
     Result,
 };
 use encoding::{extent, frames, hex_bytes, pb_bytes, qt, raster, rate, timecode, Blobs};
@@ -39,11 +41,18 @@ const ROOT_FOLDER: &str = "MediaPool/Master/MpFolder.xml";
 pub(crate) const ADAPTER: &str = "resolve.source";
 pub(crate) const BIN_ORDER_ADAPTER: &str = "resolve.bin_order";
 pub(crate) const ACTIVE_TIMELINE_ADAPTER: &str = "resolve.active_timeline";
+const OMITTED_TRACKS_ADAPTER: &str = "resolve.omitted_tracks";
+use crate::nests::{self, ADAPTER as NESTS_ADAPTER};
 pub(crate) const CLOCK_ROUTE: &str = "Resolve archive clock";
 
 /// Read an exported .drp without opening media or making application calls.
 pub fn read(path: &Path) -> Result<SourceGraph> {
     let members = xml::read(path)?;
+    read_members(&members, false)
+}
+
+fn read_drp_bytes(bytes: &[u8]) -> Result<SourceGraph> {
+    let members = xml::read_zip(std::io::Cursor::new(bytes))?;
     read_members(&members, false)
 }
 
@@ -82,6 +91,8 @@ fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<S
     let mut masters = HashMap::new();
     let mut timelines = HashMap::new();
     let mut groups = HashMap::new();
+    let mut nested = HashMap::new();
+    let mut compounds = Vec::new();
     let mut pool_items = HashSet::new();
     let mut ids = HashSet::new();
     claim(&mut ids, project.id()?)?;
@@ -152,6 +163,15 @@ fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<S
                         "timeline pool back-reference",
                     )?;
                     timelines.insert(handle_id, (handle, clip, bin_id));
+                    let child = handle.one("Sequence")?.entry()?;
+                    nested.insert(clip_id, (child, "timeline"));
+                }
+                "Sm2MpCompoundClip" => {
+                    let child = clip.one("Sequence")?.entry()?;
+                    expect(child, "Sm2Sequence")?;
+                    same(child.get("Parent")?, clip_id, "compound sequence owner")?;
+                    nested.insert(clip_id, (child, "compound"));
+                    compounds.push((clip, child, bin_id));
                 }
                 "Sm2MpMulticamClip" => {
                     groups.insert(clip_id, clip);
@@ -175,6 +195,7 @@ fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<S
         containers,
         ids,
         pool_items,
+        nested,
         blobs,
         graph,
         used_containers: HashSet::new(),
@@ -197,9 +218,6 @@ fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<S
     if !timelines.is_empty() {
         return Err("Resolve pool contains an unregistered timeline".into());
     }
-    if context.used_containers.len() != context.containers.len() {
-        return Err("Resolve archive contains an unregistered sequence container".into());
-    }
     if !inspect_drt {
         let root = members.get(ROOT_FOLDER).ok_or("missing Resolve root bin")?;
         context.graph.sidecars.push(Sidecar {
@@ -207,6 +225,60 @@ fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<S
             object: root.id()?.into(),
             data: active_timeline_receipt(project, &context.graph.sequences),
         });
+    }
+    for (clip, child, bin_id) in compounds {
+        let id = child.id()?;
+        let grid = Grid::read(child)?;
+        let clock = clock(id, "Sm2Sequence.MediaExtents", grid.origin, grid.rate)?;
+        let mut sequence = SourceSequence {
+            id: id.into(),
+            name: clip.get("Name")?.into(),
+            rate: grid.rate,
+            frame_size: Some(grid.size),
+            start: clock.exact_start(),
+            clock: Some(clock),
+            tracks: vec![],
+            placements: vec![],
+            transitions: vec![],
+            markers: vec![],
+            texts: vec![],
+        };
+        let mut container_ref_agrees = false;
+        if let Some(container) = context.container(id, grid.length)? {
+            if let Some(encoded) = child.maybe("FieldsBlob")? {
+                let bytes = hex_bytes(encoded)?;
+                context.blobs.charge(bytes.len())?;
+                let container_id = container.id()?;
+                container_ref_agrees = qt(&bytes).ok()
+                    .is_some_and(|map| map.text("SeqRef").ok().flatten() == Some(container_id));
+            }
+            read_tracks(&mut context, container, grid, &mut sequence)?;
+        }
+        receipt(&mut context.graph, id, vec![
+            ("kind", text("compound")),
+            ("container_ref_agrees", Value::Bool(container_ref_agrees)),
+            ("media_pool_clip", text(clip.id()?)),
+            ("bin_id", text(bin_id)),
+            ("record_origin", Value::Int(grid.origin)),
+            ("record_length", Value::Int(grid.length)),
+        ]);
+        context.graph.sequences.push(sequence);
+    }
+    if context.used_containers.len() != context.containers.len() {
+        return Err("Resolve archive contains an unregistered sequence container".into());
+    }
+    let parents: HashSet<_> = context.graph.sidecars.iter()
+        .filter(|row| row.adapter == NESTS_ADAPTER).map(|row| row.object.as_str()).collect();
+    for row in context.graph.sidecars.iter().filter(|row| row.adapter == NESTS_ADAPTER) {
+        let Value::Arr(uses) = &row.data else { return Err("invalid Resolve nesting facts".into()) };
+        for usage in uses {
+            let Some(Value::Str(child)) = usage.get("child_sequence") else {
+                return Err("missing Resolve nested sequence identity".into());
+            };
+            if parents.contains(child.as_str()) {
+                return Err("Resolve nested sequence chain exceeds one level or is cyclic".into());
+            }
+        }
     }
     markers::read(project, &mut context.graph, &mut context.blobs)?;
     context.graph.validate()?;
@@ -244,6 +316,7 @@ struct Context<'a> {
     containers: HashMap<&'a str, &'a Node>,
     ids: HashSet<&'a str>,
     pool_items: HashSet<&'a str>,
+    nested: HashMap<&'a str, (&'a Node, &'static str)>,
     used_containers: HashSet<&'a str>,
     inspect_drt: bool,
     blobs: Blobs,
@@ -525,7 +598,7 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
     if length <= 0 {
         return Err("invalid Resolve media duration".into());
     }
-    let saved_timecode = timing.text("Timecode")?;
+    let saved_timecode = timing.text("Timecode")?.filter(|value| !value.is_empty());
     let start = timecode(saved_timecode.unwrap_or("00:00:00:00"), 24)?;
     let geometry = blobs.qt(video.get("Geometry")?)?;
     let size = raster(geometry.bytes("Resolution")?)?;
@@ -633,7 +706,7 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
             ("video_cache_count", Value::Int(start)),
         ],
     );
-    metadata::capture(clip, video, blobs, graph)?;
+    metadata::capture(clip, video, saved_timecode, blobs, graph)?;
     graph.items.push(item);
     Ok(Master {
         rate,
@@ -1006,21 +1079,15 @@ fn sequence<'a>(
         ("record_length", Value::Int(grid.length)),
     ];
     let mut marks = Vec::new();
-    for (tag, key) in [
-        ("MarkInVideo", "video_in"),
-        ("MarkOutVideo", "video_out"),
-        ("MarkInAudio", "audio_in"),
-        ("MarkOutAudio", "audio_out"),
-    ] {
+    for (tag, key) in crate::timeline_marks::TAGS {
         if let Some(value) = pool_clip.maybe(tag)? {
             marks.push((key.into(), text(value)));
         }
     }
     if marks.iter().any(|(_, value)| value != &text("")) {
-        fields.push(("saved_timeline_marks", Value::Obj(marks)));
+        fields.push((crate::timeline_marks::FIELD, Value::Obj(marks)));
         loss(
-            &mut context.graph, id, "timeline_marks",
-            "Resolve timeline marks retained in graph; destination mapping is unqualified",
+            &mut context.graph, id, crate::timeline_marks::LOSS.0, crate::timeline_marks::LOSS.1,
         );
     }
     if let Some(ticks) = mixer.main_bus {
@@ -1080,15 +1147,37 @@ fn read_mixer_controls(
         .transpose()?
         .flatten();
     let flags_muted = track_flags.is_some_and(|flags| flags != [false; 2]);
+    let track_state = crate::track_state::TrackState::prepare(&context.graph, out).ok().flatten();
     let Some(mixer) = mixer else {
         if flags_muted {
             unqualified_mute(&mut context.graph, &out.id);
         }
+        if track_state.as_ref().is_some_and(|state| {
+            state.0[1..].iter().any(|track| !track.name.is_empty() || track.locked)
+        }) {
+            loss(&mut context.graph, &out.id, "track_state",
+                "Resolve timeline audio track state has no saved mixer mirror");
+        }
         return Ok(MixerControls::default());
     };
     context.blobs.charge(mixer.decoded_bytes())?;
-    let typed_gain_mute = typed_mixer_profile && mixer.qualified();
-    if let Some((data, requires_mapping)) = mixer.source_facts(&tracks, typed_gain_mute) {
+    let metadata = if typed_mixer_profile && (track_state.is_some() || mixer.has_track_state()) {
+        let mirrors = mixer.track_state();
+        let matches = mirrors.as_ref().zip(track_state.as_ref()).is_some_and(|((audio, video, _), state)| {
+            audio == &state.0[1..] && video.as_ref().is_none_or(|v| {
+                v[0] == state.0[0] && v[1] == crate::track_state::Track::default()
+            })
+        });
+        if !matches {
+            loss(&mut context.graph, &out.id, "track_state",
+                "Resolve timeline and mixer track state disagree");
+        }
+        mirrors.filter(|_| matches).map(|(_, _, normalized)| normalized)
+    } else {
+        None
+    };
+    let typed_gain_mute = typed_mixer_profile && metadata.as_ref().unwrap_or(&mixer).qualified();
+    if let Some((data, requires_mapping)) = mixer.source_facts(&tracks, typed_gain_mute, metadata.as_ref()) {
         context.graph.sidecars.push(Sidecar {
             adapter: mixer::FAIRLIGHT_ADAPTER.into(),
             object: out.id.clone(),
@@ -1173,10 +1262,11 @@ fn read_tracks<'a>(
     let tracks = tracks(container)?;
     let track_flags = match tracks.as_slice() {
         [(StreamKind::Video, v), (StreamKind::Audio, a1), (StreamKind::Audio, a2)]
-            if v.get("Flags")? == "0" && a1.get("SubType")? == "1" && a2.get("SubType")? == "1" =>
+            if matches!(v.get("Flags")?, "0" | "1" | "2" | "3") && a1.get("SubType")? == "1" && a2.get("SubType")? == "1" =>
         {
             match (a1.get("Flags")?, a2.get("Flags")?) {
-                (a @ ("0" | "2"), b @ ("0" | "2")) => Some([a == "2", b == "2"]),
+                (a @ ("0" | "1" | "2" | "3"), b @ ("0" | "1" | "2" | "3")) =>
+                    Some([matches!(a, "2" | "3"), matches!(b, "2" | "3")]),
                 _ => None,
             }
         }
@@ -1184,6 +1274,7 @@ fn read_tracks<'a>(
     };
     let mut video = 0;
     let mut audio = 0;
+    let mut has_track_state = false;
     for (kind, track) in tracks {
         let counter = if kind == StreamKind::Video {
             &mut video
@@ -1200,16 +1291,44 @@ fn read_tracks<'a>(
             level_db: None,
         });
         let flags = track.get("Flags")?;
-        let supported = (flags == "0"
-            || (flags == "2" && kind == StreamKind::Audio && track_flags.is_some()))
+        let name = track.maybe("UserDefinedName")?.unwrap_or("");
+        let locked = matches!(flags, "1" | "3");
+        let disabled = kind == StreamKind::Video && matches!(flags, "2" | "3");
+        if !name.is_empty() || locked || disabled {
+            has_track_state = true;
+            observations::append(&mut context.graph, crate::track_state::ADAPTER, &out.id,
+                Value::Obj(vec![
+                    ("id".into(), text(track_id)),
+                    ("kind".into(), text(kind.as_str())),
+                    ("track".into(), Value::Int(index)),
+                    ("name".into(), text(name)),
+                    ("locked".into(), Value::Bool(locked)),
+                    ("disabled".into(), Value::Bool(disabled)),
+                ]));
+        }
+        let supported = (matches!(flags, "0" | "1") || disabled
+            || (matches!(flags, "2" | "3") && kind == StreamKind::Audio && track_flags.is_some()))
             && (kind == StreamKind::Video || track.get("SubType")? == "1");
         if !supported {
+            let mut track_facts = vec![
+                ("id".into(), text(track_id)),
+                ("kind".into(), text(kind.as_str())),
+                ("track".into(), Value::Int(index)),
+            ];
+            if kind == StreamKind::Audio && flags == "0" && track.get("SubType")? == "0"
+                && track.maybe("FieldsBlob")? == Some(crate::captions::TRACK_FIELDS)
+                && track.one("Items")?.children.is_empty()
+            {
+                track_facts.push(("empty_default_stereo".into(), Value::Bool(true)));
+            }
+            observations::append(&mut context.graph, OMITTED_TRACKS_ADAPTER, &out.id,
+                Value::Obj(track_facts));
             omitted(
                 &mut context.graph,
                 &out.id,
                 track_id,
                 "track",
-                "unqualified Resolve track state or layout",
+                nests::EMPTY_STEREO,
             );
         }
         let mut entries = track.one("Items")?.elements()?.peekable();
@@ -1234,6 +1353,26 @@ fn read_tracks<'a>(
                     ],
                     context.inspect_drt,
                 )?;
+                continue;
+            }
+            if supported && kind == StreamKind::Video && node.name == "Sm2TiGenerator"
+                && node.maybe("PrettyType")? == Some("Solid Color") && node.maybe("Flags")? == Some("0")
+                && node.maybe("FieldsBlob")?.is_none_or(str::is_empty)
+                && node.maybe("MarkersBA")?.is_none_or(str::is_empty)
+            {
+                if let Some(rgb) = crate::generator::rgb(node.maybe("EffectFiltersBA")?.unwrap_or_default()) {
+                    let edit = grid.edit(node, false)?;
+                    let solid = crate::generator::Solid { start: edit.start, duration: edit.length, rgb };
+                    observations::append(&mut context.graph, crate::generator::ADAPTER, &out.id, solid.receipt(id, index));
+                    continue;
+                }
+            }
+            if supported && kind == StreamKind::Video && node.name == "Sm2TiVideoClip"
+                && node.maybe("PrettyType")? == Some("Fusion Title")
+                && node.maybe("Flags")? == Some("0")
+                && node.optional("CompositionTable")?.is_some()
+            {
+                title::capture(&mut context.graph, out, node, grid, index, &mut context.blobs)?;
                 continue;
             }
             if !supported || !ordinary_item(node, kind, &out.id, &mut context.graph)? {
@@ -1322,6 +1461,46 @@ fn read_tracks<'a>(
                 )? {
                     out.placements.push(p);
                 }
+            } else if let Some(&(child, class)) = context.nested.get(target) {
+                let edit = grid.edit(node, false)?;
+                let child_grid = Grid::read(child)?;
+                let plain = kind == StreamKind::Video && index == 1
+                    && grid.rate == Rational::integer(24) && child_grid.rate == grid.rate
+                    && child_grid.length > 0
+                    && child_grid.size == grid.size
+                    && node.maybe("FieldsBlob")? == Some(nests::ITEM_FIELDS)
+                    && node.maybe("MediaStartTime")?.and_then(|v| v.parse::<f64>().ok()) == Some(child_grid.origin as f64 / 24.0)
+                    && node.maybe("MediaFrameRate")? == Some("00000000000038400000000000000000")
+                    && node.maybe("MediaTimemapBA")?.is_some_and(|v| nests::identity_map(v, child_grid.length))
+                    && node.maybe("MixedFrameRateAlignment")? == Some("0")
+                    && node.maybe("CurrentSelectorIdx")? == Some("0")
+                    && node.maybe("WasDisbanded")? == Some("false")
+                    && node.maybe("IsForceConformed")? == Some("true")
+                    && node.maybe("IsPreConformed")? == Some("false")
+                    && !node.children.iter().any(|f| matches!(f.name.as_str(),
+                        "pLmVerTable" | "CompositionTable" | "VirtualAudioTrackBA"))
+                    && ["EffectFiltersBA", "LinkedItemSync", "MarkersBA", "PrettyType",
+                        "ImportExportMetadataBA", "MediaFilePath", "MediaReelNumber", "MediaMetadata"]
+                        .into_iter().try_fold(true, |clean, field| {
+                            Ok::<_, Box<dyn std::error::Error>>(clean && node.maybe(field)?.is_none_or(str::is_empty))
+                        })?;
+                observations::append(&mut context.graph, NESTS_ADAPTER, &out.id, Value::Obj(vec![
+                    ("profile".into(), if plain { text(nests::PROFILE) } else { Value::Null }),
+                    ("id".into(), text(id)),
+                    ("kind".into(), text(class)),
+                    ("track_kind".into(), text(kind.as_str())),
+                    ("track".into(), Value::Int(index)),
+                    ("pool_id".into(), text(target)),
+                    ("child_sequence".into(), text(child.id()?)),
+                    ("record_start_frames".into(), Value::Int(edit.start)),
+                    ("record_duration_frames".into(), Value::Int(edit.length)),
+                    ("saved_source_in_frames".into(), Value::Int(edit.source_in)),
+                    ("child_origin_frames".into(), Value::Int(child_grid.origin)),
+                    ("child_rate".into(), text(&child_grid.rate.to_string())),
+                    ("record_rate".into(), text(&grid.rate.to_string())),
+                ]));
+                omitted(&mut context.graph, &out.id, id, "placement",
+                    nests::LOSS);
             } else if context.pool_items.contains(target) {
                 omitted(
                     &mut context.graph,
@@ -1343,17 +1522,76 @@ fn read_tracks<'a>(
             }
         }
     }
-    for tag in ["SubtitleTrackVec", "GeometryTrackVec"] {
-        if !container.one(tag)?.children.is_empty() {
-            loss(
-                &mut context.graph,
-                &out.id,
-                "tracks",
-                "subtitle or geometry tracks are outside the Resolve source profile",
-            );
-        }
+    if has_track_state {
+        let (aspect, reason) = crate::track_state::LOSS;
+        loss(&mut context.graph, &out.id, aspect, reason);
+    }
+    read_captions(context, container.one("SubtitleTrackVec")?, grid, out)?;
+    if !container.one("GeometryTrackVec")?.children.is_empty() {
+        loss(&mut context.graph, &out.id, "tracks", "geometry tracks are outside the Resolve source profile");
     }
     Ok(track_flags)
+}
+
+fn read_captions<'a>(
+    context: &mut Context<'a>,
+    vector: &'a Node,
+    grid: Grid,
+    out: &mut SourceSequence,
+) -> Result<()> {
+    if vector.children.iter().any(|child| child.name != "Element") {
+        loss(&mut context.graph, &out.id, "tracks", "unsupported Resolve subtitle track");
+        return Ok(());
+    }
+    let mut entries = vector.elements()?;
+    let Some(entry) = entries.next() else { return Ok(()) };
+    let track = entry.entry()?;
+    if entries.next().is_some()
+        || track.name != "Sm2TiTrack"
+        || track.maybe("Type")? != Some("2")
+        || track.maybe("SubType")? != Some("0")
+        || track.maybe("Flags")? != Some("0")
+        || track.maybe("Sequence")? != Some(out.id.as_str())
+        || track.maybe("FieldsBlob")? != Some(crate::captions::TRACK_FIELDS)
+    {
+        loss(&mut context.graph, &out.id, "tracks", "unsupported Resolve subtitle track");
+        return Ok(());
+    }
+    claim(&mut context.ids, track.id()?)?;
+    let mut end = 0;
+    for entry in track.one("Items")?.elements()? {
+        let cue = entry.entry()?;
+        let id = cue.id()?;
+        claim(&mut context.ids, id)?;
+        if cue.name != "Sm2TiGenerator" || cue.maybe("PrettyType")? != Some("Subtitle")
+            || cue.maybe("Flags")? != Some("0")
+            || cue.maybe("RenderTextEnabled")? != Some("true")
+            || cue.maybe("FieldsBlob")?.is_some_and(|value| !value.is_empty())
+            || cue.maybe("EffectFiltersBA")?.is_some_and(|value| !value.is_empty())
+        {
+            omitted(&mut context.graph, &out.id, id, "text", "unsupported Resolve subtitle cue");
+            continue;
+        }
+        let text = cue.get("Name")?;
+        let start = cue.get("Start")?.parse::<i64>()?.checked_sub(grid.origin)
+            .ok_or("Resolve subtitle start overflow")?;
+        let duration: i64 = cue.get("Duration")?.parse()?;
+        if start < end || duration <= 0 || !crate::captions::plain_text(text) {
+            return Err(format!("invalid or overlapping Resolve subtitle {id}").into());
+        }
+        end = start.checked_add(duration).filter(|end| *end <= grid.length)
+            .ok_or("Resolve subtitle exceeds timeline extent")?;
+        out.texts.push(graph::source::SourceText {
+            id: id.into(),
+            kind: graph::source::TextKind::Caption,
+            track: 1,
+            content: Some(text.into()),
+            record_start: Some(seconds(start, grid.rate)?),
+            duration: Some(seconds(duration, grid.rate)?),
+            reason: None,
+        });
+    }
+    Ok(())
 }
 
 fn ordinary_item(
@@ -1404,7 +1642,26 @@ fn direct(
     graph: &mut SourceGraph,
     blobs: &mut Blobs,
 ) -> Result<Option<Placement>> {
-    if !leaf_matches(master, node, grid, edit, owner, graph, blobs)? {
+    let speed = if kind == StreamKind::Video
+        && track == 1
+        && grid.rate == Rational::integer(24)
+        && master.rate == grid.rate
+        && rate(&hex_bytes(node.get("MediaFrameRate")?)?)? == master.rate
+        && node.maybe("EffectFiltersBA")? == Some(crate::retime::NEAREST)
+    {
+        observations::constant_picture_speed(node.get("MediaTimemapBA")?, master.length, blobs)?
+    } else {
+        None
+    };
+    let mut edit = edit;
+    if let Some(speed) = speed {
+        record_saved_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+        let Some(source_in) = speed.file_source_in(edit.source_in, edit.length, master.length) else {
+            return Err("invalid Resolve retime in-point".into());
+        };
+        edit.source_in = source_in;
+        leaf_range_matches(master, node, grid, edit.source_in, speed.source_length(edit.length)?, owner, graph)?;
+    } else if !leaf_matches(master, node, grid, edit, owner, graph, blobs)? {
         return Ok(None);
     }
     let audio = if kind == StreamKind::Audio {
@@ -1455,6 +1712,13 @@ fn direct(
         track,
         audio,
     )?;
+    if kind == StreamKind::Video {
+        capture_grade(node, &placement.id, graph, blobs)?;
+    }
+    if let Some(speed) = speed {
+        placement.speed = speed.graph(edit.length);
+        return Ok(Some(placement));
+    }
     if kind == StreamKind::Audio {
         if let Some(saved) = node.maybe("FieldsBlob")?.filter(|saved| !saved.is_empty()) {
             if let Some(data) = fairlight::clip_plugins(saved, blobs)? {
@@ -1497,53 +1761,36 @@ fn direct(
                     None => false,
                 }
             }
-            StreamKind::Audio => match effects::clip_audio(filters, blobs, edit)? {
-                Some(effects::ClipAudio::StaticVolume(db)) => {
-                    placement.volume_db = Some(db);
-                    true
-                }
-                Some(effects::ClipAudio::VolumeKeys(keys)) => {
-                    for (frame, db) in keys {
-                        placement.volume_keys.push(graph::VolumeKey {
-                            at: seconds(frame, grid.rate)?,
-                            db,
-                        });
+            StreamKind::Audio => {
+                if let Some(envelope) = effects::clip_audio(filters, blobs, edit)? {
+                    match envelope.volume {
+                        Some(Volume::Static(db)) => placement.volume_db = Some(db),
+                        Some(Volume::Keys(keys)) => {
+                            for (frame, db) in keys {
+                                placement.volume_keys.push(graph::VolumeKey {
+                                    at: seconds(i64::from(frame), grid.rate)?,
+                                    db,
+                                });
+                            }
+                        }
+                        None => {}
                     }
-                    receipt(
-                        graph,
-                        &placement.id,
-                        vec![
-                            ("volume_key_clock", text("item_source")),
-                            ("volume_interpolation", text("linear_db")),
-                            ("volume_extrapolation", text("hold")),
-                        ],
-                    );
-                    loss(graph, &placement.id, KEY_LOSS.0, KEY_LOSS.1);
+                    if let Some((aspect, reason)) = envelope.recovered_loss() {
+                        receipt(graph, &placement.id, envelope.receipt());
+                        loss(graph, &placement.id, aspect, reason);
+                    }
                     true
+                } else {
+                    false
                 }
-                Some(effects::ClipAudio::Fades { head, tail }) => {
-                    receipt(
-                        graph,
-                        &placement.id,
-                        vec![
-                            ("fade_in_frames", Value::Int(head)),
-                            ("fade_out_frames", Value::Int(tail)),
-                            ("fade_clock", text("clip_edges")),
-                            ("fade_shape", text("linear_amplitude")),
-                        ],
-                    );
-                    loss(graph, &placement.id, FADE_LOSS.0, FADE_LOSS.1);
-                    true
-                }
-                None => false,
-            },
+            }
             _ => false,
         };
         if !interpreted {
             if kind == StreamKind::Audio {
                 if let Some(data) = effects::custom_fades(filters, blobs, edit)? {
                     graph.sidecars.push(Sidecar {
-                        adapter: "resolve.clip_fades".into(),
+                        adapter: crate::audio::UNQUALIFIED_FADE_ADAPTER.into(),
                         object: placement.id.clone(),
                         data,
                     });
@@ -1561,7 +1808,85 @@ fn direct(
     Ok(Some(placement))
 }
 
+fn capture_grade(node: &Node, id: &str, graph: &mut SourceGraph, blobs: &mut Blobs) -> Result<()> {
+    let Some(wrapper) = node.optional("pLmVerTable")? else { return Ok(()) };
+    if wrapper.children.is_empty() {
+        return Ok(());
+    }
+    let table = wrapper.entry()?;
+    expect(table, "ListMgt::LmVersionTable")?;
+    let active = table.maybe("pActive")?.filter(|id| !id.is_empty());
+    let Some(locals) = table.optional("Locals")? else {
+        if active.is_some() {
+            loss(graph, id, "grade", "Resolve grade has no supported local version");
+        }
+        return Ok(());
+    };
+    let versions = locals.elements()?.map(Node::entry).collect::<Result<Vec<_>>>()?;
+    let saved = active.and_then(|id| versions.iter().find(|v| v.id().ok() == Some(id)));
+    if let Some(version) = saved {
+        if version.maybe("HasCorrection")? != Some("true") {
+            return Ok(());
+        }
+        let body = version.get("Body")?;
+        let bytes = hex_bytes(body)?;
+        blobs.charge(bytes.len())?;
+        if versions.len() == 1 && table.maybe("VerType")? == Some("0") {
+            if let Some((gain, _)) = crate::grade::decode(&bytes) {
+                graph.sidecars.push(Sidecar {
+                    adapter: crate::grade::ADAPTER.into(),
+                    object: id.into(),
+                    data: Value::Obj(vec![
+                        ("node_id".into(), Value::Int(1)),
+                        ("version_id".into(), text(version.id()?)),
+                        ("gain".into(), Value::Float(f64::from(gain))),
+                        ("value_space".into(), text("resolve.drx")),
+                        ("body".into(), text(body)),
+                    ]),
+                });
+                return Ok(());
+            }
+        }
+        use sha2::{Digest, Sha256};
+        receipt_grade_hash(graph, id, version.id()?, &hex::encode(Sha256::digest(&bytes)));
+    } else if active.is_none() && versions.is_empty() {
+        return Ok(());
+    }
+    loss(graph, id, "grade", "Resolve clip grade requires a destination mapping");
+    Ok(())
+}
+
+fn receipt_grade_hash(graph: &mut SourceGraph, id: &str, version: &str, hash: &str) {
+    graph.sidecars.push(Sidecar {
+        adapter: "resolve.grade".into(),
+        object: id.into(),
+        data: Value::Obj(vec![
+            ("version_id".into(), text(version)),
+            ("body_sha256".into(), text(hash)),
+        ]),
+    });
+}
+
 fn record_unqualified_timing(
+    graph: &mut SourceGraph,
+    node: &Node,
+    owner: &str,
+    source_rate: Rational,
+    record_rate: Rational,
+    blobs: &mut Blobs,
+) -> Result<()> {
+    record_saved_timing(graph, node, owner, source_rate, record_rate, blobs)?;
+    omitted(
+        graph,
+        owner,
+        node.id()?,
+        "timing",
+        "unqualified Resolve rate or retime map",
+    );
+    Ok(())
+}
+
+fn record_saved_timing(
     graph: &mut SourceGraph,
     node: &Node,
     owner: &str,
@@ -1584,13 +1909,6 @@ fn record_unqualified_timing(
     }
     timing.push(("map".into(), observations::time_map(map, blobs)?));
     observations::append(graph, "resolve.timing", owner, Value::Obj(timing));
-    omitted(
-        graph,
-        owner,
-        id,
-        "timing",
-        "unqualified Resolve rate or retime map",
-    );
     Ok(())
 }
 
@@ -1614,7 +1932,20 @@ fn leaf_matches(
         record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
         return Ok(false);
     }
-    if edit.source_in + edit.length > master.length
+    leaf_range_matches(master, node, grid, edit.source_in, edit.length, owner, graph)?;
+    Ok(true)
+}
+
+fn leaf_range_matches(
+    master: &Master,
+    node: &Node,
+    grid: Grid,
+    source_in: i64,
+    source_length: i64,
+    owner: &str,
+    graph: &mut SourceGraph,
+) -> Result<()> {
+    if source_in < 0 || source_in.checked_add(source_length).is_none_or(|end| end > master.length)
         || frames(node.get("MediaStartTime")?.parse()?, grid.rate)? != master.start
     {
         return Err("Resolve edit contradicts media cache clock or extent".into());
@@ -1630,7 +1961,7 @@ fn leaf_matches(
             );
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn identity_timemap(node: &Node, length: i64, rate: Rational) -> Result<bool> {

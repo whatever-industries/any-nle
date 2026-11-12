@@ -1,5 +1,6 @@
 //! Sequence-owned markers in the 21.2 project lockable blob map.
 use super::*;
+use crate::clip_label::{self, ClipLabel};
 use encoding::{fields, Wire};
 use graph::{
     source::{SourceBinding, SourceMarker},
@@ -37,14 +38,14 @@ pub(super) fn read(project: &Node, graph: &mut SourceGraph, blobs: &mut Blobs) -
                         return Err("duplicate Resolve clip label owner".into());
                     }
                     graph.sidecars.push(Sidecar {
-                        adapter: "resolve.clip_label".into(),
+                        adapter: clip_label::ADAPTER.into(),
                         object: owner.into(),
                         data: Value::Obj(vec![
                             ("saved_code".into(), Value::Int(code)),
                             ("provenance".into(), text("drpkit:af3cedc0 and pr2resolve:61c8c9ec")),
                         ]),
                     });
-                    loss(graph, owner, "clip_label", "Resolve clip label retained in graph; destination mapping is unqualified");
+                    loss(graph, owner, "clip_label", clip_label::REASON);
                 }
             }
             continue;
@@ -128,10 +129,7 @@ fn clip_color(node: &Node, blobs: &mut Blobs) -> Result<Option<i64>> {
     let Ok(data) = map.bytes("BlobData") else { return Ok(None) };
     // Only this exact record is identified as a clip label. Other lockable
     // item state can use a different encoding or a different protobuf.
-    let [0, 0, 0x27, 0x11, 0, 0, 0, 3, 0x80, 0x28, code] = data else {
-        return Ok(None);
-    };
-    Ok(((2..=32).contains(code) && code % 2 == 0).then_some(i64::from(*code)))
+    Ok(ClipLabel::observed_code(data))
 }
 
 fn decode<'a>(
@@ -187,12 +185,7 @@ fn decode<'a>(
         .transpose()?
         .unwrap_or("");
     let start = seconds(count, rate)?;
-    let color_name = match color {
-        2 => Some("Blue"),
-        32 => Some("Red"),
-        2048 => Some("Lavender"),
-        _ => None,
-    };
+    let color_name = u64::try_from(color).ok().and_then(crate::marker_palette::name);
     Ok((
         count,
         (

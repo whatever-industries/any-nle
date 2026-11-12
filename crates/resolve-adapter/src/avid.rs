@@ -51,6 +51,7 @@ pub fn convert_avid_ume(
             atom: None,
             group: None,
             fairlight: None,
+            nested: None,
         },
         output,
         || {

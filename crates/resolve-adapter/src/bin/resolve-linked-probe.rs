@@ -8,13 +8,20 @@ use support::read;
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let fairlight = if args.len() >= 2 && args[args.len() - 2] == "--fairlight" {
-        let path = args.pop().map(Into::into);
+    let mut fairlight = None;
+    let mut nested = None;
+    while args.len() >= 2 {
+        let slot = match args[args.len() - 2].to_str() {
+            Some("--fairlight") => &mut fairlight,
+            Some("--nested") => &mut nested,
+            _ => break,
+        };
+        if slot.is_some() {
+            return Err("duplicate Resolve template option".into());
+        }
+        *slot = args.pop().map(Into::into);
         args.pop();
-        path
-    } else {
-        None
-    };
+    }
     let (graph, spec, layout, profile, probe, output, atom, group) = match args.as_slice() {
         [graph, spec, layout, profile, probe, output] => {
             (graph, spec, layout, profile, probe, output, None, None)
@@ -25,7 +32,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         [graph, spec, layout, profile, probe, output, atom, group] => {
             (graph, spec, layout, profile, probe, output, Some(Path::new(atom)), Some(Path::new(group)))
         }
-        _ => return Err("usage: resolve-linked-probe GRAPH SPEC MONO-LAYOUT.drp RATE-PROFILE.drp FFPROBE OUTPUT.drp [ATOM-TEMPLATE.drp [GROUP-TEMPLATE.drp]] [--fairlight TWO-BUS.drp]".into()),
+        _ => return Err("usage: resolve-linked-probe GRAPH SPEC MONO-LAYOUT.drp RATE-PROFILE.drp FFPROBE OUTPUT.drp [ATOM-TEMPLATE.drp [GROUP-TEMPLATE.drp]] [--fairlight TWO-BUS.drp] [--nested NEST-TEMPLATE.drp]".into()),
     };
     let graph = SourceGraph::from_json_text(&read(Path::new(graph), MAX_GRAPH_BYTES)?)?;
     let spec = serde_json::from_str(&read(Path::new(spec), 2 << 20)?)?;
@@ -38,6 +45,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             atom: atom.map(Path::to_owned),
             group: group.map(Path::to_owned),
             fairlight,
+            nested,
         },
         Path::new(output),
     )?;

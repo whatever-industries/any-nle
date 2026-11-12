@@ -1,5 +1,6 @@
 //! Same-build, sequence-owned range markers for the straight-cut writer.
 use super::*;
+use crate::clip_label::ClipLabel;
 use crate::prepare::PreparedMarker;
 
 pub(super) fn write(project: &mut String, owner: &str, markers: &[PreparedMarker]) -> Result<()> {
@@ -21,6 +22,9 @@ pub(super) fn write(project: &mut String, owner: &str, markers: &[PreparedMarker
         pb_bytes(3, marker.note.as_bytes(), &mut fields);
         pb_bytes(3, marker.duration.to_string().as_bytes(), &mut fields);
         pb_bytes(3, marker.name.as_bytes(), &mut fields);
+        if !marker.custom_data.is_empty() {
+            pb_bytes(6, marker.custom_data.as_bytes(), &mut fields);
+        }
         let mut body = Vec::new();
         pb_bytes(1, &fields, &mut body);
         let mut value = 2u32.to_be_bytes().to_vec();
@@ -48,5 +52,28 @@ pub(super) fn write(project: &mut String, owner: &str, markers: &[PreparedMarker
         .rfind("</LocableBlobSet>")
         .ok_or("missing Resolve marker set end")?;
     updated.insert_str(end, &marker);
+    replace_once(project, &old, &updated)
+}
+
+pub(super) fn write_labels(project: &mut String, labels: &[(String, ClipLabel)]) -> Result<()> {
+    if labels.is_empty() {
+        return Ok(());
+    }
+    use std::fmt::Write as _;
+    let old = block(project, "LocableBlobSet")?;
+    let mut entries = String::new();
+    for (owner, label) in labels {
+        let fields = hex::encode(qt(&[("BlobData", Bytes(&label.blob()))]));
+        write!(entries, concat!(
+            "<Element><Sm2TiItemLockableBlob DbId=\"{}\"><FieldsBlob>{}</FieldsBlob>",
+            "<BlobOwner>{}</BlobOwner><DbSavedTime>0</DbSavedTime></Sm2TiItemLockableBlob></Element>"
+        ), uid(), fields, owner)?;
+        if project.len().saturating_add(entries.len()) as u64 > MAX_XML {
+            return Err("Resolve clip labels exceed the project XML budget".into());
+        }
+    }
+    let mut updated = old.clone();
+    let end = updated.rfind("</LocableBlobSet>").ok_or("missing Resolve lockable blob set end")?;
+    updated.insert_str(end, &entries);
     replace_once(project, &old, &updated)
 }

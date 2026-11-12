@@ -11,6 +11,11 @@ const TEMPLATE_23976: &str = "4b2895fa6827801bce87bff7f657dae6454f7011459b689d19
 const TEMPLATE_24: &str = "e2a3a1ad16be932947914d866b3c8bb49b549ffd5869a06a9fc9eb576bf21bf5";
 const TWO_BUS_TEMPLATE: &str = "51e9255ae6fed4f82b7a297531a7fab0bff8353153bfe39e7f797bb7296570cf";
 const TWO_BUS_FOLDER: &str = "MediaPool/Master/000_Originals/MpFolder.xml";
+const THREE_MONO_TEMPLATE: &str = "346c93372828c5068323833437cbb4331ea1b8520d546e75850ea522926b771b";
+const THREE_MONO_SEQUENCE: &str = "SeqContainer/2ce73793-25f7-49d0-88d6-e3c95a01841f.xml";
+const NEST_TEMPLATE: &str = "48aa85bd7184d72532b52f993158e7c515b9e820887855f4e1065798b7e5263a";
+const NEST_PARENT: &str = "SeqContainer/d35c263e-bf97-4a72-8876-c35e133c6601.xml";
+const NEST_COMPOUND: &str = "SeqContainer/bdfee1f6-00ff-4a76-94fb-662551ca1846.xml";
 const MEDIA_DONOR: &str = "MediaPool/Master/002_Linked/000_Audio/MpFolder.xml";
 const TIMELINE_DONOR: &str = "SeqContainer/93a83077-933a-4ed8-9595-e12534b57e18.xml";
 const PRORES_REC709: &str = "80087810027002789e01800166880132980100d80100";
@@ -49,6 +54,7 @@ pub fn publish_turnover(
             atom: atom_template.map(Path::to_owned),
             group: group_template.map(Path::to_owned),
             fairlight: None,
+            nested: None,
         },
         output,
     )
@@ -107,11 +113,15 @@ fn assemble_turnover(
     } else {
         None
     };
-    let fairlight = if prepared
+    let two_bus = prepared
         .timelines
         .iter()
-        .any(|row| row.mixer.is_some_and(|m| m.buses == 2))
-    {
+        .any(|row| row.mixer.is_some_and(|m| m.buses == 2));
+    let three_mono = prepared.timelines.iter().any(|row| !row.lanes[4].is_empty());
+    if two_bus && three_mono {
+        return Err("two-bus and three-mono Resolve templates cannot be combined".into());
+    }
+    let fairlight = if two_bus {
         let path = templates
             .fairlight
             .as_deref()
@@ -125,6 +135,16 @@ fn assemble_turnover(
     } else {
         None
     };
+    let wider_layout = if three_mono {
+        let path = templates.fairlight.as_deref().ok_or("missing pinned three-mono layout template")?;
+        Some(template("three-mono layout", path, THREE_MONO_TEMPLATE, 4)?)
+    } else {
+        None
+    };
+    let nest_template = if prepared.timelines.iter().any(|row| !row.nests.is_empty()) {
+        let path = templates.nested.as_deref().ok_or("missing pinned Resolve nesting template")?;
+        Some(template("nesting", path, NEST_TEMPLATE, 9)?)
+    } else { None };
     build(
         prepared,
         &layout,
@@ -132,6 +152,8 @@ fn assemble_turnover(
         atom_donor.as_deref(),
         templates.group.as_deref(),
         fairlight.as_ref(),
+        wider_layout.as_ref(),
+        nest_template.as_ref(),
     )
 }
 
@@ -554,6 +576,7 @@ fn write_timeline(
     media: &[Media],
     media_ids: &[String],
     donors: &TimelineDonors<'_>,
+    labels: &mut Vec<(String, crate::clip_label::ClipLabel)>,
 ) -> Result<(String, String, String, String, String)> {
     let mut ids = new_ids(donors.pool)?;
     for (old, new) in new_ids(donors.container)? {
@@ -564,19 +587,27 @@ fn write_timeline(
     let mut pool = remap(donors.pool.to_owned(), &ids);
     let mut container = remap(donors.container.to_owned(), &ids);
     set(&mut pool, "MpFolder", bin)?;
-    set(&mut pool, "CurPlayheadPosition", "0")?;
     prefix_name(&mut pool, &timeline.name)?;
+    if let Some(marks) = timeline.marks {
+        for (tag, frame) in marks.fields() {
+            set(&mut pool, tag, &frame.to_string())?;
+        }
+    }
     replace_fields(&mut pool, |data| Ok(remap_blob(data, &ids)))?;
-    let old = block(&pool, "Sm2Timeline")?;
-    let mut handle = old.clone();
-    let head_end = handle
-        .find("<Sequence>")
-        .ok_or("missing timeline sequence wrapper")?;
-    let mut head = handle[..head_end].to_owned();
-    set(&mut head, "Name", &xml(&timeline.name))?;
-    handle.replace_range(..head_end, &head);
-    let handle_id = dbid(&handle)?.to_owned();
-    let old_sequence = block(&handle, "Sm2Sequence")?;
+    let (old, mut handle, handle_id) = if timeline.compound {
+        (String::new(), String::new(), String::new())
+    } else {
+        set(&mut pool, "CurPlayheadPosition", "0")?;
+        let old = block(&pool, "Sm2Timeline")?;
+        let mut handle = old.clone();
+        let head_end = handle.find("<Sequence>").ok_or("missing timeline sequence wrapper")?;
+        let mut head = handle[..head_end].to_owned();
+        set(&mut head, "Name", &xml(&timeline.name))?;
+        handle.replace_range(..head_end, &head);
+        let id = dbid(&handle)?.to_owned();
+        (old, handle, id)
+    };
+    let old_sequence = block(if timeline.compound { &pool } else { &handle }, "Sm2Sequence")?;
     let mut sequence = old_sequence.clone();
     let sequence_id = dbid(&sequence)?.to_owned();
     let rate_hex = hex::encode(rate_bytes(rate));
@@ -601,45 +632,82 @@ fn write_timeline(
     } else {
         fields
     };
+    let fields = if let Some(tracks) = timeline.track_state.as_ref().filter(|s| {
+        s.0[1..].iter().any(|track| !track.name.is_empty() || track.locked)
+    }) {
+        Mixer::decode(&fields)?.ok_or("missing Fairlight track-state template")?
+            .write_track_state(&tracks.0[1..])?
+    } else {
+        fields
+    };
     set(
         &mut fields_head,
         "FieldsBlob",
         &hex::encode(remap_blob(hex::decode(fields)?, &ids)),
     )?;
     sequence.replace_range(..fields_end, &fields_head);
-    replace_once(&mut handle, &old_sequence, &sequence)?;
-    replace_once(&mut pool, &old, &handle)?;
-    let item_lists = blocks("Items")?;
+    if timeline.compound {
+        replace_once(&mut pool, &old_sequence, &sequence)?;
+        let old = tag(&pool, "VideoMetadata")?;
+        let new = remap_blob(hex::decode(old)?, &ids);
+        set(&mut pool, "VideoMetadata", &hex::encode(new))?;
+    } else {
+        replace_once(&mut handle, &old_sequence, &sequence)?;
+        replace_once(&mut pool, &old, &handle)?;
+    }
+    let second_picture = !timeline.lanes[3].is_empty();
+    let third_mono = !timeline.lanes[4].is_empty();
+    if second_picture && !third_mono {
+        let video = block(&container, "VideoTrackVec")?;
+        let track = block(&video, "Sm2TiTrack")?;
+        let mut extra = track.clone();
+        replace_once(&mut extra, dbid(&track)?, &uid())?;
+        let mut expanded = video.clone();
+        replace_once(&mut expanded, "</VideoTrackVec>", &format!("<Element>{extra}</Element></VideoTrackVec>"))?;
+        replace_once(&mut container, &video, &expanded)?;
+    }
+    let item_lists = Regex::new(r"(?s)<Items(?:/>|>.*?</Items>)")?;
     let spans: Vec<_> = item_lists
         .find_iter(&container)
         .map(|m| m.range())
         .collect();
-    if spans.len() != 3 {
+    let lane_order: &[usize] = if timeline.compound {
+        &[0, 1]
+    } else if third_mono {
+        &[0, 3, 1, 2, 4]
+    } else if second_picture {
+        &[0, 3, 1, 2]
+    } else {
+        &[0, 1, 2]
+    };
+    if spans.len() != lane_order.len() {
         return Err("expected V1 and two native mono track templates".into());
     }
-    for (lane, span) in spans.into_iter().enumerate().rev() {
-        let base = blocks(if lane == 0 {
-            "Sm2TiVideoClip"
+    for (&lane, span) in lane_order.iter().zip(spans).rev() {
+        let base = if timeline.lanes[lane].is_empty() {
+            ""
         } else {
-            "Sm2TiAudioClip"
-        })?
-        .find(&container[span.clone()])
-        .ok_or("missing native edit template")?
-        .as_str()
-        .to_owned();
+            blocks(if matches!(lane, 0 | 3) { "Sm2TiVideoClip" } else { "Sm2TiAudioClip" })?
+                .find(&container[span.clone()])
+                .ok_or("missing native edit template")?.as_str()
+        };
         let mut list = String::from("<Items>");
         for edit in &timeline.lanes[lane] {
             if let Some(dissolve) = timeline
                 .dissolve
                 .as_ref()
-                .filter(|dissolve| lane == 0 && edit.start == dissolve.cut)
+                .filter(|dissolve| lane == usize::from(dissolve.audio) && edit.start == dissolve.cut)
             {
                 write_dissolve(&mut list, timeline.origin, dissolve);
             }
             let source = &media[edit.media];
-            let mut clip = base.clone();
+            let mut clip = base.to_owned();
             let old_id = dbid(&clip)?.to_owned();
-            replace_once(&mut clip, &old_id, &uid())?;
+            let clip_id = uid();
+            replace_once(&mut clip, &old_id, &clip_id)?;
+            if let Some(label) = edit.label {
+                labels.push((clip_id, label));
+            }
             set(&mut clip, "Name", &xml(&source.name))?;
             set(&mut clip, "MediaRef", &media_ids[edit.media])?;
             set(&mut clip, "MediaFilePath", &xml(utf8_path(&source.path)?))?;
@@ -649,13 +717,11 @@ fn write_timeline(
                 "Start",
                 &(timeline.origin + edit.start).to_string(),
             )?;
-            set(&mut clip, "In", &edit.source_in.to_string())?;
             set(&mut clip, "Duration", &edit.length.to_string())?;
             if let Some(video) = &edit.video {
                 set(&mut clip, "EffectFiltersBA", &video.encoded)?;
             }
-            if let Some(db) = edit.volume {
-                let envelope = crate::audio::Envelope::StaticVolume(db);
+            if let Some(envelope) = edit.envelope {
                 set(&mut clip, "EffectFiltersBA", &envelope.encode()?)?;
             }
             let atom = match &source.profile {
@@ -676,9 +742,25 @@ fn write_timeline(
                     seconds(binding.frames - 1)
                 }
             };
-            let mut map = vec![2];
-            map.extend_from_slice(&end.to_be_bytes());
+            let (saved_in, map) = match (edit.speed, &source.profile) {
+                (Some(speed), Profile::Mov { frames, .. }) => {
+                    let saved_in = speed.record_source_in(edit.source_in, edit.length, *frames)
+                        .ok_or("invalid Resolve retime source trim")?;
+                    set(&mut clip, "EffectFiltersBA", crate::retime::NEAREST)?;
+                    (saved_in, speed.encode(*frames, &uid())?)
+                }
+                (Some(_), _) => return Err("Resolve picture speed requires linked MOV media".into()),
+                (None, _) => {
+                    let mut map = vec![2];
+                    map.extend_from_slice(&end.to_be_bytes());
+                    (edit.source_in, map)
+                }
+            };
+            set(&mut clip, "In", &saved_in.to_string())?;
             set(&mut clip, "MediaTimemapBA", &hex::encode(map))?;
+            if let Some((_, body)) = &edit.grade {
+                write_grade(&mut clip, body)?;
+            }
             if let Some(channel) = edit.channel {
                 let selector = if atom.is_some() { channel } else { 0 };
                 set(
@@ -695,8 +777,51 @@ fn write_timeline(
             list.push_str(&clip);
             list.push_str("</Element>");
         }
+        if lane == 0 {
+            if let Some(solid) = &timeline.solid {
+                use std::fmt::Write as _;
+                write!(
+                    list,
+                    concat!(
+                        "<Element><Sm2TiGenerator DbId=\"{}\"><FieldsBlob/><PrettyType>Solid Color</PrettyType>",
+                        "<Name>Solid Color</Name><Start>{}</Start><Duration>{}</Duration><LinkedItemSync/>",
+                        "<WasDisbanded>false</WasDisbanded><MarkersBA/><UiMemento>0</UiMemento><Flags>0</Flags>",
+                        "<PriorityIndex>0</PriorityIndex><EffectFiltersBA>{}</EffectFiltersBA>",
+                        "<ImportExportMetadataBA/><RenderTextEnabled>true</RenderTextEnabled>",
+                        "<RenderTextGanged>true</RenderTextGanged><RenderTextPrefixed>true</RenderTextPrefixed>",
+                        "<In/></Sm2TiGenerator></Element>",
+                    ),
+                    uid(), timeline.origin + solid.start, solid.duration, solid.effect(),
+                )?;
+            }
+        }
         list.push_str("</Items>");
         container.replace_range(span, &list);
+    }
+    if let Some(state) = &timeline.track_state {
+        let pattern = blocks("Sm2TiTrack")?;
+        let spans: Vec<_> = pattern.find_iter(&container).map(|row| row.range()).collect();
+        if spans.len() != state.0.len() {
+            return Err("unexpected Resolve track-state template layout".into());
+        }
+        for (span, track) in spans.into_iter().zip(&state.0).rev() {
+            let mut xml_track = container[span.clone()].to_owned();
+            let at = xml_track.find("<Items").ok_or("missing Resolve track items")?;
+            if track.locked || track.disabled {
+                let mut head = xml_track[..at].to_owned();
+                let flags: u32 = tag(&head, "Flags")?.parse()?;
+                let flags = flags | u32::from(track.locked) | (u32::from(track.disabled) << 1);
+                set(&mut head, "Flags", &flags.to_string())?;
+                xml_track.replace_range(..at, &head);
+            }
+            if !track.name.is_empty() {
+                set(&mut xml_track, "UserDefinedName", &xml(&track.name))?;
+            }
+            container.replace_range(span, &xml_track);
+        }
+    }
+    if !timeline.captions.is_empty() {
+        write_captions(&mut container, timeline, &sequence_id)?;
     }
     Ok((
         handle_id,
@@ -707,11 +832,111 @@ fn write_timeline(
     ))
 }
 
+fn write_nested_uses(
+    parent: &Timeline,
+    project: &PreparedProject,
+    pools: &[Option<String>],
+    template: &str,
+    container: &mut String,
+    remaining_xml: &mut usize,
+) -> Result<()> {
+    let old_video = block(container, "VideoTrackVec")?;
+    let old_track = block(&old_video, "Sm2TiTrack")?;
+    let clip_pattern = blocks("Sm2TiVideoClip")?;
+    let clips = clip_pattern.find_iter(&old_track).map(|m| m.as_str());
+    let mut edits: Vec<_> = parent.lanes[0].iter().map(|edit| edit.start).zip(clips)
+        .map(|(start, clip)| (start, clip.to_owned())).collect();
+    if edits.len() != parent.lanes[0].len() {
+        return Err("generated Resolve parent V1 layout differs from preparation".into());
+    }
+    for usage in &parent.nests {
+        let child = &project.timelines[usage.child];
+        let pool = pools[usage.child].as_ref().ok_or("missing generated child pool identity")?;
+        let mut clip = remap(template.to_owned(), &new_ids(template)?);
+        for (key, value) in [
+            ("Name", xml(&child.name)),
+            ("Start", (parent.origin + usage.start).to_string()),
+            ("Duration", usage.length.to_string()),
+            ("In", usage.source_in.to_string()),
+            ("MediaRef", pool.to_owned()),
+            ("MediaStartTime", (usage.origin as f64 / 24.0).to_string()),
+            ("MediaTimemapBA", hex::encode(crate::nests::compact_map(usage.child_length))),
+        ] {
+            set(&mut clip, key, &value)?;
+        }
+        *remaining_xml = remaining_xml.checked_sub(clip.len() + 19)
+            .ok_or("nested edit XML exceeds its construction budget")?;
+        edits.push((usage.start, clip));
+    }
+    edits.sort_unstable_by_key(|(start, _)| *start);
+    let list = edits.into_iter().map(|(_, xml)| format!("<Element>{xml}</Element>")).collect::<String>();
+    let mut track = old_track.clone();
+    container_field(&mut track, "Items", &list)?;
+    let mut video = old_video.clone();
+    replace_once(&mut video, &old_track, &track)?;
+    replace_once(container, &old_video, &video)
+}
+
+fn write_grade(clip: &mut String, body: &str) -> Result<()> {
+    use crate::binary::Qt;
+    let active = uid();
+    let table = uid();
+    let fields = hex::encode(qt(&[("LastChangedTime", Qt::Long(0)), ("ActiveVersionType", Qt::Int(0))]));
+    let grade = format!(
+        concat!(
+            "<pLmVerTable><ListMgt::LmVersionTable DbId=\"{table}\"><FieldsBlob>{fields}</FieldsBlob>",
+            "<VerType>0</VerType><pActive>{active}</pActive><Locals><Element>",
+            "<ListMgt::LmVersion DbId=\"{active}\"><FieldsBlob/><Name>Version 1</Name>",
+            "<HasCorrection>true</HasCorrection><VerType>0</VerType><ImplVersion>1</ImplVersion>",
+            "<IncludedInRecording>true</IncludedInRecording><FlatPassEnabled>false</FlatPassEnabled>",
+            "<RGBAOutputEnabled>false</RGBAOutputEnabled><Body>{body}</Body>",
+            "<UseVersionClipProcParams>true</UseVersionClipProcParams></ListMgt::LmVersion>",
+            "</Element></Locals><DbSavedTime>0</DbSavedTime></ListMgt::LmVersionTable></pLmVerTable>"
+        ),
+        table=table, fields=fields, active=active, body=body
+    );
+    if clip.contains("<pLmVerTable>") {
+        return Err("Resolve skeleton already contains a clip grade".into());
+    }
+    let anchor = clip.find("<LastChangedTime>").ok_or("missing Resolve grade insertion anchor")?;
+    clip.insert_str(anchor, &grade);
+    Ok(())
+}
+
+fn write_captions(container: &mut String, timeline: &Timeline, sequence_id: &str) -> Result<()> {
+    use std::fmt::Write as _;
+    let mut track = format!(
+        "<SubtitleTrackVec><Element><Sm2TiTrack DbId=\"{}\"><FieldsBlob>{}</FieldsBlob>\
+         <Type>2</Type><SubType>0</SubType><Flags>0</Flags><Sequence>{sequence_id}</Sequence><Items>",
+        uid(), crate::captions::TRACK_FIELDS,
+    );
+    for caption in &timeline.captions {
+        if track.len().saturating_add(caption.text.len().saturating_mul(6) + 640) as u64 > MAX_XML {
+            return Err("Resolve subtitle track exceeds its construction budget".into());
+        }
+        write!(
+            track,
+            concat!(
+                "<Element><Sm2TiGenerator DbId=\"{}\"><FieldsBlob/><PrettyType>Subtitle</PrettyType>",
+                "<Name>{}</Name><Start>{}</Start><Duration>{}</Duration><LinkedItemSync/>",
+                "<WasDisbanded>false</WasDisbanded><MarkersBA/><UiMemento>0</UiMemento><Flags>0</Flags>",
+                "<PriorityIndex>0</PriorityIndex><EffectFiltersBA/><ImportExportMetadataBA/>",
+                "<RenderTextEnabled>true</RenderTextEnabled><RenderTextGanged>true</RenderTextGanged>",
+                "<RenderTextPrefixed>true</RenderTextPrefixed><In/></Sm2TiGenerator></Element>",
+            ),
+            uid(), xml(&caption.text), timeline.origin + caption.start, caption.length,
+        )?;
+    }
+    track.push_str("</Items><UserDefinedName/><LayersVec/></Sm2TiTrack></Element></SubtitleTrackVec>");
+    let empty = one(&Regex::new(r"<SubtitleTrackVec(?:\s*/>|>\s*</SubtitleTrackVec>)")?, container)?;
+    container.replace_range(empty.range(), &track);
+    Ok(())
+}
+
 fn write_dissolve(list: &mut String, origin: i64, transition: &Dissolve) {
     use std::fmt::Write as _;
-    // The saved record is between the two clips. Its range ends at the cut;
-    // the incoming clip's saved Start, In and Duration remain its visible edit.
-    let start = origin + transition.cut - dissolve::DURATION;
+    // Resolve keeps the visible edit ranges and stores overlap on the transition.
+    let start = origin + transition.window().start;
     write!(
         list,
         concat!(
@@ -727,12 +952,12 @@ fn write_dissolve(list: &mut String, origin: i64, transition: &Dissolve) {
             "</Sm2TiTransition></Element>"
         ),
         id = uid(),
-        fields = dissolve::FIELDS,
-        kind = dissolve::TYPE,
+        fields = if transition.audio { dissolve::AUDIO_FIELDS } else { dissolve::FIELDS },
+        kind = transition.type_label(),
         start = start,
         duration = dissolve::DURATION,
-        effect = dissolve::EFFECT,
-        alignment = dissolve::ALIGNMENT,
+        effect = if transition.audio { "" } else { dissolve::EFFECT },
+        alignment = transition.alignment(),
         position = dissolve::POSITION,
     )
     .expect("writing to a String cannot fail");
@@ -776,6 +1001,7 @@ struct Identities {
     bins: Vec<String>,
     media: Vec<String>,
     sequences: Vec<String>,
+    timeline_pools: Vec<Option<String>>,
     group: Option<String>,
 }
 
@@ -786,6 +1012,8 @@ fn build(
     atom_donor: Option<&str>,
     group_template: Option<&Path>,
     fairlight: Option<&Mixer>,
+    wider_layout: Option<&Members>,
+    nest_template: Option<&Members>,
 ) -> Result<(Members, Identities)> {
     let root = member(profile, POOL)?;
     let root_id = dbid(root)?.to_owned();
@@ -802,6 +1030,23 @@ fn build(
         container: member(layout, TIMELINE_DONOR)?,
         fairlight,
     };
+    let wide_pool = wider_layout.map(|members|
+        named(member(members, POOL)?, "Sm2MpTimelineClip", "Native lanes")).transpose()?;
+    let wider_donors = match (wider_layout, wide_pool.as_deref()) {
+        (Some(members), Some(pool)) => Some(TimelineDonors {
+            pool, container: member(members, THREE_MONO_SEQUENCE)?, fairlight: None,
+        }),
+        _ => None,
+    };
+    let compound_pool = nest_template.map(|members| block(member(members, POOL)?, "Sm2MpCompoundClip")).transpose()?;
+    let compound_donors = match (nest_template, compound_pool.as_deref()) {
+        (Some(members), Some(pool)) => Some(TimelineDonors {
+            pool, container: member(members, NEST_COMPOUND)?, fairlight: None,
+        }),
+        _ => None,
+    };
+    let nest_edit = nest_template.map(|members|
+        named(member(members, NEST_PARENT)?, "Sm2TiVideoClip", "Witness A")).transpose()?;
     for media in &p.media {
         let (id, item) = pool_item(donor, media, &bin_ids[media.bin], p.rate, atom_donor)?;
         remaining_xml = remaining_xml
@@ -813,7 +1058,10 @@ fn build(
     let mut members = Members::new();
     let mut handles = String::new();
     let mut sequence_ids = Vec::new();
+    let mut timeline_pools = Vec::new();
+    let mut timeline_containers = Vec::new();
     let mut group_id = None;
+    let mut labels = Vec::new();
     let mut project = member(profile, PROJECT)?.to_owned();
     set(&mut project, "ProjectName", &xml(&p.name))?;
     set(
@@ -842,6 +1090,8 @@ fn build(
             children[timeline.bin].push_str(&format!("<Element>{}</Element>", built.timeline));
             handles.push_str(&format!("<Element>{}</Element>", built.handle));
             sequence_ids.push(built.sequence);
+            timeline_pools.push(None);
+            timeline_containers.push(None);
             group_id = Some(built.id);
             for (name, contents) in built.containers {
                 if members.insert(name, contents).is_some() {
@@ -850,28 +1100,49 @@ fn build(
             }
             continue;
         }
+        let donors = if timeline.compound {
+            compound_donors.as_ref().ok_or("missing native compound template")?
+        } else if timeline.lanes[4].is_empty() {
+            &donors
+        } else {
+            wider_donors.as_ref().ok_or("missing three-mono timeline layout")?
+        };
         let (handle, sequence, container_id, pool, container) = write_timeline(
             timeline,
             p.rate,
             &bin_ids[timeline.bin],
             &p.media,
             &media_ids,
-            &donors,
+            donors,
+            &mut labels,
         )?;
         remaining_xml = remaining_xml
             .checked_sub(pool.len() + container.len() + 19)
             .ok_or("project XML exceeds its construction budget")?;
         children[timeline.bin].push_str(&format!("<Element>{pool}</Element>"));
-        handles.push_str(&format!("<Element>{handle}</Element>"));
-        markers::write(&mut project, &sequence, &timeline.markers)?;
+        if !timeline.compound {
+            handles.push_str(&format!("<Element>{handle}</Element>"));
+            markers::write(&mut project, &sequence, &timeline.markers)?;
+        }
+        timeline_pools.push(Some(dbid(&pool)?.to_owned()));
+        let path = format!("SeqContainer/{container_id}.xml");
+        timeline_containers.push(Some(path.clone()));
         sequence_ids.push(sequence);
         if members
-            .insert(format!("SeqContainer/{container_id}.xml"), container)
+            .insert(path, container)
             .is_some()
         {
             return Err("sequence container identity collision".into());
         }
     }
+    if let Some(template) = nest_edit.as_deref() {
+        for (timeline, path) in p.timelines.iter().zip(timeline_containers) {
+            if timeline.nests.is_empty() { continue; }
+            let target = path.and_then(|path| members.get_mut(&path)).ok_or("missing parent container")?;
+            write_nested_uses(timeline, p, &timeline_pools, template, target, &mut remaining_xml)?;
+        }
+    }
+    markers::write_labels(&mut project, &labels)?;
     container_field(&mut project, "TimelineHandleVec", &handles)?;
     members.insert(PROJECT.into(), project);
     members.insert("Gallery.xml".into(), member(profile, "Gallery.xml")?.into());
@@ -923,6 +1194,7 @@ fn build(
             bins: bin_ids,
             media: media_ids,
             sequences: sequence_ids,
+            timeline_pools,
             group: group_id,
         },
     ))
@@ -940,38 +1212,59 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
         .sidecar(crate::source::ACTIVE_TIMELINE_ADAPTER, &ids.bins[0])
         .ok_or("generated Resolve active timeline receipt missing")?;
     let expected_index = Value::Int(i64::try_from(p.active_timeline_index)?);
-    let expected_id = &ids.sequences[p.active_timeline_index];
+    let registered = p.timelines.iter().zip(&ids.sequences)
+        .filter(|(timeline, _)| !timeline.compound).map(|(_, id)| id);
+    if !graph.sequences.iter().filter(|s| !crate::nests::compound(&graph,&s.id))
+        .map(|s| &s.id).eq(registered.clone())
+    {
+        return Err("generated Resolve registered timeline order differs from preparation".into());
+    }
+    let expected_id = registered.clone().nth(p.active_timeline_index)
+        .ok_or("generated Resolve active timeline index is absent")?;
     if active.get("saved_index") != Some(&expected_index)
         || !matches!(active.get("sequence_id"), Some(Value::Str(id)) if id == expected_id)
         || active.get("unavailable_reason") != Some(&Value::Null)
     {
         return Err("generated Resolve active timeline differs from preparation".into());
     }
+    let readbacks: Vec<_> = ids.sequences.iter().map(|id|
+        graph.sequences.iter().find(|sequence| sequence.id == *id)
+            .ok_or("generated Resolve sequence ID is absent")).collect::<std::result::Result<_, _>>()?;
     let mut dissolves = Vec::with_capacity(p.timelines.len());
-    for (timeline, read) in p.timelines.iter().zip(&graph.sequences) {
+    let mut nested_ids = std::collections::HashSet::new();
+    for (timeline, &read) in p.timelines.iter().zip(&readbacks) {
+        use crate::nests::{int, string, ADAPTER, PROFILE};
+        match graph.sidecar(ADAPTER, &read.id) {
+            None if timeline.nests.is_empty() => {}
+            Some(Value::Arr(rows)) if rows.len() == timeline.nests.len() => {
+                for (row, expected) in rows.iter().zip(&timeline.nests) {
+                    let child = &ids.sequences[expected.child];
+                    let pool = ids.timeline_pools[expected.child].as_deref().ok_or("missing staged child pool")?;
+                    let id = string(row,"id").ok_or("missing staged nested occurrence ID")?;
+                    if !nested_ids.insert((read.id.as_str(), id))
+                        || string(row,"profile") != Some(PROFILE)
+                        || string(row,"child_sequence") != Some(child.as_str())
+                        || string(row,"pool_id") != Some(pool)
+                        || string(row,"kind") != Some(expected.kind.saved())
+                        || string(row,"track_kind") != Some("video") || int(row,"track") != Some(1)
+                        || string(row,"record_rate") != Some("24") || string(row,"child_rate") != Some("24")
+                        || int(row,"child_origin_frames") != Some(expected.origin)
+                        || int(row,"record_start_frames") != Some(expected.start)
+                        || int(row,"record_duration_frames") != Some(expected.length)
+                        || int(row,"saved_source_in_frames") != Some(expected.source_in)
+                    {
+                        return Err("generated Resolve nested binding or trim differs from preparation".into());
+                    }
+                }
+            }
+            _ => return Err("generated Resolve nested use count differs from preparation".into()),
+        }
         let saved = dissolve::prepare(&graph, read)?;
-        let cut = |dissolve: &Dissolve| dissolve.cut;
-        if saved.as_ref().map(cut) != timeline.dissolve.as_ref().map(cut) {
+        let window = |dissolve: &Dissolve| (dissolve.audio, dissolve.window());
+        if saved.as_ref().map(window) != timeline.dissolve.as_ref().map(window) {
             return Err("generated Resolve dissolve differs from preparation".into());
         }
         dissolves.push(saved);
-    }
-    if graph.losses.iter().any(|loss| {
-        !p.timelines
-            .iter()
-            .zip(&graph.sequences)
-            .zip(&dissolves)
-            .any(|((timeline, read), dissolve)| {
-                timeline.mixer.is_some() && DirectMixer::recover(loss, &read.id)
-                    || dissolve.as_ref().is_some_and(|d| d.recover(loss, &read.id))
-            })
-    })
-    {
-        return Err(format!(
-            "generated Resolve reference graph differs from prepared project: {:?}",
-            graph.losses
-        )
-        .into());
     }
     for (index, bin) in p.bins.iter().enumerate() {
         let actual = graph
@@ -1095,23 +1388,37 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             }
         }
     }
-    for (index, (timeline, read)) in p.timelines.iter().zip(&graph.sequences).enumerate() {
+    let mut recovered_audio = std::collections::HashMap::new();
+    let mut recovered_labels = HashSet::new();
+    for (index, (timeline, &read)) in p.timelines.iter().zip(&readbacks).enumerate() {
         let count = if let Some(group) = &timeline.group {
             group.prepared.lanes.iter().map(Vec::len).sum::<usize>()
         } else {
             timeline.lanes.iter().map(Vec::len).sum::<usize>()
         };
-        let folder = graph
-            .sidecar("resolve.source", &read.id)
-            .and_then(|r| r.get("bin_id"));
+        let owner = graph.sidecar("resolve.source", &read.id).ok_or("generated Resolve sequence owner is absent")?;
+        let folder = owner.get("bin_id");
+        if timeline.compound && (crate::nests::string(owner,"kind") != Some("compound")
+            || owner.get("container_ref_agrees") != Some(&Value::Bool(true))
+            || crate::nests::string(owner,"media_pool_clip") != ids.timeline_pools[index].as_deref())
+        {
+            return Err("generated Resolve compound ownership or container reference differs".into());
+        }
         if read.id != ids.sequences[index]
             || read.name != timeline.name
             || read.rate != p.rate
             || read.frame_size != Some((1920, 1080))
             || read.clock.as_ref().map(|clock| clock.effective_count)
                 != Some(timeline.origin as u64)
+            || owner.get("record_length") != Some(&Value::Int(timeline.length))
             || read.placements.len() != count
+            || crate::prepare::prepare_markers(&graph, read, timeline.length)?.0 != timeline.markers
             || read.markers.len() != timeline.markers.len()
+            || crate::timeline_marks::TimelineMarks::prepare(&graph, &read.id, timeline.length)?
+                != timeline.marks
+            || crate::track_state::TrackState::prepare(&graph, read)? != timeline.track_state
+            || read.texts.len() != timeline.captions.len()
+            || crate::generator::prepare(&graph, read)? != timeline.solid
             || !matches!(folder, Some(Value::Str(id)) if *id == ids.bins[timeline.bin])
         {
             return Err(format!(
@@ -1119,6 +1426,18 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                 timeline.name
             )
             .into());
+        }
+        for (saved, expected) in read.texts.iter().zip(&timeline.captions) {
+            let frame = |time| crate::prepare::frames_on(time, p.rate);
+            if saved.track != 1
+                || saved.kind != graph::source::TextKind::Caption
+                || saved.reason.is_some()
+                || saved.content.as_deref() != Some(expected.text.as_str())
+                || saved.record_start.map(frame).transpose()? != Some(expected.start)
+                || saved.duration.map(frame).transpose()? != Some(expected.length)
+            {
+                return Err("generated Resolve subtitle differs from preparation".into());
+            }
         }
         if DirectMixer::prepare(&graph, read)? != timeline.mixer {
             return Err(
@@ -1192,17 +1511,32 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
         for (lane, expected) in timeline.lanes.iter().enumerate() {
             let actual = read.placements.iter().filter(|edit| match lane {
                 0 => edit.video_track == Some(1),
+                3 => edit.video_track == Some(2),
+                4 => edit.audio_tracks.as_slice() == [3],
                 audio => edit.audio_tracks.as_slice() == [audio as i64],
             });
             for (edit, wanted) in actual.zip(expected) {
+                if let Some(loss) = wanted.envelope.and_then(crate::audio::Envelope::recovered_loss) {
+                    recovered_audio.insert(edit.id.as_str(), loss);
+                }
+                if wanted.label.is_some() {
+                    recovered_labels.insert(edit.id.as_str());
+                }
                 let frame = |time| crate::prepare::frames_on(time, p.rate);
                 if edit.item != ids.media[wanted.media]
                     || frame(edit.record_start)? != wanted.start
                     || frame(edit.source_in)? != wanted.source_in
                     || frame(edit.duration)? != wanted.length
+                    || edit.speed != wanted.speed.and_then(|speed| speed.graph(wanted.length))
+                    || crate::grade::prepare(&graph, &edit.id)?.map(|grade| grade.0)
+                        != wanted.grade.as_ref().map(|grade| grade.0)
                     || !crate::video::matches_readback(edit, wanted.video.as_ref())
-                    || edit.volume_db != wanted.volume
-                    || !edit.volume_keys.is_empty()
+                    || crate::clip_label::ClipLabel::prepare(&graph, &edit.id)? != wanted.label
+                    || (matches!(lane, 1 | 2 | 4)
+                        && crate::audio::prepare(
+                            edit, wanted.source_in, wanted.length, p.rate,
+                            graph.sidecar(crate::source::ADAPTER, &edit.id),
+                        )? != wanted.envelope)
                     || !edit
                         .audio_streams
                         .iter()
@@ -1217,6 +1551,8 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                 .iter()
                 .filter(|edit| match lane {
                     0 => edit.video_track == Some(1),
+                    3 => edit.video_track == Some(2),
+                    4 => edit.audio_tracks.as_slice() == [3],
                     audio => edit.audio_tracks.as_slice() == [audio as i64],
                 })
                 .count()
@@ -1225,6 +1561,40 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                 return Err("generated Resolve track count differs from preparation".into());
             }
         }
+    }
+    if graph.losses.iter().any(|loss| {
+        if recovered_labels.contains(loss.object.as_str()) && crate::clip_label::ClipLabel::recover(loss) {
+            return false;
+        }
+        if recovered_audio
+            .get(loss.object.as_str())
+            .is_some_and(|(aspect, reason)| loss.aspect == *aspect && loss.reason == *reason)
+        {
+            return false;
+        }
+        if loss.aspect == "placement" && loss.reason.split_once(": ").is_some_and(|(id, reason)|
+            reason == crate::nests::LOSS && nested_ids.contains(&(loss.object.as_str(), id)))
+        {
+            return false;
+        }
+        !p.timelines
+            .iter()
+            .zip(&readbacks)
+            .zip(&dissolves)
+            .any(|((timeline, read), dissolve)| {
+                timeline.mixer.is_some() && DirectMixer::recover(loss, &read.id)
+                    || timeline.track_state.is_some() && crate::track_state::TrackState::recover(loss, &read.id)
+                    || timeline.marks.is_some() && crate::timeline_marks::TimelineMarks::recover(loss, &read.id)
+                    || dissolve.as_ref().is_some_and(|d| d.recover(loss, &read.id))
+                    || crate::nests::recover_empty_stereo(&graph, loss, &read.id)
+            })
+    })
+    {
+        return Err(format!(
+            "generated Resolve reference graph differs from prepared project: {:?}",
+            graph.losses
+        )
+        .into());
     }
     Ok(())
 }

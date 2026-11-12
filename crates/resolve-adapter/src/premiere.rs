@@ -13,7 +13,7 @@ use crate::{
 use graph::{
     source::{
         OriginalStream, SourceClock, SourceClockProvenance, SourceGraph, SourceItem,
-        SourceItemMedia, SourceMedia, SourceSequence, SourceText, TextKind,
+        SourceBinding, SourceItemMedia, SourceMedia, SourceSequence, SourceText, SourceTransition, TextKind,
     },
     Bin, Loss, Placement, Project as GraphProject, Rational, Sidecar, StreamKind, Track, Value,
 };
@@ -217,7 +217,7 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         let mut track_indexes = HashSet::new();
         for &track_id in tracks {
             let track = project.track(track_id);
-            if !track.transitions.is_empty() {
+            if !track.transitions.is_empty() && (kind != StreamKind::Video || !capture_components) {
                 return Err(
                     "Premiere transitions require a qualified Resolve timing mapping".into(),
                 );
@@ -290,12 +290,19 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                         "Premiere clip selects a nonexistent channel on its saved media".into(),
                     );
                 }
-                if project.speed(clip)? != 1.0 || project.is_speed_reversed(clip)? {
-                    return Err(
-                        "Premiere clip speed or direction is outside the straight-cut profile"
-                            .into(),
-                    );
-                }
+                use crate::retime::PictureSpeed;
+                let native_speed = project.speed(clip)?;
+                let reversed = project.is_speed_reversed(clip)?;
+                let picture_speed = match (native_speed, reversed) {
+                    (1.0, false) => None,
+                    (0.5, false) if capture_components && kind == StreamKind::Video && rate == Rational::integer(24) => {
+                        Some(PictureSpeed::Half)
+                    }
+                    (1.0, true) if capture_components && kind == StreamKind::Video && rate == Rational::integer(24) => {
+                        Some(PictureSpeed::Reverse)
+                    }
+                    _ => return Err("Premiere clip speed or direction is outside the Resolve picture profile".into()),
+                };
                 let tree = &project.doc.tree;
                 let native = project.track_item(clip);
                 let occurrence = tree
@@ -322,21 +329,48 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                 }
                 let start = project.start(clip)?.ticks;
                 let end = project.end(clip)?.ticks;
-                let source_in = project.in_point(clip)?.ticks;
-                let source_out = project.out_point(clip)?.ticks;
                 let span = end
                     .checked_sub(start)
                     .ok_or("Premiere record span overflow")?;
+                let speed = picture_speed
+                    .map(|speed| speed.graph(span / frame_ticks).ok_or("invalid Premiere constant speed span"))
+                    .transpose()?;
+                let source_span = match picture_speed {
+                    Some(PictureSpeed::Half) => span / 2,
+                    _ => span,
+                };
+                let (source_in, source_out) = if let Some(mode) = picture_speed {
+                    let original = binding.streams.iter().find(|s| s.channel.is_none())
+                        .and_then(|s| graph.media.iter().find(|m| m.id == s.media_id))
+                        .filter(|m| m.kind == StreamKind::Video && m.codec.as_deref() == Some("prores"))
+                        .ok_or("Premiere constant speed requires a verified ProRes HQ picture original")?;
+                    let file_end = crate::prepare::frames_on(original.duration, rate)?
+                        .checked_mul(frame_ticks).ok_or("invalid Premiere original duration")?;
+                    let raw = |tag| -> Result<i64> {
+                        Ok(tree.findtext(native.clip, tag)?.ok_or("missing raw Premiere speed trim")?.parse()?)
+                    };
+                    let a = raw("Clip/InPoint")?;
+                    let b = raw("Clip/OutPoint")?;
+                    if a < 0 || b > file_end {
+                        return Err("Premiere speed trim exceeds the verified original".into());
+                    }
+                    match mode {
+                        PictureSpeed::Half => (a,b),
+                        PictureSpeed::Reverse => (file_end - b,file_end - a),
+                    }
+                } else {
+                    (project.in_point(clip)?.ticks, project.out_point(clip)?.ticks)
+                };
                 if span <= 0
                     || start < 0
                     || source_in < 0
-                    || source_out.checked_sub(source_in) != Some(span)
+                    || source_out.checked_sub(source_in) != Some(source_span)
                     || [start, end, source_in, source_out]
                         .into_iter()
                         .any(|v| v % frame_ticks != 0)
                 {
                     return Err(
-                        "Premiere record/source ranges require whole, equal frame spans".into(),
+                        "Premiere record and source spans disagree with the saved speed or frame grid".into(),
                     );
                 }
                 let mut mapped = false;
@@ -398,14 +432,19 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                     volume_keys: vec![],
                     track_gains_db: vec![],
                     track_pans: vec![],
-                    speed: None,
+                    speed,
                     frame_map: None,
                     transform,
                     effects: picture_effects,
                 });
             }
+            if !track.transitions.is_empty() {
+                read_dissolve(project, &track.transitions, &mut out, frame_ticks)?;
+            }
         }
-        if track_indexes.len() != expected as usize {
+        if track_indexes.len() != expected as usize
+            && !(kind == StreamKind::Audio && track_indexes.is_empty())
+        {
             return Err("Premiere profile requires picture and two nonempty mono lanes".into());
         }
     }
@@ -455,9 +494,14 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                 ("duration_ticks".into(), Value::Int(duration)),
             ]));
             caption_omissions.push(Loss {
-                object: occurrence,
+                object: occurrence.clone(),
                 aspect: crate::turnover::PREMIERE_CAPTION_LOSS.into(),
-                reason: "Premiere caption is omitted from the straight-cut Resolve output".into(),
+                reason: "Premiere caption is outside the editable Resolve subtitle profile".into(),
+            });
+            graph.losses.push(Loss {
+                object: occurrence,
+                aspect: "text_appearance".into(),
+                reason: "Premiere caption appearance uses Resolve default subtitle styling".into(),
             });
         }
     }
@@ -517,6 +561,75 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
     });
     graph.sequences.push(out);
     Turnover::prepare(graph, spec, ffprobe, vec![(path, digest)], vec![], caption_omissions)
+}
+
+fn read_dissolve(
+    project: &Project,
+    transitions: &[NodeId],
+    sequence: &mut SourceSequence,
+    frame_ticks: i64,
+) -> Result<()> {
+    use prproj::model::transition::*;
+    let [transition] = transitions else {
+        return Err("Resolve preparation requires exactly one Premiere dissolve".into());
+    };
+    let tree = &project.doc.tree;
+    let id = tree.get(*transition, "ObjectID").ok_or("Premiere transition lacks ObjectID")?;
+    let refuse = |reason| format!("Premiere transition {id}: {reason}");
+    let start = transition_start(tree, *transition)?.ticks;
+    let end = transition_end(tree, *transition)?.ticks;
+    let offset = transition_cut_point_offset(tree, *transition)?.ticks;
+    let duration = end.checked_sub(start).ok_or_else(|| refuse("duration overflow"))?;
+    if !crate::dissolve::supported_rate(sequence.rate)
+        || start < 0
+        || start % frame_ticks != 0
+        || duration != frame_ticks.checked_mul(8).ok_or("transition duration overflow")?
+        || (offset != duration && offset.checked_mul(2) != Some(duration))
+        || transition_match_name(tree, *transition)? != "ADBE Cross Dissolve"
+        || transition_is_reversed(tree, *transition)?
+        || transition_border_width(tree, *transition)? != 0
+        || !transition_has_incoming_clip(tree, *transition)?
+        || !transition_has_outgoing_clip(tree, *transition)?
+    {
+        return Err(refuse("expected the eight-frame left-aligned or centered Cross Dissolve profile").into());
+    }
+    let cut = ticks(start.checked_add(offset).ok_or_else(|| refuse("cut overflow"))?)?;
+    let duration = ticks(duration)?;
+    let before = ticks(offset)?;
+    let after = duration.checked_sub(before).ok_or_else(|| refuse("invalid alignment"))?;
+    let begin = ticks(start)?;
+    let mut outgoing = sequence.placements.iter_mut().filter(|p| {
+        p.video_track == Some(1) && p.record_start <= begin
+            && p.record_start.checked_add(p.duration) == Some(cut)
+    });
+    let out = outgoing.next().ok_or_else(|| refuse("missing outgoing edit"))?;
+    if outgoing.next().is_some() {
+        return Err(refuse("ambiguous outgoing edit").into());
+    }
+    let outgoing_id = out.id.clone();
+    out.duration = out.duration.checked_add(after).ok_or_else(|| refuse("outgoing extent overflow"))?;
+    let mut incoming = sequence.placements.iter_mut()
+        .filter(|p| p.video_track == Some(1) && p.record_start == cut);
+    let input = incoming.next().ok_or_else(|| refuse("missing incoming edit"))?;
+    if incoming.next().is_some() {
+        return Err(refuse("ambiguous incoming edit").into());
+    }
+    input.source_in = input.source_in.checked_sub(before).filter(|time| !time.is_negative())
+        .ok_or_else(|| refuse("insufficient incoming preroll"))?;
+    input.record_start = begin;
+    input.duration = input.duration.checked_add(before).ok_or_else(|| refuse("edit range overflow"))?;
+    sequence.transitions.push(SourceTransition {
+        id: format!("premiere:transition:{id}"),
+        kind: StreamKind::Video,
+        track: 1,
+        cut,
+        duration,
+        cut_offset: before,
+        style: "premiere.ADBE Cross Dissolve".into(),
+        outgoing: SourceBinding { placements: vec![outgoing_id], reason: None },
+        incoming: SourceBinding { placements: vec![input.id.clone()], reason: None },
+    });
+    Ok(())
 }
 
 fn premiere_path(path: &Path) -> Result<PathBuf> {

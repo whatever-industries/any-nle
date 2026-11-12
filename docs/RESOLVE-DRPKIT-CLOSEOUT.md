@@ -6,7 +6,7 @@ The Fairlight review pins [drpkit `af3cedc0`](https://github.com/higuchiki/drpki
 
 | drpkit area | Graph/2 read | Write and qualification |
 |---|---|---|
-| Mixer faders, mute, pre-gain, pan, pan bypass, solo, Effects In, and output assignment | `resolve.fairlight` holds named integer controls, including fader and pre-gain in tenths of a dB, pan in tenths of a percent, connection code and zero-based output bus index. Rows bind to saved strip IDs, with an explicit channel index for a continuation. Optional channel names are descriptive. | Existing two-mono fader and mute writer profiles remain scoped. The turnover writer now preserves qualified static mono pan and direct stereo bus assignment; the reopened render checks are below. |
+| Mixer faders, mute, pre-gain, pan, pan bypass, solo, Effects In, and output assignment | `resolve.fairlight` holds named integer controls, including fader and pre-gain in tenths of a dB, pan in tenths of a percent, connection code and zero-based output bus index. Rows bind to saved strip IDs, with an explicit channel index for a continuation. Optional channel names are descriptive. | Existing two-mono fader and mute writer profiles remain scoped. The turnover writer preserves qualified static mono pan and direct stereo bus assignment, and pan bypass on the one-bus profile. |
 | Bus prefix and bus processing | Fader, mute, pre-gain, channel count, strip ID, outgoing routing cells, EQ and dynamics are bus-owned. Bus pan, bypass and solo are retained as raw codes. The first bus keeps the existing `main_bus` receipt. | The turnover profile preserves Bus 2 gain and mute. The main bus fader has a separate qualified profile. |
 | Processing order and six EQ bands | Order and master enable codes, per-band enable and type codes, frequency in Hz, gain in tenths of a dB, slope and range codes, raw Q and knob. Original EQ and dynamics row IDs and integer values remain available. | A paired EQ save must vary frequency, gain and Q independently. Confirm the frequency knob and range updates before writing. Keep the partially calibrated Q law in research. |
 | Compressor, expander/gate and limiter | Named raw controls and documented units where established. Stored knob encodings, expander mode and partially calibrated thresholds stay raw. | Test one compressor threshold/ratio pair with controlled audio levels, then timing laws and gate modes. A decoded knob law alone does not qualify processing equivalence. |
@@ -50,6 +50,24 @@ Raw projects, renders and their measurement script remain private.
 
 The Resolve knowledgebase records this observation as RESOLVE-0015
 (SHA-256 `d8ee32e18487d2ad931877e6161355a2348227944de4a779be83bdce31dcde98`).
+
+## Mono track pan bypass
+
+In Resolve Studio 21.2.0 build 00006, the two-mono, one-stereo-bus control
+retained its hard-left and hard-right positions when the corresponding
+`0x00d` track cells were set to 1. Resolve reopened the left-only,
+right-only and both-bypassed variants without changing their saved
+`0x004` positions. Each bypassed mono signal reached both stereo channels
+at unity in this fixture. The stereo sum was within one PCM24 least
+significant bit of the prediction over 96,000 sample frames.
+
+The linked writer carries the bypass bit separately from pan in the
+existing graph/2 receipt and verifies both on staged read-back. The
+writer's A1-bypassed archive matched the corresponding reopened archive
+control sample for sample and kept all 48 picture frames unchanged.
+Nonbinary values and active bypass on two-bus layouts remain unsupported.
+Solo is separate: in the test mixer only the first of two `0x011` rows
+affected the mix. The second row's meaning remains open.
 
 ## Turnover writer qualification
 

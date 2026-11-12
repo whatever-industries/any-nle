@@ -8,6 +8,7 @@ publish = false
 avid-reader = { path = "../../avid-reader" }
 anynle-avid-adapter = { path = "../avid-adapter" }
 anynle-graph = { path = "../graph" }
+anynle-premiere-adapter = { path = "../premiere-adapter" }
 prproj = { path = "../../prproj" }
 flate2 = "1"
 hex = "0.4.3"

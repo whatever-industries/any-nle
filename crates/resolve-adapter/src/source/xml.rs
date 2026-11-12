@@ -102,7 +102,7 @@ pub(super) fn checked_zip<R: Read + Seek>(mut input: R) -> Result<ZipArchive<R>>
     Ok(archive)
 }
 
-fn read_zip(input: impl Read + Seek) -> Result<BTreeMap<String, Node>> {
+pub(super) fn read_zip(input: impl Read + Seek) -> Result<BTreeMap<String, Node>> {
     let mut archive = checked_zip(input)?;
     let mut seen = HashSet::new();
     let mut members = BTreeMap::new();

@@ -1,6 +1,10 @@
 //! Static faders and track mute in the qualified two-mono Fairlight mixer.
 use super::encoding::qt;
-use crate::Result;
+use crate::{
+    linked::mixer::{ProcessingCells, StripProcessing, PROCESSING_RECEIPT, PROCESSING_ROWS},
+    track_state::{valid_name, Track},
+    Result,
+};
 use flate2::{bufread::ZlibDecoder, write::ZlibEncoder, Compression};
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,14 +26,58 @@ const DIRECT_ONE: &[&str] = &[
     "46ac7ad463f934d2456732b1a8f086eb79d129db1176b43e2551753466fbbf07",
 ];
 const DIRECT_TWO: &str = "00765117a479b3e6469ce7a35f66c7befb8e5981d3baa4969f08e47815abed11";
+// Native track-state saves after neutralizing the identified track controls
+// and the existing direct mixer cells.
+const DIRECT_TRACK_STATE_SAVE: &[&str] = &[
+    "d1e00dc8c0439a16a20c75672487a7ca867ba4b7d4334d97464c5ab46a269bea",
+    "e87824e22afb81d176b45211d4aceed3c879d4505f86e3829be6f447f1887391",
+    "cd119bc87d33ae0e298aee89d2ba814f6c97d1e05705a4b6f8ac3f75a26e15bd",
+    "16cbeed9bc0e951b469785040842bf9410cedbe88698ebedfbf66f6f312e098b",
+    "20d2bdf778983a562f20a2f2f181a0b509d810f3e3340b2f631d88ec63408dca",
+];
 const DIRECT_TWO_FAIRLIGHT_SAVE: &str =
     "83d76c19c40bbb9d75afb2bea828387fb364303b8da9885fd4eaf5185582650c";
 const DIRECT_PAN: usize = 203_173;
+const DIRECT_PAN_BYPASS: usize = 203_393;
 const DIRECT_ROUTE: usize = 211_685;
 const TWO_BUS_SHIFT: usize = 8;
 const BUS_2_FADER: usize = 235_352;
 const BUS_2_MUTE: usize = 235_372;
 const BUS_2_MUTE_MIRROR: usize = 235_392;
+
+fn bus_processing_row(ordinal: usize, buses: i64, shift: usize) -> usize {
+    if buses == 1 {
+        return 302_641 + ordinal * 16;
+    }
+    302_838 + (shift - TWO_BUS_SHIFT) + ordinal * 20
+}
+
+fn bus_pre_gain_row(buses: i64, shift: usize) -> usize {
+    if buses == 1 {
+        235_632
+    } else {
+        235_716 + (shift - TWO_BUS_SHIFT)
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct DirectProfile {
+    buses: i64,
+    tracks: [ProcessingCells; 2],
+    bus_processing: [ProcessingCells; 2],
+    bus_pre_gain: [i32; 2],
+}
+
+impl DirectProfile {
+    const fn neutral(buses: i64) -> Self {
+        Self {
+            buses,
+            tracks: [StripProcessing::DEFAULT.cells(); 2],
+            bus_processing: [StripProcessing::DEFAULT.cells(); 2],
+            bus_pre_gain: [0; 2],
+        }
+    }
+}
 
 pub(crate) const FAIRLIGHT_ADAPTER: &str = "resolve.fairlight";
 pub(crate) const DIRECT_PROFILE: &str = "direct_mono_stereo_profile";
@@ -58,7 +106,171 @@ pub(crate) struct Mixer {
     model: Vec<u8>,
 }
 
+struct TrackCells {
+    names: Range<usize>,
+    locks: Range<usize>,
+}
+
+impl TrackCells {
+    fn locate(model: &[u8], name_row: usize, next_id: u32, lock_delta: usize) -> Option<Self> {
+        let header = |offset, id: u32| {
+            model.get(offset..offset + 12).is_some_and(|row| {
+                row[..4] == 1u32.to_le_bytes()
+                    && row[4..8] == id.to_le_bytes()
+                    && row[8..] == 2u32.to_le_bytes()
+            })
+        };
+        if !header(name_row, 0xbc) {
+            return None;
+        }
+        let start = name_row + 12;
+        let mut end = start;
+        for _ in 0..2 {
+            let len = u32::from_le_bytes(model.get(end..end + 4)?.try_into().ok()?) as usize;
+            if len > 255 {
+                return None;
+            }
+            end += 4 + len;
+        }
+        let lock = end + lock_delta;
+        if !header(end, next_id) || !header(lock, 0xdb) {
+            return None;
+        }
+        model.get(lock + 12..lock + 20)?;
+        Some(Self {
+            names: start..end,
+            locks: lock + 12..lock + 20,
+        })
+    }
+
+    fn read(&self, model: &[u8]) -> Option<[Track; 2]> {
+        let mut names = model.get(self.names.clone())?;
+        let mut out: [Track; 2] = Default::default();
+        for (track, lock) in out
+            .iter_mut()
+            .zip(model.get(self.locks.clone())?.chunks_exact(4))
+        {
+            let len = u32::from_le_bytes(names.get(..4)?.try_into().ok()?) as usize;
+            let name = std::str::from_utf8(names.get(4..4 + len)?).ok()?;
+            if !valid_name(name) || !matches!(lock, [0 | 1, 0, 0, 0]) {
+                return None;
+            }
+            track.name = name.into();
+            track.locked = lock[0] == 1;
+            names = &names[4 + len..];
+        }
+        Some(out)
+    }
+}
+
+fn audio_track_cells(model: &[u8]) -> Option<TrackCells> {
+    let mut rows = [206_869, 206_877, 206_917]
+        .into_iter()
+        .filter_map(|offset| TrackCells::locate(model, offset, 0xbd, 140));
+    let found = rows.next()?;
+    rows.next().is_none().then_some(found)
+}
+
+fn video_track_cells(model: &[u8]) -> Option<TrackCells> {
+    let mut rows = (340_000..model.len().min(360_000))
+        .filter_map(|offset| TrackCells::locate(model, offset, 0xd6, 20));
+    let found = rows.next()?;
+    rows.next().is_none().then_some(found)
+}
+
+fn video_mute_cells(model: &[u8], row: &TrackCells) -> Option<[Range<usize>; 2]> {
+    // The optional video registry stores the same mute flags in two rows
+    // before the names. Its columns are distinct from the audio mixer.
+    let name_header = row.names.start.checked_sub(12)?;
+    let cells = [name_header.checked_sub(60)?, name_header.checked_sub(40)?];
+    cells
+        .iter()
+        .all(|&header| model.get(header..header + 12) == Some(&TRACK_MUTE_HEADER))
+        .then(|| cells.map(|header| header + 12..header + 20))
+}
+
+fn update_model_length(model: &mut [u8]) -> Option<()> {
+    if model.get(..8)? != b"\x66\x88\x66\x77\x01\x00\x00\x00" {
+        return None;
+    }
+    let len = u32::try_from(model.len().checked_sub(12)?).ok()?;
+    model.get_mut(8..12)?.copy_from_slice(&len.to_le_bytes());
+    Some(())
+}
+
 impl Mixer {
+    pub(super) fn has_track_state(&self) -> bool {
+        let active =
+            |row: &TrackCells| !self.cells_are_neutral([row.names.clone(), row.locks.clone()]);
+        audio_track_cells(&self.model).as_ref().is_some_and(active)
+            || video_track_cells(&self.model).as_ref().is_some_and(|row| {
+                active(row)
+                    || video_mute_cells(&self.model, row)
+                        .is_some_and(|cells| !self.cells_are_neutral(cells))
+            })
+    }
+
+    pub(super) fn track_state(&self) -> Option<([Track; 2], Option<[Track; 2]>, Self)> {
+        let audio = audio_track_cells(&self.model)?;
+        let a = audio.read(&self.model)?;
+        let video = video_track_cells(&self.model);
+        let mut model = self.model.clone();
+        let v = if let Some(row) = &video {
+            let mut tracks = row.read(&self.model)?;
+            let mut mutes = [None; 2];
+            for (cell, copy) in video_mute_cells(&self.model, row)?
+                .into_iter()
+                .zip(&mut mutes)
+            {
+                let values = model.get_mut(cell)?;
+                let [first @ (0 | 1), 0, 0, 0, second @ (0 | 1), 0, 0, 0] = values else {
+                    return None;
+                };
+                *copy = Some([*first == 1, *second == 1]);
+                values.fill(0);
+            }
+            if mutes[0] != mutes[1] {
+                return None;
+            }
+            for (track, disabled) in tracks.iter_mut().zip(mutes[0]?) {
+                track.disabled = disabled;
+            }
+            Some(tracks)
+        } else {
+            None
+        };
+        for row in video.into_iter().chain([audio]) {
+            model.get_mut(row.locks)?.fill(0);
+            model.splice(row.names, [0; 8]);
+        }
+        update_model_length(&mut model)?;
+        Some((
+            a,
+            v,
+            Self {
+                fields: vec![],
+                field: 0..0,
+                model,
+            },
+        ))
+    }
+
+    pub(crate) fn write_track_state(mut self, tracks: &[Track]) -> Result<String> {
+        let row =
+            audio_track_cells(&self.model).ok_or("missing Fairlight track-name and lock rows")?;
+        if tracks.len() != 2 || row.read(&self.model) != Some(Default::default()) {
+            return Err("expected neutral Fairlight track names and locks in the template".into());
+        }
+        let mut names = Vec::new();
+        for (slot, track) in self.model[row.locks].chunks_exact_mut(4).zip(tracks) {
+            slot.copy_from_slice(&i32::from(track.locked).to_le_bytes());
+            names.extend_from_slice(&u32::try_from(track.name.len())?.to_le_bytes());
+            names.extend_from_slice(track.name.as_bytes());
+        }
+        self.model.splice(row.names, names);
+        update_model_length(&mut self.model).ok_or("invalid Fairlight model header")?;
+        self.encode()
+    }
     pub(crate) fn decoded_bytes(&self) -> usize {
         self.fields.len() + self.model.len()
     }
@@ -179,11 +391,30 @@ impl Mixer {
         &self,
         tracks: &[i64],
         typed_gain_mute: bool,
+        profile: Option<&Self>,
     ) -> Option<(graph::Value, bool)> {
-        let (mut facts, active) = super::fairlight::mixer(&self.model, tracks, typed_gain_mute)?;
-        if active {
-            if let (graph::Value::Obj(fields), Some(buses)) = (&mut facts, self.direct_profile()) {
-                fields.push((DIRECT_PROFILE.into(), graph::Value::Int(buses)));
+        let (mut facts, mut active) =
+            super::fairlight::mixer(&self.model, tracks, typed_gain_mute)?;
+        if let (graph::Value::Obj(fields), Some(profile)) =
+            (&mut facts, profile.unwrap_or(self).direct_profile())
+        {
+            let changed = profile.tracks != [StripProcessing::DEFAULT.cells(); 2];
+            active |= changed
+                || profile.bus_processing != [StripProcessing::DEFAULT.cells(); 2]
+                || profile.bus_pre_gain != [0; 2];
+            if let ([Some(a1), Some(a2)], [Some(_), Some(_)]) = (
+                profile.tracks.map(StripProcessing::from_cells),
+                profile.bus_processing.map(StripProcessing::from_cells),
+            ) {
+                if changed {
+                    fields.push((
+                        PROCESSING_RECEIPT.into(),
+                        graph::Value::Arr(vec![a1.receipt(), a2.receipt()]),
+                    ));
+                }
+                if active {
+                    fields.push((DIRECT_PROFILE.into(), graph::Value::Int(profile.buses)));
+                }
             }
         }
         Some((facts, active))
@@ -199,11 +430,18 @@ impl Mixer {
     }
 
     fn digest_with_neutral_cells(&self, cells: impl IntoIterator<Item = Range<usize>>) -> String {
+        self.digest_with_cells(cells.into_iter().map(|cell| (cell, [0; 8])))
+    }
+
+    fn digest_with_cells(
+        &self,
+        cells: impl IntoIterator<Item = (Range<usize>, [u8; 8])>,
+    ) -> String {
         let mut hash = Sha256::new();
         let mut end = 0;
-        for field in cells {
+        for (field, value) in cells {
             hash.update(&self.model[end..field.start]);
-            hash.update(&[0; 8][..field.len()]);
+            hash.update(&value[..field.len()]);
             end = field.end;
         }
         hash.update(&self.model[end..]);
@@ -218,26 +456,99 @@ impl Mixer {
         )
     }
 
-    fn direct_profile(&self) -> Option<i64> {
-        if matches!(self.model.len(), 364_028 | 364_088 | 364_092) {
-            let digest = self.digest_with_neutral_cells(direct_track_cells(0));
-            return DIRECT_ONE.contains(&digest.as_str()).then_some(1);
-        }
+    fn direct_profile(&self) -> Option<DirectProfile> {
         // Saving on the Fairlight page adds 40 bytes before the control tables
-        // in the observed project. Both layouts have an independent fingerprint.
-        let (offset, expected) = match self.model.len() {
-            365_437 => (0, DIRECT_TWO),
-            365_477 => (40, DIRECT_TWO_FAIRLIGHT_SAVE),
+        // in the observed two-bus project. Both layouts have their own fingerprint.
+        let (buses, shift, expected) = match self.model.len() {
+            364_028 | 364_088 | 364_092 => (1, 0, DIRECT_ONE),
+            364_152 => (1, 0, DIRECT_TRACK_STATE_SAVE),
+            365_437 => (2, TWO_BUS_SHIFT, std::slice::from_ref(&DIRECT_TWO)),
+            365_477 => (
+                2,
+                TWO_BUS_SHIFT + 40,
+                std::slice::from_ref(&DIRECT_TWO_FAIRLIGHT_SAVE),
+            ),
             _ => return None,
         };
-        let [gain, mute, mirror] = bus_2_cells(offset);
-        if self.model[mute.clone()] != self.model[mirror.clone()] {
+        let [pan, route] = direct_track_cells(shift);
+        let mut cells = vec![(pan, [0; 8])];
+        if buses == 1 {
+            let row = DIRECT_PAN_BYPASS;
+            if self.model.get(row - 12..row)? != [1u32, 0x0d, 2].map(u32::to_le_bytes).concat() {
+                return None;
+            }
+            cells.push((row..row + 8, [0; 8]));
+        }
+        let mut profile = DirectProfile::neutral(buses);
+        for (index, (row, default)) in PROCESSING_ROWS
+            .into_iter()
+            .zip(StripProcessing::DEFAULT.cells())
+            .enumerate()
+        {
+            let header = row.offset + shift;
+            let range = header + 12..header + 20;
+            let expected_header = [1, row.id, 2].map(u32::to_le_bytes).concat();
+            if self.model.get(header..range.start)? != expected_header {
+                return None;
+            }
+            for (column, slot) in self.model.get(range.clone())?.chunks_exact(4).enumerate() {
+                profile.tracks[column][index] = i32::from_le_bytes(slot.try_into().ok()?);
+            }
+            let mut neutral = [0; 8];
+            for column in neutral.chunks_exact_mut(4) {
+                column.copy_from_slice(&default.to_le_bytes());
+            }
+            cells.push((range, neutral));
+        }
+        cells.push((route, [0; 8]));
+        let header = bus_pre_gain_row(buses, shift);
+        let start = header + 12;
+        let range = start..start + 4 * buses as usize;
+        if self.model.get(header..start)? != [1, 0x19, buses as u32].map(u32::to_le_bytes).concat()
+        {
             return None;
         }
-        let cells = direct_track_cells(TWO_BUS_SHIFT + offset)
+        for (slot, value) in self
+            .model
+            .get(range.clone())?
+            .chunks_exact(4)
+            .zip(&mut profile.bus_pre_gain)
+        {
+            *value = i32::from_le_bytes(slot.try_into().ok()?);
+        }
+        cells.push((range, [0; 8]));
+        for (index, (row, default)) in PROCESSING_ROWS
             .into_iter()
-            .chain([gain, mute, mirror]);
-        (self.digest_with_neutral_cells(cells) == expected).then_some(2)
+            .zip(StripProcessing::DEFAULT.cells())
+            .enumerate()
+        {
+            let Some(ordinal) = row.bus_ordinal() else {
+                continue;
+            };
+            let header = bus_processing_row(ordinal, buses, shift);
+            let range = header + 12..header + 12 + 4 * buses as usize;
+            let expected_header = [1, row.id, buses as u32].map(u32::to_le_bytes).concat();
+            if self.model.get(header..range.start)? != expected_header {
+                return None;
+            }
+            let mut neutral = [0; 8];
+            for (column, slot) in self.model.get(range.clone())?.chunks_exact(4).enumerate() {
+                profile.bus_processing[column][index] = i32::from_le_bytes(slot.try_into().ok()?);
+                neutral[4 * column..4 * column + 4].copy_from_slice(&default.to_le_bytes());
+            }
+            cells.push((range, neutral));
+        }
+        if buses == 2 {
+            let [gain, mute, mirror] = bus_2_cells(shift - TWO_BUS_SHIFT);
+            if self.model[mute.clone()] != self.model[mirror.clone()] {
+                return None;
+            }
+            cells.extend([gain, mute, mirror].map(|range| (range, [0; 8])));
+        }
+        // The outer EQ slopes follow the track routing row in the archive.
+        cells.sort_unstable_by_key(|(range, _)| range.start);
+        let digest = self.digest_with_cells(cells);
+        expected.contains(&digest.as_str()).then_some(profile)
     }
 
     pub(crate) fn write_direct(
@@ -245,7 +556,11 @@ impl Mixer {
         two_bus_donor: Option<&Mixer>,
         mixer: crate::linked::mixer::DirectMixer,
     ) -> Result<String> {
-        if self.direct_profile() != Some(1) || !self.cells_are_neutral(direct_track_cells(0)) {
+        if self.direct_profile() != Some(DirectProfile::neutral(1))
+            || !self.cells_are_neutral(
+                direct_track_cells(0).into_iter().chain([DIRECT_PAN_BYPASS..DIRECT_PAN_BYPASS + 8]),
+            )
+        {
             return Err("expected a qualified neutral one-bus Fairlight template".into());
         }
         let shift = if mixer.buses == 2 {
@@ -254,7 +569,7 @@ impl Mixer {
                 .into_iter()
                 .chain(bus_2_cells(0));
             if donor.model.len() != 365_437
-                || donor.direct_profile() != Some(2)
+                || donor.direct_profile() != Some(DirectProfile::neutral(2))
                 || !donor.cells_are_neutral(cells)
             {
                 return Err("expected a qualified neutral two-bus Fairlight template".into());
@@ -270,6 +585,42 @@ impl Mixer {
         {
             for (slot, value) in self.model[cells].chunks_exact_mut(4).zip(values) {
                 slot.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        if mixer.buses == 1 {
+            for (slot, bypassed) in self.model[DIRECT_PAN_BYPASS..DIRECT_PAN_BYPASS + 8]
+                .chunks_exact_mut(4)
+                .zip(mixer.pan_bypassed)
+            {
+                slot.copy_from_slice(&i32::from(bypassed).to_le_bytes());
+            }
+        }
+        let [a1, a2] = mixer.processing.map(StripProcessing::cells);
+        for (row, (left, right)) in PROCESSING_ROWS.into_iter().zip(a1.into_iter().zip(a2)) {
+            let start = row.offset + shift + 12;
+            self.model[start..start + 4].copy_from_slice(&left.to_le_bytes());
+            self.model[start + 4..start + 8].copy_from_slice(&right.to_le_bytes());
+        }
+        let start = bus_pre_gain_row(mixer.buses, shift) + 12;
+        let end = start + 4 * mixer.buses as usize;
+        for (slot, value) in self.model[start..end]
+            .chunks_exact_mut(4)
+            .zip(mixer.bus_pre_gain)
+        {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+        for (column, bus) in mixer
+            .bus_processing
+            .into_iter()
+            .take(mixer.buses as usize)
+            .enumerate()
+        {
+            for (row, value) in PROCESSING_ROWS.iter().zip(bus.cells()) {
+                let Some(ordinal) = row.bus_ordinal() else {
+                    continue;
+                };
+                let start = bus_processing_row(ordinal, mixer.buses, shift) + 12 + 4 * column;
+                self.model[start..start + 4].copy_from_slice(&value.to_le_bytes());
             }
         }
         if mixer.buses == 2 {

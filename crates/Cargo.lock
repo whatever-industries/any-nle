@@ -257,6 +257,7 @@ version = "0.1.0"
 dependencies = [
  "anynle-avid-adapter",
  "anynle-graph",
+ "anynle-premiere-adapter",
  "avid-reader",
  "flate2",
  "hex",

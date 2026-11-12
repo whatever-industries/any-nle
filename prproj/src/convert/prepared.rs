@@ -569,7 +569,8 @@ impl PreparedProjectInput {
                     return Err(fail("prepared event range/grid mismatch"));
                 }
                 if let PreparedClip::Original(c) = c {
-                    if e.speed_ratio.is_some() || e.time_remap.as_ref().is_some_and(|map| {
+                    if (e.speed_ratio.is_some() && !is_linked_prores_constant_speed(c, s, e))
+                        || e.time_remap.as_ref().is_some_and(|map| {
                         !is_automatic_adapter_picture(c, s, e, map)
                     }) {
                         return Err(fail("original-file retiming is not qualified"));
@@ -616,6 +617,26 @@ impl PreparedProjectInput {
         }
         super::multicam::validate(self, &clips)
     }
+}
+
+fn is_linked_prores_constant_speed(c: &OriginalClip, s: &Sequence, e: &Event) -> bool {
+    let frame = ticks_per_unit(s.rate);
+    c.container == "mov"
+        && c.video.as_ref().is_some_and(|v| v.codec == "apch" && v.rate == s.rate)
+        && c.audio.is_none()
+        && s.rate == Fraction::new(24, 1)
+        && (s.width, s.height) == (1920, 1080)
+        && e.video_track == Some(1)
+        && e.audio_tracks.is_empty()
+        && e.stereo.is_empty()
+        && e.source_in % frame == 0
+        && e.time_remap.is_none()
+        && match e.speed_ratio {
+            Some((2, 1)) => e.source_duration.is_some_and(|source|
+                source % frame == 0 && source.checked_mul(2) == Some(e.duration)),
+            Some((-1, 1)) => e.source_duration == Some(e.duration),
+            _ => false,
+        }
 }
 pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
     let require = |b: bool, s: &str| if b { Ok(()) } else { Err(ModelError(s.into())) };

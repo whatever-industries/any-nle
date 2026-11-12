@@ -7,7 +7,7 @@ publication engine; the GUI does not run the CLI as a subprocess.
 
 The five steps are Project, Clips & media, Markers & colors, Effects, and Review.
 The Project step starts with **Translate from** and **Translate to**. Both menus list
-Avid Media Composer, Premiere, Resolve, Pro Tools and After Effects.
+Avid Media Composer, Premiere and Resolve.
 Avid Media Composer → Premiere is selected and is the only available direction.
 To inspect the menus with a keyboard, Tab to each dropdown and press Enter or
 Space to open it. Press Escape to close it.

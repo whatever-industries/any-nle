@@ -19,12 +19,13 @@ pub(super) fn transition(
     timeline_export: bool,
 ) -> Result<()> {
     let id = node.id()?;
-    let qualified = if kind == StreamKind::Video
-        && index == 1
-        && grid.rate == crate::prepare::rate()
+    let audio = kind == StreamKind::Audio;
+    let qualified = if index == 1
+        && (!audio || (!timeline_export && grid.rate == graph::Rational::integer(24)))
+        && dissolve::supported_rate(grid.rate)
         && grid.size == (1920, 1080)
     {
-        left_dissolve(node, neighbors, grid, timeline_export)?
+        read_transition(node, neighbors, grid, timeline_export, audio)?
     } else {
         None
     };
@@ -45,10 +46,11 @@ pub(super) fn transition(
         ("timeline_origin_frames", Value::Int(grid.origin)),
         (
             "interpretation",
-            text(if qualified.is_some() {
-                dissolve::INTERPRETATION
-            } else {
-                "saved_fields_only"
+            text(match qualified {
+                Some(_) if audio => dissolve::AUDIO_INTERPRETATION,
+                Some((_, _, _, 4)) => dissolve::CENTER_INTERPRETATION,
+                Some(_) => dissolve::INTERPRETATION,
+                None => "saved_fields_only",
             }),
         ),
     ];
@@ -75,7 +77,7 @@ pub(super) fn transition(
             fields.push((field, Value::Str(hex::encode(Sha256::digest(bytes)))));
         }
     }
-    if let Some((cut, outgoing, incoming)) = qualified {
+    if let Some((cut, outgoing, incoming, _)) = qualified {
         fields.extend([
             ("cut_frames", Value::Int(cut)),
             ("outgoing", text(outgoing)),
@@ -107,21 +109,27 @@ pub(super) fn transition(
     Ok(())
 }
 
-fn left_dissolve<'a>(
+fn read_transition<'a>(
     node: &Node,
     neighbors: [Option<&'a Node>; 2],
     grid: Grid,
     timeline_export: bool,
-) -> Result<Option<(i64, &'a str, &'a str)>> {
+    audio: bool,
+) -> Result<Option<(i64, &'a str, &'a str, i64)>> {
     let [Some(left), Some(right)] = neighbors else {
         return Ok(None);
     };
-    if left.name != "Sm2TiVideoClip" || right.name != "Sm2TiVideoClip" {
+    let clip_class = if audio { "Sm2TiAudioClip" } else { "Sm2TiVideoClip" };
+    if left.name != clip_class || right.name != clip_class {
         return Ok(None);
     }
+    let before = match node.maybe("AlignmentType")? {
+        Some(dissolve::ALIGNMENT) if !audio => dissolve::DURATION,
+        Some("2") => 4,
+        _ => return Ok(None),
+    };
     for (field, expected) in [
-        ("PrettyType", dissolve::TYPE),
-        ("AlignmentType", dissolve::ALIGNMENT),
+        ("PrettyType", if audio { dissolve::AUDIO_TYPE } else { dissolve::TYPE }),
         ("Position", dissolve::POSITION),
         ("Duration", "8"),
         ("Flags", "0"),
@@ -137,13 +145,14 @@ fn left_dissolve<'a>(
             return Ok(None);
         }
     }
-    if node.maybe("EffectFiltersBA")? != Some(dissolve::EFFECT)
+    let effect = node.maybe("EffectFiltersBA")?.unwrap_or("");
+    if effect != if audio { "" } else { dissolve::EFFECT }
         || !node
             .maybe("FieldsBlob")?
-            .is_some_and(if timeline_export {
-                dissolve::timeline_export_fields_match
-            } else {
-                dissolve::native_fields_match
+            .is_some_and(|fields| {
+                if audio { fields == dissolve::AUDIO_FIELDS }
+                else if timeline_export { dissolve::timeline_export_fields_match(fields) }
+                else { dissolve::native_fields_match(fields) }
             })
     {
         return Ok(None);
@@ -161,9 +170,9 @@ fn left_dissolve<'a>(
         return Ok(None);
     };
     if start < grid.origin
-        || left_length < dissolve::DURATION
-        || incoming_in < dissolve::DURATION
-        || start.checked_add(dissolve::DURATION) != Some(cut)
+        || left_length < before
+        || incoming_in < before
+        || start.checked_add(before) != Some(cut)
         || left_start.checked_add(left_length) != Some(cut)
     {
         return Ok(None);
@@ -171,7 +180,7 @@ fn left_dissolve<'a>(
     let Some(relative) = cut.checked_sub(grid.origin) else {
         return Ok(None);
     };
-    Ok(Some((relative, left.id()?, right.id()?)))
+    Ok(Some((relative, left.id()?, right.id()?, before)))
 }
 
 pub(super) fn append(graph: &mut SourceGraph, adapter: &str, owner: &str, value: Value) {
@@ -242,6 +251,65 @@ pub(super) fn time_map(encoded: &str, blobs: &mut encoding::Blobs) -> Result<Val
     Ok(Value::Obj(row))
 }
 
+pub(super) fn constant_picture_speed(
+    encoded: &str,
+    available: i64,
+    blobs: &mut encoding::Blobs,
+) -> Result<Option<crate::retime::PictureSpeed>> {
+    use crate::retime::PictureSpeed;
+    if !encoded.starts_with("00000001") {
+        return Ok(None);
+    }
+    let map = blobs.qt(encoded)?;
+    if map.keys().count() != 7
+        || map.text("DbType").ok().flatten() != Some("Sm2TimeMap")
+        || map.text("UniqueId").ok().flatten().and_then(|id| uuid::Uuid::parse_str(id).ok()).is_none()
+        || map.real("YMin").ok() != Some(-1.0)
+        || map.real("YMax").ok() != Some(-1.0)
+    {
+        return Ok(None);
+    }
+    let observed = (|| {
+        let payload = map.bytes("KeyframesBA").ok()?.strip_prefix(&[0x80])?;
+        use encoding::Wire;
+        let fields = encoding::fields(payload).ok()?;
+        let points = Value::Obj(map_keys(payload)?);
+        let Value::Arr(points) = points.get("keyframes")? else { return None };
+        let get = |point: &Value, key| match point.get(key)? {
+            Value::Float(value) => Some(*value),
+            _ => None,
+        };
+        let (first_source, last) = match (fields.as_slice(), points.as_slice()) {
+            ([(1, Wire::Bytes(_)), (1, Wire::Bytes(_))], [first, last])
+                if get(first, "record_seconds")? == 0.0 && first.get("saved_handles").is_none() =>
+            {
+                (get(first, "source_seconds")?, last)
+            }
+            _ => return None,
+        };
+        if last.get("saved_handles").is_some() {
+            return None;
+        }
+        Some([
+            first_source,
+            get(last, "record_seconds")?,
+            get(last, "source_seconds")?,
+            map.real("LastValidYOffset").ok()?,
+            map.real("XMax").ok()?,
+        ])
+    })();
+    Ok(observed.and_then(|observed| {
+        [PictureSpeed::Half, PictureSpeed::Reverse].into_iter().find(|mode| {
+            mode.coordinates(available).is_some_and(|(first, last_record, last_source, source_end)| {
+                [first, last_record, last_source, source_end, last_record]
+                    .into_iter()
+                    .zip(observed)
+                    .all(|(expected, saved)| (expected - saved).abs() * 24.0 <= 1e-7)
+            })
+        })
+    }))
+}
+
 fn compact_map(bytes: &[u8]) -> Option<Vec<Value>> {
     let [2, payload @ ..] = bytes else {
         return None;
@@ -265,7 +333,13 @@ fn map_keys(bytes: &[u8]) -> Option<Vec<(String, Value)>> {
         decoded = zstd::bulk::decompress(&bytes[1..], 16 << 10).ok()?;
         &decoded
     } else {
-        bytes
+        // Resolve's uncompressed envelope starts with 0x80. The documented
+        // bare protobuf marker (field 160 = 0) starts with the same byte.
+        if bytes.starts_with(&[0x80, 0x0a, 0x00, 0x0a]) {
+            bytes
+        } else {
+            bytes.strip_prefix(&[0x80]).unwrap_or(bytes)
+        }
     };
     let mut keys = Vec::new();
     let mut origin = None;

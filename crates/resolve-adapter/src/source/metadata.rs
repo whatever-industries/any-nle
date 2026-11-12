@@ -2,13 +2,21 @@
 use super::{encoding, Blobs, Node, Result, Sidecar, SourceGraph, Value};
 use sha2::{Digest, Sha256};
 
+pub(super) const ADAPTER: &str = "resolve.media_metadata";
+pub(super) const REEL: &str = "BtVideoInfo.VideoMetadata.ActualReelNumber";
+pub(super) const TIMECODE: &str = "BtVideoTime.Timecode";
+
 pub(super) fn capture(
     clip: &Node,
     cache: &Node,
+    saved_timecode: Option<&str>,
     blobs: &mut Blobs,
     graph: &mut SourceGraph,
 ) -> Result<()> {
     let mut fields = Vec::new();
+    if let Some(value) = saved_timecode {
+        fields.push((TIMECODE.into(), Value::Str(value.into())));
+    }
     if let Some(value) = clip
         .maybe("UniqueMediaPoolItemId")?
         .filter(|value| !value.is_empty())
@@ -25,10 +33,7 @@ pub(super) fn capture(
             .and_then(|map| Ok(map.text("ActualReelNumber")?.map(str::to_owned)))
         {
             Ok(Some(reel)) if !reel.is_empty() => {
-                fields.push((
-                    "BtVideoInfo.VideoMetadata.ActualReelNumber".into(),
-                    Value::Str(reel),
-                ));
+                fields.push((REEL.into(), Value::Str(reel)));
             }
             Ok(_) => {}
             Err(_) => fields.push(("VideoMetadata.unresolved_sha256".into(), digest(&data))),
@@ -45,7 +50,7 @@ pub(super) fn capture(
     }
     if !fields.is_empty() {
         graph.sidecars.push(Sidecar {
-            adapter: "resolve.media_metadata".into(),
+            adapter: ADAPTER.into(),
             object: clip.id()?.into(),
             data: Value::Obj(fields),
         });

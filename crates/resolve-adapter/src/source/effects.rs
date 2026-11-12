@@ -1,6 +1,8 @@
 //! Resolve clip controls corroborated by native renders.
 use super::*;
-use crate::audio::{EFFECT, HEAD, KEY_FLAGS, TAIL, VOLUME, VOLUME_DB};
+use crate::audio::{
+    Envelope, FadePoint, Fades, Volume, VolumeKeys, EFFECT, HEAD, HEAD_POINT, KEY_FLAGS, TAIL, TAIL_POINT, VOLUME, VOLUME_DB,
+};
 use crate::video::{
     motion::{Curve, LinearMotion, CONTROLS, KEY_BYTES, KEY_FLAGS as VIDEO_KEY_FLAGS},
     PictureControl, Reflection, CROP, FLIP_X, FLIP_Y, SCALE_X, SCALE_Y, X, Y,
@@ -178,41 +180,53 @@ fn static_slot(slots: &[&[u8]], (slot, id): (usize, u64), neutral: f64) -> Resul
     }
 }
 
-pub(super) enum ClipAudio {
-    StaticVolume(f64),
-    VolumeKeys([(i64, f64); 2]),
-    Fades { head: i64, tail: i64 },
-}
-
 pub(super) fn clip_audio(
     encoded: &str,
     blobs: &mut Blobs,
     edit: Edit,
-) -> Result<Option<ClipAudio>> {
+) -> Result<Option<Envelope>> {
     let bytes = blobs.envelope(encoded)?;
     let Some(slots) = control_slots(&bytes, EFFECT)? else {
         return Ok(None);
     };
-    let [volume, head, tail, [], []] = slots.as_slice() else {
+    let [volume, head, tail, in_shape, out_shape] = slots.as_slice() else {
         return Ok(None);
     };
-    if head.is_empty() && tail.is_empty() {
-        if let Some(db) = static_parameter(volume, VOLUME)?.filter(|db| VOLUME_DB.contains(db)) {
-            return Ok(Some(ClipAudio::StaticVolume(db)));
+    let volume = if volume.is_empty() {
+        None
+    } else if let Some(db) = static_parameter(volume, VOLUME)?.filter(|db| VOLUME_DB.contains(db)) {
+        Some(Volume::Static(db))
+    } else if let Some(keys) = volume_keys(volume, edit)? {
+        Some(Volume::Keys(keys))
+    } else {
+        return Ok(None);
+    };
+    let fades = if [head, tail, in_shape, out_shape].iter().all(|slot| slot.is_empty()) {
+        None
+    } else {
+        let (Some(head), Some(tail)) = (
+            fade_length(head, HEAD, edit.length)?,
+            fade_length(tail, TAIL, edit.length)?,
+        ) else {
+            return Ok(None);
+        };
+        let head_point = fade_point(in_shape, HEAD_POINT)?
+            .and_then(|(position, level)| FadePoint::new(position, level));
+        let tail_point = fade_point(out_shape, TAIL_POINT)?
+            .and_then(|(position, level)| FadePoint::new(position, level));
+        if (!in_shape.is_empty() && head_point.is_none())
+            || (!out_shape.is_empty() && tail_point.is_none())
+            || (matches!(volume, Some(Volume::Static(_))) && head_point.is_none() && tail_point.is_none())
+        {
+            return Ok(None);
         }
-        return Ok(volume_keys(volume, edit)?.map(ClipAudio::VolumeKeys));
-    }
-    // Combined curves and other active Fairlight controls need separate evidence.
-    if !volume.is_empty() {
-        return Ok(None);
-    }
-    let (Some(head), Some(tail)) = (
-        fade_length(head, HEAD, edit.length)?,
-        fade_length(tail, TAIL, edit.length)?,
-    ) else {
-        return Ok(None);
+        let fades = Fades { head, tail, head_point, tail_point };
+        if !fades.valid_for(edit.length) {
+            return Ok(None);
+        }
+        Some(fades)
     };
-    Ok((head + tail <= edit.length).then_some(ClipAudio::Fades { head, tail }))
+    Ok((volume.is_some() || fades.is_some()).then_some(Envelope { volume, fades }))
 }
 
 /// Capture documented custom fade control points without assigning a
@@ -227,8 +241,8 @@ pub(super) fn custom_fades(encoded: &str, blobs: &mut Blobs, edit: Edit) -> Resu
     ];
     let mut seen = false;
     for (edge, duration_id, point_id, duration, shape) in [
-        ("in", HEAD, 99, *head, *in_shape),
-        ("out", TAIL, 100, *tail, *out_shape),
+        ("in", HEAD, HEAD_POINT, *head, *in_shape),
+        ("out", TAIL, TAIL_POINT, *tail, *out_shape),
     ] {
         let Some(length) = fade_length(duration, duration_id, edit.length)? else { continue };
         if !duration.is_empty() {
@@ -237,14 +251,9 @@ pub(super) fn custom_fades(encoded: &str, blobs: &mut Blobs, edit: Edit) -> Resu
         if shape.is_empty() {
             continue;
         }
-        let params = fields(shape)?;
-        let [(1, Wire::Int(id)), (7, Wire::Bytes(point))] = params.as_slice() else { continue };
-        if *id != point_id || point.len() != 16 || length == 0 {
-            continue;
-        }
-        let position = f64::from_be_bytes(point[..8].try_into()?);
-        let level = f64::from_be_bytes(point[8..].try_into()?);
-        if (0.0..=100.0).contains(&position) && level.is_finite() {
+        if let Some((position, level)) = fade_point(shape, point_id)?
+            .filter(|(position, level)| length > 0 && (0.0..=100.0).contains(position) && level.is_finite())
+        {
             data.push((format!("{edge}_point"), Value::Obj(vec![
                 ("position_percent".into(), Value::Float(position)),
                 ("relative_tenths_db".into(), Value::Float(level)),
@@ -258,6 +267,31 @@ pub(super) fn custom_fades(encoded: &str, blobs: &mut Blobs, edit: Edit) -> Resu
     Ok(seen.then_some(Value::Obj(data)))
 }
 
+fn fade_point(shape: &[u8], expected: u64) -> Result<Option<(f64, f64)>> {
+    let params = fields(shape)?;
+    let [(1, Wire::Int(id)), (3, Wire::Bytes(curve))] = params.as_slice() else {
+        return Ok(None);
+    };
+    if *id != expected {
+        return Ok(None);
+    }
+    let curve = fields(curve)?;
+    let [(1, Wire::Bytes(point))] = curve.as_slice() else {
+        return Ok(None);
+    };
+    let point = fields(point)?;
+    let [(7, Wire::Bytes(point))] = point.as_slice() else {
+        return Ok(None);
+    };
+    if point.len() != 16 {
+        return Ok(None);
+    }
+    Ok(Some((
+        f64::from_be_bytes(point[..8].try_into()?),
+        f64::from_be_bytes(point[8..].try_into()?),
+    )))
+}
+
 fn fade_length(data: &[u8], id: u64, limit: i64) -> Result<Option<i64>> {
     if data.is_empty() {
         return Ok(Some(0));
@@ -267,7 +301,7 @@ fn fade_length(data: &[u8], id: u64, limit: i64) -> Result<Option<i64>> {
         .map(|n| n as i64))
 }
 
-fn volume_keys(data: &[u8], edit: Edit) -> Result<Option<[(i64, f64); 2]>> {
+fn volume_keys(data: &[u8], edit: Edit) -> Result<Option<VolumeKeys>> {
     let parameters = fields(data)?;
     let [(1, Wire::Int(VOLUME)), (3, Wire::Bytes(first)), (10, Wire::Bytes(keys))] =
         parameters.as_slice()
@@ -279,12 +313,12 @@ fn volume_keys(data: &[u8], edit: Edit) -> Result<Option<[(i64, f64); 2]>> {
     }
     let mut pair = [(0, 0.0); 2];
     for (entry, bytes) in pair.iter_mut().zip(keys[4..].chunks_exact(16)) {
-        let frame = i64::from(u32::from_le_bytes(bytes[..4].try_into()?));
+        let frame = u32::from_le_bytes(bytes[..4].try_into()?);
         let flags = u32::from_le_bytes(bytes[4..8].try_into()?);
         let db = f64::from_le_bytes(bytes[8..].try_into()?);
         if flags != KEY_FLAGS
             || !VOLUME_DB.contains(&db)
-            || !(edit.source_in..edit.source_in + edit.length).contains(&frame)
+            || !(edit.source_in..edit.source_in + edit.length).contains(&i64::from(frame))
         {
             return Ok(None);
         }
@@ -575,7 +609,7 @@ mod tests {
             "0000000200000020800a1d087c38004a0f085f1a0b0a091100000000000018c04a004a004a004a00";
         let plus = minus.replacen("18c0", "0840", 1);
         for (native, db) in [(minus, -6.0), (plus.as_str(), 3.0)] {
-            let encoded = crate::audio::Envelope::StaticVolume(db).encode().unwrap();
+            let encoded = Envelope::static_volume(db).encode().unwrap();
             assert_eq!(
                 crate::binary::unpack(native).unwrap(),
                 crate::binary::unpack(&encoded).unwrap(),
@@ -588,7 +622,7 @@ mod tests {
                 length: 28,
             };
             match clip_audio(encoded, &mut Blobs::default(), edit).unwrap() {
-                Some(ClipAudio::StaticVolume(db)) => Some(db),
+                Some(Envelope { volume: Some(Volume::Static(db)), fades: None }) => Some(db),
                 _ => None,
             }
         };
@@ -621,8 +655,8 @@ mod tests {
         let keys = "00000002000000428128b52ffd2045c50100c4020a43087c38004a35085f1a0b0a09110018c05224ffffffe008000c0018c013000c0008404a004a004a004a000510008303191cc8b504";
         use crate::audio::Envelope;
         for (witness, controls) in [
-            (fades, Envelope::Fades { head: 5, tail: 9 }),
-            (keys, Envelope::VolumeKeys([(8, -6.0), (19, 3.0)])),
+            (fades, Envelope { volume: None, fades: Some(Fades::linear(5, 9)) }),
+            (keys, Envelope { volume: Some(Volume::Keys([(8, -6.0), (19, 3.0)])), fades: None }),
         ] {
             assert_eq!(
                 crate::binary::unpack(witness).unwrap(),
@@ -644,9 +678,9 @@ mod tests {
         for source_in in [2, 6] {
             assert!(matches!(
                 read(fades, source_in, 28),
-                Some(ClipAudio::Fades { head: 5, tail: 9 })
+                Some(Envelope { volume: None, fades: Some(Fades { head: 5, tail: 9, .. }) })
             ));
-            let Some(ClipAudio::VolumeKeys(points)) = read(keys, source_in, 28) else {
+            let Some(Envelope { volume: Some(Volume::Keys(points)), fades: None }) = read(keys, source_in, 28) else {
                 panic!("expected exact source-coordinate volume keys");
             };
             assert_eq!(points, [(8, -6.0), (19, 3.0)]);
@@ -665,5 +699,35 @@ mod tests {
         })
         .unwrap();
         assert!(read(&crate::binary::pack(&bad).unwrap(), 2, 28).is_none());
+    }
+
+    #[test]
+    fn custom_fade_points_use_native_curve_nesting_and_require_a_fade() {
+        let body = hex::decode(concat!(
+            "0a5c087c38004a004a0f08611a0b0a091100000000000020404a0f08621a0b0a09110000000000002040",
+            "4a1808631a140a123a10404f690690690690c039000000000000",
+            "4a1808641a140a123a10404296f96f96f970c042800000000000",
+        )).unwrap();
+        let read = |body: &[u8], length| {
+            clip_audio(
+                &crate::binary::pack(body).unwrap(),
+                &mut Blobs::default(),
+                Edit { start: 0, source_in: 4, length },
+            ).unwrap()
+        };
+        let Some(envelope @ Envelope { volume: None, fades: Some(fades) }) = read(&body, 24) else {
+            panic!("expected the native fade points");
+        };
+        assert_eq!(fades.head_point, FadePoint::new(62.82051282051282, -25.0));
+        assert_eq!(fades.tail_point, FadePoint::new(37.17948717948718, -37.0));
+        assert_eq!(
+            crate::binary::unpack(&envelope.encode().unwrap()).unwrap(),
+            body,
+        );
+        assert!(read(&body, 15).is_none());
+        let mut outside = body.clone();
+        let pos = outside.windows(8).position(|bytes| bytes == 62.82051282051282f64.to_be_bytes()).unwrap();
+        outside[pos..pos + 8].copy_from_slice(&100.0f64.to_be_bytes());
+        assert!(read(&outside, 24).is_none());
     }
 }

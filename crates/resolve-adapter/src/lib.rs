@@ -4,15 +4,25 @@ mod atom;
 mod audio;
 mod avid;
 mod binary;
+mod captions;
+mod clip_label;
 mod dissolve;
+mod generator;
+mod grade;
 mod group;
 pub mod linked;
 mod media;
+mod marker_palette;
+mod nests;
 mod prepare;
 mod premiere;
+pub mod premiere_export;
 pub mod relink;
+mod retime;
 pub mod source;
 pub mod turnover;
+mod timeline_marks;
+mod track_state;
 mod video;
 
 pub use archive::{

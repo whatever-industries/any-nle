@@ -46,10 +46,20 @@ outer angle cuts, and independent mono audio selectors. A leaf placement
 is emitted only where its selected source covers the use. The full Group
 use retains the original range and any gap or unresolved binding.
 
-Sequence markers preserve relative position, duration, title and note.
-Blue, Red and Lavender have native color witnesses. Other saved color bits
-and custom data remain in a Resolve receipt. Clip-owned marker clocks are
-unqualified. Bounded static position, independent scale, crop, and
+Sequence markers preserve relative position, duration, title, note, all
+16 Resolve marker colors, and saved custom data. The writer verifies
+these values and the sequence owner before publication. Clip-owned marker
+clocks and cross-editor palette equivalents remain open.
+
+The linked writer preserves matching audio and video timeline In/Out
+marks, including In-only and Out-only selections. These are timeline-relative
+frames, and Out is inclusive. The paired 24 fps control selected the same
+35-frame native render after reopen. Independent audio and video marks
+and frame-zero In marks remain readable and block writing because fresh
+Resolve imports changed those selections. [Pinned pr2resolve format notes](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md#颜色标记与编辑状态)
+· [Pinned drpkit marker notes](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/FORMAT.md#edit-information---edits)
+
+Bounded static position, independent scale, crop, and
 isolated horizontal and vertical reflections use the witnessed controls
 on equal 1920×1080 source and timeline rasters. A reflection is read as
 a `resolve.flip` effect with both axis flags. The witnessed two- and
@@ -73,10 +83,48 @@ bounded two-point volume curve preserves exact item-source times and dB
 values. Its interpolation and hold law stay in Resolve metadata. Default
 linear-amplitude fades retain whole-frame head and tail lengths as
 clip-edge metadata and report the portable representation loss. The
-current graph and destination interfaces stay unchanged. Combined
-controls, custom fade shapes, keys outside the edit, wider gain ranges,
-Group audio effects, other mixer controls, mixed rates, and discontinuous
+linked-project writer also rebuilds these two envelope types on qualified
+24 fps mono WAV edits and checks the reconstructed control on each clip
+before publication.
+
+The Resolve reader also retains one custom curve point per clip edge
+through graph/2. The writer rebuilds the editable Resolve curve on the
+24 fps linked mono WAV profile and the 23.976 standalone OP1a profile.
+Each point belongs to a nonzero fade and stores a position from 1 to
+99 percent and a level relative to clip volume from −6 to 0 dB. The
+clip's qualified static volume stays separate. In the saved envelope,
+parameters 99 and 100 store two big-endian doubles at field path
+`3 → 1 → 7`. A test with field 7 directly on the parameter lost both
+points after Resolve reopen. [Pinned drpkit fade notes](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/FORMAT.md#unresolved)
+
+The same clip can carry both its two Linear volume keys and default or
+custom fade controls. Graph/2 keeps the keys on the item source clock and
+the fade lengths on the edit edges. Resolve reopened both controls and
+matched the isolated audio on the qualified 24 fps WAV and 23.976 OP1a
+profiles. Curve interpolation outside Resolve, keys outside the edit,
+wider gain ranges, Group audio effects, mixed rates and discontinuous
 MultiGroups need separate evidence.
+
+Resolve timeline clip colors live in the project lockable blob map.
+The linked writer preserves all 16 known color codes by edit occurrence.
+It uses the generated edit UUID as the label owner, including when two
+edits reference the same media and share a display name. Read-back checks
+each generated owner and its code. Uncolored edits carry no color entry.
+An unknown code or duplicate label owner blocks the affected round trip.
+Color mappings from other editors need separate evidence. [Pinned drpkit clip color notes](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/FORMAT.md#edit-information---edits)
+
+Linked Resolve exports preserve names and edit locks on the qualified
+V1/A1/A2 timeline. Graph/2 records them by sequence and track kind/index,
+so repeated names keep separate owners. The writer sets the timeline's
+`UserDefinedName` and lock bit and writes the matching audio name and
+lock rows in Fairlight. It checks the decoded state before publication.
+Native audio XML and mixer values that disagree block the write. This
+profile preserves lock separately from audio mute. [Pinned pr2resolve track state notes](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md#颜色标记与编辑状态)
+
+The same profile preserves disabled V1 independently of the edit lock.
+The output retains the original edits and can be re-enabled. Resolve
+reopened the disabled and disabled-plus-locked controls and rendered black
+picture while both audio channels matched the enabled control.
 
 Static track faders on the qualified two-mono Fairlight mixer map to
 the graph track's level. Static clip volume stays on the placement.
@@ -141,6 +189,69 @@ reported just the added transition. The replay also covered a one-frame
 source trim, switched WAV channels, duplicate names, ambiguous slots and
 unresolved bindings. Native archives and reports remain in private local
 evidence.
+
+## Check conform at V1 cuts
+
+```text
+resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json
+resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json --renders REFERENCE.mov CANDIDATE.mov FFMPEG FFPROBE
+```
+
+Select exact timeline IDs in DRP, qualified DRT, or saved graph/2 files.
+The probe samples the two sides of each internal V1 edit boundary on
+either timeline, at matching exact 24 or 23.976 rates and a known common
+origin. The report compares the full saved locator and the file-relative
+source frame, applying the item-to-file offset once. It also compares
+physical video stream selectors when both are known. The profile covers
+originals linked in place. Unknown mappings are inconclusive, and a
+confirmed mismatch stays visible alongside gaps. Qualified dissolve
+windows use half-open frame intervals, and samples inside them are
+excluded.
+
+For the optional picture check, supply same-profile full-timeline MOV
+renders beginning at record frame zero. The probe checks their decoded
+extent and constant frame grid and compares the SHA-256 of decoded pixels
+at the eligible positions. It reports picture and saved mapping results
+independently. For example, a missing source offset can leave the saved
+mapping inconclusive while the supplied pictures still match. An
+unavailable or unsuitable render leaves the saved mapping report usable.
+Each media process has a 60-second deadline and an 8 MiB output limit.
+Reports are written exclusively.
+
+The retained straight-cut graph and DRP both map record frames 23 and
+24 to file frames 28 and 8. The native and reopened dissolve renders
+match at record frame 24, with frames 16–23 excluded. Local controls
+detected a one-frame slip, a same-name locator change, and a picture
+mismatch with matching saved mappings. [Pinned conform runbook](https://github.com/samuelgursky/davinci-resolve-mcp/blob/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/conform-qc/docs/runbook.md)
+
+### Verify conform after a media move
+
+```text
+resolve-source-probe --conform BEFORE.drp BEFORE_ID REOPENED.drp REOPENED_ID OUTPUT.json --moves MOVES.json [--checksums MANIFEST.json] [--renders BEFORE.mov REOPENED.mov FFMPEG FFPROBE]
+```
+
+Use the [verified relink](VERIFIED-RELINK.md) move list and optional pre-move
+checksum manifest. The original paths in the reference DRP may be offline.
+Path mode checks the moved files at their explicit destinations and checks
+embedded reel and source timecode for duplicate basenames. Checksum mode
+hashes the moved files against the reference manifest. The probe uses
+`ffprobe` on PATH or the tool supplied with `--renders`. If move evidence
+fails or a destination changes during the check, the probe exits with an
+error before it publishes a report.
+
+Each cut sample shows the original locator, expected destination, and actual
+candidate locator. The probe checks the exact file-relative frame and any
+known physical selector, and compares saved reel and timecode where the
+reference establishes them. Missing candidate metadata makes that sample
+inconclusive unless another fact already differs. Supplied render results
+remain independent.
+
+Both verification modes matched the retained same-name DRPs and renders at
+record frames 23 and 24. The saved archives select file frames 27 and 5.
+The outgoing edit's saved In is 4, while the earlier Resolve scripting
+readback reported 3. The outgoing source repeats its picture, so the
+render comparison confirms picture equality at the cut without resolving
+that source-index discrepancy.
 
 ## Inventory saved effects
 
@@ -218,3 +329,216 @@ can recreate bounded static clip volume, fades, two-point volume keys,
 static track faders, static main bus fader and static track mute using the
 saved Resolve clock and verified media inputs. The envelope and mixer
 receipts remain Resolve-specific.
+
+## Editable conversion profiles
+
+The linked DRP probe consumes saved graph/2 through the existing internal
+manifest. The following profiles use exact rates and source trims; unsupported
+timing, routing and topology remain explicit. The public routes are unchanged.
+
+- **Picture retiming:** A same-rate 24 fps picture-only edit can carry
+  50% forward or 100% reverse as graph/2 `Speed`. Resolve's saved map uses
+  a stretched In for half speed and an end-relative In for reverse. Qualified
+  two-point maps and Premiere 27 saved speed/direction use the same file
+  range in graph/2. Other maps remain source observations. Each of two
+  24-frame Resolve renders matched the corresponding native control after
+  save, close, and reopen. The Premiere 27 saves read back through graph/2
+  and produced matching Resolve renders. Premiere 27 uses raw file In/Out
+  for the linked forward clip and end-relative In/Out for reverse. The
+  corrected Premiere files matched all 48 source frame selections after
+  Save As, close, and reopen.
+- **Plain captions:** One Resolve subtitle track with editable default
+  styling maps to graph/2 `SourceText`. The saved XML and visible burn-in
+  checks passed for two adjacent accented cues, one multiline, on a
+  nonzero timeline start. Premiere saved caption text is supported as input;
+  preserve destination defaults and report unmapped styling. Both cues
+  were visible in the reopened Premiere projects. A retained Avid SubCap
+  over linked OP-Atom at 24000/1001 mapped V2 to Resolve subtitle 1, with
+  both saved lines and all 48 visible frames after reopen. More than one
+  source caption lane requires a separate mapping.
+- **Dissolve:** One eight-frame left or center V1 Cross Dissolve between
+  plain edits at 24 or 24000/1001. The Resolve sequence-owned transition
+  receipt keeps the native alignment, interval, and endpoint IDs. Avid
+  Blend Dissolve and Premiere Cross Dissolve use graph/2 transition
+  occurrences and verified handles. The two 24 fps native Resolve
+  comparisons matched all 48 decoded frames in each timeline. One centered
+  eight-frame 0 dB A1 Cross Fade is also writable at 24 fps with verified
+  WAV handles. The native reopened comparison matched both isolated
+  PCM lanes; the difference from straight cuts stayed inside the A1
+  fade window. The comparison control was made from documented saved
+  fields, then imported, saved, reopened and rendered in Resolve.
+- **Structure:** A matched native skeleton supports 24 fps V1/V2 overlap
+  and three independent 48 kHz PCM WAV mono lanes. All 48 picture frames
+  and three distinct isolated PCM renders matched after reopen. The
+  [picture nesting profile](#write-picture-nests) also writes one level of
+  native Resolve compound clips and nested timelines by saved child ID.
+- **Generator and titles:** A sequence-owned `resolve.generators` receipt
+  can recreate one opaque Solid Color generator at the end of a picture-only
+  V1 timeline. The combined native control reopens with that generator,
+  speed edits, captions and a separate dissolve. The Text+ source reader
+  extracts bounded literal controls without evaluating the Fusion graph.
+  Editable Text+ writing and visible text qualification remain open.
+- **Color and Fairlight:** `resolve.primary_gain` belongs to the graded edit.
+  One exact primary node profile can be recreated in Resolve. The 1.25
+  control matches the native render on all 24 frames; a 1.5 control changes
+  the output. The [Fairlight track processing profile](#write-fairlight-track-processing)
+  also writes one EQ bell and the compressor switch, ratio, threshold
+  and timing.
+
+The internal reverse route uses
+`resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj`.
+It verifies the original 1080p24 ProRes HQ picture binding and qualified clock
+before handing the prepared graph to the Premiere writer. It does not flatten
+unresolved nested edits, grade controls or generators.
+
+## Write picture nests
+
+The internal linked probe can round-trip one level of picture-only 1080p24
+nests on V1. Select the parent and every referenced child by exact sequence
+ID in the project manifest, including unregistered compound children. Use
+the saved owning bin for each row. Ordinary project registration order is
+preserved independently of where the compound definitions appear in the
+manifest.
+
+```text
+resolve-source-probe INPUT.drp GRAPH.json
+resolve-linked-probe GRAPH.json SPEC.json MONO-LAYOUT.drp RATE-PROFILE.drp FFPROBE OUTPUT.drp --nested NEST-TEMPLATE.drp
+```
+
+The same-build synthetic donor is hash-pinned at
+`48aa85bd7184d72532b52f993158e7c515b9e820887855f4e1065798b7e5263a`.
+Use fresh source receipts so the writer can verify the plain picture
+mapping and the compound's saved `SeqRef` container link. The parent
+clip's `In` stays relative to its child; `MediaStartTime` retains the
+child origin. The identity time map spans the child, including material
+outside the parent edit. Before publication, the staged reader checks the
+generated pool and sequence IDs, child extent, parent range, trim, and
+compound container linkage. Audio nests, deeper nesting, and mixed rates
+remain unsupported.
+
+Resolve Studio 21.2.0 build 00006 reopened two identically named children
+at 02:00:00:00 and 03:00:00:00 with parent trims of 3 and 7 frames. The
+writer intentionally registered them in the opposite order. The 32-frame
+parent matched the native control frame for frame, including its trimmed
+compound. Editing the 02:00 child advanced only its ten parent frames.
+A second control with two compound clips, one starting at 00:00:10:00,
+matched all 40 parent frames after reopen. These are Resolve round trips.
+[Native structure reference](https://github.com/samuelgursky/davinci-resolve-mcp/blob/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/drp-format/compound-nav.js)
+
+
+## Write Fairlight track processing
+
+The internal linked DRP writer preserves all six track EQ bands on the
+qualified two-mono Resolve profile. Each band retains its switch,
+filter type, frequency and knob position, gain and Q. Bands 2–5 also
+retain the saved frequency range. Bands 1 and 6 retain their slope.
+The writer also preserves the EQ switch, processing order, dynamics
+makeup gain and the compressor switch, threshold, ratio, attack, hold,
+release, knee and mix. The reader verifies the
+mixer fingerprint with the supported rows restored to
+their defaults. The saved frequency, range and knob position must agree.
+Two exact factory frequency/knob pairs have a separate check because
+they differ from the edited frequency law.
+Q, ratio, timing, knee and mix retain their native encoding. The writer
+checks the qualified values against the raw track rows and verifies the
+staged archive.
+Older receipts can omit later controls at their native defaults.
+
+The native comparison uses two separate channels and a third project
+with both controls active. Resolve Studio 21.2.0 build 00006 reopens and
+re-exports each generated project. In the 24 fps fixtures, a +6 dB bell on
+A1 and an enabled compressor at −30 dB on A2 changed only their own
+channel. Each generated render matched its reopened control over all
+96,000 stereo PCM24 sample frames and 48 picture frames. The controls
+were prepared with targeted changes to documented saved rows and then
+saved and reopened in Resolve. Both ratio encodings and a disabled
+compressor with changed threshold and ratio survive reopen. A two-bus
+control retained its A1/A2 routes and Bus 2 fader while Bus 1 PCM
+matched its native reference.
+
+Separate 24 fps controls also verify a 1223 Hz bell in the high-mid
+range, a changed Q and changed compressor timing. Reopened writer
+outputs match every PCM sample and picture frame in each comparison.
+The EQ changes affect A1 only and the timing changes affect A2 only.
+The combined control preserves both.
+
+Separate changes to knee, mix and makeup gain changed only the
+compressed A2 signal. Bypassing EQ changed only A1 and retained the
+saved bell controls. On A2 with EQ and compression active, putting EQ
+before Dynamics changed the render relative to the same settings in
+Dynamics-before-EQ order. These checks used one stereo bus and no inserts;
+the order field does not enable insert plug-in conversion.
+
+The writer accepts band gains from −20 to +20 dB and thresholds from
+−60 to 0 dB on this profile. The four middle bands accept low shelf,
+bell, notch and high shelf. The outer bands accept both shelves and
+notch, plus high-pass on band 1 and low-pass on band 6. It admits
+compressor knee and mix codes from 0 to 100 and makeup gain from 0 to
++12 dB.
+
+The same profile preserves the built-in expander's switch, threshold,
+range, ratio and timing, plus the limiter's switch, threshold and timing.
+Each remains tied to its saved mono strip. The expander threshold, range,
+ratio and both processors' timing retain their saved encodings; this
+path does not convert their knobs into settings for another editor.
+The shared expander/gate slot accepts saved mode 0 for expander and mode 1
+for gate. Mode and enable are separate. Other mode codes and malformed
+knob codes remain readable source observations and block this write profile.
+In the 24 fps control, the expander affected only A1, the limiter only A2,
+and disabled processors retained edited settings with unchanged audio.
+All four reopened writer outputs matched 96,000 stereo PCM24 sample
+frames and 48 picture frames per case.
+
+The gate comparison uses a two-level A1 signal. With the same threshold,
+range and timing rows, mode 1 attenuates the quiet section more than mode
+0. A lower-threshold gate control passes the quiet section as well. The
+writer preserves the selected mode and settings even when the enable
+switch is off. The scope is the built-in track gate on the qualified
+two-mono profile.
+
+Multitone controls exercised pass-filter slopes, both shelves, bells
+and notches, per-band enable and master EQ bypass. The reopened controls
+retain independent A1 and A2 settings, and bypass renders match the
+neutral reference. The filter choices and frequency checks are scoped
+to the qualified track EQ profile. In a repeated outer-shelf test,
+two separate imports of the same reference archive rendered different
+A2 spectra with identical exported mixer bytes. Each import gave
+identical PCM across three consecutive renders.
+
+The writer preserves compressor and limiter controls independently on
+each bus in the qualified one- and two-stereo-bus layouts. Preparation
+checks the interpreted settings against the raw rows and preserves the
+saved values when a processor is off. The compressor retains ratio,
+knee, mix, threshold and timing. The limiter retains threshold and
+timing. Dynamics makeup gain also round-trips.
+
+The two-bus test exports two stereo PCM streams. Enabling the limiter
+on one bus leaves the other stream sample-identical to neutral. A
+second test uses distinct compressor settings per bus, then adds a
+limiter to Bus 2. Each stream retains its own response. Disabled
+settings survive with neutral PCM.
+
+The same stereo bus profiles preserve all six EQ bands independently,
+including filter types, frequency and knob values, Q, outer-band slope,
+middle-band range, per-band enable and the bus EQ switch. The graph receipt
+keeps each control on its bus and is checked against the saved numeric rows.
+The reopened multitone controls verify independent processing and bypass
+with saved settings intact. In the simultaneous six-band case, Bus 1
+matched exactly across imports. Bus 2 initially differed by 0.248 dB RMS
+between the reference and writer. A new import of the same reference
+archive rendered at the writer's level, and the exported mixer bytes
+remained identical. Exact PCM across imports is unqualified for that case.
+The two observed
+processing-order codes survive a round trip, and rendered PCM was identical
+between those codes in the bus EQ and compressor fixture. The qualified bus
+tables contain no track expander or gate rows.
+
+The same profiles preserve the saved bus input-gain row (`0x019`)
+from −6 to +6 dB in tenths of a decibel. This value has its own bus
+receipt and storage location, separate from the bus fader and dynamics
+makeup. Resolve rendered the expected gain on each assigned output.
+drpkit labels this field pre-dynamics gain. With the tested compressor
+settings, applying +6 dB here or at the fader produced identical PCM,
+so this comparison leaves the processing position open.
+[drpkit Fairlight field map](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/FORMAT.md#channel-items)
+· [Pinned frequency ranges](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/drpkit/fairlight_map.yaml#L209)

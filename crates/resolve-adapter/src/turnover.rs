@@ -7,7 +7,7 @@ use crate::{
 };
 use graph::source::SourceGraph;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::{collections::HashSet, path::{Path, PathBuf}};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +17,7 @@ pub struct Templates {
     pub atom: Option<PathBuf>,
     pub group: Option<PathBuf>,
     pub fairlight: Option<PathBuf>,
+    pub nested: Option<PathBuf>,
 }
 
 /// Internal saved-job contract for the two experimental Resolve routes.
@@ -97,6 +98,7 @@ pub struct Turnover {
     prepared: PreparedProject,
     inputs: Vec<(PathBuf, [u8; 32])>,
     caption_omissions: Vec<graph::Loss>,
+    selected_texts: HashSet<String>,
 }
 
 impl Turnover {
@@ -108,13 +110,21 @@ impl Turnover {
         notices: Vec<String>,
         caption_omissions: Vec<graph::Loss>,
     ) -> Result<Self> {
+        let selected: HashSet<_> = spec.timelines.iter().map(|timeline| timeline.id.as_str()).collect();
+        let selected_texts = graph.sequences.iter()
+            .filter(|sequence| selected.contains(sequence.id.as_str()))
+            .flat_map(|sequence| &sequence.texts)
+            .map(|text| text.id.clone()).collect();
         let prepared = linked::prepare_project(&graph, spec, ffprobe, Some(&caption_omissions))?;
+        let caption_omissions = caption_omissions.into_iter()
+            .filter(|loss| !prepared.writes_caption(&loss.object)).collect();
         Ok(Self {
             graph,
             notices,
             prepared,
             inputs,
             caption_omissions,
+            selected_texts,
         })
     }
 
@@ -130,7 +140,8 @@ impl Turnover {
         self.graph
             .losses
             .iter()
-            .filter(|loss| is_reviewable_loss(loss))
+            .filter(|loss| is_reviewable_loss(loss)
+                && (loss.aspect != "text_appearance" || self.selected_texts.contains(&loss.object)))
             .chain(&self.caption_omissions)
     }
 
@@ -170,7 +181,7 @@ pub(crate) const PREMIERE_CAPTION_LOSS: &str = "premiere.caption";
 pub(crate) fn is_reviewable_loss(loss: &graph::Loss) -> bool {
     matches!(
         loss.aspect.as_str(),
-        "premiere.appearance" | "premiere.marker" | crate::premiere::CLIP_METADATA_LOSS
+        "premiere.appearance" | "premiere.marker" | "text_appearance" | crate::premiere::CLIP_METADATA_LOSS
     )
 }
 

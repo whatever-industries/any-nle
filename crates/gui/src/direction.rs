@@ -5,26 +5,16 @@ enum Editor {
     AvidMediaComposer,
     Premiere,
     Resolve,
-    ProTools,
-    AfterEffects,
 }
 
 impl Editor {
-    const ALL: [Self; 5] = [
-        Self::AvidMediaComposer,
-        Self::Premiere,
-        Self::Resolve,
-        Self::ProTools,
-        Self::AfterEffects,
-    ];
+    const ALL: [Self; 3] = [Self::AvidMediaComposer, Self::Premiere, Self::Resolve];
 
     fn label(self) -> &'static str {
         match self {
             Self::AvidMediaComposer => "Avid Media Composer",
             Self::Premiere => "Premiere",
             Self::Resolve => "Resolve",
-            Self::ProTools => "Pro Tools",
-            Self::AfterEffects => "After Effects",
         }
     }
 }

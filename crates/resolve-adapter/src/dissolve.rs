@@ -9,6 +9,13 @@ use std::io::Read;
 
 pub(crate) const ADAPTER: &str = "resolve.transitions";
 pub(crate) const INTERPRETATION: &str = "resolve.left_cross_dissolve_8";
+pub(crate) const CENTER_INTERPRETATION: &str = "resolve.center_cross_dissolve_8";
+pub(crate) const AUDIO_INTERPRETATION: &str = "resolve.center_cross_fade_0db_8";
+pub(crate) const AUDIO_TYPE: &str = "Cross Fade 0DB";
+pub(crate) const AUDIO_FIELDS: &str =
+    "00000002000000158012120000002c789c636660642016000000da0005";
+const AUDIO_FIELDS_SHA: &str =
+    "bc87b3394116f6be254b620a0fdfaec66a3130602aad452bef2dc8ef6d02ddc1";
 pub(crate) const DURATION: i64 = 8;
 pub(crate) const TYPE: &str = "Cross Dissolve";
 pub(crate) const ALIGNMENT: &str = "3";
@@ -68,7 +75,82 @@ fn fields_match(encoded: &str, timeline_export: bool) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Dissolve {
     pub(crate) cut: i64,
+    pub(crate) before: i64,
     id: String,
+    pub(crate) audio: bool,
+}
+
+impl Dissolve {
+    pub(crate) fn type_label(&self) -> &'static str {
+        if self.audio { AUDIO_TYPE } else { TYPE }
+    }
+
+    pub(crate) fn alignment(&self) -> &'static str {
+        if self.before == DURATION { ALIGNMENT } else { "2" }
+    }
+
+    pub(crate) fn window(&self) -> std::ops::Range<i64> {
+        let start = self.cut - self.before;
+        start..start + DURATION
+    }
+}
+
+pub(crate) struct SourceDissolve<'a> {
+    pub(crate) prepared: Dissolve,
+    pub(crate) incoming: &'a str,
+    pub(crate) outgoing: &'a str,
+}
+
+/// The common graph stores source handles as overlapping placements. Resolve
+/// stores the incoming preroll in its transition and abuts the visible edits.
+pub(crate) fn from_source(sequence: &SourceSequence) -> Result<Option<SourceDissolve<'_>>> {
+    let transition = match sequence.transitions.as_slice() {
+        [] => return Ok(None),
+        [transition] => transition,
+        _ => return Err("Resolve source dissolve profile requires one transition".into()),
+    };
+    let refuse = |why| format!("Resolve transition {}: {why}", transition.id);
+    let before = frames_on(transition.cut_offset, sequence.rate)?;
+    if !supported_rate(sequence.rate)
+        || transition.track != 1
+        || transition.kind != StreamKind::Video
+        || !matches!(transition.style.as_str(), "avid.EFF2_BLEND_DISSOLVE" | "premiere.ADBE Cross Dissolve")
+        || frames_on(transition.duration, sequence.rate)? != DURATION
+        || !matches!(before, 4 | DURATION)
+        || transition.outgoing.reason.is_some()
+        || transition.incoming.reason.is_some()
+    {
+        return Err(refuse("expected an eight-frame left-aligned or centered V1 dissolve").into());
+    }
+    let ([out], [input]) = (
+        transition.outgoing.placements.as_slice(), transition.incoming.placements.as_slice()
+    ) else {
+        return Err(refuse("ambiguous endpoints").into());
+    };
+    let find = |id: &str| {
+        sequence.placements.iter().find(|p| p.id == id && p.video_track == Some(1))
+            .ok_or_else(|| refuse("missing V1 endpoint"))
+    };
+    let outgoing = find(out)?;
+    let incoming = find(input)?;
+    let cut = frames_on(transition.cut, sequence.rate)?;
+    let begin = transition.cut.checked_sub(transition.cut_offset).ok_or_else(|| refuse("invalid interval"))?;
+    let after = transition.duration.checked_sub(transition.cut_offset).ok_or_else(|| refuse("invalid interval"))?;
+    let end = transition.cut.checked_add(after).ok_or_else(|| refuse("invalid interval"))?;
+    if outgoing.record_start.checked_add(outgoing.duration) != Some(end)
+        || incoming.record_start != begin
+        || incoming.duration <= transition.cut_offset
+        || [outgoing, incoming].iter().any(|p| {
+            p.transform.is_some() || !p.effects.is_empty() || p.speed.is_some() || p.frame_map.is_some()
+        })
+    {
+        return Err(refuse("expected plain endpoints spanning the saved interval and a visible incoming edit").into());
+    }
+    Ok(Some(SourceDissolve {
+        prepared: Dissolve { cut, before, id: transition.id.clone(), audio: false },
+        incoming: input,
+        outgoing: out,
+    }))
 }
 
 impl Dissolve {
@@ -104,22 +186,32 @@ pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<
         .clock
         .as_ref()
         .ok_or_else(|| unsupported("missing timeline clock"))?;
-    if sequence.rate != Rational::new(24000, 1001).unwrap()
+    let audio = str_field(row, "interpretation") == Some(AUDIO_INTERPRETATION);
+    let before = match (str_field(row, "alignment_type"), str_field(row, "interpretation")) {
+        (Some(ALIGNMENT), Some(INTERPRETATION)) => DURATION,
+        (Some("2"), Some(CENTER_INTERPRETATION | AUDIO_INTERPRETATION)) => 4,
+        _ => return Err(unsupported("unqualified Resolve dissolve alignment").into()),
+    };
+    if !supported_rate(sequence.rate)
         || sequence.frame_size != Some((1920, 1080))
         || clock.provenance.route != "Resolve archive clock"
-        || str_field(row, "interpretation") != Some(INTERPRETATION)
-        || str_field(row, "kind") != Some("video")
+        || (audio && sequence.rate != Rational::integer(24))
+        || str_field(row, "kind") != Some(if audio { "audio" } else { "video" })
         || row.get("track") != Some(&Value::Int(1))
-        || row.get("track_rate_numerator") != Some(&Value::Int(24000))
-        || row.get("track_rate_denominator") != Some(&Value::Int(1001))
+        || row.get("track_rate_numerator") != Some(&Value::Int(sequence.rate.num()))
+        || row.get("track_rate_denominator") != Some(&Value::Int(sequence.rate.den()))
         || row.get("timeline_origin_frames").and_then(int)
             != i64::try_from(clock.effective_count).ok()
-        || str_field(row, "type_label") != Some(TYPE)
-        || str_field(row, "alignment_type") != Some(ALIGNMENT)
+        || str_field(row, "type_label") != Some(if audio { AUDIO_TYPE } else { TYPE })
         || str_field(row, "position") != Some(POSITION)
         || str_field(row, "saved_duration").and_then(|s| s.parse().ok()) != Some(DURATION)
         || str_field(row, "flags") != Some("0")
-        || str_field(row, "effect_filters_sha256") != Some(EFFECT_SHA)
+        || (if audio {
+            row.get("effect_filters_sha256").is_some()
+                || str_field(row, "fields_blob_sha256") != Some(AUDIO_FIELDS_SHA)
+        } else {
+            str_field(row, "effect_filters_sha256") != Some(EFFECT_SHA)
+        })
         || str_field(row, "native_track_id").is_none_or(str::is_empty)
         || str_field(row, "id").is_none_or(str::is_empty)
     {
@@ -137,7 +229,7 @@ pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<
         .and_then(|s| s.parse::<i64>().ok())
         .and_then(|s| s.checked_sub(origin))
         .ok_or_else(|| unsupported("invalid saved start"))?;
-    if start < 0 || start.checked_add(DURATION) != Some(cut) {
+    if start < 0 || start.checked_add(before) != Some(cut) {
         return Err(unsupported("invalid blend interval").into());
     }
     let outgoing =
@@ -149,7 +241,7 @@ pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<
     for p in sequence
         .placements
         .iter()
-        .filter(|p| p.video_track == Some(1))
+        .filter(|p| if audio { p.video_track.is_none() && p.audio_tracks == [1] } else { p.video_track == Some(1) })
     {
         let first = frames_on(p.record_start, sequence.rate)?;
         let length = frames_on(p.duration, sequence.rate)?;
@@ -157,7 +249,7 @@ pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<
             first.checked_add(length) == Some(cut) && at_end.replace((p, length)).is_some();
         let duplicate_in = first == cut && at_start.replace(p).is_some();
         if duplicate_out || duplicate_in {
-            return Err(unsupported("ambiguous V1 endpoints").into());
+            return Err(unsupported("ambiguous transition endpoints").into());
         }
     }
     let (left, length) = at_end.ok_or_else(|| unsupported("missing outgoing edit at cut"))?;
@@ -168,22 +260,59 @@ pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<
     if [left, right].iter().any(|p| {
         p.transform.is_some() || !p.effects.is_empty() || p.speed.is_some() || p.frame_map.is_some()
     }) {
-        return Err(unsupported("expected plain V1 edits").into());
+        return Err(unsupported("expected plain edits at the transition").into());
     }
-    if length < DURATION || frames_on(right.source_in, sequence.rate)? < DURATION {
+    if length < before
+        || frames_on(right.duration, sequence.rate)? < DURATION - before
+        || frames_on(right.source_in, sequence.rate)? < before
+    {
         return Err(unsupported("insufficient outgoing frames or incoming source handle").into());
+    }
+    if before != DURATION {
+        let check_handle = |edit: &graph::Placement, before, after| -> Result<()> {
+            let kind = if audio { StreamKind::Audio } else { StreamKind::Video };
+            let item = graph.items.iter().find(|item| item.id == edit.item)
+                .ok_or_else(|| unsupported("missing endpoint media"))?;
+            let mut streams = item.media.iter().filter_map(|link| {
+                let media = graph.media.iter().find(|m| m.id == link.media)?;
+                (media.kind == kind).then_some((link, media))
+            });
+            let (link, media) = streams.next().ok_or_else(|| unsupported("missing endpoint stream"))?;
+            let available = frames_on(media.duration, sequence.rate)?;
+            let source_in = frames_on(edit.source_in, sequence.rate)?;
+            let length = frames_on(edit.duration, sequence.rate)?;
+            if streams.next().is_some() || link.source_offset != Some(Rational::ZERO)
+                || source_in < before
+                || source_in.checked_add(length).and_then(|end| end.checked_add(after))
+                    .is_none_or(|end| end > available)
+                || (audio && (edit.volume_db.is_some() || edit.gain_db != 0.0
+                    || !edit.volume_keys.is_empty() || !edit.grouped_audio.is_empty()
+                    || media.sample_rate != Some(48000)))
+            {
+                return Err(unsupported("insufficient source handle or unsupported stream controls").into());
+            }
+            Ok(())
+        };
+        check_handle(left, 0, DURATION - before)?;
+        if audio { check_handle(right, before, 0)?; }
     }
     if !sequence
         .tracks
         .iter()
-        .any(|track| track.index == 1 && track.kind == StreamKind::Video)
+        .any(|track| track.index == 1 && track.kind == if audio { StreamKind::Audio } else { StreamKind::Video })
     {
-        return Err(unsupported("missing V1 owner").into());
+        return Err(unsupported("missing transition track owner").into());
     }
     Ok(Some(Dissolve {
         cut,
+        before,
         id: id(row).into(),
+        audio,
     }))
+}
+
+pub(crate) fn supported_rate(rate: Rational) -> bool {
+    rate == Rational::integer(24) || rate == Rational::new(24000, 1001).unwrap()
 }
 
 fn int(value: &Value) -> Option<i64> {

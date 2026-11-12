@@ -1,8 +1,9 @@
 # Any NLE
 
 Any NLE aims to translate editing projects between Avid Media Composer,
-Adobe Premiere Pro, DaVinci Resolve, Avid Pro Tools, and Adobe After Effects.
-The project also includes an experimental FCPXML export for Final Cut Pro.
+Adobe Premiere Pro, and DaVinci Resolve. Avid Pro Tools and Adobe After Effects
+are longer-term targets. The project also includes an experimental FCPXML
+export for Final Cut Pro.
 
 The current desktop wizard and CLI convert selected Avid bins to native
 Premiere Pro projects (`.prproj`). They link or prepare the source media

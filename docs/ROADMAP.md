@@ -377,9 +377,13 @@ Implemented fixes, tests and remaining native gates.
       A later eight-patch export stayed inside the physical Y′CbCr limits
       and matched unclamped 1.5× gain within 1.06 RGB codes. Compare a
       rail-crossing chart in both Y′CbCr and RGB to locate the clipping and
-      distinguish exact bounds before changing the LUT. Clip Low, Clip High,
-      Invert Luma and Invert Chroma have saved parameter mappings and still
-      need renders that vary one control at a time. Editable Lumetri controls
+      distinguish exact bounds before changing the LUT. A separate static
+      HSL Master matrix verified that Clip Low/High clamp Y′ to their selected
+      codes after luma inversion, leaving chroma intact. Luma inversion
+      reflects about the legal-range midpoint; chroma inversion reflects Cb
+      and Cr about neutral and matches Hue 180 on the tested patches.
+      Fractional thresholds, exact higher-bit-depth behavior and the full
+      processing order still need evidence before changing the LUT. Editable Lumetri controls
       are on hold below. [Source packing reference](https://pub.smpte.org/pub/rdd50/rdd50-2019.pdf#page=15).
 
 ## Timeline and effects
@@ -604,8 +608,15 @@ User's priority tiers to scope converter tasks.
       destination writer through the neutral graph. Start with a native project
       containing one composition, linked footage and a trimmed layer. Establish
       layer timing, frame rate, transform and media identity before choosing the
-      first editor pair to qualify. Both direction menus list After Effects as
-      unavailable until a route is implemented and checked.
+      first editor pair to qualify. Add After Effects to the direction menus
+      when a route is ready to use.
+- [ ] **EffectCraft AEP reference review.**
+      [storytold/effectcraft#1869](https://github.com/storytold/effectcraft/pull/1869)
+      describes `.aep` and `.aepx` import and `.aep` export. The PR closed
+      without a merge. Use its [pinned format notes](https://github.com/storytold/effectcraft/blob/b3900c70cce9b40a3e10f0e94c773427dddd1f5f/docs/aep-format.md)
+      to guide comparisons for composition and layer timing, footage
+      references, keyframes, and conversion losses against our own After
+      Effects saves.
 
 ## DaVinci Resolve (User 2026-10-26: bookmark and research)
 
@@ -709,6 +720,16 @@ only for comparing results; route (3) (scripting API) is for test read-back.
       transitions, timing maps, Fairlight controls, custom fade points,
       timeline marks, and clip color codes with their saved owners.
       [Capture status](RESOLVE-TURNOVER-IMPLEMENTATION.md#capture-in-graph2).
+- [x] Preserve matching audio and video timeline In/Out marks, including
+      one-sided selections, in linked Resolve projects. Keep independent
+      audio/video selections and frame-zero In marks read-only after fresh
+      import changed them.
+- [x] Preserve all 16 Resolve sequence marker colors and marker custom data.
+      Verify the marked sequence after reopen.
+- [x] Preserve Resolve track names and edit locks on the qualified
+      V1/A1/A2 profile. Verify the saved audio mixer mirrors after reopening.
+- [x] Preserve disabled V1 separately from the edit lock and verify black
+      picture with both audio channels preserved after reopening.
 - [ ] **Qualify a native Premiere source turnover.** Author the same-rate
       ProRes HQ MOV and PCM WAV project natively in Premiere, including exact
       source selectors and nonzero trims. Run the package and product route gates.
@@ -749,17 +770,18 @@ only for comparing results; route (3) (scripting API) is for test read-back.
   hierarchy, identity and locator comparison. Current source and writer work
   targets the version 17 profile. See [editor-version compatibility](#editor-version-compatibility).
 - [ ] **Widen Resolve source and destination evidence.** Qualify other media,
-      mixed-rate clocks, custom fade curves, portable envelope
+      mixed-rate clocks, portable envelope
       rendering, other transforms, and independent Group audio before extending support.
 - [ ] **Qualify product exposure separately.** Resolve remains unavailable in
       the CLI and wizard. Expand media, project structure and version coverage
       before enabling a route.
 
-Premiere → Resolve and Avid → Resolve are planned primarily for grading
-turnovers. The preferred media menu default is **Link to originals**. Preserve
-saved camera-original locators, source timecode and reel or file identity when
-qualified, and diagnose unresolved relinks. Offer rewrap as a separate choice
-for a verified workflow that needs it, with the **Creates new media.** notice.
+Premiere → Resolve and Avid → Resolve target editable project conversion.
+Grading turnovers use **Link to originals** as the preferred media menu
+default. Preserve saved camera-original locators, source timecode and reel
+or file identity when qualified, and diagnose unresolved relinks. Offer
+rewrap as a separate choice for a verified workflow that needs it, with
+the **Creates new media.** notice.
 
 - [x] Start the [Premiere and Resolve metadata inventory and crosswalk](PREMIERE-RESOLVE-METADATA.md).
       Capture Premiere logging and physical identity receipts and the Resolve
@@ -767,6 +789,10 @@ for a verified workflow that needs it, with the **Creates new media.** notice.
 - [x] Add [verified MOV relink for existing Premiere 27 and Resolve projects](VERIFIED-RELINK.md).
       Explicit saved paths and source filenames drive the move. Duplicate names
       use embedded reel and source timecode, with optional pre-move checksums.
+- [x] [Verify Resolve conform after a media move](RESOLVE-SOURCE-READER.md#verify-conform-after-a-media-move).
+      Both move verification modes matched the reopened same-name DRP
+      at the sampled cut. The checks cover relocated paths, saved source
+      frames, reel and timecode, and matching supplied renders.
 - [ ] Qualify metadata and conform in both directions. Prioritize nonzero source
       timecode, explicit reel ownership, moved originals, duplicate basenames,
       and physical audio selectors before destination logging. Widen the column
@@ -785,7 +811,15 @@ for a verified workflow that needs it, with the **Creates new media.** notice.
 - [ ] Qualify animated clip volume against rendered Premiere and Resolve
       audio. Preserve the source receipt and report the omitted ramp.
 
-### Closed reference review
+### Completed reference reviews and their scope
+
+- [x] **Samuel Gursky Resolve MCP offline conform verification** (`1e2bf034`).
+      The internal probe compares saved V1 source frames around cuts and
+      can check the corresponding frames in supplied renders. The retained
+      fixtures verified exact trims, dissolve exclusion, and independent
+      mapping and picture results. Database repair, automated relinking,
+      grade transfer, and wider timing are separate research leads.
+      [Conform checks](RESOLVE-SOURCE-READER.md#check-conform-at-v1-cuts)
 
 - [x] **davinci-project-repair saved timeline selection** (`cbfcf62`).
       The DRP reader retains the active sequence UUID and the linked writer
@@ -866,17 +900,110 @@ for a verified workflow that needs it, with the **Creates new media.** notice.
       [editor-version compatibility policy](#editor-version-compatibility).
       [Pinned source](https://github.com/sergeiventurinov/PRPROJ-READER/tree/a51a2a5b1095b8bdead114c812e85132a5eb26e0)
 
-For broader integration, use the Resolve knowledgebase comparison matrix
-and integration sequence. Start by widening archive, media and clock
-coverage, then expand editable timeline controls and Fairlight on verified
-bindings. Titles, Color and Fusion need distinct rendered controls.
+### General conversion priorities from the pinned references
+
+Use the Resolve knowledgebase comparison matrix for the full reference
+inventory. Track source capture, destination writing, and native reopen
+and render for each conversion direction.
+
+- [x] **Internal editable picture speed and reverse.** At 24 fps, exact
+      trimmed 50% forward and 100% reverse travel through graph/2. Native
+      Resolve reopen and all 48 rendered frames passed, including outputs
+      from Premiere 27 saves. The Premiere 27 saves retain the editable
+      controls, and all 48 numbered Premiere frames matched the Resolve
+      cadence after Save As and reopen.
+      Freeze, ramps, mixed-rate and pitch-preserving audio are separate.
+      [Time-map codec](https://github.com/samuelgursky/davinci-resolve-mcp/blob/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/drp-format/media-timemap.js)
+- [x] **Plain captions and Solid Color.** Read and write one default
+      subtitle track; two adjacent accented cues survived native Resolve
+      reopen and rendered visibly. Support one opaque Solid Color at the
+      end of the qualified picture-only timeline. Capture literal Text+
+      controls. The same captions were visible in the reopened Premiere project.
+      A retained Avid SubCap over online OP-Atom also reopened and
+      rendered on Resolve subtitle 1. Per-cue style and editable Text+
+      remain separate.
+      [Caption fields](https://github.com/samuelgursky/davinci-resolve-mcp/blob/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/drp-format/subtitle-captions.js)
+- [x] **Video dissolves.** Extend the eight-frame left-aligned dissolve to
+      centered alignment and both 24 and 24000/1001. Map exact Avid and
+      Premiere source transition endpoints for the bounded profile. The
+      24 fps native Resolve round trips matched every frame for both
+      alignments. The centered A1 0 dB Fairlight crossfade matched the
+      reopened comparison PCM; A2 was unchanged. Native cross-editor
+      transition tests remain separate.
+      [Dissolve baseline](RESOLVE-DRP-FORMAT-CLOSEOUT.md#qualified-left-aligned-cross-dissolve)
+      · [Fairlight transition fields](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/FORMAT.md#edit-information---edits)
+- [x] **Bounded multilayer profile.** Read and write a 24 fps V1/V2 overlay
+      with three independent WAV mono lanes using a matching native
+      skeleton. Reopen retained all tracks, with matching picture and
+      three distinct isolated PCM renders. Wider layouts remain open.
+- [x] **Editable Resolve picture nests.** Read and write one level of
+      native compounds and nested timelines at 1080p24. Two identically
+      named children with different origins and trims remained distinct
+      after reopen and rendered frame for frame. Also verified two
+      separately trimmed compounds, including a nonzero compound origin.
+      [Scope and checks](RESOLVE-SOURCE-READER.md#write-picture-nests)
+- [ ] Qualify nested audio and wider layouts as separate Resolve profiles.
+- [x] **Resolve primary gain.** Read and recreate one clip-owned, single
+      primary gain node on the qualified Resolve profile. The native
+      1.25 control matched all 24 decoded frames after reopen; a 1.5
+      variant changed the render. Other node topologies and cross-editor
+      grade mappings remain open.
+      [DRX calibration](https://github.com/samuelgursky/davinci-resolve-mcp/blob/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/drx-parameters/CALIBRATION-STATUS.md)
+
+See the [internal conversion checks](RESOLVE-SOURCE-READER.md#editable-conversion-profiles)
+for the exact read, write, reopen and render scope.
 
 - [x] Apply static mono track pan and direct routing to persisted stereo buses
       during Resolve preparation. Verify both outputs after reopen.
+- [x] Preserve independent pan bypass on the qualified two-mono, one-stereo-bus
+      Resolve profile. The saved pan values and reopened PCM match a one-change
+      archive control. [Pan bypass](RESOLVE-DRPKIT-CLOSEOUT.md#mono-track-pan-bypass)
+- [ ] Qualify track solo independently of mute and routing. Two saved
+      rows share item ID `0x011`; only the first affected the tested mix.
+      Verify an Inspector or mixer change, multiple soloed tracks, and
+      interactions with mute and routing before expanding the writer.
 - [x] Qualify Bus 2 static gain and mute with separate native saves and PCM.
-- [ ] Qualify a one-band EQ control and a compressor threshold/ratio pair
-      with separate native saves and PCM.
-- [ ] Scope plug-in bypass, track and plug-in automation, custom fade
+- [x] **Editable Fairlight track processing.** Round-trip the default
+      band 3 bell gain and compressor enable, threshold and saved ratio
+      on the qualified two-mono Resolve mixer. Separate and combined
+      reopened controls match the rendered PCM.
+      [Fairlight processing checks](RESOLVE-SOURCE-READER.md#write-fairlight-track-processing)
+- [x] Preserve band 3 frequency and Q plus compressor attack, hold and
+      release through the same two-mono profile. Reopened controls match
+      native PCM, with independent checks for frequency, Q and timing.
+- [x] Preserve compressor knee and mix, dynamics makeup gain, track EQ
+      bypass and processing order. Compare reopened PCM with separate
+      one-change controls and with EQ and compression on the same track.
+- [x] Preserve editable Fairlight track expander and limiter settings.
+      Verify independent and combined playback renders plus disabled
+      controls after reopen.
+      [Pinned drpkit dynamics map](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/drpkit/fairlight_map.yaml#L87-L103)
+- [x] Preserve Fairlight track gate mode 1, its enable switch and saved
+      controls. Compare reopened PCM with the same expander settings and
+      a separate threshold control. Other mode codes remain read-only.
+- [x] Preserve all six Fairlight track EQ bands, including filter type,
+      outer-band slope, and mid-band frequency range. Verify reopened
+      renders with multitone sources, bypass and individual band switches.
+- [x] Preserve the single stereo bus limiter, including disabled settings.
+      Compare reopened PCM with bus and track limiter controls.
+- [x] Preserve independent limiter and compressor controls on the two
+      qualified stereo buses. Compare both reopened PCM outputs and
+      confirm their stored settings and bypass behavior.
+- [x] Preserve six-band EQ and bypass independently on the qualified stereo
+      buses. Verify both reopened outputs and retain the two observed saved
+      processing-order codes.
+- [x] Preserve independent static bus input gain from −6 to +6 dB on the
+      qualified layouts, with fader and dynamics makeup stored separately.
+- [x] Write the qualified default clip fades and two-key volume curves on
+      direct mono WAV edits in linked 24 fps Resolve projects.
+- [x] Preserve editable custom clip fade points, including a separate static
+      clip volume, on the qualified Resolve WAV and OP1a profiles.
+- [x] Preserve two source-time volume keys alongside clip-edge fades on the
+      same qualified Resolve WAV or OP1a edit.
+- [x] Preserve the 16 Resolve timeline clip labels by edit occurrence in
+      linked project exports, including repeated edits of the same media.
+- [ ] Qualify additional Fairlight bus processing and wider bus layouts.
+- [ ] Scope plug-in bypass, track and plug-in automation, cross-editor fade
       interpolation, and additional dynamics laws with one-change native controls.
 
 - **Bookmark: storytold/filmcraft PR #670** "Interchange: import DaVinci
@@ -894,11 +1021,11 @@ bindings. Titles, Color and Fusion need distinct rendered controls.
   | Project | Language / licence | Scope |
   |---|---|---|
   | hfiguiere/drp-extractor | Rust, MPL-2.0 | parse .drp (2018-2023) |
-  | samuelgursky/davinci-resolve-mcp | Python/JS, MIT, ~3.8k stars | Resolve scripting API + offline .drp/DB tools (`drp-timeline-clips.mjs`, `project_db.mjs`) |
+  | samuelgursky/davinci-resolve-mcp | Python/JS, MIT | [Offline conform verification reviewed](RESOLVE-SOURCE-READER.md#check-conform-at-v1-cuts) |
   | CiprianSpiridon/davinci-resolve-mcp | Python, MIT | `formats/drt.py` reviewed; [native DRT reader scope](RESOLVE-DRT-CLOSEOUT.md) |
   | koosoli/DaVinci-Resolve-DRP-Toolkit | Python, GPL-3.0 | [Comparison and effect inventory reviewed](RESOLVE-SOURCE-READER.md#inventory-saved-effects) |
-  | donutinit/sqsolve | Go, AGPL-3.0 | [Archive and bin order reviewed](#closed-reference-review) |
-  | LucaL1fe/davinci-project-repair | MIT | [Saved timeline selection reviewed](#closed-reference-review) |
+  | donutinit/sqsolve | Go, AGPL-3.0 | [Archive and bin order reviewed](#completed-reference-reviews-and-their-scope) |
+  | LucaL1fe/davinci-project-repair | MIT | [Saved timeline selection reviewed](#completed-reference-reviews-and-their-scope) |
 - **Routes to evaluate:** (1) native `.drp` read/write (most fidelity, undocumented, version
   drift 19 -> 20 -> 21); (2) Resolve's own interchange imports (FCPXML, FCP7 XML, AAF, EDL, OTIO):
   FCPXML is an optional export, and further FCPXML work is on hold; these imports may be used

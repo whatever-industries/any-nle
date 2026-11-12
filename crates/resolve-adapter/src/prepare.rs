@@ -234,7 +234,10 @@ pub(crate) fn prepare_bindings(
                 return Err("unsupported Resolve picture placement receipt".into());
             }
             if lane != 0 {
-                edit.envelope = audio::prepare(p, edit, receipt)?;
+                if graph.sidecar(audio::UNQUALIFIED_FADE_ADAPTER, &p.id).is_some() {
+                    return Err(format!("{}: unqualified Resolve clip fade points", p.id).into());
+                }
+                edit.envelope = audio::prepare(p, source_in, length, rate(), receipt)?;
                 if let Some(loss) = edit.envelope.and_then(Envelope::recovered_loss) {
                     recovered.insert(p.id.as_str(), loss);
                 }
@@ -269,7 +272,7 @@ pub(crate) fn prepare_bindings(
     if duration == 0 {
         return Err("empty timeline".into());
     }
-    let (markers, mut omitted_markers) = prepare_markers(sequence, duration);
+    let (markers, mut omitted_markers) = prepare_markers(graph, sequence, duration)?;
     omitted_markers.extend(
         items
             .iter()
@@ -291,18 +294,35 @@ pub(crate) fn prepare_bindings(
     })
 }
 
+#[derive(PartialEq, Eq)]
 pub(crate) struct PreparedMarker {
     pub(crate) frame: u64,
     pub(crate) duration: u64,
     pub(crate) color_bit: u64,
     pub(crate) name: String,
     pub(crate) note: String,
+    pub(crate) custom_data: String,
 }
 
 pub(crate) fn prepare_markers(
+    graph: &SourceGraph,
     sequence: &SourceSequence,
     duration: i64,
-) -> (Vec<PreparedMarker>, Vec<String>) {
+) -> Result<(Vec<PreparedMarker>, Vec<String>)> {
+    let mut native = HashMap::new();
+    if let Some(data) = graph.sidecar(ADAPTER, &sequence.id).and_then(|row| row.get("markers")) {
+        let Value::Arr(rows) = data else {
+            return Err("invalid Resolve sequence marker receipt".into());
+        };
+        for row in rows {
+            let (Some(Value::Int(frame)), Some(Value::Int(color)), Some(Value::Str(custom))) =
+                (row.get("frame"), row.get("color_bit"), row.get("custom_data"))
+            else { return Err("invalid Resolve sequence marker receipt".into()) };
+            if native.insert(*frame, (*color, custom.as_str())).is_some() {
+                return Err("duplicate frame in Resolve sequence marker receipt".into());
+            }
+        }
+    }
     let mut counts = HashMap::new();
     for marker in &sequence.markers {
         if let Some(frame) = marker.start.and_then(|t| frames_on(t, sequence.rate).ok()) {
@@ -313,18 +333,28 @@ pub(crate) fn prepare_markers(
     let mut omitted = Vec::new();
     let mut budget = 32 << 10;
     for marker in &sequence.markers {
-        let bytes = marker.name.len() + marker.comment.len() + 128;
+        let frame = marker.start.and_then(|t| frames_on(t, sequence.rate).ok());
+        let saved = frame.filter(|_| marker.owner == MarkerOwner::Sequence)
+            .and_then(|frame| native.remove(&frame));
+        let custom = saved.map_or("", |(_, custom)| custom);
+        let bytes = marker.name.len() + marker.comment.len() + custom.len() + 128;
         if kept.len() < 128 && bytes <= budget {
             if let Some(mark) = prepare_marker(marker, sequence.rate, duration, &counts) {
-                kept.push(mark);
+                if saved.is_some_and(|(color, _)| u64::try_from(color).ok() != Some(mark.color_bit)) {
+                    return Err("Resolve sequence marker color disagrees with its receipt".into());
+                }
+                kept.push(PreparedMarker { custom_data: custom.into(), ..mark });
                 budget -= bytes;
                 continue;
             }
         }
         omitted.push(marker.owner_occurrence.clone());
     }
+    if !native.is_empty() {
+        return Err("Resolve sequence marker receipt lacks a matching marker".into());
+    }
     kept.sort_unstable_by_key(|marker| marker.frame);
-    (kept, omitted)
+    Ok((kept, omitted))
 }
 
 fn prepare_marker(
@@ -354,9 +384,9 @@ fn prepare_marker(
     }
     let color = marker.color.as_ref()?;
     let color_bit = match (color.palette.as_str(), color.name.as_str()) {
-        ("avid" | "resolve", "Blue") => 2,
-        ("avid" | "resolve", "Red") => 32,
-        ("resolve", "Lavender") => 2048,
+        ("resolve", name) => crate::marker_palette::bit(name)?,
+        ("avid", "Blue") => 2,
+        ("avid", "Red") => 32,
         _ => return None,
     };
     Some(PreparedMarker {
@@ -365,6 +395,7 @@ fn prepare_marker(
         color_bit,
         name: marker.name.clone(),
         note: marker.comment.clone(),
+        custom_data: String::new(),
     })
 }
 
@@ -589,27 +620,26 @@ pub(crate) fn check_plain(p: &graph::Placement) -> Result<()> {
 }
 
 pub(crate) fn check_linked_placement(p: &graph::Placement) -> Result<()> {
-    let static_mono = p.video_track.is_none()
-        && matches!(p.audio_tracks.as_slice(), [1 | 2])
-        && p.volume_keys.is_empty();
-    check_placement_profile(p, static_mono, p.video_track == Some(1))
+    let mono = p.video_track.is_none() && matches!(p.audio_tracks.as_slice(), [1 | 2 | 3]);
+    check_placement_profile(p, mono, p.video_track == Some(1), true)
 }
 
 fn check_placement(p: &graph::Placement, allow_audio_controls: bool) -> Result<()> {
-    check_placement_profile(p, allow_audio_controls, false)
+    check_placement_profile(p, allow_audio_controls, false, false)
 }
 
 fn check_placement_profile(
     p: &graph::Placement,
     allow_audio_controls: bool,
     allow_picture_controls: bool,
+    allow_speed: bool,
 ) -> Result<()> {
     if p.gain_db != 0.0
         || (!allow_audio_controls && (p.volume_db.is_some() || !p.volume_keys.is_empty()))
         || !p.track_gains_db.is_empty()
         || !p.track_pans.is_empty()
         || !p.grouped_audio.is_empty()
-        || p.speed.is_some()
+        || (!allow_speed && p.speed.is_some())
         || p.frame_map.is_some()
         || (!allow_picture_controls && (p.transform.is_some() || !p.effects.is_empty()))
     {

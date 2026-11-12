@@ -134,7 +134,11 @@ pub struct PreparedPremiere {
 pub struct PreparedPremiereInput {
     pub input:PreparedProjectInput, pub losses:Vec<Loss>,pub diagnostics:Vec<String>,pub ownership:HashMap<String,(usize,usize)>,
 }
-pub fn prepare_originals(g:&SourceGraph,options:&Options,clock:ClockProfile)->R<PreparedPremiereInput>{prepare_input(g,options,clock,true)}
+pub fn prepare_originals(g:&SourceGraph,options:&Options,clock:ClockProfile)->R<PreparedPremiereInput>{prepare_input(g,options,clock,true,false)}
+
+pub fn prepare_resolve_originals(g: &SourceGraph, options: &Options) -> R<PreparedPremiereInput> {
+    prepare_input(g, options, ClockProfile::VerifiedRewrap, true, true)
+}
 fn loss(out: &mut Vec<Loss>, object: &str, aspect: &str, reason: impl Into<String>) {
     out.push(Loss {
         object: object.into(),
@@ -522,12 +526,12 @@ pub fn prepare(g: &SourceGraph, options: &Options, clock: ClockProfile) -> R<Pre
     if !g.multicams.is_empty() || !g.multicam_uses.is_empty() {
         return Err(error("multicam_native_route_required: editable Groups require typed native rewrap preparation"));
     }
-    let p=prepare_input(g,options,clock,false)?;
+    let p=prepare_input(g,options,clock,false,false)?;
     let model=Model{project_name:p.input.project_name,options:p.input.options,clips:p.input.clips.into_iter().map(|c|match c{PreparedClip::Legacy(c)=>c,_=>unreachable!()}).collect(),bins:p.input.bins,sequences:p.input.sequences};
     model::validate_model(&model).map_err(|e|error(e.to_string()))?;
     Ok(PreparedPremiere{model,losses:p.losses,diagnostics:p.diagnostics,ownership:p.ownership,texts:p.input.texts,video_dissolves:p.input.video_dissolves,picture_effects:p.input.picture_effects})
 }
-fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_originals:bool)->R<PreparedPremiereInput> {
+fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_originals:bool,allow_original_speed:bool)->R<PreparedPremiereInput> {
     g.validate()?;
     g.encoded_len()?;
     if (!g.multicams.is_empty() || !g.multicam_uses.is_empty()) && clock != ClockProfile::VerifiedRewrap {
@@ -874,8 +878,9 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
     for (si, s) in g.sequences.iter().enumerate() {
         let exact_start = qualified_sequence_start(s);
         if let Some(start) = exact_start {
+            let rate_label = if s.rate == Rational::integer(24) { "24" } else { "23.976" };
             diagnostics.push(format!(
-                "{}: sequence start from the qualified 23.976 clock ({start} seconds)",
+                "{}: sequence start from the qualified {rate_label} clock ({start} seconds)",
                 s.name
             ));
         }
@@ -892,6 +897,16 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
     }
     multicam::prepare(g, &mut model, &ownership, &mut diagnostics, &mut losses)?;
     text::prepare(g, &mut model, &mut losses)?;
+    if !allow_original_speed {
+        let originals: HashSet<_> = model.clips.iter().filter_map(|clip| match clip {
+            PreparedClip::Original(clip) => Some(clip.metadata.id.as_str()),
+            _ => None,
+        }).collect();
+        if model.sequences.iter().flat_map(|s| &s.events).any(|event|
+            event.speed_ratio.is_some() && originals.contains(event.clip.as_str())) {
+            return Err(error("original-file retiming is not qualified"));
+        }
+    }
     model.validate().map_err(|e| error(e.to_string()))?;
     losses.extend(g.losses.iter().cloned());
     Ok(PreparedPremiereInput {
@@ -912,8 +927,14 @@ fn qualified_sequence_start(s: &SourceSequence) -> Option<Rational> {
     let clock = s.clock.as_ref()?;
     // The existing 23.976 Premiere sequence presets use non-drop display
     // code 110. This changes only the zero point, not any record-local times.
-    (s.rate.num() == 24000
-        && s.rate.den() == 1001
+    ((s.rate.num() == 24000 && s.rate.den() == 1001
+        || s.rate == Rational::integer(24)
+            && clock.provenance.route == "Resolve archive clock"
+            && clock.provenance.source_package == s.id
+            && clock.provenance.timecode_track == "Sm2Sequence.MediaExtents"
+            && clock.provenance.origin_count == clock.effective_count
+            && clock.provenance.source_offset == 0
+            && clock.exact_start() == s.start)
         && clock.rate == s.rate
         && clock.display_base == 24
         && !clock.drop

@@ -1294,16 +1294,35 @@ impl Writer<'_> {
             }};
             for &t in &placed {
                 let mut span = e.duration;
+                let mut original_speed = None;
+                let mut original_speed_start = None;
                 if let Some(ratio) = e.speed_ratio {
-                    set_playback_speed(&mut self.project, t, ratio)?;
                     span = e
                         .source_duration
                         .ok_or_else(|| other("unsupported operand type(s) for +: 'int' and 'NoneType'"))?;
+                    if let Some(original) = original {
+                        // Premiere 27 plays original-file cuts from the raw In.
+                        // In reverse the raw trim is measured from media end.
+                        original_speed = Some(ratio);
+                        if ratio.0 < 0 {
+                            let available = original.video.as_ref()
+                                .ok_or_else(|| other("retimed original lacks picture"))?.duration;
+                            original_speed_start = Some(available.checked_sub(e.source_in)
+                                .and_then(|v| v.checked_sub(span)).filter(|&v| v >= 0)
+                                .ok_or_else(|| other("reverse original trim exceeds source"))?);
+                        }
+                    } else {
+                        set_playback_speed(&mut self.project, t, ratio)?;
+                    }
                 }
                 // A remapped clip's In/Out are positions on its remap curve (see writer.py).
-                let start = if let Some(u) = group_use { u.source_in } else if e.time_remap.is_some() { ticks_per_unit(seq.rate) } else { e.source_in };
+                let start = if let Some(u) = group_use { u.source_in } else if e.time_remap.is_some() { ticks_per_unit(seq.rate) } else { original_speed_start.unwrap_or(e.source_in) };
                 self.project.set_in_point(t, Time::new(start))?;
                 self.project.set_out_point(t, Time::new(add(start, span)?))?;
+                // Preserve raw file coordinates; the legacy setter scales by speed.
+                if let Some(ratio) = original_speed {
+                    set_playback_speed(&mut self.project, t, ratio)?;
+                }
                 self.project.set_end(t, Time::new(add(e.record_start, e.duration)?))?;
                 let is_video = self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem";
                 let r = if is_video { rect.as_deref() } else { None };
