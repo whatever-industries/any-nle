@@ -5,7 +5,7 @@ on:
       version:
         description: Reviewed release version
         required: true
-        default: 0.1.0-alpha.1
+        default: 0.1.0-alpha.2
       private_gate_sha256:
         description: SHA256 of the retained private full acceptance and privacy receipt
         required: true
@@ -35,6 +35,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.13'
+      - name: Check the After Effects inspector
+        run: python -m unittest discover -s tests -p test_aep_inspect.py -v
       - name: Fetch and verify pinned FFmpeg source
         run: python scripts/release/build_ffmpeg.py --prepare-source --work backend-work
       - name: Share verified FFmpeg source with native builders
@@ -96,7 +98,7 @@ jobs:
         run: |
           python - <<'PY'
           import os,pathlib,re,subprocess
-          assert os.environ['VERSION']=='0.1.0-alpha.1'
+          assert os.environ['VERSION']=='0.1.0-alpha.2'
           assert re.fullmatch('[0-9a-f]{64}',os.environ['PRIVATE_GATE'])
           source=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
           assert re.fullmatch('[0-9a-f]{40}',os.environ['QUALIFIED_SOURCE'])

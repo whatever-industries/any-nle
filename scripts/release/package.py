@@ -58,7 +58,7 @@ def linux_dependencies(stage):
     shutil.copy2(ROOT/'packaging/LINUX_RUNTIME_REQUIREMENTS.md',resources/'LINUX_RUNTIME_REQUIREMENTS.md')
 
 def package(target,binaries,backend,notices,output,version):
-    if version!='0.1.0-alpha.1': raise ValueError('release version must be reviewed in source')
+    if version!='0.1.0-alpha.2': raise ValueError('release version must be reviewed in source')
     verify_backend(backend,target)
     binaries,backend,notices,output=map(pathlib.Path,(binaries,backend,notices,output))
     output.mkdir(parents=True,exist_ok=True)
@@ -145,4 +145,4 @@ def package(target,binaries,backend,notices,output,version):
         (output/(p.name+'.sha256')).write_text(sha(p)+'  '+p.name+'\n')
     print(json.dumps({'package':stem+extension,'sha256':sha(output/(stem+extension))}))
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--target',required=True,choices=TARGETS);p.add_argument('--binaries',required=True);p.add_argument('--backend',required=True);p.add_argument('--notices',required=True);p.add_argument('--output',required=True);p.add_argument('--version',default='0.1.0-alpha.1');a=p.parse_args();package(a.target,a.binaries,a.backend,a.notices,a.output,a.version)
+    p=argparse.ArgumentParser();p.add_argument('--target',required=True,choices=TARGETS);p.add_argument('--binaries',required=True);p.add_argument('--backend',required=True);p.add_argument('--notices',required=True);p.add_argument('--output',required=True);p.add_argument('--version',default='0.1.0-alpha.2');a=p.parse_args();package(a.target,a.binaries,a.backend,a.notices,a.output,a.version)

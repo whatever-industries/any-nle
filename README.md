@@ -11,7 +11,7 @@ without requiring Premiere to be installed.
 
 ## Download
 
-[Download the published alpha](https://github.com/whatever-industries/any-nle/releases/tag/v0.1.0-alpha.1)
+[Download Any NLE](https://github.com/whatever-industries/any-nle/releases)
 for macOS, Windows or Linux. The packages include the desktop wizard, CLI and
 FFmpeg tools. See the [release notes](RELEASE_NOTES.md) for platform downloads,
 installation details and checksums.
