@@ -1,6 +1,6 @@
 # Any NLE native wizard
 
-`any-nle-gui` is the native Rust desktop entry point, version `0.1.0-alpha.3`. It uses
+`any-nle-gui` is the native Rust desktop entry point. Run `any-nle-gui --version` to see its build version. It uses
 eframe/egui 0.37 with the Glow renderer, AccessKit, bundled fonts, X11 and Wayland support.
 It calls `anynle_app::job` in process. The CLI and GUI share the same job preparation and
 publication engine; the GUI does not run the CLI as a subprocess.

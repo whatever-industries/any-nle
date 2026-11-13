@@ -1,7 +1,7 @@
 # Native release process
 
-Release version: `0.1.0-alpha.3`. First-party code is MIT; dependency notices remain
-applicable. The GUI is native Rust, and both GUI and CLI ship with media tools.
+The GUI Cargo manifest sets the release version. First-party code is MIT, and
+dependency notices remain applicable. The GUI and CLI ship with media tools.
 
 ## Runtime layout
 
@@ -17,7 +17,10 @@ verified bundle.
 
 ## Reproduce a candidate
 
-Use Rust 1.95.0 and the committed lockfile. If several Rust installations are on
+Use Rust 1.95.0 and the committed lockfile. Read the release version with
+`python3 scripts/release/release_version.py` using Python 3.11 or later.
+For a new release, update the GUI Cargo version, refresh the Cargo lockfile
+with Cargo, and update the release notes heading and download links. If several Rust installations are on
 your PATH, put the rustup shims first and set `RUSTUP_TOOLCHAIN=1.95.0` before
 running the scripts. Check `rustc --version` and `cargo --version` in that shell.
 `packaging/ffmpeg.json` pins the source
@@ -107,9 +110,9 @@ private material is absent.
 Use `build_only=true` and `publish=false` in the manual `Native release candidate`
 workflow to verify a new commit against the current version. This uploads six
 workflow artifacts and leaves existing releases and tags in place. With
-`build_only=false`, the workflow stages a draft by default. Both modes require
-the retained private-gate receipt SHA256 and the reviewed filtered export
-commit SHA. The latter must equal both the checkout HEAD and workflow event SHA,
+`build_only=false`, the workflow stages a draft by default. Both modes require the explicit Cargo version, the retained private-gate
+receipt SHA256, and the reviewed filtered export commit SHA. The first job
+validates those inputs before downloading FFmpeg. The latter must equal both the checkout HEAD and workflow event SHA,
 so an attestation for a different source cannot be dispatched accidentally. The
 private receipt remains an owner attestation; its contents are retained privately.
 One job downloads and verifies the pinned FFmpeg source archive. All six jobs
@@ -123,11 +126,27 @@ If the artwork changes, regenerate the committed resources with
 The candidate artifacts retain evidence for seven days; release assets retain
 provenance and checksums.
 
-Only the release job has `contents: write`. `publish.py` refuses any published version or draft from a different source. It
-stages a prerelease, downloads all uploaded assets, verifies exact
-SHA256 equality and publishes only when explicitly selected. An existing draft can be resumed only with identical source and downloaded asset
-bytes; it is never overwritten. A published version is immutable: use a new version for any change. The script never changes repository
-visibility or pushes Git history. The release owner performs those actions only
-after the full private and remote privacy gates have passed. Publication fails if
-the repository is still private when publishing is selected. There is no updater,
-signing secret, file association or extra approval environment.
+Only the release job has `contents: write`. It creates or resumes a draft
+prerelease for the reviewed commit. It verifies existing asset names and
+SHA256 digests, uploads missing assets, and downloads the full set for a byte
+check. A conflicting tag, changed asset, unexpected file, or published version
+stops the operation. The workflow serializes publication by version.
+
+After an interrupted upload, rerun the failed release job while the original
+six candidate artifacts are available. Retain those artifacts for manual
+recovery. From the exact filtered export checkout, use the original private
+receipt digest and the directory containing the six `any-nle-*` folders.
+
+```sh
+GITHUB_REPOSITORY="$REPOSITORY" GITHUB_SHA="$REVIEWED_EXPORT" \
+PRIVATE_GATE="$PRIVATE_RECEIPT_SHA256" python3 scripts/release/publish.py \
+  --candidates "$ORIGINAL_CANDIDATES" --version "$VERSION" --publish false
+```
+
+This verifies or completes the draft. Use `--publish true` after the private
+package audit and explicit publication approval. If a rebuild produces
+different bytes, recover the original artifacts. The draft binds the complete
+asset set before the first upload, so a change to an asset that has not been
+uploaded also blocks recovery. An older draft without that binding, or a
+conflicting draft with unrecoverable assets, requires manual review. A
+published release requires a new version for any change.

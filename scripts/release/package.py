@@ -4,6 +4,7 @@ import argparse, hashlib, json, os, pathlib, plistlib, shutil, subprocess, sys, 
 from build_ffmpeg import fetch, sha
 from appimage_runtime import bundle as appimage_runtime
 from windows_pe import verify as verify_windows_pe
+from release_version import release_version
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 ICONS=ROOT/'packaging/icons'
 TARGETS={
@@ -58,7 +59,7 @@ def linux_dependencies(stage):
     shutil.copy2(ROOT/'packaging/LINUX_RUNTIME_REQUIREMENTS.md',resources/'LINUX_RUNTIME_REQUIREMENTS.md')
 
 def package(target,binaries,backend,notices,output,version):
-    if version!='0.1.0-alpha.3': raise ValueError('release version must be reviewed in source')
+    version = release_version(version)
     verify_backend(backend,target)
     binaries,backend,notices,output=map(pathlib.Path,(binaries,backend,notices,output))
     output.mkdir(parents=True,exist_ok=True)
@@ -100,8 +101,9 @@ def package(target,binaries,backend,notices,output,version):
             else: shutil.copy2(p,dest)
     shutil.copy2(ROOT/'LICENSE',resources/'LICENSE'); shutil.copy2(ROOT/'THIRD_PARTY_NOTICES.md',resources/'THIRD_PARTY_NOTICES.md')
     if 'apple' in target:
+        numeric_version = version.split('-', 1)[0]
         contents=stage/'Any NLE.app/Contents'
-        info={'CFBundleName':'Any NLE','CFBundleDisplayName':'Any NLE','CFBundleIdentifier':'industries.whatever.any-nle','CFBundleExecutable':'any-nle-gui','CFBundlePackageType':'APPL','CFBundleShortVersionString':'0.1.0','CFBundleVersion':'0.1.0','LSMinimumSystemVersion':'12.0','NSHighResolutionCapable':True}
+        info={'CFBundleName':'Any NLE','CFBundleDisplayName':'Any NLE','CFBundleIdentifier':'industries.whatever.any-nle','CFBundleExecutable':'any-nle-gui','CFBundlePackageType':'APPL','CFBundleShortVersionString':numeric_version,'CFBundleVersion':numeric_version,'LSMinimumSystemVersion':'12.0','NSHighResolutionCapable':True}
         info['CFBundleIconFile']='any-nle.icns'
         shutil.copy2(ICONS/'any-nle.icns',resources/info['CFBundleIconFile'])
         (contents/'Info.plist').write_bytes(plistlib.dumps(info))
@@ -139,10 +141,11 @@ def package(target,binaries,backend,notices,output,version):
     with tarfile.open(provenance,'w:gz') as t:
         t.add(resources,arcname='resources'); t.add(bindir/'backend-manifest.json',arcname='backend-manifest.json')
         t.add(ROOT/'packaging/ffmpeg.json',arcname='packaging/ffmpeg.json')
+        t.add(ROOT/'crates/gui/Cargo.toml',arcname='crates/gui/Cargo.toml')
         t.add(ROOT/'packaging/appimage-runtime.json',arcname='packaging/appimage-runtime.json')
-        for script in ('build_ffmpeg.py','package.py','licenses.py','appimage_runtime.py','windows_pe.py'): t.add(ROOT/'scripts/release'/script,arcname='scripts/release/'+script)
+        for script in ('build_ffmpeg.py','package.py','licenses.py','appimage_runtime.py','windows_pe.py','release_version.py'): t.add(ROOT/'scripts/release'/script,arcname='scripts/release/'+script)
     for p in (output/(stem+extension),provenance):
         (output/(p.name+'.sha256')).write_text(sha(p)+'  '+p.name+'\n')
     print(json.dumps({'package':stem+extension,'sha256':sha(output/(stem+extension))}))
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--target',required=True,choices=TARGETS);p.add_argument('--binaries',required=True);p.add_argument('--backend',required=True);p.add_argument('--notices',required=True);p.add_argument('--output',required=True);p.add_argument('--version',default='0.1.0-alpha.3');a=p.parse_args();package(a.target,a.binaries,a.backend,a.notices,a.output,a.version)
+    p=argparse.ArgumentParser();p.add_argument('--target',required=True,choices=TARGETS);p.add_argument('--binaries',required=True);p.add_argument('--backend',required=True);p.add_argument('--notices',required=True);p.add_argument('--output',required=True);p.add_argument('--version',default=None);a=p.parse_args();package(a.target,a.binaries,a.backend,a.notices,a.output,a.version)

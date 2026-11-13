@@ -4,7 +4,7 @@ import argparse,hashlib,json,os,pathlib,plistlib,shutil,struct,subprocess,tempfi
 from package import ICONS,TARGETS
 from build_ffmpeg import sha
 ROOT=pathlib.Path(__file__).resolve().parents[2]
-VERSION='0.1.0-alpha.3'
+from release_version import gate_binding, release_version
 def architecture(path,target):
     b=path.read_bytes()[:4096]
     arm=target.startswith('aarch64')
@@ -52,6 +52,7 @@ def verify_launcher_icon(target, extracted, package):
                 raise ValueError('Windows launcher icon mismatch: ' + path.name)
 
 def verify_package(target,directory,version):
+    version = release_version(version)
     directory=pathlib.Path(directory);suffix,extension=TARGETS[target];stem=f'Any.NLE_{suffix}_v{version}'
     package=directory/(stem+extension);stage=directory/(stem+'.stage')
     if not package.is_file() or package.stat().st_size<10000:raise ValueError('missing or empty package')
@@ -81,12 +82,21 @@ def verify_package(target,directory,version):
                 counterpart=extracted/p.relative_to(stage)
                 if not counterpart.is_file() or sha(p)!=sha(counterpart):raise ValueError('extracted package differs from audited stage')
         verify_launcher_icon(target,extracted,package)
+        if 'apple' in target:
+            info = plistlib.loads((bindir.parent/'Info.plist').read_bytes())
+            numeric_version = version.split('-', 1)[0]
+            if any(info.get(key) != numeric_version for key in ('CFBundleShortVersionString', 'CFBundleVersion')):
+                raise ValueError('macOS bundle version mismatch')
         m=json.loads((bindir/'backend-manifest.json').read_text())
         if m['target']!=target:raise ValueError('manifest target mismatch')
         for name in ('any-nle','any-nle-gui','ffmpeg','ffprobe'):
             p=bindir/(name+exe);architecture(p,target)
             if not exe:p.chmod(p.stat().st_mode|0o111)
             if name in m['tools'] and sha(p)!=m['tools'][name]['sha256']:raise ValueError('shipped backend hash mismatch')
+        if not exe:
+            gui_version = subprocess.check_output([str(bindir/'any-nle-gui'), '--version'], text=True)
+            if gui_version.strip() != f'Any NLE {version}':
+                raise ValueError('packaged GUI version differs from the release version')
         help_result=subprocess.run([str(bindir/('any-nle'+exe)),'--help'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
         if help_result.returncode or 'any-nle' not in help_result.stdout.lower():raise ValueError('packaged CLI smoke failed')
         for name in ('ffmpeg','ffprobe'):
@@ -97,7 +107,8 @@ def verify_package(target,directory,version):
     receipt={'schema':'anynle.candidate-verification/1','target':target,'version':version,'package':package.name,'sha256':sha(package),'extracted_bytes_match':True,'architecture_verified':True,'launcher_icon_verified':True,'cli_smoke':True,'backend_smoke':True}
     pathlib.Path('candidate-verification.json').write_text(json.dumps(receipt,indent=2)+'\n');print(json.dumps(receipt));return receipt
 
-def verify_all(directory,version):
+def verify_all(directory,version,*,expected_binding=None):
+    version = release_version(version)
     directory=pathlib.Path(directory);seen=set();binding=None;files=[]
     for target,(suffix,ext) in TARGETS.items():
         candidate=directory/('any-nle-'+suffix)
@@ -111,6 +122,8 @@ def verify_all(directory,version):
         audit=json.loads((candidate/'package-audit.json').read_text())
         if not audit['passed'] or audit['match_locations'] or any(not x.get('accepted_upstream_fixture',False) for x in audit.get('undecodable_archives',[])):raise ValueError('package privacy gate failed')
         gate=(candidate/'gate-binding.txt').read_text()
+        if expected_binding is not None and gate != expected_binding:
+            raise ValueError('candidate does not match reviewed source and receipt')
         if binding is None:binding=gate
         if gate!=binding:raise ValueError('candidate source/private receipt bindings differ')
         for asset in (p,candidate/f'Any.NLE_{suffix}_v{version}.provenance.tar.gz'):
@@ -121,8 +134,9 @@ def verify_all(directory,version):
     sums=directory/'SHA256SUMS';sums.write_text(''.join(sha(p)+'  '+p.name+'\n' for p in sorted(files,key=lambda p:p.name)))
     print(json.dumps({'schema':'anynle.six-platform-gate/1','targets':sorted(seen),'assets':len(files),'source_private_receipt_binding':binding}));return files+[sums]
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--target',choices=TARGETS);p.add_argument('--output');p.add_argument('--all');p.add_argument('--version',default=VERSION);a=p.parse_args()
-    if a.version!=VERSION:raise ValueError('unreviewed version')
-    if a.all:verify_all(a.all,a.version)
+    p=argparse.ArgumentParser();p.add_argument('--target',choices=TARGETS);p.add_argument('--output');p.add_argument('--all');p.add_argument('--version');a=p.parse_args()
+    if a.all:
+        expected = gate_binding(os.environ['GITHUB_SHA'], os.environ['PRIVATE_GATE']) if os.environ.get('GITHUB_ACTIONS') == 'true' else None
+        verify_all(a.all,a.version,expected_binding=expected)
     elif a.target and a.output:verify_package(a.target,a.output,a.version)
     else:p.error('use --all or --target and --output')
