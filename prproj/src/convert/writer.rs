@@ -16,11 +16,11 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::audio::{add_crossfade, set_clip_gain, set_clip_volume, set_track_level, split_overflow};
+use super::audio::{add_crossfade, set_clip_gain, set_clip_volume, set_mix_level, set_mono_track_pan, set_track_level, split_overflow};
 use super::avid_color;
 use super::colors;
 use super::combined::{
-    combined_order, create_grouped_with_display as create_grouped, create_merged, create_stereo_nest, declare_stereo_chain, display_format,
+    combined_order, create_grouped_with_media as create_grouped, create_merged, create_stereo_nest, declare_stereo_chain, display_format,
     group_for_channel, move_to_processed_clips, narrow_to_group, parts_bin, set_clip_pan, Pan,
 };
 use super::lumetri::{apply_lumetri_lut, cube_text};
@@ -31,7 +31,7 @@ use super::time_remap::set_time_remap;
 use super::metadata;
 use super::prepared::{PictureEffect, PreparedPictureEffect, PreparedText, PreparedVideoDissolve};
 use super::model::{event_audio_files, py_str_repr, ticks_per_unit, Clip, ColorCorrection, Event, EventAudio, Fraction, Marker, Model, ModelError, Sequence};
-use super::opatom::{add_audio_item, add_video_item, source_item_names, MediaTable, OpatomError, UnverifiedShape};
+use super::opatom::{add_audio_item, add_video_item, source_item_names, DirectDnxhrFile, MediaTable, OpatomError, UnverifiedShape};
 use super::placement::normalize_placement;
 use crate::build::fmt::{fmt_f, py_repr};
 use crate::build::sequence::{extra_formats, formats};
@@ -549,7 +549,11 @@ struct WriterInput<'a> {
     bins:&'a [super::model::Bin], sequences:&'a [Sequence],
     texts:&'a [super::prepared::PreparedText],
     video_dissolves: &'a [PreparedVideoDissolve],
+    audio_edge_fades: &'a [super::prepared::PreparedAudioEdgeFade],
+    audio_crossfades: &'a [super::prepared::PreparedAudioCrossfade],
+    audio_mixers: &'a BTreeMap<usize, super::prepared::PreparedAudioMixer>,
     picture_effects: &'a [PreparedPictureEffect],
+    direct_dnxhr_origins: &'a HashMap<String, i64>,
     multicams: &'a [super::multicam::PreparedMulticam],
     multicam_uses: &'a [super::multicam::PreparedMulticamUse],
 }
@@ -594,6 +598,8 @@ struct Writer<'a> {
     multicam_items: Vec<ItemId>,
     multicam_uses: HashMap<(usize, usize), &'a super::multicam::PreparedMulticamUse>,
     video_dissolves: HashMap<usize, Vec<&'a PreparedVideoDissolve>>,
+    audio_edge_fades: HashMap<(usize, usize, i64), &'a super::prepared::PreparedAudioEdgeFade>,
+    audio_crossfades: HashMap<usize, Vec<&'a super::prepared::PreparedAudioCrossfade>>,
     picture_effects: HashMap<(usize, usize), (PictureEffect, [bool; 2])>,
 }
 
@@ -711,7 +717,7 @@ impl Writer<'_> {
                     ("merged", Payload::Parts { video: Some(video_copy), audio: audio_copies, stereo: Vec::new() }),
                 );
             } else {
-                let grouped_item = create_grouped(&mut self.project, clip, Some(video), &combined, target, &clip.name, clip.video.as_ref().and_then(|v|self.media.rewrap_formats.get(&v.path)).and_then(|s|s.parse().ok()), self.ids)?;
+                let grouped_item = create_grouped(&mut self.project, clip, Some(video), &combined, target, &clip.name, Some(&self.media), self.ids)?;
                 self.apply_metadata(grouped_item, clip)?;
                 label_items(&mut self.project, clip, &[grouped_item], model.options)?;
                 self.build_markers(clip, grouped_item, None)?;
@@ -907,7 +913,7 @@ impl Writer<'_> {
         }
         if kind == "grouped" {
             let combined: Vec<ItemId> = combined_order(clip)?.into_iter().map(|j| audio[j]).collect();
-            let copy = create_grouped(&mut self.project, clip, video, &combined, target, &name, clip.video.as_ref().and_then(|v|self.media.rewrap_formats.get(&v.path)).and_then(|s|s.parse().ok()), self.ids)?;
+            let copy = create_grouped(&mut self.project, clip, video, &combined, target, &name, Some(&self.media), self.ids)?;
             self.apply_metadata(copy, clip)?;
             label_items(&mut self.project, clip, &[copy], model.options)?;
             let all: Vec<&Marker> = clip.markers.iter().collect();
@@ -1043,7 +1049,20 @@ impl Writer<'_> {
             self.report.unverified.push(format!("sequence {seq_name}: expanded audio-track count requires fresh native Premiere read-back; structural checks do not qualify playback"));
         }
         let text_tracks = model.texts.iter().filter(|t| t.sequence == sequence_index && t.kind == super::prepared::PreparedTextKind::Graphic).map(|t| t.track as usize).max().unwrap_or(0);
-        let sequence = self.project.add_sequence(&seq.name, &preset, (text_tracks > base.video_tracks).then_some(text_tracks), self.ids)?;
+        let mixer = model.audio_mixers.get(&sequence_index);
+        let track_pans = mixer.and_then(|mixer| mixer.mono_track_pans);
+        let sequence = if let Some(pans) = track_pans {
+            let mut format = crate::build::sequence::format_by_name(&preset)
+                .ok_or_else(|| UnverifiedShape("unknown sequence preset".into()))?;
+            if format.mono_discrete || format.grouped_channels != 0 || format.audio_tracks < 2 {
+                return Err(UnverifiedShape("track pan requires two mono inputs and a stereo mix".into()).into());
+            }
+            format.mono_stereo_inputs = pans.map(|pan| pan.is_some());
+            format.video_tracks = format.video_tracks.max(text_tracks);
+            self.project.add_sequence_with_format(&seq.name, &format, self.ids)?
+        } else {
+            self.project.add_sequence(&seq.name, &preset, (text_tracks > base.video_tracks).then_some(text_tracks), self.ids)?
+        };
         if let Some(parent) = self.sequence_parent {
             let item = self.project.sequence_item(sequence).ok_or_else(|| other("sequence has no project-panel item"))?;
             self.project.move_item(item, parent)?;
@@ -1088,6 +1107,9 @@ impl Writer<'_> {
         let dissolve_events: HashSet<_> = self.video_dissolves.get(&sequence_index)
             .into_iter().flatten().flat_map(|d| [d.outgoing, d.incoming]).collect();
         let mut dissolve_items = HashMap::new();
+        let crossfade_events: HashSet<_> = self.audio_crossfades.get(&sequence_index).into_iter().flatten()
+            .flat_map(|fade| [(fade.outgoing, fade.track), (fade.incoming, fade.track)]).collect();
+        let mut crossfade_items = HashMap::new();
         for (i, e) in seq.events.iter().enumerate() {
             let group_use = self.multicam_uses.get(&(sequence_index, i)).copied();
             let prepared_picture = self.picture_effects.get(&(sequence_index, i)).copied();
@@ -1495,6 +1517,11 @@ impl Writer<'_> {
                     Some(&(pan, track)) => (pan, Some(track)),
                     None => (None, None),
                 };
+                if let Some(track) = track {
+                    if crossfade_events.contains(&(i, track)) && crossfade_items.insert((i, track), t).is_some() {
+                        return Err(other("audio crossfade endpoint produced more than one item"));
+                    }
+                }
                 if let (None, Some(track)) = (pan, track) {
                     if options.match_avid_default_pan {
                         pan = Some(if track.rem_euclid(2) != 0 { -100.0 } else { 100.0 }); // Avid default: odd tracks left, even right
@@ -1504,6 +1531,16 @@ impl Writer<'_> {
                 }
                 if let Some(p) = pan.filter(|&p| p != 0.0) {
                     set_clip_pan(&mut self.project, t, Pan::Percent(p))?;
+                }
+                if let Some((track, fade)) = track.and_then(|track| {
+                    self.audio_edge_fades.get(&(sequence_index, i, track)).map(|fade| (track, fade))
+                }) {
+                    let track = track_at(&atracks, track)?;
+                    for (at_start, duration) in [(true, fade.head), (false, fade.tail)] {
+                        if duration > 0 {
+                            self.project.add_prepared_audio_fade(track, t, at_start, duration)?;
+                        }
+                    }
                 }
             }
         }
@@ -1518,6 +1555,21 @@ impl Writer<'_> {
             }
             set_track_level(&mut self.project, track_at(&atracks, level.track)?, level.db)?;
         }
+        if let Some(mixer) = mixer {
+            if let Some(db) = mixer.mix_level_db {
+                set_mix_level(&mut self.project, sequence, db)?;
+            }
+            if let Some(pans) = track_pans {
+                for (index, pan) in pans.into_iter().enumerate() {
+                    if let Some(pan) = pan {
+                        set_mono_track_pan(&mut self.project, atracks[index], pan)?;
+                    }
+                }
+            }
+            for &track in &mixer.muted_tracks {
+                self.project.set_muted(track_at(&atracks, track)?, true)?;
+            }
+        }
         for fade in &seq.audio_crossfades {
             if fade.track > atracks.len() as i64 {
                 return Err(UnverifiedShape(format!("sequence {seq_name}: crossfade on missing audio track {}", fade.track)).into());
@@ -1528,6 +1580,15 @@ impl Writer<'_> {
                 Err(Error::Value(message)) => return Err(UnverifiedShape(format!("sequence {seq_name}: {message}")).into()),
                 Err(error) => return Err(error.into()),
             }
+        }
+        for fade in self.audio_crossfades.get(&sequence_index).into_iter().flatten() {
+            let out = *crossfade_items.get(&(fade.outgoing, fade.track))
+                .ok_or_else(|| other("missing outgoing audio crossfade item"))?;
+            let inc = *crossfade_items.get(&(fade.incoming, fade.track))
+                .ok_or_else(|| other("missing incoming audio crossfade item"))?;
+            let cut = seq.events[fade.incoming].record_start;
+            self.project.add_prepared_audio_crossfade(track_at(&atracks, fade.track)?, out, inc,
+                cut - fade.before_cut, add(cut, fade.duration - fade.before_cut)?, fade.before_cut)?;
         }
         for d in self.video_dissolves.get(&sequence_index).into_iter().flatten() {
             let out = *dissolve_items.get(&d.outgoing).ok_or_else(|| other("missing outgoing dissolve item"))?;
@@ -1660,7 +1721,7 @@ pub fn prepare_project_with_texts(model: &Model, texts: &[super::prepared::Prepa
 pub fn prepare_project_with_editorial(model: &Model, texts: &[super::prepared::PreparedText],
     video_dissolves: &[PreparedVideoDissolve], out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
     media: &[super::rewrap::MediaRelink], native_av: bool) -> Result<PreparedProject> {
-    prepare_project_with_effects(model, Editorial { texts, video_dissolves, picture_effects: &[] },
+    prepare_project_with_effects(model, Editorial { texts, video_dissolves, picture_effects: &[], direct_dnxhr_origins: &HashMap::new() },
         out_path, ids, media, native_av)
 }
 
@@ -1668,17 +1729,18 @@ pub struct Editorial<'a> {
     pub texts: &'a [PreparedText],
     pub video_dissolves: &'a [PreparedVideoDissolve],
     pub picture_effects: &'a [PreparedPictureEffect],
+    pub direct_dnxhr_origins: &'a HashMap<String, i64>,
 }
 
 pub fn prepare_project_with_effects(model: &Model, editorial: Editorial<'_>,
     out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
     media: &[super::rewrap::MediaRelink], native_av: bool) -> Result<PreparedProject> {
     super::model::validate_model(model)?;
-    let Editorial { texts, video_dissolves, picture_effects } = editorial;
+    let Editorial { texts, video_dissolves, picture_effects, direct_dnxhr_origins } = editorial;
     super::prepared::validate_texts(texts, &model.sequences)?;
     super::prepared::validate_video_dissolves(video_dissolves, &model.sequences)?;
     super::prepared::validate_picture_effects(picture_effects, &model.sequences)?;
-    let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,picture_effects,multicams:&[],multicam_uses:&[]};
+    let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_mixers:&BTreeMap::new(),picture_effects,direct_dnxhr_origins,multicams:&[],multicam_uses:&[]};
     prepare_view(&view,model,out_path,ids,media,native_av,None)
 }
 
@@ -1696,7 +1758,7 @@ fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_p
     if let Some(layout) = layout { layout.validate(&input.bins)?; }
     input.validate()?;
     let legacy=Model{project_name:input.project_name.clone(),options:input.options.clone(),clips:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Legacy(c)=>Some(c.clone()),_=>None}).collect(),bins:input.bins.iter().map(|b|super::model::Bin{name:b.name.clone(),clips:b.clips.iter().filter(|id|input.clips.iter().any(|c|matches!(c,super::prepared::PreparedClip::Legacy(c) if c.id==**id))).cloned().collect()}).collect(),sequences:input.sequences.iter().map(|s|{let mut s=s.clone();s.events.retain(|e|input.clips.iter().any(|c|matches!(c,super::prepared::PreparedClip::Legacy(c) if c.id==e.clip)));s.markers.clear();s}).collect()};
-    let view=WriterInput{options:&input.options,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,picture_effects:&input.picture_effects,multicams:&input.multicams,multicam_uses:&input.multicam_uses};
+    let view=WriterInput{options:&input.options,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_mixers:&input.audio_mixers,picture_effects:&input.picture_effects,direct_dnxhr_origins:&input.direct_dnxhr_origins,multicams:&input.multicams,multicam_uses:&input.multicam_uses};
     prepare_view(&view,&legacy,out_path,ids,media,native_av,layout)
 }
 fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
@@ -1717,7 +1779,59 @@ fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
     }
     Ok(())
 }
+fn direct_dnxhr_files(
+    model: &WriterInput<'_>,
+    media: &[super::rewrap::MediaRelink],
+    native_av: bool,
+) -> Result<HashMap<String, DirectDnxhrFile>> {
+    if model.direct_dnxhr_origins.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if native_av || !media.is_empty() {
+        return Err(other("direct DNxHR OP-Atom cannot use rewrap bindings"));
+    }
+    let rate = super::model::Fraction::new(24000, 1001);
+    let unit = ticks_per_unit(rate);
+    let mut files = HashMap::new();
+    for (id, &origin) in model.direct_dnxhr_origins {
+        let c = model.clips.get(id).ok_or_else(|| other("direct DNxHR OP-Atom clip ID is unavailable"))?;
+        let v = c.video.as_ref().ok_or_else(|| other("direct DNxHR OP-Atom clip has no picture"))?;
+        let [a, b] = c.audio.as_slice() else {
+            return Err(other("direct DNxHR OP-Atom requires two independent mono siblings"));
+        };
+        if v.codec != "AVdn" || (v.width, v.height) != (1920, 1080) || v.rate != rate
+            || origin < 0 || origin % unit != 0
+            || v.start < 0 || v.start % unit != 0 || v.duration <= 0 || v.duration % unit != 0
+            || !matches!((a.avid_track, b.avid_track), (Some(1), Some(2)) | (Some(2), Some(1)))
+            || !c.stereo_pairs.is_empty() || !c.multichannel_groups.is_empty()
+            || [a, b].iter().any(|s| s.sample_rate != 48000 || s.bits != 24 || s.start != v.start || s.duration != v.duration)
+            || v.path == a.path || v.path == b.path || a.path == b.path
+        {
+            return Err(other("invalid direct DNxHR OP-Atom clip profile"));
+        }
+        for (path, is_picture) in [(&v.path, true), (&a.path, false), (&b.path, false)] {
+            let profile = (DirectDnxhrFile { origin, picture: is_picture }, v.start, v.duration);
+            if files.insert(path, profile).is_some_and(|prior| prior != profile) {
+                return Err(other("shared direct DNxHR OP-Atom media has conflicting file facts"));
+            }
+        }
+    }
+    for c in model.clips.values().filter(|c| !model.direct_dnxhr_origins.contains_key(&c.id)) {
+        if c.video.as_ref().is_some_and(|v| files.contains_key(&v.path))
+            || c.audio.iter().any(|a| files.contains_key(&a.path))
+        {
+            return Err(other("direct DNxHR OP-Atom media is shared with an unqualified clip"));
+        }
+    }
+    if model.sequences.iter().any(|s| s.rate != rate
+        && s.events.iter().any(|e| model.direct_dnxhr_origins.contains_key(&e.clip))) {
+        return Err(other("direct DNxHR OP-Atom needs a same-rate 23.976 sequence"));
+    }
+    Ok(files.into_iter().map(|(path, (file, _, _))| (path.clone(), file)).collect())
+}
+
 fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>)->Result<PreparedProject> {
+    let direct_dnxhr = direct_dnxhr_files(model, media, native_av)?;
     dissolve_handles(model)?;
     for p in model.picture_effects {
         if let PictureEffect::TrimmedWarp(trim) | PictureEffect::TrimmedResize(trim) = p.effect {
@@ -1792,6 +1906,7 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
     let Some(project_root) = project.root_item() else { return Err(other("project has no root item")) };
     let root = if let Some(layout) = layout { project.add_bin(project_root, &layout.root_name, ids)? } else { project_root };
     let mut table = MediaTable::new();
+    table.direct_dnxhr = direct_dnxhr;
     if native_av {
         for c in model.clips.values().filter(|c|c.audio.len()>2) {
             if let Some(v)=&c.video { if media.iter().any(|m|m.source_path==v.path && m.target_path.to_ascii_lowercase().ends_with(".mov")) {table.mono_views.insert(v.path.clone());} }
@@ -1816,6 +1931,10 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
     for d in model.video_dissolves {
         video_dissolves.entry(d.sequence).or_default().push(d);
     }
+    let mut audio_crossfades: HashMap<_, Vec<_>> = HashMap::new();
+    for fade in model.audio_crossfades {
+        audio_crossfades.entry(fade.sequence).or_default().push(fade);
+    }
     let mut writer = Writer {
         model,
         rewrapped: !media.is_empty(),
@@ -1835,6 +1954,9 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         multicam_items: Vec::new(),
         multicam_uses: model.multicam_uses.iter().map(|u| ((u.sequence,u.event),u)).collect(),
         video_dissolves,
+        audio_crossfades,
+        audio_edge_fades: model.audio_edge_fades.iter()
+            .map(|fade| ((fade.sequence, fade.event, fade.track), fade)).collect(),
         picture_effects: model.picture_effects.iter()
             .map(|e| ((e.sequence, e.event), (e.effect, e.reflection_before_motion))).collect(),
     };

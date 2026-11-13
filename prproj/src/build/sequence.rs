@@ -38,6 +38,7 @@ fn class(tag: &str) -> (&'static str, &'static str) {
         "VideoComponentChain" => ("0970e08a-f58f-4108-b29a-1a717b8e12e2", "3"),
         "AudioClipTrack" => ("097f6203-99ae-11d5-84f2-8cf14bde7040", "7"),
         "AudioMixTrack" => ("4b1d8400-e89e-11d5-abc4-a1a13b1e80a0", "4"),
+        "MonoToStereoPanProcessor" => ("33a94283-ee2c-11d5-abc4-c1cd7f9e3c10", "1"),
         "StereoToStereoPanProcessor" => ("7bf86a01-efbe-11d5-abc4-c1ce2b1e9090", "1"),
         "MonoTo16ChannelPanProcessor" => ("8c9778ad-af4e-4e98-99fe-542f4eda2dac", "2"),
         "StereoTo16ChannelPanProcessor" => ("1a356806-5dc5-4e2f-914c-d8353e1a6581", "2"),
@@ -102,6 +103,7 @@ pub struct SequenceFormat {
     pub preview_format: &'static str,
     pub linear_compositing: bool,
     pub mono_discrete: bool,
+    pub mono_stereo_inputs: [bool; 2],
     /// Explicit 5.1 (6) or eight-channel Adaptive (8) template; zero keeps legacy behavior.
     pub grouped_channels: usize,
     /// `MZ.Sequence.PreviewRenderingPresetCodec` as its FourCC.
@@ -123,6 +125,7 @@ impl SequenceFormat {
             preview_format: "fc3cd4d9-d839-8259-9276-05c5000000ea",
             linear_compositing: true,
             mono_discrete: false,
+            mono_stereo_inputs: [false; 2],
             grouped_channels: 0,
             preview_codec: "apcs",
             color_space: REC709,
@@ -494,6 +497,7 @@ pub fn build_with_format(
     let root = t.new_element_with("PremiereData", &[("Version", "3")]);
 
     let mono = fmt.mono_discrete;
+    let mono_stereo_input = |index| fmt.mono_stereo_inputs.get(index).copied().unwrap_or(false);
     let clip_layout = if mono || wide == 8 { mono_layout(BUS_CHANNELS) } else if wide == 6 { crate::build::media::audio_channel_layout(6) } else { STEREO.to_string() };
     let clip_type = if mono || wide == 8 { CT_BUS } else if wide == 6 { "2" } else { CT_STEREO };
     let track_layout = if wide > 0 { clip_layout.as_str() } else if mono { MONO } else { STEREO };
@@ -615,8 +619,9 @@ pub fn build_with_format(
         t.sub_element(audio_track, "Panner", &[("ObjectRef", a(&format!("panner_{index}")))]);
         let id = uid.get(&format!("audio_track_id_{index}"));
         leaf(t, audio_track, "ID", &id);
-        if mono || wide > 0 {
-            leaf(t, audio_track, "ChannelType", track_type);
+        if mono || wide > 0 || mono_stereo_input(index) {
+            let input_type = if mono_stereo_input(index) { CT_MONO } else { track_type };
+            leaf(t, audio_track, "ChannelType", input_type);
         }
         leaf(t, audio_track, "NextPannerID", NEXT_PANNER_ID);
     }
@@ -652,8 +657,8 @@ pub fn build_with_format(
             chain,
             a(&format!("fader_{index}")),
             a(&format!("meter_{index}")),
-            if mono { None } else { Some(track_layout) },
-            track_type,
+            if mono || mono_stereo_input(index) { None } else { Some(track_layout) },
+            if mono_stereo_input(index) { CT_MONO } else { track_type },
         );
         if wide > 0 {
             let kind = if wide == 6 { "DefaultPanProcessor" } else { "AdaptiveToAdaptivePanProcessor" };
@@ -680,6 +685,12 @@ pub fn build_with_format(
             );
             leaf(t, processor, "OutputAudioChannelLayout", &mono_layout(BUS_CHANNELS));
             leaf(t, direct, "Matrix", &format!("[[0,[{}]]]", index / 2 * 2));
+        } else if mono_stereo_input(index) {
+            let panner = object(t, root, "MonoToStereoPanProcessor", Some(a(&format!("panner_{index}"))), None);
+            let processor = t.sub_element(panner, "PanProcessor", &[("Version", "3")]);
+            audio_component(t, processor, PANNER_COMPONENT_ID, "0",
+                &[a(&format!("balance_{index}"))], MONO, CT_MONO);
+            leaf(t, processor, "OutputAudioChannelLayout", STEREO);
         } else {
             let panner = object(t, root, "StereoToStereoPanProcessor", Some(a(&format!("panner_{index}"))), None);
             let processor = t.sub_element(panner, "PanProcessor", &[("Version", "3")]);
@@ -713,8 +724,9 @@ pub fn build_with_format(
 
     for strip in strip_keys(fmt.audio_tracks) {
         let is_master = strip == "master";
-        let layout: &str = if is_master { &clip_layout } else { track_layout };
-        let channel_type = if is_master { clip_type } else { track_type };
+        let mono_input = !is_master && mono_stereo_input(strip.parse::<usize>().expect("strip index"));
+        let layout: &str = if is_master { &clip_layout } else if mono_input { MONO } else { track_layout };
+        let channel_type = if is_master { clip_type } else if mono_input { CT_MONO } else { track_type };
         let fader = object(t, root, "AudioFader", Some(a(&format!("fader_{strip}"))), None);
         audio_component(
             t,
@@ -741,7 +753,7 @@ pub fn build_with_format(
         } else {
             leaf(t, pan, "StartKeyframe", "-91445760000000000,0.5,0,0,0,0,0,0");
             leaf(t, pan, "CurrentValue", "0.5");
-            leaf(t, pan, "Name", "Balance");
+            leaf(t, pan, "Name", if mono_input { "Pan" } else { "Balance" });
         }
         leaf(t, pan, "IsInverted", "true");
     }

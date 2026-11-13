@@ -165,6 +165,140 @@ fn q(n: i64) -> Q {
 fn options() -> Options {
     Options::default()
 }
+
+#[test]
+fn direct_dnxhr_needs_the_native_codec_clock_and_discrete_siblings() {
+    use prproj::convert::{
+        model::{AudioCrossfade, Fraction, TICKS_PER_SECOND},
+        writer::prepare_typed_project,
+    };
+
+    let mut g = fixture();
+    g.sequences.clear();
+    g.sidecars.retain(|s| g.media.iter().any(|m| m.id == s.object)
+        || g.items.iter().any(|item| item.id == s.object));
+    let rate = Q::new(24000, 1001).unwrap();
+    let duration = Q::new(3003, 2000).unwrap(); // 36 pictures or 72,072 samples
+    let start = Q::new(1001, 20).unwrap(); // frame 1,200 at the exact file rate
+    g.items[0].rate = Some(rate);
+    for (i, m) in g.media.iter_mut().enumerate() {
+        let picture = m.kind == StreamKind::Video;
+        let lane = m.stream;
+        m.online = Some(true);
+        m.duration = duration;
+        m.start = Some(start);
+        m.clock = Some(SourceClock {
+            effective_count: 1200,
+            rate,
+            display_base: 24,
+            drop: false,
+            provenance: SourceClockProvenance {
+                origin_count: 1198,
+                source_offset: if picture { 2 } else { 4004 },
+                source_rate: if picture { rate } else { q(48000) },
+                source_package: "native source package".into(),
+                timecode_track: format!("native timecode track {i}"),
+                route: "file_source_clip_to_physical_timecode_track".into(),
+            },
+        });
+        let descriptor = if picture {
+            m.rate = Some(rate);
+            v(vec![("compression", Value::Str("RI00".into())),
+                   ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)]))])
+        } else {
+            assert!(matches!(lane, Some(1 | 2)));
+            m.bits = Some(24);
+            v(vec![("channels", Value::Int(1))])
+        };
+        let facts = g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == m.id).unwrap();
+        facts.data = v(vec![
+            ("legacy_clock", clock(1198, 24, false)),
+            ("file_package", Value::Str(format!("file package {i}"))),
+            ("descriptor_length", Value::Int(if picture { 36 } else { 72072 })),
+            ("descriptor", descriptor),
+            ("picture_coding", if picture { Value::Str("060E2B340401010D0401020271280000".into()) } else { Value::Null }),
+        ]);
+    }
+    let separate = Options { bin_mode: "separate".into(), ..options() };
+    let prepared = prepare(&g, &separate, ClockProfile::LegacyImport).unwrap();
+    let clip = prepared.model.clips.values().next().unwrap();
+    let exact_ticks = start.to_units(TICKS_PER_SECOND).unwrap();
+    let origin = Q::new(1198 * 1001, 24000).unwrap().to_units(TICKS_PER_SECOND).unwrap();
+    assert_eq!(prepared.direct_dnxhr_origins.get(&clip.id), Some(&origin));
+    assert_eq!(clip.video.as_ref().unwrap().start, exact_ticks);
+    assert!(clip.audio.iter().all(|a| a.start == exact_ticks));
+    let dir = std::env::temp_dir().join(format!("anynle-direct-dnxhr-{}-{}",
+        std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir(&dir).unwrap();
+    let unit = TICKS_PER_SECOND / 24_000 * 1_001;
+    let mut timeline = parse_model_str(include_str!("../../../examples/opatom_clip.model.json"))
+        .unwrap().sequences.remove(0);
+    timeline.rate = Fraction::new(24_000, 1_001);
+    timeline.markers.clear();
+    let first = &mut timeline.events[0];
+    first.clip = clip.id.clone();
+    first.source_in = 4 * unit;
+    first.duration = 10 * unit;
+    let mut second = first.clone();
+    second.record_start = 10 * unit;
+    second.source_in = 6 * unit;
+    timeline.events.push(second);
+    timeline.audio_crossfades.push(AudioCrossfade {
+        track: 2,
+        cut: 10 * unit,
+        duration: 4 * unit,
+        cut_offset: 2 * unit,
+        style: "constant_power".into(),
+    });
+    for mode in ["separate", "grouped", "merged"] {
+        let options = Options { bin_mode: mode.into(), ..options() };
+        let mut input = premiere_adapter::prepare_originals(&g, &options, ClockProfile::LegacyImport).unwrap().input;
+        assert_eq!(input.direct_dnxhr_origins, prepared.direct_dnxhr_origins);
+        input.sequences.push(timeline.clone());
+        let out = dir.join(format!("{mode}.prproj"));
+        let mut ids = prproj::SeededUuids::new("synthetic-direct-dnxhr");
+        let ready = prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap();
+        assert!(!out.exists());
+        ready.publish().unwrap();
+        let mut doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(doc.tree.iter_tag(doc.root, "CodecType").any(|n| doc.tree.text(n) == Some("1096180840")));
+        assert!(doc.tree.iter_tag(doc.root, "TimecodeFormat").any(|n| doc.tree.text(n) == Some("110")));
+        assert_eq!(doc.tree.iter_tag(doc.root, "AudioTransitionTrackItem").count(), 1);
+        let media_starts: Vec<_> = doc.tree.iter_tag(doc.root, "Media")
+            .filter_map(|n| doc.tree.child_by_tag(n, "Start"))
+            .map(|n| doc.tree.text(n).unwrap().parse::<i64>().unwrap())
+            .collect();
+        assert_eq!(media_starts, [origin; 3]);
+        let modification_states: Vec<_> = doc.tree.iter_tag(doc.root, "Media")
+            .filter_map(|n| doc.tree.child_by_tag(n, "ModificationState"))
+            .collect();
+        assert_eq!(modification_states.len(), 3);
+        for state in modification_states {
+            assert!(doc.payload(state).unwrap().is_some_and(|bytes| !bytes.is_empty()));
+        }
+        if mode == "grouped" {
+            assert_eq!(doc.tree.iter_tag(doc.root, "MonoToStereoPanProcessor").count(), 2);
+        }
+        assert!(doc.tree.iter_tag(doc.root, "MediaInPoint")
+            .any(|n| doc.tree.text(n).and_then(|v| v.parse::<i64>().ok()) == Some(exact_ticks)));
+    }
+    let picture = g.media.iter().find(|m| m.kind == StreamKind::Video).unwrap();
+    let facts = g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == picture.id).unwrap();
+    if let Value::Obj(fields) = &mut facts.data {
+        fields.retain(|(name, _)| name != "picture_coding");
+    }
+    for mode in ["separate", "grouped", "merged"] {
+        let options = Options { bin_mode: mode.into(), ..options() };
+        let input = premiere_adapter::prepare_originals(&g, &options, ClockProfile::LegacyImport).unwrap().input;
+        assert!(input.direct_dnxhr_origins.is_empty());
+        let refused = dir.join(format!("unqualified-{mode}.prproj"));
+        let mut ids = prproj::SeededUuids::new("synthetic-direct-dnxhr");
+        let error = prepare_typed_project(&input, &refused, &mut ids, &[], false).err().unwrap();
+        assert!(error.to_string().contains("no Premiere-observed media timecode format"));
+        assert!(!refused.exists());
+    }
+}
+
 fn two_edits() -> SourceGraph {
     let mut g = fixture();
     let s = &mut g.sequences[0];

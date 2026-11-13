@@ -430,6 +430,60 @@ impl Project {
         )
     }
 
+    /// Write a one-sided, clip-owned Constant Gain fade at exact sequence ticks.
+    pub(crate) fn add_prepared_audio_fade(
+        &mut self, track: TrackId, clip: TrackItemId, at_start: bool, duration: i64,
+    ) -> Result<()> {
+        let start = self.start(clip)?.ticks;
+        let end = self.end(clip)?.ticks;
+        if self.track(track).media_type != MediaType::Audio || self.track_item(clip).track != track
+            || duration <= 0 || end.checked_sub(start).is_none_or(|span| duration > span)
+        {
+            return value("prepared audio fade does not fit its written clip");
+        }
+        let (start, end, alignment) = if at_start {
+            (start, start + duration, 0)
+        } else {
+            (end - duration, end, duration)
+        };
+        let fade = self.attach_transition(
+            track, clip, None, at_start, start, end, alignment, "Constant Gain", "Constant Gain",
+        )?;
+        self.set_constant_gain_shape(track, fade)
+    }
+
+    pub(crate) fn add_prepared_audio_crossfade(
+        &mut self, track: TrackId, outgoing: TrackItemId, incoming: TrackItemId,
+        start: i64, end: i64, offset: i64,
+    ) -> Result<()> {
+        let cut = self.start(incoming)?.ticks;
+        if self.track(track).media_type != MediaType::Audio
+            || self.track_item(outgoing).track != track || self.track_item(incoming).track != track
+            || self.end(outgoing)?.ticks != cut || start.checked_add(offset) != Some(cut)
+            || !(start < cut && cut < end)
+        {
+            return value("prepared audio crossfade endpoints do not match the written cut");
+        }
+        let fade = self.attach_transition(
+            track, incoming, Some(outgoing), true, start, end, offset, "Constant Gain", "Constant Gain",
+        )?;
+        self.set_constant_gain_shape(track, fade)
+    }
+
+    fn set_constant_gain_shape(&mut self, track: TrackId, fade: NodeId) -> Result<()> {
+        let mono = self.doc.tree.findtext(self.track(track).element, "AudioTrack/ChannelType")?
+            .as_deref() == Some("0");
+        let tree = &mut self.doc.tree;
+        if !mono {
+            if let Some(layout) = tree.child_by_tag(fade, "AudioChannelLayout") {
+                tree.set_text(layout, Some(r#"[{"channellabel":100},{"channellabel":101}]"#));
+            }
+        }
+        append_leaf(tree, fade, "FadeShapeType", "0");
+        append_leaf(tree, fade, "FadeShapeValue", "0");
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attach_transition(
         &mut self, track: TrackId, clip: TrackItemId, neighbour: Option<TrackItemId>,
@@ -532,11 +586,26 @@ impl Project {
 
     /// `_handle_after`: footage past the out point, in timeline ticks.
     fn handle_after(&self, clip: TrackItemId) -> Result<i64> {
-        let source = self
-            .track_item_source(clip)
-            .and_then(|i| self.item(i).default_out_ticks)
-            .ok_or_else(|| Error::Value("cannot size a transition: the clip's source duration is unknown".into()))?;
-        let spare = source - self.out_point(clip)?.ticks;
+        let unknown = || Error::Value("cannot size a transition: the clip's source duration is unknown".into());
+        let source = match self.track_item_source(clip) {
+            Some(item) => self.item(item).default_out_ticks.ok_or_else(unknown)?,
+            None => {
+                // A merged audio component can have a saved source without a panel item.
+                let tree = &self.doc.tree;
+                let reference = tree.find1(self.track_item(clip).clip, "Clip/Source").ok_or_else(unknown)?;
+                let source = self.doc.resolve(reference)?;
+                if tree.tag(source) != "AudioMediaSource" {
+                    return Err(unknown());
+                }
+                let duration = py_int(&tree.findtext(source, "OriginalDuration")?.ok_or_else(unknown)?)?;
+                if duration < 0 {
+                    return value("cannot size a transition: negative source duration");
+                }
+                duration
+            }
+        };
+        let spare = source.checked_sub(self.out_point(clip)?.ticks)
+            .ok_or_else(|| Error::Value("transition source handle overflows".into()))?;
         Ok(py_div_trunc(spare, self.speed(clip)?)?.max(0))
     }
 }

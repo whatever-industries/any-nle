@@ -29,3 +29,15 @@ pub(crate) fn bit(name: &str) -> Option<u64> {
         .into_iter()
         .find_map(|(bit, saved)| (name == saved).then_some(bit))
 }
+
+
+// Keep the distinct Premiere color categories when using Resolve's named palette.
+// These three substitutions use swatches observed in a native Resolve export.
+pub(crate) fn premiere_substitute(name: &str) -> Option<&'static str> {
+    match name {
+        "Magenta" => Some("Lavender"),
+        "Orange" => Some("Sand"),
+        "White" => Some("Cream"),
+        _ => None,
+    }
+}

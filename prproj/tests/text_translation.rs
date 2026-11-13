@@ -6,7 +6,11 @@ fn input() -> PreparedProjectInput {
     let frame = TICKS_PER_SECOND / 24;
     PreparedProjectInput {
         video_dissolves: Vec::new(),
+        audio_edge_fades: Vec::new(),
+        audio_crossfades: Vec::new(),
+        audio_mixers: Default::default(),
         picture_effects: Vec::new(),
+        direct_dnxhr_origins: Default::default(),
         project_name: "Synthetic caption and title".into(),
         options: Options::default(),
         clips: vec![],

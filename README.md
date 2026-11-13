@@ -97,6 +97,11 @@ source snapshots explicitly use graph/2. Graph/1 reading and the standalone mode
 API remain available; held FCPXML conversion keeps its legacy profile.
 [Architecture, limits and acceptance](docs/SOURCE-GRAPH-MIGRATION.md).
 
+**Separate files**, **Grouped**, and **Merged** can link the qualified 1080p
+23.976 DNxHR LB OP-Atom profile directly. All three use the original picture
+MXF and two mono PCM24/48 kHz sibling MXFs in place.
+[Premiere 27 playback and reopen checks](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#premiere-27-direct-linking).
+
 Optional OP-Atom media preparation: append `--rewrap-op1a NEW_MEDIA_DIRECTORY` to an
 Avid→Premiere conversion. It displays **“Creates new media.”** Add `--rewrap-dry-run` for
 a preview without writes. On macOS, use `--rewrap-op1a-prompt` instead of a directory

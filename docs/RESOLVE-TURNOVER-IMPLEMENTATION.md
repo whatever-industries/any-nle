@@ -32,9 +32,10 @@ It follows the saved audio selector through its source reference, checks
 cached timing against the file, and admits independent mono selections on
 two tracks with a neutral stereo mix. Source and record ranges must agree.
 Premiere source bins retain panel ownership and stable IDs. Captions keep
-their content, lane and exact record span in graph/2. Native sequence marker
-payloads retain their owning sequence and occurrence in the source receipt.
-Review reports caption, marker and unsupported component omissions by occurrence.
+their content, lane and exact record span in graph/2. The reader captures
+sequence Comment markers with exact ticks and preserves bounded native
+receipts by occurrence. Review reports unsupported markers, captions and
+components by occurrence.
 
 Both jobs supply `ffprobe`, `templates`, and `output`. The templates are
 the existing hash-pinned layout and rate profile, plus the applicable Atom
@@ -44,6 +45,36 @@ the source document. Reviewable omissions require
 `--accept-losses` on the publication run. Timing, media, routing and topology
 failures still block publication. Each input project and media binding is
 checked again before exclusive publication.
+
+## Premiere sequence markers
+
+On qualified Premiere → Resolve timelines, a Comment marker on the
+sequence retains its name, comment, and record-relative time in graph/2.
+Resolve receives a whole-frame marker at the same position. A point
+uses Resolve's one-frame marker duration. Whole-frame ranges retain
+their saved length. Green, Red, Blue, Cyan and Yellow map by name.
+The installed Premiere 27 exposes eight marker color indices and Resolve
+accepts sixteen named colors. When Premiere's color has no counterpart,
+Resolve uses Lavender for Magenta, Sand for Orange, and Cream for White.
+Review reports the substitution and graph/2 keeps the Premiere color.
+A marker whose position or duration cannot be represented, whose start
+is shared with another marker, or whose type or payload is unsupported
+is reported by occurrence and requires loss approval.
+Saved values remain in graph/2 or the bounded source receipt. Clip
+markers and richer Premiere marker types remain outside this profile.
+
+A Premiere 27.0.0 build 88 Save As and reopen supplied a 24 fps
+sequence beginning at `01:00:00:01`. Resolve Studio 21.2.0 build 00006
+imported, saved, closed and reopened the generated DRP with all five
+sequence markers, including frame zero, a cut boundary and two
+four-frame ranges. Names, multiline accented comments, Green, Red,
+Blue and Yellow survived. The six linked edit ranges and both WAV
+channel selectors were unchanged. The same Premiere project's linked
+AAF contained all five marker positions and comments, with no embedded
+essence. Its marker entries lacked names, colors and range lengths.
+Resolve imported the AAF at the same timeline origin and reopened it
+with zero timeline markers. That import did not reconnect the originals
+in the tested setup, so it does not qualify AAF media or audio behavior.
 
 ## Premiere clip components
 

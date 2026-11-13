@@ -1,6 +1,6 @@
 //! Borrowed source interpretation -> bounded, destination-specific Premiere input.
 //! This is deliberately separate from graph/1 projection and from project I/O.
-use graph::source::{SourceGraph, SourceMarker, SourceMedia, SourceSequence};
+use graph::source::{SourceGraph, SourceItem, SourceMarker, SourceMedia, SourceSequence};
 use graph::{GraphError, Loss, MarkerOwner, Rational, StreamKind, Value};
 use prproj::convert::model::{
     self, AudioCrossfade, AudioFile, Bin, Clip, Event, EventAudio, Fraction, Marker, Model,
@@ -130,6 +130,7 @@ pub struct PreparedPremiere {
     pub texts: Vec<prproj::convert::prepared::PreparedText>,
     pub video_dissolves: Vec<PreparedVideoDissolve>,
     pub picture_effects: Vec<prproj::convert::prepared::PreparedPictureEffect>,
+    pub direct_dnxhr_origins: HashMap<String, i64>,
 }
 pub struct PreparedPremiereInput {
     pub input:PreparedProjectInput, pub losses:Vec<Loss>,pub diagnostics:Vec<String>,pub ownership:HashMap<String,(usize,usize)>,
@@ -244,6 +245,90 @@ fn old_clock(sc: &Sidecars, m: &SourceMedia) -> R<i64> {
     } else {
         0
     })
+}
+
+/// The AAF/Premiere 27 control qualifies one physical DNxHR LB OP-Atom
+/// picture with two discrete mono siblings. AVdn alone is also used for DNxHD
+/// in the source graph, so require the MXF coding and the Avid descriptor.
+fn direct_dnxhr_clocks(
+    item: &SourceItem,
+    media: &HashMap<&str, &SourceMedia>,
+    sc: &Sidecars,
+) -> Option<(i64, i64)> {
+    let rate = Rational::new(24000, 1001)?;
+    if item.media.len() != 3 || !item.stream_groups.is_empty()
+        || item.rate != Some(rate)
+        || side(sc, "avid.source", &item.id).and_then(|v| key(v, "raw_groups"))
+            .is_some_and(|v| !matches!(v, Value::Arr(groups) if groups.is_empty()))
+    {
+        return None;
+    }
+    let mut picture = None;
+    let mut audio = [None, None];
+    let mut paths = HashSet::new();
+    let mut packages = HashSet::new();
+    for binding in &item.media {
+        let m = media[binding.media.as_str()];
+        let [path] = m.locations.as_slice() else { return None };
+        let clock = m.clock.as_ref()?;
+        let start = clock.exact_start()?;
+        let origin = Rational::new(
+            i128::from(clock.provenance.origin_count) * i128::from(rate.den()),
+            i128::from(rate.num()),
+        )?;
+        let facts = side(sc, "avid.source", &m.id)?;
+        let descriptor = key(facts, "descriptor")?;
+        let package = key(facts, "file_package").and_then(str_value)?;
+        if m.original.is_some() || m.online != Some(true)
+            || binding.source_offset != Some(Rational::ZERO)
+            || !path.to_ascii_lowercase().ends_with(".mxf") || !paths.insert(path)
+            || package.is_empty() || !packages.insert(package)
+            || clock.rate != rate || clock.display_base != 24 || clock.drop
+            || clock.provenance.route != "file_source_clip_to_physical_timecode_track"
+            || m.start != Some(start)
+            || m.duration <= Rational::ZERO
+        {
+            return None;
+        }
+        let (slot, units) = match m.kind {
+            StreamKind::Video if m.codec.as_deref() == Some("AVdn") && m.rate == Some(rate)
+                && m.frame_size == Some((1920, 1080))
+                && clock.provenance.source_rate == rate
+                && key(descriptor, "compression").and_then(str_value) == Some("RI00")
+                && matches!(key(descriptor, "display_aspect"),
+                    Some(Value::Arr(a)) if a.as_slice() == [Value::Int(16), Value::Int(9)])
+                && key(facts, "picture_coding").and_then(str_value) == Some("060E2B340401010D0401020271280000") =>
+            {
+                let units = Rational::new(
+                    i128::from(m.duration.num()) * i128::from(rate.num()),
+                    i128::from(m.duration.den()) * i128::from(rate.den()),
+                )?.to_units(1)?;
+                (&mut picture, units)
+            }
+            StreamKind::Audio if m.sample_rate == Some(48_000) && m.bits == Some(24)
+                && clock.provenance.source_rate == Rational::integer(48_000)
+                && key(descriptor, "channels").and_then(integer) == Some(1) =>
+            {
+                let slot = match m.stream {
+                    Some(1) => &mut audio[0],
+                    Some(2) => &mut audio[1],
+                    _ => return None,
+                };
+                (slot, m.duration.to_units(48_000)?)
+            }
+            _ => return None,
+        };
+        if key(facts, "descriptor_length").and_then(integer) != Some(units)
+            || slot.replace((start, origin, m.duration)).is_some()
+        {
+            return None;
+        }
+    }
+    let (start, origin, duration) = picture?;
+    if audio != [Some((start, origin, duration)); 2] {
+        return None;
+    }
+    Some((start.to_units(TICKS_PER_SECOND)?, origin.to_units(TICKS_PER_SECOND)?))
 }
 fn display(rate: Option<Rational>, drop: bool) -> Option<i64> {
     match rate.map(|r| (r.num(), r.den()))? {
@@ -529,7 +614,7 @@ pub fn prepare(g: &SourceGraph, options: &Options, clock: ClockProfile) -> R<Pre
     let p=prepare_input(g,options,clock,false,false)?;
     let model=Model{project_name:p.input.project_name,options:p.input.options,clips:p.input.clips.into_iter().map(|c|match c{PreparedClip::Legacy(c)=>c,_=>unreachable!()}).collect(),bins:p.input.bins,sequences:p.input.sequences};
     model::validate_model(&model).map_err(|e|error(e.to_string()))?;
-    Ok(PreparedPremiere{model,losses:p.losses,diagnostics:p.diagnostics,ownership:p.ownership,texts:p.input.texts,video_dissolves:p.input.video_dissolves,picture_effects:p.input.picture_effects})
+    Ok(PreparedPremiere{model,losses:p.losses,diagnostics:p.diagnostics,ownership:p.ownership,texts:p.input.texts,video_dissolves:p.input.video_dissolves,picture_effects:p.input.picture_effects,direct_dnxhr_origins:p.input.direct_dnxhr_origins})
 }
 fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_originals:bool,allow_original_speed:bool)->R<PreparedPremiereInput> {
     g.validate()?;
@@ -561,6 +646,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
     let media: HashMap<_, _> = g.media.iter().map(|m| (m.id.as_str(), m)).collect();
     let mut clips = Vec::new();
     let mut ids = HashSet::new();
+    let mut direct_dnxhr_origins = HashMap::new();
     let items_used_for_sequence_audio: HashSet<_> = g.sequences.iter()
         .flat_map(|s| &s.placements)
         .filter(|p| !p.audio_tracks.is_empty() || !p.grouped_audio.is_empty())
@@ -574,6 +660,15 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         let mut video = None;
         let mut audio = Vec::new();
         let mut original:Option<OriginalClip>=None;
+        let direct_clocks = if clock == ClockProfile::LegacyImport {
+            direct_dnxhr_clocks(item, &media, &sc)
+        } else {
+            None
+        };
+        if let Some((_, origin)) = direct_clocks {
+            direct_dnxhr_origins.insert(id.clone(), origin);
+            diagnostics.push(format!("{}: direct 23.976 DNxHR LB OP-Atom with discrete A1/A2, separate file origin and clip timecode, and no new media", item.name));
+        }
         let original_count=item.media.iter().filter(|im|media[im.media.as_str()].original.is_some()).count();
         if original_count>0 && (!allow_originals || original_count!=item.media.len()){return Err(error("original-file media require the typed prepared route with complete original bindings"));}
         for im in &item.media {
@@ -614,7 +709,10 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 }
                 continue;
             }
-            let start = old_clock(&sc, m)?;
+            let start = match direct_clocks {
+                Some((start, _)) => start,
+                None => old_clock(&sc, m)?,
+            };
             let duration = ticks(m.duration, "media duration")?;
             match m.kind {
                 StreamKind::Video => {
@@ -816,7 +914,11 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         sequences: Vec::new(),
         texts: Vec::new(),
         video_dissolves: Vec::new(),
+        audio_edge_fades: Vec::new(),
+        audio_crossfades: Vec::new(),
+        audio_mixers: Default::default(),
         picture_effects: Vec::new(),
+        direct_dnxhr_origins,
         multicams: Vec::new(),
         multicam_uses: Vec::new(),
     };

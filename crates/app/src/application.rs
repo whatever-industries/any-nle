@@ -418,7 +418,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     let policy_losses = policy.losses_source(&graph);
     let clock = if a.wants_rewrap() { premiere_adapter::ClockProfile::VerifiedRewrap }
         else { premiere_adapter::ClockProfile::LegacyImport };
-    let (model, texts, video_dissolves, picture_effects, mut typed, preparation_notes, bridge_losses) =
+    let (model, texts, video_dissolves, picture_effects, direct_dnxhr_origins, mut typed, preparation_notes, bridge_losses) =
         if !gain.is_empty() || !graph.multicams.is_empty() || !graph.multicam_uses.is_empty() {
             if matches!(route, PremiereRoute::Bin(_)) {
                 return Err("multicam_native_route_required: editable Groups require the native OP1a rewrap route".into());
@@ -426,11 +426,11 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             let p = premiere_adapter::prepare_originals(&graph, &policy.to_options(), clock)
                 .map_err(|e| format!("Premiere preparation failed: {e}"))?;
             let media = p.input.build_native_media_model().map_err(|e| e.to_string())?;
-            (media, Vec::new(), Vec::new(), Vec::new(), Some(p.input), p.diagnostics, p.losses)
+            (media, Vec::new(), Vec::new(), Vec::new(), Default::default(), Some(p.input), p.diagnostics, p.losses)
         } else {
             let p = premiere_adapter::prepare(&graph, &policy.to_options(), clock)
                 .map_err(|e| format!("Premiere preparation failed: {e}"))?;
-            (p.model, p.texts, p.video_dissolves, p.picture_effects, None, p.diagnostics, p.losses)
+            (p.model, p.texts, p.video_dissolves, p.picture_effects, p.direct_dnxhr_origins, None, p.diagnostics, p.losses)
         };
     let prepared_event_count: usize = typed.as_ref().map_or(&model.sequences, |p| &p.sequences)
         .iter().map(|s| s.events.len()).sum();
@@ -478,6 +478,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         Some(p) => prproj::convert::writer::prepare_typed_project(p, &output, ids.as_mut(), &bindings, true),
         None => route.prepare(&model, &output, ids.as_mut(), &bindings, prproj::convert::writer::Editorial {
             texts: &texts, video_dissolves: &video_dissolves, picture_effects: &picture_effects,
+            direct_dnxhr_origins: &direct_dnxhr_origins,
         }),
     }.map_err(|e| format!("Premiere document preparation failed: {e}"))?;
     drop(typed);

@@ -1,6 +1,6 @@
 //! Typed writer input. Original files are never represented as PCM OP-Atom model/1 clips.
 use super::model::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClipMetadata {
@@ -139,6 +139,27 @@ impl PreparedClip {
         }
     }
 }
+/// A one-sided Constant Gain fade attached to a specific mono edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedAudioEdgeFade {
+    pub sequence: usize,
+    pub event: usize,
+    pub track: i64,
+    pub head: i64,
+    pub tail: i64,
+}
+
+/// A Constant Gain crossfade between two identified mono WAV edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedAudioCrossfade {
+    pub sequence: usize,
+    pub track: i64,
+    pub outgoing: usize,
+    pub incoming: usize,
+    pub duration: i64,
+    pub before_cut: i64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedProjectInput {
     pub project_name: String,
@@ -148,9 +169,25 @@ pub struct PreparedProjectInput {
     pub sequences: Vec<Sequence>,
     pub texts: Vec<PreparedText>,
     pub video_dissolves: Vec<PreparedVideoDissolve>,
+    pub audio_edge_fades: Vec<PreparedAudioEdgeFade>,
+    pub audio_crossfades: Vec<PreparedAudioCrossfade>,
+    pub audio_mixers: BTreeMap<usize, PreparedAudioMixer>,
     pub picture_effects: Vec<PreparedPictureEffect>,
+    /// Verified direct DNxHR LB clip IDs and their physical media start ticks.
+    /// The legacy clip fields carry the effective logging timecode.
+    pub direct_dnxhr_origins: std::collections::HashMap<String, i64>,
     pub multicams: Vec<super::multicam::PreparedMulticam>,
     pub multicam_uses: Vec<super::multicam::PreparedMulticamUse>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PreparedAudioMixer {
+    /// Static stereo mix fader in dB.
+    pub mix_level_db: Option<f64>,
+    /// One-based audio track indices with static mute.
+    pub muted_tracks: Vec<i64>,
+    /// Static percent pan on mono inputs A1 and A2. A missing lane uses the standard stereo input.
+    pub mono_track_pans: Option<[Option<f64>; 2]>,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MotionKey {
@@ -318,7 +355,7 @@ pub(super) fn validate_video_dissolves(
         let inc = s.events.get(d.incoming).ok_or_else(|| fail("dissolve references unknown incoming edit"))?;
         let track = out.video_track.filter(|&t| inc.video_track == Some(t))
             .ok_or_else(|| fail("dissolve endpoints are not on one picture track"))?;
-        let after = d.duration.checked_sub(d.before_cut).filter(|n| *n > 0)
+        let after = d.duration.checked_sub(d.before_cut).filter(|n| *n >= 0)
             .ok_or_else(|| fail("invalid dissolve extent"))?;
         check_rate(s.rate, "dissolve sequence rate")?;
         let frame = ticks_per_unit(s.rate);
@@ -392,6 +429,64 @@ pub fn validate_texts(texts: &[PreparedText], sequences: &[Sequence]) -> Result<
     Ok(())
 }
 impl PreparedProjectInput {
+    fn validate_audio_crossfades(&self, clips: &HashMap<&str, &PreparedClip>) -> Result<(), ModelError> {
+        let fail = || ModelError("invalid prepared mono audio crossfade or source handles".into());
+        if self.audio_crossfades.len() > MAX_ITEMS {
+            return Err(fail());
+        }
+        let mut spans = Vec::with_capacity(self.audio_crossfades.len());
+        let edge_fade_lanes: HashSet<_> = self.audio_edge_fades.iter()
+            .map(|f| (f.sequence, f.track)).collect();
+        for fade in &self.audio_crossfades {
+            let seq = self.sequences.get(fade.sequence).ok_or_else(fail)?;
+            let out = seq.events.get(fade.outgoing).ok_or_else(fail)?;
+            let inc = seq.events.get(fade.incoming).ok_or_else(fail)?;
+            let after = fade.duration.checked_sub(fade.before_cut).filter(|n| *n > 0).ok_or_else(fail)?;
+            check_rate(seq.rate, "audio crossfade sequence rate")?;
+            let frame = ticks_per_unit(seq.rate);
+            let mono_input = usize::try_from(fade.track).ok().and_then(|t| t.checked_sub(1))
+                .and_then(|i| self.audio_mixers.get(&fade.sequence)?.mono_track_pans?.get(i).copied())
+                .flatten().is_some();
+            if !(1..=99).contains(&fade.track) || frame <= 0 || fade.before_cut <= 0
+                || fade.before_cut % frame != 0 || after % frame != 0
+                || out.record_start.checked_add(out.duration) != Some(inc.record_start)
+                || fade.before_cut > out.duration || after > inc.duration
+                || inc.source_in < fade.before_cut || mono_input
+                || self.options.match_avid_default_pan
+                || edge_fade_lanes.contains(&(fade.sequence, fade.track))
+                || seq.audio_crossfades.iter().any(|f| f.track == fade.track)
+            {
+                return Err(fail());
+            }
+            for (edit, postroll) in [(out, after), (inc, 0)] {
+                let Some(PreparedClip::Original(clip)) = clips.get(edit.clip.as_str()) else {
+                    return Err(fail());
+                };
+                if edit.video_track.is_some() || edit.audio_tracks != [fade.track]
+                    || !edit.stereo.is_empty() || edit.speed_ratio.is_some() || edit.time_remap.is_some()
+                    || edit.source_duration.is_some() || edit.source_in < 0
+                    || edit.audio != super::model::EventAudio::default()
+                    || edit.audio_pans.iter().flatten().any(|pan| *pan != 0.0)
+                    || edit.audio_gains.iter().flatten().any(|gain| *gain != 0.0)
+                    || clip.container != "wav"
+                    || !clip.audio.as_ref().is_some_and(|a| a.channels == 1 && a.sample_rate == 48_000
+                        && edit.source_in.checked_add(edit.duration).and_then(|n| n.checked_add(postroll))
+                            .is_some_and(|end| end <= a.duration))
+                {
+                    return Err(fail());
+                }
+            }
+            let start = inc.record_start.checked_sub(fade.before_cut).ok_or_else(fail)?;
+            let end = inc.record_start.checked_add(after).ok_or_else(fail)?;
+            spans.push((fade.sequence, fade.track, start, end));
+        }
+        spans.sort_unstable();
+        if spans.windows(2).any(|w| (w[0].0, w[0].1) == (w[1].0, w[1].1) && w[1].2 < w[0].3) {
+            return Err(fail());
+        }
+        Ok(())
+    }
+
     pub fn from_model(m: &Model) -> Result<Self, ModelError> {
         validate_model(m)?;
         Ok(Self {
@@ -407,7 +502,11 @@ impl PreparedProjectInput {
             sequences: m.sequences.clone(),
             texts: Vec::new(),
             video_dissolves: Vec::new(),
+            audio_edge_fades: Vec::new(),
+            audio_crossfades: Vec::new(),
+            audio_mixers: BTreeMap::new(),
             picture_effects: Vec::new(),
+            direct_dnxhr_origins: Default::default(),
             multicams: Vec::new(),
             multicam_uses: Vec::new(),
         })
@@ -489,6 +588,39 @@ impl PreparedProjectInput {
         {
             return Err(fail("prepared input collection limit"));
         }
+        for (&sequence, mixer) in &self.audio_mixers {
+            let mut muted = HashSet::new();
+            if sequence >= self.sequences.len()
+                || mixer.mix_level_db.is_some_and(|db| !(-200.0..=15.0).contains(&db))
+                || mixer.mono_track_pans.is_some_and(|pans| {
+                    !pans.iter().flatten().all(|pan| (-100.0..=100.0).contains(pan))
+                })
+                || mixer.muted_tracks.iter().any(|&track| {
+                    !(1..=99).contains(&track) || !muted.insert(track)
+                })
+            {
+                return Err(fail("invalid prepared audio mixer controls"));
+            }
+            if let Some(pans) = mixer.mono_track_pans {
+                let seq = &self.sequences[sequence];
+                let mono = |track| match track {
+                    1 => pans[0].is_some(),
+                    2 => pans[1].is_some(),
+                    _ => false,
+                };
+                if self.options.match_avid_default_pan
+                    || seq.events.iter().any(|event| {
+                        event.stereo.iter().any(|edit| mono(edit.audio_track))
+                            || event.audio_tracks.iter().zip(&event.audio_pans).any(|(&track, pan)| {
+                                mono(track) && pan.is_some_and(|value| value != 0.0)
+                            })
+                    })
+                    || seq.audio_crossfades.iter().any(|fade| mono(fade.track))
+                {
+                    return Err(fail("unsupported edits on mono inputs with track pan"));
+                }
+            }
+        }
         let mut clips = HashMap::new();
         let mut budget = std::mem::size_of::<Self>() + self.project_name.len();
         for c in &self.clips {
@@ -506,6 +638,26 @@ impl PreparedProjectInput {
                 PreparedClip::Legacy(c) => super::model::validate_clip(c, "prepared legacy clip")?,
             }
         }
+        let mut fade_owners = HashSet::new();
+        for fade in &self.audio_edge_fades {
+            let sequence = self.sequences.get(fade.sequence)
+                .ok_or_else(|| fail("audio edge fade references unknown sequence"))?;
+            let event = sequence.events.get(fade.event)
+                .ok_or_else(|| fail("audio edge fade references unknown edit"))?;
+            if !fade_owners.insert((fade.sequence, fade.event, fade.track))
+                || !event.audio_tracks.contains(&fade.track)
+                || event.video_track.is_some()
+                || !event.stereo.is_empty()
+                || !matches!(clips.get(event.clip.as_str()),
+                    Some(PreparedClip::Original(clip)) if clip.container == "wav")
+                || fade.head < 0 || fade.tail < 0
+                || fade.head.checked_add(fade.tail).is_none_or(|n| n == 0 || n > event.duration)
+                || sequence.audio_crossfades.iter().any(|f| f.track == fade.track)
+            {
+                return Err(fail("unqualified or duplicate mono audio edge fade"));
+            }
+        }
+        self.validate_audio_crossfades(&clips)?;
         for b in &self.bins {
             super::model::check_text(&b.name, "prepared bin", 4096, false)?;
             for id in &b.clips {
@@ -693,7 +845,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
                 .and_then(|suffix| suffix.to_str())
                 .is_some_and(|suffix| suffix.eq_ignore_ascii_case("mov"))
             && c.audio.is_none() && v.width == 1920 && v.height == 1080
-            && v.rate == Fraction::new(24, 1));
+            && (v.rate == Fraction::new(24, 1) || v.rate == Fraction::new(24000, 1001)));
         require(
             c.container == "mov" && qualified_codec && v.stream_index == 0,
             "unqualified original picture stream/profile",

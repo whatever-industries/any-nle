@@ -76,7 +76,7 @@ fn fields_match(encoded: &str, timeline_export: bool) -> bool {
 pub(crate) struct Dissolve {
     pub(crate) cut: i64,
     pub(crate) before: i64,
-    id: String,
+    pub(crate) id: String,
     pub(crate) audio: bool,
 }
 
@@ -167,6 +167,10 @@ impl Dissolve {
 }
 
 pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<Option<Dissolve>> {
+    Ok(prepare_native(graph, sequence)?.map(|source| source.prepared))
+}
+
+pub(crate) fn prepare_native<'a>(graph: &'a SourceGraph, sequence: &SourceSequence) -> Result<Option<SourceDissolve<'a>>> {
     let Some(data) = graph.sidecar(ADAPTER, &sequence.id) else {
         return Ok(None);
     };
@@ -303,11 +307,10 @@ pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<
     {
         return Err(unsupported("missing transition track owner").into());
     }
-    Ok(Some(Dissolve {
-        cut,
-        before,
-        id: id(row).into(),
-        audio,
+    Ok(Some(SourceDissolve {
+        prepared: Dissolve { cut, before, id: id(row).into(), audio },
+        incoming,
+        outgoing,
     }))
 }
 

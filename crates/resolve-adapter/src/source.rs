@@ -1176,8 +1176,16 @@ fn read_mixer_controls(
     } else {
         None
     };
-    let typed_gain_mute = typed_mixer_profile && metadata.as_ref().unwrap_or(&mixer).qualified();
-    if let Some((data, requires_mapping)) = mixer.source_facts(&tracks, typed_gain_mute, metadata.as_ref()) {
+    let linked_mutes = track_flags.filter(|_| track_state.is_none());
+    let linked_pans = mixer.linked_track_pans(linked_mutes);
+    let typed_gain_mute = typed_mixer_profile
+        && (linked_pans.is_some() || metadata.as_ref().unwrap_or(&mixer).qualified(linked_mutes));
+    if let Some((mut data, requires_mapping)) = mixer.source_facts(&tracks, typed_gain_mute, metadata.as_ref()) {
+        if let (Some(pans), Value::Obj(fields)) = (linked_pans, &mut data) {
+            fields.push((mixer::LINKED_TRACK_PANS.into(), Value::Arr(
+                pans.into_iter().map(|pan| Value::Int(i64::from(pan))).collect(),
+            )));
+        }
         context.graph.sidecars.push(Sidecar {
             adapter: mixer::FAIRLIGHT_ADAPTER.into(),
             object: out.id.clone(),
@@ -1762,21 +1770,38 @@ fn direct(
                 }
             }
             StreamKind::Audio => {
-                if let Some(envelope) = effects::clip_audio(filters, blobs, edit)? {
-                    match envelope.volume {
-                        Some(Volume::Static(db)) => placement.volume_db = Some(db),
-                        Some(Volume::Keys(keys)) => {
-                            for (frame, db) in keys {
-                                placement.volume_keys.push(graph::VolumeKey {
-                                    at: seconds(i64::from(frame), grid.rate)?,
-                                    db,
-                                });
-                            }
-                        }
-                        None => {}
+                if let Some(audio) = effects::clip_audio(filters, blobs, edit)? {
+                    if let Some(pan) = audio.pan {
+                        placement.track_pans = vec![Some(pan)];
+                        let (aspect, reason) = crate::audio::CLIP_PAN_LOSS;
+                        loss(graph, &placement.id, aspect, reason);
                     }
-                    if let Some((aspect, reason)) = envelope.recovered_loss() {
-                        receipt(graph, &placement.id, envelope.receipt());
+                    if let Some(envelope) = audio.envelope {
+                        match envelope.volume {
+                            Some(Volume::Static(db)) => placement.volume_db = Some(db),
+                            Some(Volume::Keys(keys)) => {
+                                for (frame, db) in keys {
+                                    placement.volume_keys.push(graph::VolumeKey {
+                                        at: seconds(i64::from(frame), grid.rate)?,
+                                        db,
+                                    });
+                                }
+                            }
+                            None => {}
+                        }
+                        if let Some((aspect, reason)) = envelope.recovered_loss() {
+                            receipt(graph, &placement.id, envelope.receipt());
+                            loss(graph, &placement.id, aspect, reason);
+                        }
+                    }
+                    if let Some([head, tail]) = audio.fractional_fades {
+                        receipt(graph, &placement.id, vec![
+                            ("fade_clock", text("clip_edges")),
+                            ("fade_shape", text("linear_amplitude")),
+                            ("fade_in_fractional_frames", Value::Float(head)),
+                            ("fade_out_fractional_frames", Value::Float(tail)),
+                        ]);
+                        let (aspect, reason) = crate::audio::FRACTIONAL_FADE_LOSS;
                         loss(graph, &placement.id, aspect, reason);
                     }
                     true

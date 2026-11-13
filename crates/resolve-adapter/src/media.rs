@@ -4,7 +4,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, Read},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{ChildStdout, Command, Stdio},
     time::UNIX_EPOCH,
@@ -68,6 +68,62 @@ pub(crate) fn media_digest(path: &Path) -> Result<[u8; 32]> {
         return Err("media changed while hashing".into());
     }
     Ok(hash.finalize().into())
+}
+
+/// Check the declared PCM data against bytes actually present. A demuxer can
+/// estimate duration on a damaged WAV, so its duration alone is insufficient.
+pub(crate) fn check_wav_extent(path: &Path, bits: i64, channels: i64, samples: i64) -> Result<()> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut header = [0; 12];
+    file.read_exact(&mut header)?;
+    if &header[..4] != b"RIFF"
+        || &header[8..] != b"WAVE"
+        || u64::from(u32::from_le_bytes(header[4..8].try_into()?)) + 8 != len
+    {
+        return Err("WAV RIFF extent disagrees with file size".into());
+    }
+    let expected = u64::try_from(i128::from(samples) * i128::from(channels) * i128::from(bits / 8))?;
+    let mut offset = 12;
+    let mut found_data = false;
+    for _ in 0..1024 {
+        if offset == len && found_data {
+            return Ok(());
+        }
+        if offset + 8 > len {
+            break;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut chunk = [0; 8];
+        file.read_exact(&mut chunk)?;
+        let size = u64::from(u32::from_le_bytes(chunk[4..].try_into()?));
+        offset += 8 + size + size % 2;
+        if &chunk[..4] == b"data" {
+            if found_data || size != expected {
+                return Err("WAV PCM data extent disagrees with the verified sample count".into());
+            }
+            found_data = true;
+        }
+    }
+    Err("WAV has truncated PCM data or an unsupported chunk layout".into())
+}
+
+#[cfg(test)]
+mod wav_extent_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn verifies_padded_pcm24_chunk_and_refuses_a_short_file() {
+        let mut wav = tempfile::NamedTempFile::new().unwrap();
+        // Three mono PCM24 samples require one RIFF padding byte.
+        wav.write_all(b"RIFF\x2e\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\xbb\0\0\x80\x32\x02\0\x03\0\x18\0data\x09\0\0\0").unwrap();
+        wav.write_all(&[0; 10]).unwrap();
+        assert!(check_wav_extent(wav.path(), 24, 1, 3).is_ok());
+        assert!(check_wav_extent(wav.path(), 24, 1, 2).is_err());
+        wav.as_file().set_len(52).unwrap();
+        assert!(check_wav_extent(wav.path(), 24, 1, 3).is_err());
+    }
 }
 
 fn ffprobe(tool: &Path, path: &Path) -> Result<Value> {

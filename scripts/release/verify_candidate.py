@@ -4,7 +4,7 @@ import argparse,hashlib,json,os,pathlib,plistlib,shutil,struct,subprocess,tempfi
 from package import ICONS,TARGETS
 from build_ffmpeg import sha
 ROOT=pathlib.Path(__file__).resolve().parents[2]
-VERSION='0.1.0-alpha.2'
+VERSION='0.1.0-alpha.3'
 def architecture(path,target):
     b=path.read_bytes()[:4096]
     arm=target.startswith('aarch64')

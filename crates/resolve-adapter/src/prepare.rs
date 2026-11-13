@@ -149,22 +149,7 @@ pub(crate) fn prepare_bindings(
         if !native {
             return Err("Resolve track mute requires a native Resolve sequence".into());
         }
-        let Value::Arr(tracks) = value else {
-            return Err("invalid Resolve muted audio track list".into());
-        };
-        if !(1..=2).contains(&tracks.len()) {
-            return Err("invalid Resolve muted audio track count".into());
-        }
-        for track in tracks {
-            let slot = match track {
-                Value::Int(1) => &mut track_mutes[0],
-                Value::Int(2) => &mut track_mutes[1],
-                _ => return Err("unsupported Resolve muted audio track index".into()),
-            };
-            if std::mem::replace(slot, true) {
-                return Err("duplicate Resolve muted audio track index".into());
-            }
-        }
+        track_mutes = mixer::parse_track_mutes(value)?;
     }
 
     let mut item_indices = HashMap::new();
@@ -378,13 +363,18 @@ fn prepare_marker(
         return None;
     }
     let frame = frames_on(marker.start?, rate).ok()?;
+    let color = marker.color.as_ref()?;
     let duration = frames_on(marker.duration, rate).ok()?;
+    let duration = if color.palette == "premiere" && duration == 0 { 1 } else { duration };
     if duration == 0 || frame.checked_add(duration)? > end || counts.get(&frame) != Some(&1) {
         return None;
     }
-    let color = marker.color.as_ref()?;
     let color_bit = match (color.palette.as_str(), color.name.as_str()) {
         ("resolve", name) => crate::marker_palette::bit(name)?,
+        ("premiere", name @ ("Blue" | "Cyan" | "Green" | "Yellow" | "Red")) => {
+            crate::marker_palette::bit(name)?
+        }
+        ("premiere", name) => crate::marker_palette::bit(crate::marker_palette::premiere_substitute(name)?)?,
         ("avid", "Blue") => 2,
         ("avid", "Red") => 32,
         _ => return None,

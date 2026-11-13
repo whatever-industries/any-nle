@@ -75,9 +75,28 @@ pub struct MediaTable {
     media: HashMap<String, (String, String)>,
     pub(crate) mono_views: std::collections::HashSet<String>,
     pub(crate) rewrap_formats: HashMap<String, String>,
+    pub(crate) direct_dnxhr: HashMap<String, DirectDnxhrFile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirectDnxhrFile {
+    pub origin: i64,
+    pub picture: bool,
 }
 
 impl MediaTable {
+    pub(super) fn is_direct_dnxhr_picture(&self, path: &str) -> bool {
+        self.direct_dnxhr.get(path).is_some_and(|file| file.picture)
+    }
+
+    pub(super) fn picture_format_override(&self, path: &str) -> Option<&str> {
+        if self.is_direct_dnxhr_picture(path) {
+            Some("110")
+        } else {
+            self.rewrap_formats.get(path).map(String::as_str)
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -129,7 +148,7 @@ pub fn add_video_item(
     name: Option<&str>,
     ids: &mut dyn UuidSource,
 ) -> Result<ItemId, OpatomError> {
-    let timecode_format = media.rewrap_formats.get(&video.path).map(String::as_str)
+    let timecode_format = media.picture_format_override(&video.path)
         .unwrap_or(if video.rate == Fraction::new(24, 1) { "100" } else { "" })
         .to_string();
     if timecode_format.is_empty() {
@@ -223,7 +242,9 @@ pub(crate) fn ensure_video_media(project: &mut Project, media: &mut MediaTable, 
     if !media.media.contains_key(&video.path) {
         let media_uid = ids.uuid4().to_string();
         let content_state = ids.uuid4().to_string();
-        let vi = op::VideoInfo { frame_rate_ticks: frame_rate, duration: video.duration, width: video.width, height: video.height, codec: &video.codec };
+        let direct = media.direct_dnxhr.get(&video.path);
+        let codec = if direct.is_some_and(|file| file.picture) { "AVdh" } else { &video.codec };
+        let vi = op::VideoInfo { frame_rate_ticks: frame_rate, duration: video.duration, width: video.width, height: video.height, codec };
         let stream = op::video_stream(&mut project.doc.tree, &vi)?;
         let stream_id = project.register(stream)?;
         let element = op::opatom_media(
@@ -237,7 +258,7 @@ pub(crate) fn ensure_video_media(project: &mut Project, media: &mut MediaTable, 
             &info,
             &content_state,
             None,
-            video.start,
+            direct.map_or(video.start, |file| file.origin),
         );
         let registered = project.register_uid(element, &media_uid)?;
         project.imported_media.push(registered);
@@ -268,7 +289,7 @@ pub(crate) fn ensure_audio_media(project: &mut Project, media: &mut MediaTable, 
             &info,
             &content_state,
             Some(rate),
-            audio.start,
+            media.direct_dnxhr.get(&audio.path).map_or(audio.start, |file| file.origin),
         );
         let registered = project.register_uid(element, &media_uid)?;
         project.imported_media.push(registered);

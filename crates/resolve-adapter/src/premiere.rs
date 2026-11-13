@@ -1,6 +1,7 @@
 //! Same-rate Premiere straight cuts into the shared Resolve turnover path.
 mod components;
 mod controls;
+mod markers;
 mod metadata;
 pub(crate) use metadata::LOSS as CLIP_METADATA_LOSS;
 
@@ -516,37 +517,7 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
     if markers.len() > MAX_EDITS {
         return Err("Premiere marker count exceeds edit limit".into());
     }
-    let mut marker_receipts = Vec::with_capacity(markers.len());
-    let tree = &project.doc.tree;
-    for (ordinal, &marker) in markers.iter().enumerate() {
-        let occurrence = format!("{id}/marker/{}", ordinal + 1);
-        let mut fields = vec![("occurrence".into(), Value::Str(occurrence.clone()))];
-        if let Some(native_id) = tree.get(marker, "ObjectID") {
-            fields.push(("native_object_id".into(), Value::Str(native_id.into())));
-        }
-        if let Some(payload) = tree.child_by_tag(marker, "DVAMarker").and_then(|node| tree.text(node)) {
-            fields.push(("byte_count".into(), Value::Int(payload.len() as i64)));
-            fields.push(("sha256".into(), Value::Str(hex::encode(Sha256::digest(payload.as_bytes())))));
-            if payload.len() <= 4096 {
-                fields.push(("saved_payload".into(), Value::Str(payload.into())));
-            }
-        }
-        marker_receipts.push(Value::Obj(fields));
-        graph.losses.push(Loss {
-            object: id.clone(),
-            aspect: "premiere.marker".into(),
-            reason: format!(
-                "Premiere sequence marker {occurrence} is omitted from the straight-cut output"
-            ),
-        });
-    }
-    if !marker_receipts.is_empty() {
-        graph.sidecars.push(Sidecar {
-            adapter: "premiere.markers".into(),
-            object: id.clone(),
-            data: Value::Arr(marker_receipts),
-        });
-    }
+    markers::capture(&project.doc.tree, markers, &mut out, &mut graph.sidecars, &mut graph.losses);
     graph.sidecars.push(Sidecar {
         adapter: "premiere.source".into(),
         object: id,

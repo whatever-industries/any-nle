@@ -583,16 +583,22 @@ fn volume(t: &Timeline<'_>, p: &Placement) -> Json {
         "volume_extrapolation",
         "fade_in_frames",
         "fade_out_frames",
+        "fade_in_fractional_frames",
+        "fade_out_fractional_frames",
         "fade_clock",
         "fade_shape",
         "fade_in_point",
         "fade_out_point",
     ];
-    json!({"gain_db":p.gain_db, "level_db":p.volume_db,
+    let mut facts = json!({"gain_db":p.gain_db, "level_db":p.volume_db,
         "keys":p.volume_keys.iter().map(|k| json!({"at":exact(k.at),"db":k.db})).collect::<Vec<_>>(),
         "saved":fields.into_iter().filter_map(|key| t.receipt(&p.id,key).map(|value| (key,graph_value(value))))
             .collect::<BTreeMap<_,_>>(),
-    })
+    });
+    if !p.track_pans.is_empty() {
+        facts["clip_pan_percent"] = json!(p.track_pans);
+    }
+    facts
 }
 
 fn markers(t: &Timeline<'_>) -> Option<Json> {

@@ -20,12 +20,16 @@ pub(super) fn picture_control(
     let bytes = blobs.envelope(encoded)?;
     let outer = fields(&bytes)?;
     let (motion, crop) = match outer.as_slice() {
-        [(1, Wire::Bytes(motion))] => (*motion, None),
-        [(1, Wire::Bytes(motion)), (1, Wire::Bytes(crop))] => (*motion, Some(*crop)),
+        [(1, Wire::Bytes(section))] if section.starts_with(&[8, 6]) => (None, Some(*section)),
+        [(1, Wire::Bytes(motion))] => (Some(*motion), None),
+        [(1, Wire::Bytes(motion)), (1, Wire::Bytes(crop))] => (Some(*motion), Some(*crop)),
         _ => return Ok(None),
     };
-    let Some(motion) = section_slots(motion, 4, 0)? else {
-        return Ok(None);
+    let motion = if let Some(motion) = motion {
+        let Some(slots) = section_slots(motion, 4, 0)? else { return Ok(None) };
+        slots
+    } else {
+        vec![&[][..]; 12]
     };
     if motion.len() != 12 {
         return Ok(None);
@@ -110,10 +114,11 @@ pub(super) fn picture_control(
         anchor: (0.0, 0.0),
         crop: edges,
     };
-    Ok(crate::video::encode_with_reflection(&t, reflection).ok().map(|_| {
-        if reflection.active() { PictureControl::ReflectedTransform(t, reflection) }
-        else { PictureControl::Transform(t) }
-    }))
+    if reflection.active() {
+        return Ok(crate::video::encode_with_reflection(&t, reflection).ok()
+            .map(|_| PictureControl::ReflectedTransform(t, reflection)));
+    }
+    Ok(crate::video::validate_static_geometry(&t).ok().map(|_| PictureControl::Transform(t)))
 }
 
 fn source_crop_slots(crop: &[u8]) -> Result<Option<Vec<&[u8]>>> {
@@ -180,16 +185,55 @@ fn static_slot(slots: &[&[u8]], (slot, id): (usize, u64), neutral: f64) -> Resul
     }
 }
 
+#[derive(Default)]
+pub(super) struct ClipAudio {
+    pub(super) envelope: Option<Envelope>,
+    pub(super) pan: Option<f64>,
+    pub(super) fractional_fades: Option<[f64; 2]>,
+}
+
 pub(super) fn clip_audio(
     encoded: &str,
     blobs: &mut Blobs,
     edit: Edit,
-) -> Result<Option<Envelope>> {
+) -> Result<Option<ClipAudio>> {
     let bytes = blobs.envelope(encoded)?;
-    let Some(slots) = control_slots(&bytes, EFFECT)? else {
+    let outer = fields(&bytes)?;
+    let (first, second) = match outer.as_slice() {
+        [(1, Wire::Bytes(first))] => (*first, None),
+        [(1, Wire::Bytes(first)), (1, Wire::Bytes(second))] => (*first, Some(*second)),
+        _ => return Ok(None),
+    };
+    let mut audio = ClipAudio::default();
+    let pan = if let Some(slots) = section_slots(first, EFFECT, 0)? {
+        let Some((envelope, fractional_fades)) = clip_envelope(&slots, edit)? else {
+            return Ok(None);
+        };
+        audio.envelope = Some(envelope);
+        audio.fractional_fades = fractional_fades;
+        second
+    } else if second.is_none() {
+        Some(first)
+    } else {
         return Ok(None);
     };
-    let [volume, head, tail, in_shape, out_shape] = slots.as_slice() else {
+    if let Some(pan) = pan {
+        let Some(slots) = section_slots(pan, 144, 2)? else {
+            return Ok(None);
+        };
+        let [slot] = slots.as_slice() else {
+            return Ok(None);
+        };
+        audio.pan = static_parameter(slot, 96)?.filter(|value| (-100.0..=100.0).contains(value));
+        if audio.pan.is_none() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(audio))
+}
+
+fn clip_envelope(slots: &[&[u8]], edit: Edit) -> Result<Option<(Envelope, Option<[f64; 2]>)>> {
+    let [volume, head, tail, in_shape, out_shape] = slots else {
         return Ok(None);
     };
     let volume = if volume.is_empty() {
@@ -205,28 +249,33 @@ pub(super) fn clip_audio(
         None
     } else {
         let (Some(head), Some(tail)) = (
-            fade_length(head, HEAD, edit.length)?,
-            fade_length(tail, TAIL, edit.length)?,
+            fade_length_value(head, HEAD, edit.length)?,
+            fade_length_value(tail, TAIL, edit.length)?,
         ) else {
             return Ok(None);
         };
+        if head.fract() != 0.0 || tail.fract() != 0.0 {
+            if !in_shape.is_empty() || !out_shape.is_empty()
+                || matches!(volume, Some(Volume::Keys(_))) || head + tail > edit.length as f64
+            {
+                return Ok(None);
+            }
+            return Ok(Some((Envelope { volume, fades: None }, Some([head, tail]))));
+        }
         let head_point = fade_point(in_shape, HEAD_POINT)?
             .and_then(|(position, level)| FadePoint::new(position, level));
         let tail_point = fade_point(out_shape, TAIL_POINT)?
             .and_then(|(position, level)| FadePoint::new(position, level));
-        if (!in_shape.is_empty() && head_point.is_none())
-            || (!out_shape.is_empty() && tail_point.is_none())
-            || (matches!(volume, Some(Volume::Static(_))) && head_point.is_none() && tail_point.is_none())
-        {
+        if (!in_shape.is_empty() && head_point.is_none()) || (!out_shape.is_empty() && tail_point.is_none()) {
             return Ok(None);
         }
-        let fades = Fades { head, tail, head_point, tail_point };
+        let fades = Fades { head: head as i64, tail: tail as i64, head_point, tail_point };
         if !fades.valid_for(edit.length) {
             return Ok(None);
         }
         Some(fades)
     };
-    Ok((volume.is_some() || fades.is_some()).then_some(Envelope { volume, fades }))
+    Ok((volume.is_some() || fades.is_some()).then_some((Envelope { volume, fades }, None)))
 }
 
 /// Capture documented custom fade control points without assigning a
@@ -293,12 +342,14 @@ fn fade_point(shape: &[u8], expected: u64) -> Result<Option<(f64, f64)>> {
 }
 
 fn fade_length(data: &[u8], id: u64, limit: i64) -> Result<Option<i64>> {
+    Ok(fade_length_value(data, id, limit)?.filter(|n| n.fract() == 0.0).map(|n| n as i64))
+}
+
+fn fade_length_value(data: &[u8], id: u64, limit: i64) -> Result<Option<f64>> {
     if data.is_empty() {
-        return Ok(Some(0));
+        return Ok(Some(0.0));
     }
-    Ok(static_parameter(data, id)?
-        .filter(|n| *n > 0.0 && *n <= limit as f64 && n.fract() == 0.0)
-        .map(|n| n as i64))
+    Ok(static_parameter(data, id)?.filter(|n| *n > 0.0 && *n <= limit as f64))
 }
 
 fn volume_keys(data: &[u8], edit: Edit) -> Result<Option<VolumeKeys>> {
@@ -604,6 +655,21 @@ mod tests {
         assert!(crate::video::encode(&ambiguous).is_err());
     }
     #[test]
+    fn native_static_crop_can_stand_alone_or_accompany_motion() {
+        let crop_only = "000000020000004c8128b52ffd204e15020054030a4c080638064a0f08361a0b0a091166a63f4a0f083755953f4a0f083874e501c93a579e3f4a0f0839427b09ed25b4a73f4a004a0005040220d12cdca5598025";
+        let combined = "000000020000008b8128b52ffd20b00d040014060a60080438004a0f082a1a0b0a091100f23f4a0f082bec3f4a08082c1a040a0228004a0f082833a33f4a0f0829a13f4a000a4c080638064a0f083666a63f4a0f083755953f4a0f083874e501c93a579e3f4a0f0839427b09ed25b4a73f4a004a000d004012cd2b5cbb34a57077916a518e131840f30ad72e9f62d1b4e2024b";
+        let edges = [84.0 / 1920.0, 32.0 / 1080.0, 40.0 / 1920.0, 50.0 / 1080.0];
+        for (saved, position, scale) in [
+            (crop_only, (0.0, 0.0), (100.0, 100.0)),
+            (combined, (72.0 / 1920.0, -36.0 / 1080.0), (112.5, 87.5)),
+        ] {
+            let expected = Transform { position, scale, rotation: 0.0, anchor: (0.0, 0.0), crop: edges };
+            assert_eq!(picture_control(saved, &mut Blobs::default(), 5, 24, 48).unwrap(),
+                Some(PictureControl::Transform(expected)));
+        }
+    }
+
+    #[test]
     fn static_clip_volume_preserves_signed_db_and_refuses_other_controls() {
         let minus =
             "0000000200000020800a1d087c38004a0f085f1a0b0a091100000000000018c04a004a004a004a00";
@@ -621,7 +687,7 @@ mod tests {
                 source_in: 2,
                 length: 28,
             };
-            match clip_audio(encoded, &mut Blobs::default(), edit).unwrap() {
+            match clip_audio(encoded, &mut Blobs::default(), edit).unwrap().and_then(|audio| audio.envelope) {
                 Some(Envelope { volume: Some(Volume::Static(db)), fades: None }) => Some(db),
                 _ => None,
             }
@@ -650,6 +716,26 @@ mod tests {
         assert_eq!(read(&hex::encode(with_keys)), None);
     }
     #[test]
+    fn static_clip_pan_keeps_its_sign_and_coexists_with_an_envelope() {
+        let edit = Edit { start: 0, source_in: 3, length: 48 };
+        let pan = "0000000200000019800a1608900138024a0f08601a0b0a091100000000000049c0";
+        let read = |encoded: &str| clip_audio(encoded, &mut Blobs::default(), edit).unwrap();
+        assert_eq!(read(pan).unwrap().pan, Some(-50.0));
+        assert_eq!(read(&pan.replace("49c0", "4940")).unwrap().pan, Some(50.0));
+        assert!(read(&pan.replace("08601a", "08611a")).is_none());
+        let mut body = crate::binary::unpack(&Envelope {
+            volume: Some(Volume::Static(-6.0)),
+            fades: Some(Fades::linear(6, 0)),
+        }.encode().unwrap()).unwrap();
+        body.extend(crate::binary::unpack(pan).unwrap());
+        let combined = read(&crate::binary::pack(&body).unwrap()).unwrap();
+        assert_eq!(combined.pan, Some(-50.0));
+        let envelope = combined.envelope.unwrap();
+        assert_eq!(envelope.volume, Some(Volume::Static(-6.0)));
+        assert_eq!(envelope.fades, Some(Fades::linear(6, 0)));
+    }
+
+    #[test]
     fn direct_audio_fades_are_clip_edge_lengths_and_keys_keep_source_frames() {
         let fades = "000000020000002f800a2c087c38004a004a0f08611a0b0a091100000000000014404a0f08621a0b0a091100000000000022404a004a00";
         let keys = "00000002000000428128b52ffd2045c50100c4020a43087c38004a35085f1a0b0a09110018c05224ffffffe008000c0018c013000c0008404a004a004a004a000510008303191cc8b504";
@@ -674,6 +760,7 @@ mod tests {
                 },
             )
             .unwrap()
+            .and_then(|audio| audio.envelope)
         };
         for source_in in [2, 6] {
             assert!(matches!(
@@ -713,7 +800,7 @@ mod tests {
                 &crate::binary::pack(body).unwrap(),
                 &mut Blobs::default(),
                 Edit { start: 0, source_in: 4, length },
-            ).unwrap()
+            ).unwrap().and_then(|audio| audio.envelope)
         };
         let Some(envelope @ Envelope { volume: None, fades: Some(fades) }) = read(&body, 24) else {
             panic!("expected the native fade points");

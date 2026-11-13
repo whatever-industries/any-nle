@@ -95,7 +95,11 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         multicams: Vec::new(),
         multicam_uses: Vec::new(),
         video_dissolves: Vec::new(),
+        audio_edge_fades: Vec::new(),
+        audio_crossfades: Vec::new(),
+        audio_mixers: Default::default(),
         picture_effects: Vec::new(),
+        direct_dnxhr_origins: Default::default(),
         project_name: "Synthetic".into(),
         options: Options::default(),
         clips: vec![PreparedClip::Original(c)],
@@ -233,6 +237,83 @@ fn sequence(events: Vec<Event>) -> Sequence {
         start: 0,
     }
 }
+
+#[test]
+fn left_aligned_dissolve_uses_only_incoming_preroll() {
+    let scratch = Scratch::new();
+    let frame = TICKS_PER_SECOND / 24;
+    let mut project = input(original("prores_hq"));
+    let mut outgoing = event();
+    outgoing.stereo.clear();
+    outgoing.source_in = 24 * frame;
+    let mut incoming = outgoing.clone();
+    incoming.record_start = 24 * frame;
+    incoming.source_in = 8 * frame;
+    project.sequences.push(sequence(vec![outgoing, incoming]));
+    project.video_dissolves.push(PreparedVideoDissolve {
+        sequence: 0, outgoing: 0, incoming: 1, duration: 8 * frame, before_cut: 8 * frame,
+    });
+    let output = scratch.0.join("left.prproj");
+    let mut ids = SeededUuids::new("left-dissolve");
+    prepare_typed_project(&project, &output, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&output).unwrap();
+    let tr = doc.tree.find1(doc.root, "VideoTransitionTrackItem/TransitionTrackItem").unwrap();
+    for (field, value) in [
+        ("TrackItem/Start", 16 * frame), ("TrackItem/End", 24 * frame), ("Alignment", 8 * frame),
+    ] {
+        assert_eq!(doc.tree.findtext(tr, field).unwrap(), Some(value.to_string()));
+    }
+    project.sequences[0].events[1].source_in = 7 * frame;
+    let invalid = scratch.0.join("missing-handle.prproj");
+    assert!(prepare_typed_project(&project, &invalid, &mut ids, &[], false).is_err());
+    assert!(!invalid.exists());
+}
+
+#[test]
+fn linked_mono_crossfade_uses_both_edit_ids_and_requires_source_handles() {
+    let frame = TICKS_PER_SECOND / 24;
+    let mut project = input(original("wav24mono"));
+    let mut outgoing = event();
+    outgoing.video_track = None;
+    outgoing.audio_tracks = vec![1];
+    outgoing.stereo.clear();
+    outgoing.source_in = 8 * frame;
+    let mut incoming = outgoing.clone();
+    incoming.record_start = 24 * frame;
+    project.sequences.push(sequence(vec![outgoing, incoming]));
+    project.audio_crossfades.push(PreparedAudioCrossfade {
+        sequence: 0, track: 1, outgoing: 0, incoming: 1, duration: 8 * frame, before_cut: 4 * frame,
+    });
+
+    let scratch = Scratch::new();
+    let path = scratch.0.join("linked-mono-crossfade.prproj");
+    let mut ids = SeededUuids::new("linked-mono-crossfade");
+    prepare_typed_project(&project, &path, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&path).unwrap();
+    let tree = &doc.tree;
+    let clips = tree.findall(doc.root, "AudioClipTrackItem").unwrap();
+    let [out, inc] = clips.as_slice() else { panic!("expected two audio edits") };
+    let transition = tree.find1(doc.root, "AudioTransitionTrackItem").unwrap();
+    for (edit, edge) in [(*out, "TailTransition"), (*inc, "HeadTransition")] {
+        let edge = tree.find1(edit, &format!("ClipTrackItem/{edge}")).unwrap();
+        assert_eq!(doc.resolve(edge).unwrap(), transition);
+    }
+    for (field, value) in [
+        ("MatchName", "Constant Gain".into()),
+        ("TrackItem/Start", (20 * frame).to_string()),
+        ("TrackItem/End", (28 * frame).to_string()),
+        ("Alignment", (4 * frame).to_string()),
+    ] {
+        assert_eq!(tree.findtext(transition, &format!("TransitionTrackItem/{field}")).unwrap(), Some(value));
+    }
+    let seq = &mut project.sequences[0];
+    seq.events[1].source_in = 3 * frame;
+    assert!(project.validate().is_err());
+    project.sequences[0].events[1].source_in = 8 * frame;
+    project.sequences[0].events[0].source_in = 21 * frame;
+    assert!(project.validate().is_err());
+}
+
 #[test]
 fn typed_mixed_timeline_and_master_copies_keep_sources_and_channels_separate() {
     let scratch = Scratch::new();
@@ -277,6 +358,107 @@ fn typed_mixed_timeline_and_master_copies_keep_sources_and_channels_separate() {
     let source = original("stereo").path;
     assert!(actual.contains(&source.replace('&', "&amp;")));
 }
+#[test]
+fn mono_wav_edge_fades_and_volume_keys_keep_their_own_clocks() {
+    let scratch = Scratch::new();
+    let out = scratch.0.join("clip-fades.prproj");
+    let mut project = input(original("wav16mono"));
+    let mut audio = event();
+    audio.video_track = None;
+    audio.audio_tracks = vec![1];
+    audio.stereo.clear();
+    audio.source_in = TICKS_PER_SECOND / 4;
+    let mut neighbor = audio.clone();
+    neighbor.record_start = TICKS_PER_SECOND;
+    audio.audio.volume_keys = vec![
+        VolumeKey { ticks: TICKS_PER_SECOND / 2, db: -6.0 },
+        VolumeKey { ticks: TICKS_PER_SECOND, db: 3.0 },
+    ];
+    let mut timeline = sequence(vec![audio, neighbor]);
+    timeline.track_levels.push(TrackLevel { track: 1, db: -3.0 });
+    project.sequences.push(timeline);
+    project.audio_mixers.insert(0, PreparedAudioMixer {
+        mix_level_db: Some(-3.7),
+        muted_tracks: vec![1],
+        mono_track_pans: None,
+    });
+    let duration = TICKS_PER_SECOND / 4 + 1;
+    let fade = PreparedAudioEdgeFade {
+        sequence: 0,
+        event: 0,
+        track: 1,
+        head: 0,
+        tail: duration,
+    };
+    project.audio_edge_fades.push(fade.clone());
+    let mut ids = SeededUuids::new("mono-wav-clip-fades");
+    prepare_typed_project(&project, &out, &mut ids, &[], false)
+        .unwrap()
+        .publish()
+        .unwrap();
+    let actual = xml(&out);
+    assert_eq!(actual.matches("<TailTransition ObjectRef=").count(), 1);
+    assert!(!actual.contains("<HeadTransition ObjectRef="));
+    assert!(actual.contains("<HasIncomingClip>false</HasIncomingClip>"));
+    assert!(actual.contains("<HasOutgoingClip>true</HasOutgoingClip>"));
+    assert!(actual.contains(&format!("<Alignment>{duration}</Alignment>")));
+    assert!(actual.contains(&format!("<Start>{}</Start>", TICKS_PER_SECOND - duration)));
+    let keys = actual.lines().find_map(|line| line.split_once("<Keyframes>")).unwrap().1;
+    assert!(keys.starts_with(&format!("{},", TICKS_PER_SECOND / 2)));
+    assert!(keys.contains(&format!(";{},", TICKS_PER_SECOND)));
+    assert!(actual.contains("<CurrentValue>0.7079457843841379</CurrentValue>"));
+    assert!(!actual.contains("<Gain>"));
+    let doc = prproj::xml::parse_prproj(&out).unwrap();
+    let master = doc.tree.find1(doc.root, "AudioTrackGroup/MasterTrack").unwrap();
+    let mix = doc.resolve(master).unwrap();
+    assert_eq!(doc.tree.tag(mix), "AudioMixTrack");
+    let owner = doc.tree.find1(mix, "AudioTrack/ComponentOwner/Components").unwrap();
+    let chain = doc.resolve(owner).unwrap();
+    let fader = doc.tree.findall(chain, "ComponentChain/Components/Component").unwrap()
+        .into_iter().map(|node| doc.resolve(node).unwrap())
+        .find(|&node| doc.tree.tag(node) == "AudioFader").unwrap();
+    let volume = doc.tree.iter_tag(fader, "Param").map(|node| doc.resolve(node).unwrap())
+        .find(|&node| doc.tree.findtext(node, "Name").unwrap().as_deref() == Some("Volume")).unwrap();
+    let value = doc.tree.findtext(volume, "CurrentValue").unwrap().unwrap();
+    assert!((value.parse::<f64>().unwrap() - 10.0_f64.powf(-3.7 / 20.0)).abs() < 1e-14);
+    let reopened = prproj::model::Project::from_document(doc, &out).unwrap();
+    let sequence = reopened.sequences().iter().next().copied().unwrap();
+    let tracks = reopened.audio_tracks(sequence);
+    assert!(reopened.is_muted(tracks[0]).unwrap());
+    assert!(!reopened.is_muted(tracks[1]).unwrap());
+    project.audio_mixers.insert(1, PreparedAudioMixer::default());
+    assert!(project.validate().is_err());
+    project.audio_mixers.remove(&1);
+    project.audio_edge_fades.push(fade);
+    assert!(project.validate().is_err());
+    project.audio_edge_fades.pop();
+    project.audio_edge_fades[0].tail = TICKS_PER_SECOND + 1;
+    assert!(project.validate().is_err());
+
+    project.audio_edge_fades[0].tail = duration;
+    project.audio_mixers.get_mut(&0).unwrap().mono_track_pans = Some([Some(-100.0), Some(100.0)]);
+    let panned = scratch.0.join("track-pan.prproj");
+    prepare_typed_project(&project, &panned, &mut ids, &[], false)
+        .unwrap()
+        .publish()
+        .unwrap();
+    let doc = prproj::xml::parse_prproj(&panned).unwrap();
+    assert_eq!(doc.tree.findtext(doc.root, "AudioTransitionTrackItem/AudioChannelLayout").unwrap()
+        .as_deref(), Some(r#"[{"channellabel":0}]"#));
+    let group = doc.tree.find1(doc.root, "AudioTrackGroup").unwrap();
+    let tracks = doc.tree.findall(group, "TrackGroup/Tracks/Track").unwrap();
+    for (reference, want) in tracks.into_iter().zip([0.0, 1.0]) {
+        let track = doc.resolve(reference).unwrap();
+        let panner = doc.resolve(doc.tree.find1(track, "AudioTrack/Panner").unwrap()).unwrap();
+        assert_eq!(doc.tree.tag(panner), "MonoToStereoPanProcessor");
+        let param = doc.resolve(doc.tree.find1(
+            panner, "PanProcessor/AudioComponent/Component/Params/Param",
+        ).unwrap()).unwrap();
+        let value = doc.tree.findtext(param, "CurrentValue").unwrap().unwrap();
+        assert_eq!(value.parse::<f64>().unwrap(), want);
+    }
+}
+
 #[test]
 fn original_refusals_are_atomic_and_legacy_model_remains_strict() {
     let scratch = Scratch::new();

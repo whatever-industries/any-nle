@@ -8,6 +8,9 @@ Reviewed on 2026-11-08. The converter includes the bounded editable Group
 implementation and its native checks. Research references are pinned in
 `research-dependencies.json`.
 
+See [linked-media conversion parity](#linked-media-conversion-parity) for the
+checklist across Avid Media Composer, Premiere Pro, and DaVinci Resolve.
+
 ## Editor-version compatibility
 
 Target current editor versions for new readers, writers, and native qualification.
@@ -22,6 +25,285 @@ editor behavior supports them. AMA links may also qualify when a current Avid
 build still resolves or carries the saved locator. Each exception covers its
 tested feature and format. Broader old project-version support needs its own
 product decision.
+
+## Linked-media conversion parity
+
+Use each editor pair's linked AAF transfer as the baseline where it works.
+For features with documented support, confirm what the source actually
+exports and the destination reopens. Where the pair has no dependable AAF
+baseline, compare against the native source edit and a native destination
+control. Count an effect as transferred only when its saved controls and
+playback agree within the tested scope. This checklist covers links to
+existing media. Embedding, consolidation, rendered round trips and rewrap
+are outside the parity target. The [existing holds](#on-hold-user-2026-10-28)
+still apply. [AAF Edit Protocol](https://static.amwa.tv/as-01-aaf-edit-protocol-spec.pdf)
+· [AAF Effects Protocol](https://static.amwa.tv/as-05-aaf-effects-protocol-spec.pdf)
+
+### Shared graph/2 work and acceptance
+
+- [ ] **Qualify linked edit and media identity across routes.** Reuse graph/2
+      source and record ranges, exact timeline and file clocks, known or
+      unresolved source offsets, saved paths, source filename, reel or
+      package identity, and physical audio selectors. Extend the shared
+      checks for duplicate basenames, moved originals, and wrong sibling
+      channels. Keep each editor's relink rules in destination preparation.
+      [Metadata crosswalk](PREMIERE-RESOLVE-METADATA.md)
+      · [Verified relink](VERIFIED-RELINK.md)
+- [ ] **Extend portable edit relationships where two routes can use them.**
+      Reuse exact transition endpoints and handles, marker ownership,
+      ordered picture effects, Group angles and audio selectors, and
+      timed text. Add subclip ranges, child sequence references, and
+      effect or envelope semantics where both consumers can use the same
+      meaning. Retain saved parameters, interpolation, and unresolved
+      values on their source owners. Keep native mixer, color, and effect
+      encodings with their adapters. [Source graph design](SOURCE-GRAPH-MIGRATION.md)
+- [ ] **Give each route a reproducible native acceptance fixture.** Start
+      with cuts, a nonzero start and trim, linked picture and two distinct
+      mono signals. Reuse retained fixtures where they answer the same
+      question. For each added feature compare saved edit ranges and
+      controls after reopen, decoded picture frames, and isolated PCM
+      where relevant. Record source capture, destination writing, reopen,
+      and render separately. Report safe omissions by occurrence and
+      block ambiguous media, timing, or routing.
+- [ ] **Advance the native routes through the existing product gates.**
+      Reuse route-aware review, saved jobs, and exclusive publication.
+      Expose a route after its native and packaged checks pass. Retain
+      AAF as an interchange reference and use graph/2 as the intermediate
+      for native conversion. [Architecture decision](ARCHITECTURE.md#adr-0004-more-programs-go-through-one-neutral-graph-2026-10-26)
+
+### Avid → Premiere
+
+The production route has selected-bin import, scoped editable Avid Groups,
+SubCap and Titler+ text, and direct 1080p23.976 DNxHR LB with two PCM24 mono
+siblings in Separate, Grouped, and Merged. Preserve those controls as coverage
+widens. [Direct-link read-back](SPLIT-EDIT-AUDIO-2026-11-06.md#grouped-and-merged-direct-linking)
+· [Adobe AAF migration baseline](https://helpx.adobe.com/il_en/premiere/desktop/render-and-export/export-files/export-from-avid-media-composer-to-premiere.html)
+
+- [ ] **Widen linked media coverage.** Qualify representative managed
+      and UME profiles outside the current direct cohort, starting with
+      PCM16, another fractional rate, and a mix of directly linked managed
+      and UME sources. Check physical
+      channel assignments, full source extents, source timecode, and fresh
+      insertion. Keep the codec-specific refusals visible in Review.
+      [Media linking queue](#media-linking-user-2026-10-14)
+- [ ] **Close the edit and audio fidelity gaps.** Compare video dissolves
+      and asymmetric audio fades against Avid source renders. Measure
+      gain and pan envelopes, including PVOL interpolation and subframe
+      placement. Retain marker ownership and color and account for every
+      marker location in the AAF comparison. [Timeline and effects](#timeline-and-effects)
+      · [Audio queue](#audio)
+- [ ] **Extend editable structure and effects.** Add reusable subclip bin
+      items and simple nests, then qualify wider Group angle and audio choices. Extend the
+      already supported Resize/Warp, Timewarp, and text mappings only for
+      demonstrated gaps. Replay high-use controls whose native evidence is
+      from earlier Premiere builds on Premiere 27, including a link-in-place
+      retiming test. [Source structure and effects](#timeline-and-effects)
+
+### Avid → Resolve
+
+The internal native DRP route has linked DNxHR siblings and selected H.264
+originals, multiple timelines and nested bins, a fixed-audio Group, SubCap,
+and scoped Resize/Warp and crop. Resolve's AAF importer is the stronger
+baseline for several common picture effects. [Any NLE qualification](RESOLVE-PROJECT-CORE.md)
+· [Resolve AAF conform features](https://documents.blackmagicdesign.com/UserManuals/DaVinciResolveReferenceManual.pdf?_v=1783666810000#page=468)
+
+- [ ] **Complete the combined linked turnover.** Qualify an automatically
+      assembled project with managed and UME media, multiple timelines,
+      shared originals, and the editable Group. Recheck camera-original
+      conform, reel and source timecode, and A1/A2 routing after reopen.
+      [Resolve turnover gates](RESOLVE-TURNOVER-IMPLEMENTATION.md#qualification-boundary)
+- [ ] **Match the documented Avid picture interchange.** Compare editable
+      constant and variable Timewarp, freeze, and both 24 ↔ 23.976
+      Motion Adapter directions. Check frame cadence and sound timing
+      separately. Extend 3D Warp to the qualified pitch/yaw and opacity
+      cases once the destination geometry and blend order match the source.
+      [Resolve qualification queue](#davinci-resolve-user-2026-10-26-bookmark-and-research)
+- [ ] **Widen transitions and timeline structure.** Finish native
+      cross-editor dissolve and mono fade checks, then qualify Dip to Color,
+      Edge Wipe, and the other documented wipe and iris families against
+      the linked AAF result. Check subclips, simple nests,
+      and alternate Group audio against saved source IDs. Inventory
+      additional AAF features, including plug-in-specific transfer, as
+      separate comparisons with their own fixtures.
+      [Resolve conversion priorities](#general-conversion-priorities-from-the-pinned-references)
+
+### Premiere → Resolve
+
+The internal route qualifies selected linked ProRes/WAV edits, static and
+two-key Linear Motion, and static mono clip volume. Plain captions and
+bounded picture speed have separate native controls. Use a linked Premiere
+AAF only where Resolve can import it, with the native Premiere save as the
+source reference. [Turnover evidence](RESOLVE-TURNOVER-IMPLEMENTATION.md)
+· [Adobe AAF export scope](https://helpx.adobe.com/premiere/desktop/render-and-export/export-files/export-aaf-files.html)
+
+- [ ] **Qualify a fully native Premiere 27 source project for rollout.**
+      Compare reopened Resolve clocks, trims, source selectors, picture and
+      PCM. Extend one selected timeline to multiple timelines, nested bins,
+      and shared media. Qualify wider linked MOV/MP4/WAV profiles and a
+      same-name conform case before expanding media admission.
+- [ ] **Complete editable audio and picture controls.** Resolve the measured
+      volume ramp mismatch. Qualify pan, clip fades, linked channel layouts,
+      and native cross-editor video and audio dissolves. Extend bounded Motion,
+      crop and speed only where the saved controls and reopened renders agree.
+      [Motion and audio read-back](RESOLVE-TURNOVER-IMPLEMENTATION.md#native-premiere-27-and-resolve-mapping-trial)
+- [x] **Carry editable sequence Comment markers.** Premiere 27's
+      linked AAF carried five marker positions and comments but Resolve
+      imported none in the tested workflow. The native DRP retained all
+      five with names, comments, colors and range lengths after reopen.
+      [Sequence marker comparison](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-sequence-markers)
+- [ ] **Carry more structure and annotations.** Map clip markers,
+      additional marker types and colors, logging and labels, followed by
+      native nests and multicam with explicit angle and audio selectors.
+      Verify editable caption styling where both editors' behavior is
+      understood. [Metadata crosswalk](PREMIERE-RESOLVE-METADATA.md#cross-editor-transfer)
+
+### Resolve → Premiere
+
+The internal Premiere destination writes a selected linked 1080p ProRes
+HQ timeline with two discrete WAV mono lanes at 24 or 23.976 fps.
+The 24 fps picture-only profile also covers scoped forward speed, reverse
+and plain captions.
+[Current profiles](RESOLVE-SOURCE-READER.md#editable-conversion-profiles)
+· [Resolve AAF export](https://documents.blackmagicdesign.com/UserManuals/DaVinciResolveReferenceManual.pdf?_v=1783666810000#page=4162)
+
+- [x] **Capture and write two linked PCM16/PCM24 mono lanes.** Saved
+      Resolve channel selectors and independent trims survive graph/2
+      reload and internal Premiere project writing. [Linked audio profile](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
+- [x] **Reopen and render the linked PCM cohort in Premiere 27.** All
+      three controls kept their links, clocks, trims and independent
+      channels after Save As and reopen. Isolated renders and fresh
+      insertions match the selected source PCM within one 24-bit code
+      value under Premiere's center-pan law. The 23.976 PCM16 stereo
+      linked AAF matches the same cuts, source ranges, channels and
+      Premiere-rendered picture. Its isolated audio differs by at most
+      one 24-bit code value. [Native comparison](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
+- [x] **Write editable clip gain, pan, and default fades.** Premiere 27
+      retained the static controls and clip-owned Constant Gain fade
+      intervals after Save As and reopen. Both isolated lanes were
+      rendered and checked against the selected source samples and
+      the Resolve fade curves. Nonzero pan retains its value and
+      reports the destination pan-law difference. [Clip-control qualification](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
+- [x] **Write editable two-key clip volume.** Both trimmed mono lanes
+      kept their key times and levels in Premiere 27 after Save As
+      and reopen, including ramps overlapping default whole-frame
+      fades. The conversion reports the measured difference in curve
+      interpolation. [Volume-key qualification](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
+- [x] **Write separate static track faders.** Premiere 27 kept the
+      A1 and A2 fader settings after Save As and reopen. The isolated
+      renders show the expected fader scaling with both static and
+      keyframed clip volume. [Track-fader qualification](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
+- [x] **Write static main stereo bus gain.** Resolve Bus 1 maps to
+      the Premiere sequence Mix fader. Premiere 27 kept the Mix,
+      track, and clip settings after Save As and reopen, and both
+      isolated lanes matched the expected bus scaling. [Bus-fader qualification](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
+- [x] **Preserve static audio track mute.** Premiere 27 retained each
+      lane's saved mute after Save As and reopen. Each muted lane
+      rendered silence, the other lane matched its reference, and
+      Mix, track, and clip levels survived. [Track mute qualification](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
+- [x] **Preserve static mono track pan.** Premiere 27 kept editable
+      track pan alongside mute and independent gains. Both hard-panned
+      lanes reached their expected output without crossfeed. The
+      converter reports the intermediate pan-law difference.
+      [Track pan qualification](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
+- [x] **Combine static track pan with clip pan and default fades.**
+      Premiere retains the effective pan as an editable clip value on
+      affected lanes and keeps track pan on lanes without clip pan.
+      Both lanes retained mute, gains and editable fades after reopen.
+      A separate linked AAF from the same opposing-pan fixture kept the
+      original links, trims, channels and clip levels. Resolve omitted
+      clip and track pan, track and bus gain, and track mute from the
+      export. Premiere imported the saved fades as Constant Power, with
+      a seven-frame tail where the Resolve project and native conversion
+      kept eight. The isolated renders confirmed centered audio through
+      AAF and the expected stereo bias through the native conversion.
+      [Combined pan qualification](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
+- [x] **Write an editable mono audio crossfade.** Preserve the eight-frame
+      centered Resolve Cross Fade 0DB at 24 fps as Premiere Constant Gain
+      with exact endpoints and verified original WAV handles. After Save As
+      and reopen, the blend follows Resolve's linear amplitude curve.
+      The linked AAF imported as Constant Power and shifted the incoming
+      source by four frames. A2 agreed within one PCM24 code value.
+      [Crossfade qualification](RESOLVE-SOURCE-READER.md#resolve-to-premiere-audio-crossfades)
+- [x] **Write editable V1 Cross Dissolve.** Preserve an eight-frame
+      left-aligned or centered Resolve dissolve at 23.976 with verified
+      original picture handles. Both alignments reopened in Premiere 27
+      with their visible trims, cut and interval. Premiere samples the
+      blend differently, and the conversion reports that difference.
+      Both isolated WAV lanes match the Premiere straight-cut control.
+      [Video dissolve qualification](RESOLVE-SOURCE-READER.md#resolve-to-premiere-video-dissolves)
+- [x] **Write editable static position, scale, and crop.** The internal
+      23.976 Resolve → Premiere path preserves signed X/Y position,
+      independent width and height, and four source-space crop edges.
+      Combined controls survived Premiere 27 Save As and reopen, with
+      measured picture edges within one pixel of Resolve.
+      [Static picture qualification](RESOLVE-SOURCE-READER.md#resolve-to-premiere-static-picture-controls)
+- [x] **Write editable two-key Linear position and scale.** Preserve a
+      shared source-frame grid with independent X/Y scale at 23.976.
+      Premiere 27 retained both keys after Save As and reopen on the
+      trimmed 48-frame fixture.
+      [Linear picture qualification](RESOLVE-SOURCE-READER.md#resolve-to-premiere-linear-position-and-scale)
+- [x] **Write editable three-key Linear position and scale on trimmed
+      clips.** At 23.976, Premiere 27 preserved the separate width grid
+      and keys outside the visible edit after Save As and reopen. Six
+      cases covered head and tail trims. All 192 rendered frames agreed
+      with the Resolve controls within one pixel at the outer edges.
+      [Trimmed motion qualification](RESOLVE-SOURCE-READER.md#resolve-to-premiere-linear-position-and-scale)
+- [ ] **Map more captured controls to Premiere.** Qualify wider
+      volume curves, custom fade curves, and track automation. Map
+      wider animated picture controls and transition profiles through
+      the shared placements and endpoints. Report unmapped Fairlight
+      bus routing, processing and Resolve grade controls by occurrence.
+- [ ] **Widen native project transfer.** Bring over more linked profiles
+      and timelines, bin ownership, markers, and logging. Qualify one
+      editable nest and a multicam with explicit angle and audio selection.
+      Check moved media and duplicate filenames using the shared identity work.
+
+### Premiere → Avid
+
+Adobe documents the linked AAF workflow, including unmerging Premiere
+merged clips and a separate relink step in Media Composer. Any NLE has no
+end-to-end Avid destination route yet. [Adobe AAF export](https://helpx.adobe.com/premiere/desktop/render-and-export/export-files/export-aaf-files.html)
+
+- [ ] **Establish the shared native Avid destination.** Use the existing
+      AVB writer research to create a disposable bin with one sequence,
+      linked picture and two discrete mono lanes. Prove source file or
+      managed package identity, edit and track IDs, nonzero source and
+      sequence timecode, and independent channel assignment after Media
+      Composer saves and reopens the bin. Reuse this graph/2 preparation and
+      writer for both incoming routes.
+      [Destination architecture](ARCHITECTURE.md#adr-0004-more-programs-go-through-one-neutral-graph-2026-10-26)
+- [ ] **Qualify the Premiere input against its AAF control.** Reuse the
+      Premiere reader for exact source ranges, saved locators, and audio
+      selectors. Compare a current Premiere 27 cut and fade fixture with
+      the linked AAF in Media Composer. Verify original-file linking and
+      make relink requirements visible in Review.
+- [ ] **Extend the verified Avid output.** Add markers, source logging
+      fields, audio levels and pan, and common dissolves. Then qualify
+      editable Motion, speed and text and investigate preserving the
+      components of merged, nested and multicam clips.
+
+### Resolve → Avid
+
+Resolve can export standalone AAF. For an unedited imported Avid timeline,
+its round-trip workflow can also carry unsupported material through from
+the original AAF. Any NLE has no end-to-end route here. Use a Resolve-authored
+linked timeline as the core comparison. [Resolve AAF export](https://documents.blackmagicdesign.com/UserManuals/DaVinciResolveReferenceManual.pdf?_v=1783666810000#page=4162)
+
+- [ ] **Connect the Resolve reader to the shared Avid destination.** Start
+      with a linked same-rate MOV/WAV sequence, known reel and source
+      timecode, and distinct mono selectors. Compare both the native AVB
+      output and Resolve's standalone AAF in Media Composer after reopen.
+      Reuse the direct DNxHR package observations for a separate managed
+      media test. [Resolve source profiles](RESOLVE-SOURCE-READER.md)
+- [ ] **Carry source edits and annotations.** Add sequence markers,
+      nonzero source trims and a dissolve, then clip gain, pan and fades.
+      Qualify same-rate speed, reverse and still frames before mixed-rate
+      conversions. Keep Fairlight buses and grades in the source receipt
+      when the Avid destination has no established mapping.
+- [ ] **Qualify editorial structures and round-trip behavior.** Add bins,
+      multiple timelines, and one simple nest or Group. Test a re-edited
+      Resolve timeline and separately check an unedited Avid-origin
+      timeline to distinguish new conversion from AAF carry-through.
 
 ## Declared multichannel media (User, 2026-11-07)
 
@@ -231,14 +513,19 @@ Implemented fixes, tests and remaining native gates.
       and 32-source cases have backend coverage. Audio-only preparation, flexible
       source spans, derived mono-from-stereo, arbitrary MCA routing, unequal stereo
       gains and verified resume/reuse remain open. [Current scope](MEDIA-REWRAP.md).
-- [ ] **Resolve and qualify direct OP-Atom alternatives** (User, 2026-11-06).
-      A fresh DNxHR import supplies the missing 23.976 format110 and AVdh witnesses,
-      with three pictures matching the OP1a return. Separate, Merged and Grouped
-      still refuse that cohort before writing. Direct ProRes OP-Atom playback also
-      remains unresolved. If direct playback cannot be qualified, revisit the User's
-      conditional decision to offer only rewrap for managed OP-Atom. The current
-      rewrap destinations are DNx to OP1a and admitted ProRes LT to MOV.
-      Evidence and decision gate.
+- [x] **Qualify direct linking for 23.976 DNxHR LB in Premiere 27** (2026-11-12).
+      Separate files links the original 1080p picture and two mono PCM24/48 kHz
+      siblings. Save As and reopen preserved the two split-edit timelines, and
+      all decoded frames and both isolated PCM lanes matched the rewrap control.
+      [Scope and evidence](SPLIT-EDIT-AUDIO-2026-11-06.md#premiere-27-direct-linking).
+- [x] **Qualify Grouped and Merged for the same 23.976 DNxHR LB profile.**
+      Both retained the original MXFs and matched picture and both mono lanes
+      after Premiere 27 reopen. Fresh insertion of each bin item also matched
+      the Separate files control.
+      [Combined clip checks](SPLIT-EDIT-AUDIO-2026-11-06.md#grouped-and-merged-direct-linking).
+- [ ] **Qualify wider direct OP-Atom profiles.** Direct ProRes OP-Atom playback
+      remains unresolved.
+      [Evidence and decision gate](SPLIT-EDIT-AUDIO-2026-11-06.md#wider-direct-link-profiles).
 
 - [ ] **Resolve the retained anamorphic ProRes fixture and OP1a alternative**
       (2026-11-07). Its 446/447 duration/index conflict, 21952-byte terminal nonframe,
@@ -1155,9 +1442,9 @@ for the exact read, write, reopen and render scope.
       record rate. The split-edit bin now writes the `01:00:00:00` origin
       (`915372057600000` ticks); relative edit and transition ranges are unchanged.
       Unknown or unsupported sequence clocks retain the compatibility fallback.
-- [ ] **Read back the corrected zero point in Premiere.** Check both split-edit
-      sequences at the first frame and after save/reopen. The old release's native
-      read-back displayed `00:59:56:09`; it does not qualify the corrected output.
+- [x] **Read back the corrected zero point in Premiere 27.** Both direct-linked
+      split-edit sequences retained `01:00:00:00` after Save As and reopen.
+      [Native read-back](SPLIT-EDIT-AUDIO-2026-11-06.md#premiere-27-direct-linking)
 - [ ] **Extend the wizard for new directions and destination versions.** Reuse the
       direction-specific flow when another route is implemented. Offer a target
       Premiere version choice when the output differs by version. Proxy and

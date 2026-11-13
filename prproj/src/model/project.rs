@@ -13,7 +13,7 @@ use super::{
     MediaType, Project, SequenceData, SequenceId, TrackData, TrackId, TrackItemData, TrackItemId,
 };
 use crate::build::media::media_relpath;
-use crate::build::sequence::build_sequence;
+use crate::build::sequence::{build_sequence, build_with_format, SequenceFormat};
 use crate::build::skeleton::{build_empty_project, EmptyProjectOptions};
 use crate::error::{value, Error, Result};
 use crate::ids::UuidSource;
@@ -711,6 +711,21 @@ impl Project {
             return value("must be >= 1, got 0");
         }
         let fragment = build_sequence(&mut self.doc.tree, name, preset, None, video_tracks, uuids)?;
+        self.add_sequence_fragment(fragment, uuids)
+    }
+
+    pub(crate) fn add_sequence_with_format(
+        &mut self,
+        name: &str,
+        format: &SequenceFormat,
+        uuids: &mut dyn UuidSource,
+    ) -> Result<SequenceId> {
+        validate_name(name)?;
+        let fragment = build_with_format(&mut self.doc.tree, name, format, None, uuids);
+        self.add_sequence_fragment(fragment, uuids)
+    }
+
+    fn add_sequence_fragment(&mut self, fragment: NodeId, uuids: &mut dyn UuidSource) -> Result<SequenceId> {
         let spliced = self.splice(fragment, uuids)?;
         let (Some(sequence_element), Some(item_element), Some(master_element)) =
             (spliced.get("Sequence"), spliced.get("ClipProjectItem"), spliced.get("MasterClip"))

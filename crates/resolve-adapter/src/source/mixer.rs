@@ -19,10 +19,13 @@ const TRACK_MUTES: [Range<usize>; 2] = [203_113..203_121, 203_133..203_141];
 const TRACK_MUTE_HEADER: [u8; 12] = [1, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0];
 const MAIN_BUS_FADER: Range<usize> = 235_340..235_344;
 const SKELETON: &str = "5bfebb8fa74dacf3d8185bfe459d719b4824cf3ba623d11c9d873a2cace5adb8";
+const LINKED_MONO: &str = "a3b176b7e9dc4ba936b2efe909b975775004cfc2e9508f6681addeb2d638bdcf";
+const LINKED_MONO_REOPENED: &str =
+    "b65c95eea5c6d6fb1e8b29325e79320f0592593fe419d28d97edbf7bf3b230ea";
 // Fingerprints with only the qualified control cells neutralized.
 const DIRECT_ONE: &[&str] = &[
     SKELETON,
-    "a3b176b7e9dc4ba936b2efe909b975775004cfc2e9508f6681addeb2d638bdcf",
+    LINKED_MONO,
     "46ac7ad463f934d2456732b1a8f086eb79d129db1176b43e2551753466fbbf07",
 ];
 const DIRECT_TWO: &str = "00765117a479b3e6469ce7a35f66c7befb8e5981d3baa4969f08e47815abed11";
@@ -82,6 +85,7 @@ impl DirectProfile {
 
 pub(crate) const FAIRLIGHT_ADAPTER: &str = "resolve.fairlight";
 pub(crate) const DIRECT_PROFILE: &str = "direct_mono_stereo_profile";
+pub(crate) const LINKED_TRACK_PANS: &str = "qualified_linked_track_pans";
 pub(crate) const FAIRLIGHT_LOSS: (&str, &str) = (
     "fairlight_controls",
     "Resolve Fairlight state retained in graph; destination mapping is unqualified",
@@ -449,12 +453,42 @@ impl Mixer {
         hex::encode(hash.finalize())
     }
 
-    pub(crate) fn qualified(&self) -> bool {
+    pub(super) fn qualified(&self, linked_mutes: Option<[bool; 2]>) -> bool {
         // The fingerprints include strip identity, routing and all other mixer state.
-        matches!(
-            self.neutral_digest().as_str(),
-            SKELETON | NATIVE_CONTROL | NATIVE_BUS_CONTROL
-        )
+        match self.neutral_digest().as_str() {
+            SKELETON | NATIVE_CONTROL | NATIVE_BUS_CONTROL => true,
+            LINKED_MONO | LINKED_MONO_REOPENED => {
+                self.main_bus_fader().is_some()
+                    && linked_mutes.is_some_and(|expected| self.track_mutes() == Some(expected))
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn linked_track_pans(&self, flags: Option<[bool; 2]>) -> Option<[i32; 2]> {
+        if self.main_bus_fader().is_none() || self.track_mutes()? != flags? {
+            return None;
+        }
+        let row = self.model.get(DIRECT_PAN - 12..DIRECT_PAN + 8)?;
+        if row[..12] != [1, 4, 2].map(u32::to_le_bytes).concat() {
+            return None;
+        }
+        let pans = [
+            i32::from_le_bytes(row[12..16].try_into().ok()?),
+            i32::from_le_bytes(row[16..20].try_into().ok()?),
+        ];
+        if pans == [0, 0] || !pans.iter().all(|pan| (-1000..=1000).contains(pan)) {
+            return None;
+        }
+        // The two full fingerprints hold routing, bypass, and processing fixed.
+        let neutral = self.digest_with_neutral_cells([
+            TRACK_FADERS,
+            TRACK_MUTES[0].clone(),
+            TRACK_MUTES[1].clone(),
+            DIRECT_PAN..DIRECT_PAN + 8,
+            MAIN_BUS_FADER,
+        ]);
+        matches!(neutral.as_str(), LINKED_MONO | LINKED_MONO_REOPENED).then_some(pans)
     }
 
     fn direct_profile(&self) -> Option<DirectProfile> {
@@ -700,6 +734,27 @@ fn bus_2_cells(shift: usize) -> [Range<usize>; 3] {
 pub(crate) fn fader_ticks(db: f64) -> Option<i32> {
     let ticks = (db * 10.0).round() as i32;
     (valid_ticks(ticks) && f64::from(ticks) / 10.0 == db).then_some(ticks)
+}
+
+pub(crate) fn parse_track_mutes(value: &graph::Value) -> Result<[bool; 2]> {
+    let graph::Value::Arr(tracks) = value else {
+        return Err("invalid Resolve muted audio track list".into());
+    };
+    if !(1..=2).contains(&tracks.len()) {
+        return Err("invalid Resolve muted audio track count".into());
+    }
+    let mut mutes = [false; 2];
+    for track in tracks {
+        let slot = match track {
+            graph::Value::Int(1) => &mut mutes[0],
+            graph::Value::Int(2) => &mut mutes[1],
+            _ => return Err("unsupported Resolve muted audio track index".into()),
+        };
+        if std::mem::replace(slot, true) {
+            return Err("duplicate Resolve muted audio track index".into());
+        }
+    }
+    Ok(mutes)
 }
 
 pub(crate) fn valid_ticks(ticks: i32) -> bool {

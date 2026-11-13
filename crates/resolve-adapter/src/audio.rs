@@ -10,6 +10,14 @@ pub(crate) const FADE_LOSS: (&str, &str) = (
     "clip_fades",
     "Resolve clip fades are retained in source metadata",
 );
+pub(crate) const CLIP_PAN_LOSS: (&str, &str) = (
+    "clip_pan",
+    "Resolve clip pan is retained in source metadata",
+);
+pub(crate) const FRACTIONAL_FADE_LOSS: (&str, &str) = (
+    "fractional_clip_fades",
+    "Resolve fractional clip fade lengths are retained in source metadata",
+);
 pub(crate) const KEY_LOSS: (&str, &str) = (
     "volume_interpolation",
     "Resolve volume curve law is retained in source metadata",
@@ -212,9 +220,7 @@ pub(crate) fn prepare(
             head_point: point("fade_in_point")?,
             tail_point: point("fade_out_point")?,
         };
-        if !fades.valid_for(length)
-            || (matches!(volume, Some(Volume::Static(_))) && !fades.custom())
-        {
+        if !fades.valid_for(length) {
             return Err(unsupported().into());
         }
         Some(fades)

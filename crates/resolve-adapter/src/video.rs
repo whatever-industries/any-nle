@@ -209,7 +209,7 @@ pub(crate) fn encode(t: &Transform) -> Result<Option<String>> {
     encode_with_reflection(t, Reflection::default())
 }
 
-pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> Result<Option<String>> {
+pub(crate) fn validate_static_geometry(t: &Transform) -> Result<()> {
     let (x, y) = t.position;
     let (sx, sy) = t.scale;
     if t.rotation != 0.0
@@ -222,6 +222,13 @@ pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> R
     {
         return Err("unsupported Resolve static picture geometry".into());
     }
+    Ok(())
+}
+
+pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> Result<Option<String>> {
+    validate_static_geometry(t)?;
+    let (x, y) = t.position;
+    let (sx, sy) = t.scale;
     let has_crop = t.crop != [0.0; 4];
     let has_transform = t.position != (0.0, 0.0) || t.scale != (100.0, 100.0);
     if has_crop && has_transform {

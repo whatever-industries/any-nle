@@ -252,11 +252,13 @@ separate from these observations.
 
 The internal Premiere source reader emits sequence captions as `texts` with
 exact rational record spans and source occurrence IDs. Saved caption text
-and ticks remain in `premiere.captions`. Sequence marker occurrences keep
-bounded native payload receipts in `premiere.markers`. Resolve turnover
-reports the omission of each caption at destination review and requires
-approval for that run. Caption content and timing remain graph facts
-regardless of the Resolve destination's support for writing them.
+and ticks remain in `premiere.captions`. Premiere sequence Comment
+markers with qualified fields keep exact ticks in the sequence's
+`markers` array. Native payload receipts in `premiere.markers` identify
+each occurrence, including markers the reader cannot interpret. Resolve
+preparation decides which marker positions, spans and colors it can
+write. Unsupported occurrences remain visible at Review and require
+approval for that run.
 
 ## Picture reflection
 

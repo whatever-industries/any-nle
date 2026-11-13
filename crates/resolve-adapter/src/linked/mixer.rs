@@ -311,7 +311,7 @@ impl StripProcessing {
         )
     }
 
-    fn from_bus_receipt(bus: &Value) -> Result<Self> {
+    pub(crate) fn from_bus_receipt(bus: &Value) -> Result<Self> {
         let mut bands = [None; 6];
         match bus.get("eq_bands") {
             None => {}
@@ -350,7 +350,7 @@ impl StripProcessing {
         Self::from_cells(cells).ok_or_else(|| "unsupported Fairlight bus processing values".into())
     }
 
-    fn saved_rows_are_default(track: &Value) -> bool {
+    pub(crate) fn saved_rows_are_default(track: &Value) -> bool {
         let Some(rows) = track.get("eq_dynamics_fields") else {
             // Earlier receipts can omit raw processing observations.
             return true;
@@ -609,7 +609,7 @@ fn number(row: &Value, name: &str) -> Result<i64> {
     }
 }
 
-fn neutral_when_present(row: &Value, names: &[&str]) -> bool {
+pub(crate) fn neutral_when_present(row: &Value, names: &[&str]) -> bool {
     names
         .iter()
         .all(|name| matches!(row.get(name), None | Some(Value::Int(0))))

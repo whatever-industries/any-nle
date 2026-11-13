@@ -128,13 +128,19 @@ picture while both audio channels matched the enabled control.
 
 Static track faders on the qualified two-mono Fairlight mixer map to
 the graph track's level. Static clip volume stays on the placement.
+The reader also recognizes static track and main bus faders in the two
+saved linked mono mixer forms with the qualified remaining mixer state.
 The static main stereo bus level is retained in the Resolve sequence
-receipt as `main_bus_level_db`, with a scoped portability loss that the
-internal Resolve writer resolves.
+receipt as `main_bus_level_db`. The qualified internal writers for
+Resolve and Premiere apply that value to their respective output faders.
 Static track mute on that mixer is retained in the Resolve sequence
 receipt as `muted_audio_tracks`, with a scoped portability loss. The
 timeline flags and both mixer rows must agree. The track and its edits
 remain present, with clip volume, track level and bus level independent.
+The qualified internal Resolve and Premiere writers apply the saved
+mute to the owning audio track.
+The linked mixer forms also retain static track pan with the saved
+track ownership, routing, and processing qualification.
 Recognized but unqualified mixer settings or conflicting mute fields
 receive scoped losses that block an internal Resolve write.
 
@@ -425,11 +431,224 @@ timing, routing and topology remain explicit. The public routes are unchanged.
   also writes one EQ bell and the compressor switch, ratio, threshold
   and timing.
 
-The internal reverse route uses
-`resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj`.
-It verifies the original 1080p24 ProRes HQ picture binding and qualified clock
-before handing the prepared graph to the Premiere writer. It does not flatten
-unresolved nested edits, grade controls or generators.
+### Write linked audio to Premiere
+
+```text
+resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj
+```
+
+The internal reverse route accepts same-rate progressive square-pixel
+1080p ProRes HQ MOV on V1 at 24 or 24000/1001 with a qualified non-drop
+origin and two independent mono WAV lanes. The WAV can be PCM16 or
+PCM24 at 48 kHz. Each placement keeps its saved physical stream and
+channel, including independent trims when both lanes reference one
+stereo file. Premiere gets discrete mono source views for fresh
+insertion. The 24 fps picture-only speed and caption profile remains
+available through the same command.
+
+Source capture and project writing are checked with the retained 24 fps
+separate-file control and the two 23.976 stereo-file controls. The
+offline check follows each written edit to its file and physical
+channel, verifies exact clocks and ranges after graph reload, and
+decodes the selected PCM ranges from the originals. The retained
+Resolve renders include a 72-sample edge ramp and a −3 dB output pan law
+in these fixtures. Compare those separately from sample placement and
+channel selection.
+
+Premiere 27.0.0 build 88 retained all three timelines' origins, edit
+ranges, paths and channel selectors after Save As, close and reopen.
+All 48 numbered picture frames per timeline match the Resolve source
+frame selections. Decoded pixel hashes differ between the two editors'
+renders. The six isolated Premiere renders keep their exact 96,000 or
+96,096-sample spans and source offsets. Those renders and fresh mono
+insertions match source PCM to within one 24-bit code value at Premiere's
+center-pan amplitude of `1/sqrt(2)`. The converter adds no Resolve ramp.
+
+Resolve Studio 21.2.0 build 00006 also exported a standalone linked AAF
+for the 23.976 PCM16 stereo timeline. The imported Premiere timeline
+needed no relink. Its reopened paths, clock, trims and physical
+selectors agree with the Any NLE project. All 48 Premiere-rendered
+picture hashes match between those two routes and both isolated lanes
+agree within one 24-bit code value.
+
+The linked mono profile also writes static clip gain from −6 through
++3 dB as editable Premiere Volume Level, and saved static clip pan
+from −100 through +100 as the mono clip panner. Default linear-amplitude
+fades become editable, one-sided Constant Gain transitions owned by
+the original clip edge. Whole-frame durations are exact. Fractional
+durations are rounded to the nearest Premiere tick.
+
+In Premiere 27.0.0 build 88, both the native fractional-fade case and
+the whole-frame control kept their original file, independent channel
+selectors, trims, gain, pan, and fade ranges after Save As and reopen.
+The tests isolated each mono lane into a stereo PCM24 render of 96,096
+sample frames. They checked a −6 dB / −50 pan clip with a head fade and
+a +3 dB / +50 pan clip with a tail fade. Both normalized fade midpoints
+measured within 0.04 percentage points of half amplitude in each
+editor. Premiere applies its own panning law, which changes the stereo
+balance at the same pan setting. The conversion reports that difference
+on each nonzero pan occurrence. PCM equality across editors is outside
+this qualification.
+
+For direct mono clips, the route also writes two in-range, Linear Resolve
+volume keys as editable Premiere Volume Level keys. Source times stay on
+the item clock and dB values stay within the qualified −6 to +3 dB range.
+Keys can coexist with default whole-frame fades on the same clip.
+
+The 23.976 stereo PCM16 source control uses opposite ramps on two
+independently trimmed mono lanes. Premiere 27 retained both pairs of
+keys, their source times, channels, and trims after Save As and reopen.
+A second control overlapped the ramps with a 12-frame head fade and an
+18-frame tail fade. The reopened projects retained both fade intervals,
+and the isolated PCM renders confirmed their linear-amplitude response.
+Across the two 9 dB ramps, Premiere's Linear interpolation differed from
+Resolve's linear-dB curve by up to 0.31 dB after normalizing steady
+channel levels. The converter reports the interpolation difference on
+each keyed clip.
+
+Static Resolve track faders transfer as editable Premiere Audio Track
+Mixer faders on A1 and A2. The qualified linked mono mixer accepts exact
+tenths of a dB from −6 through 0. Clip Volume Level and its source-time
+keys remain on each clip. Premiere 27 kept −3 dB on A1 and −6 dB on A2
+after Save As and reopen in two 23.976 controls. One used static clip
+volume, pan, and fades. The other used two editable volume keys per
+clip. Compared with the corresponding clip-only Premiere renders, all
+96,096 sample frames per lane matched the expected fader scaling within
+one PCM24 code value after rounding.
+
+The same profile transfers the static main stereo bus fader from Resolve
+Bus 1 to Premiere's sequence Mix fader. It accepts exact tenths of a dB
+from −6 through 0. Premiere 27 kept a −3.7 dB Mix fader alongside the
+separate A1 and A2 faders and each clip's static or keyed volume after
+Save As and reopen. The isolated renders confirmed that the Mix fader
+applied −3.7 dB to each lane. Against the unity-bus Premiere renders,
+all 96,096 frames per lane matched within one PCM24 code value after
+rounding. [Adobe Audio Track Mixer overview](https://helpx.adobe.com/uk/premiere/desktop/add-audio-effects/advanced-audio-techniques/about-audio-track-mixer.html)
+
+Static track mute transfers to the owning Premiere audio track. Premiere
+27 kept A1 muted in the static clip volume control and A2 muted in the
+keyframed clip volume control after Save As and reopen. Each isolated
+muted lane rendered digital silence across all 96,096 stereo PCM24
+sample frames. The other lane matched its unmuted reference sample for
+sample. Re-enabling the muted lane restored its reference signal. The
+Mix fader, both track faders, and the clip volume and keyframes survived
+on their original owners.
+
+Static track pan is editable on A1 and A2 of the Premiere Audio Track
+Mixer. These inputs use mono tracks feeding a stereo Mix. The qualified
+Resolve profile keeps the single main bus, direct routing, and static
+pan values in tenths of a percent. Premiere 27 kept the pan, mute, Mix
+level, both track levels, and each clip's static volume or keyframes
+after Save As and reopen. At hard left and hard right, each isolated
+lane produced digital zero on the opposite channel. At ±50 the
+quieter channel measured about 41% of the louder channel in Premiere
+and 27% in Resolve. The converter preserves the pan setting and
+reports the difference in pan law for intermediate values.
+
+With both static clip pan and track pan on a lane, Resolve adds the
+two values and clamps the result to −100 through +100. Premiere's
+mono input did not apply a separate clip panner in the native control.
+The converter writes the effective value as one editable Premiere
+clip pan on each affected edit, including edits with neutral clip pan.
+It reports the loss of independent pan controls. A lane without clip
+pan keeps its editable track panner. Premiere's pan law still applies.
+
+Default linear-amplitude clip fades remain editable with both forms.
+The fade uses the mono channel layout on a mono input and the stereo
+layout on a standard track. Premiere 27 Save As and reopen controls
+covered aligned, opposing and intermediate pans, a mixed mono/stereo
+timeline, and fades overlapping volume keyframes. Both tracks
+retained their source assignments, mute state, Mix and track gains,
+and static or keyed clip volume. Isolated PCM confirmed expected
+routing, digital silence while muted, and the fade response.
+
+Unknown offsets, out-of-range edits, ambiguous selectors, unsupported
+controls and malformed files block the internal write. Other volume
+curves, keys outside the edit, keys combined with fractional or custom
+fades, mixer automation, additional buses and custom
+routing remain outside this Premiere profile. Originals stay in place.
+
+### Resolve to Premiere static picture controls
+
+For the internal 1920×1080 square-pixel ProRes HQ profile at exact
+24000/1001, the converter writes static position, independent X/Y scale
+and all four crop edges as editable Premiere Motion controls. Position
+is limited to five percent per axis, scale to 87.5–112.5 percent and
+crop to five percent per edge. Rotation, anchor changes, animated
+controls and effect stacks are outside this profile.
+
+The Resolve reader accepts native crop with no Motion section and
+retains combined static crop and motion on the same graph/2 edit.
+In Premiere 27.0.0 build 88, isolated and combined controls kept their
+values after Save As and reopen. The rendered crop moved and scaled
+with the image. Across 48 frames per case, measured edges matched
+Resolve within one pixel. The effect was confined to the intended
+24-frame edit. The Resolve writer keeps its separate admission rules
+for combined static geometry.
+
+### Resolve to Premiere Linear position and scale
+
+The internal writer maps the saved `resolve.motion_linear` record to
+editable Premiere Motion at exact 24000/1001 on the 1920×1080
+square-pixel ProRes HQ profile. Resolve's vertical position is positive
+up. The writer negates it once and converts Zoom X/Y to Premiere
+percentages. It uses the saved file-relative key frames directly.
+
+- Two Linear keys share the source frames at the first and last visible
+  frames. Premiere 27.0.0 build 88 kept Position, Scale Width and Scale
+  Height on frames 24 and 71 after Save As and reopen. Across 48 frames,
+  the measured chart features agreed with Resolve within three pixels
+  horizontally and one vertically.
+- Three Linear keys on each axis can span a head or tail trim. Position
+  and height share a source-frame grid, and width can have its own grid.
+  Both grids must span the visible edit and share its first or last
+  frame. Every key must fall inside verified original media, including
+  keys outside the edit. Premiere 27 retained all three keys and Linear
+  interpolation after Save As and reopen in six head- and tail-trim
+  cases. Across 192 rendered frames, measured outer edges agreed with
+  Resolve within one pixel. Internal chart features agreed within four
+  pixels horizontally and one vertically.
+
+Longer curves, nonlinear interpolation, reflection combined with this
+motion, and animated crop require separate qualification.
+
+### Resolve to Premiere video dissolves
+
+At exact 24000/1001, the internal writer maps one eight-frame V1 Cross
+Dissolve with left or centered alignment to Premiere Cross Dissolve
+(Legacy). It retains the two saved edit identities and checks the
+same-rate ProRes HQ source handles before writing. The left alignment
+needs eight frames of incoming preroll. The centered alignment needs
+four frames on each side. Visible clip trims remain intact.
+
+After Save As and reopen in Premiere 27.0.0 build 88, both controls
+retained the cut at frame 24, the transition intervals (frames 16–23
+and 20–27), and all media links. Picture outside each blend matched
+the Premiere straight-cut control. Premiere used the outgoing image
+at the first blend frame, where Resolve had already started blending.
+The writer reports the difference in blend sampling. Both isolated
+audio lanes matched the Premiere straight-cut control sample for
+sample across 96,096 frames.
+
+### Resolve to Premiere audio crossfades
+
+The internal writer maps one centered eight-frame Resolve Cross Fade 0DB
+on A1 at 24 fps to an editable Premiere Constant Gain transition. The
+originals are mono 48 kHz PCM WAV. The writer uses the two saved edit
+identities, verifies both four-frame handles against the original files,
+and preserves the visible trims. Wider transition profiles and crossfades
+on a track with independent pan or clip edge fades remain unqualified.
+
+In Premiere 27.0.0 build 88, the native output and Resolve's linked AAF
+both reopened with the same links, physical channels, record spans and
+eight-frame transition at frames 20–28. The AAF contained an Avid Audio
+Dissolve with a linear Level ramp. Premiere imported it as Constant
+Power, saved both handle extensions in the clip trims, and played A1's
+incoming source four frames early. The native output preserved the
+source trim and the linear blend. Its blend coefficients differed from
+Resolve by less than 0.00003 after accounting for the editors' center pan
+levels. Across all 96,000 sample frames on A2, the two Premiere renders
+agreed within one PCM24 code value.
 
 ## Write picture nests
 

@@ -1,6 +1,6 @@
 # Native release process
 
-Release version: `0.1.0-alpha.2`. First-party code is MIT; dependency notices remain
+Release version: `0.1.0-alpha.3`. First-party code is MIT; dependency notices remain
 applicable. The GUI is native Rust, and both GUI and CLI ship with media tools.
 
 ## Runtime layout

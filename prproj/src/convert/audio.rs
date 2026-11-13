@@ -13,7 +13,8 @@ use crate::build::time::Time;
 use crate::build::{leaf, top};
 use crate::convert::model::{py_str_repr, AudioCrossfade, EventAudio, VolumeKey};
 use crate::error::{value, Result};
-use crate::model::{Project, TrackId, TrackItemId};
+use crate::model::{Project, SequenceId, TrackId, TrackItemId};
+use crate::xml::NodeId;
 
 pub const PREMIERE_VOLUME_MAX_DB: f64 = 6.0;
 const FILTER_CLASS_ID: &str = "d77a90a0-6c9e-44bf-9b20-de8c21168fe1";
@@ -169,6 +170,39 @@ pub fn set_clip_volume(project: &mut Project, placed: TrackItemId, audio: &Event
 /// `set_track_level(project, track, db)`: set an audio track's fader Volume (linear).
 pub fn set_track_level(project: &mut Project, track: TrackId, db: f64) -> Result<()> {
     let element = project.track(track).element;
+    set_fader_level(project, element, db)
+}
+
+/// Set the sequence's stereo output fader through the audio group's master reference.
+pub(crate) fn set_mix_level(project: &mut Project, sequence: SequenceId, db: f64) -> Result<()> {
+    let data = project.sequence(sequence);
+    if data.audio_channel_count != Some(2) {
+        return value("prepared mix fader requires a stereo output");
+    }
+    let mut mix = None;
+    for pair in project.doc.tree.findall(data.element, "TrackGroups/TrackGroup")? {
+        let Some(second) = project.doc.tree.child_by_tag(pair, "Second") else {
+            continue;
+        };
+        let group = project.doc.resolve(second)?;
+        if project.doc.tree.tag(group) != "AudioTrackGroup" {
+            continue;
+        }
+        let Some(master) = project.doc.tree.child_by_tag(group, "MasterTrack") else {
+            return value("audio group has no master track");
+        };
+        let element = project.doc.resolve(master)?;
+        if project.doc.tree.tag(element) != "AudioMixTrack" || mix.replace(element).is_some() {
+            return value("invalid or ambiguous sequence mix track");
+        }
+    }
+    let Some(element) = mix else {
+        return value("sequence has no audio mix track");
+    };
+    set_fader_level(project, element, db)
+}
+
+fn set_fader_level(project: &mut Project, element: NodeId, db: f64) -> Result<()> {
     let Some(chain_ref) = project.doc.tree.find1(element, "AudioTrack/ComponentOwner/Components") else {
         return value("audio track has no ComponentOwner/Components");
     };
@@ -182,26 +216,50 @@ pub fn set_track_level(project: &mut Project, track: TrackId, db: f64) -> Result
         for p in params {
             let param = project.doc.resolve(p)?;
             if project.doc.tree.findtext(param, "Name")?.as_deref() == Some("Volume") {
-                let v = fmt(linear(db));
-                let tree = &mut project.doc.tree;
-                for (tag, text) in [("StartKeyframe", format!("{START},{v},0,0,0,0,0,0")), ("CurrentValue", v.clone())] {
-                    let e = match tree.child_by_tag(param, tag) {
-                        Some(e) => e,
-                        None => {
-                            let e = tree.new_element(tag);
-                            let tail = tree.children(param).first().and_then(|&c| tree.tail(c)).map(String::from);
-                            tree.set_tail(e, tail);
-                            tree.insert(param, 0, e);
-                            e
-                        }
-                    };
-                    tree.set_text(e, Some(text));
-                }
+                set_static_scalar(project, param, linear(db));
                 return Ok(());
             }
         }
     }
     value("audio track has no fader Volume parameter")
+}
+
+pub(crate) fn set_mono_track_pan(project: &mut Project, track: TrackId, percent: f64) -> Result<()> {
+    let element = project.track(track).element;
+    let Some(reference) = project.doc.tree.find1(element, "AudioTrack/Panner") else {
+        return value("audio track has no panner");
+    };
+    let panner = project.doc.resolve(reference)?;
+    if project.doc.tree.tag(panner) != "MonoToStereoPanProcessor" {
+        return value("track pan requires a mono input feeding stereo");
+    }
+    let Some(reference) = project.doc.tree.find1(panner, "PanProcessor/AudioComponent/Component/Params/Param") else {
+        return value("mono track panner has no Pan parameter");
+    };
+    let param = project.doc.resolve(reference)?;
+    if project.doc.tree.findtext(param, "Name")?.as_deref() != Some("Pan") {
+        return value("unexpected mono track panner parameter");
+    }
+    set_static_scalar(project, param, (percent + 100.0) / 200.0);
+    Ok(())
+}
+
+fn set_static_scalar(project: &mut Project, param: NodeId, scalar: f64) {
+    let v = fmt(scalar);
+    let tree = &mut project.doc.tree;
+    for (tag, text) in [("StartKeyframe", format!("{START},{v},0,0,0,0,0,0")), ("CurrentValue", v)] {
+        let e = match tree.child_by_tag(param, tag) {
+            Some(e) => e,
+            None => {
+                let e = tree.new_element(tag);
+                let tail = tree.children(param).first().and_then(|&c| tree.tail(c)).map(String::from);
+                tree.set_tail(e, tail);
+                tree.insert(param, 0, e);
+                e
+            }
+        };
+        tree.set_text(e, Some(text));
+    }
 }
 
 /// `add_crossfade(track, fade, style)`: an audio crossfade over the cut at `fade.cut`,

@@ -12,6 +12,7 @@ pub(crate) type Curve = Vec<(u32, f64)>;
 const BAD_MOTION: &str = "unsupported Resolve Linear motion keys or geometry";
 const BAD_HANDLE: &str = "Resolve Linear motion key is outside verified source media";
 const BAD_CROP: &str = "unsupported Resolve Linear crop keys or clock";
+pub(crate) const NATIVE_LINEAR_KIND: &str = "resolve.motion_linear";
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct LinearMotion {
@@ -63,6 +64,97 @@ fn pair(value: &Value, key: &str) -> Option<(f64, f64)> {
 }
 
 impl LinearMotion {
+    pub(crate) fn prepare_premiere(
+        effect: &Effect,
+        source_in: i64,
+        length: i64,
+        available: i64,
+        frame_ticks: i64,
+    ) -> Result<(Transform, prproj::convert::prepared::PictureEffect)> {
+        use prproj::convert::prepared::{MotionKey, PictureEffect, TrimmedMotion, TrimmedMotionKey};
+
+        let Value::Obj(fields) = &effect.params else {
+            return Err(BAD_MOTION.into());
+        };
+        if effect.kind != NATIVE_LINEAR_KIND || fields.len() != NAMES.len() {
+            return Err(BAD_MOTION.into());
+        }
+        let mut curves: [Curve; 4] = Default::default();
+        for (axis, curve) in NAMES.into_iter().zip(&mut curves) {
+            let Some(Value::Arr(keys)) = effect.params.get(axis) else {
+                return Err(BAD_MOTION.into());
+            };
+            if !matches!(keys.len(), 2 | 3) {
+                return Err(BAD_MOTION.into());
+            }
+            for key in keys {
+                let Value::Arr(pair) = key else {
+                    return Err(BAD_MOTION.into());
+                };
+                let [Value::Int(frame), value] = pair.as_slice() else {
+                    return Err(BAD_MOTION.into());
+                };
+                curve.push((u32::try_from(*frame)?, number(value).ok_or(BAD_MOTION)?));
+            }
+        }
+        if curves.iter().flatten().any(|&(frame, _)| i64::from(frame) >= available) {
+            return Err(BAD_HANDLE.into());
+        }
+        let native = Self::from_saved(curves, None, Reflection::default(), source_in, length, available)
+            .ok_or(BAD_MOTION)?;
+        let [pan, tilt, width, height] = &native.curves;
+        let aligned_width = width.iter().map(|key| key.0).eq(pan.iter().map(|key| key.0));
+        let ticks = |frame: u32| i64::from(frame).checked_mul(frame_ticks).ok_or(BAD_HANDLE);
+        let position = |i: usize| [pan[i].1, -tilt[i].1];
+        let scale = |i: usize| [width[i].1 * 100.0, height[i].1 * 100.0];
+        let picture = if pan.len() == 2 {
+            if !aligned_width {
+                return Err(BAD_MOTION.into());
+            }
+            let key = |i: usize| -> Result<MotionKey> {
+                Ok(MotionKey {
+                    ticks: ticks(pan[i].0)?,
+                    position: position(i),
+                    scale: scale(i),
+                    crop: None,
+                })
+            };
+            PictureEffect::Resize([key(0)?, key(1)?])
+        } else {
+            let (start, end) = key_range(source_in, length).ok_or(BAD_MOTION)?;
+            if !((pan[0].0 == start && width[0].0 == start)
+                || (pan[2].0 == end && width[2].0 == end))
+            {
+                return Err("Resolve Linear motion needs a shared visible edge on both key grids".into());
+            }
+            let motion = |i: usize| -> Result<TrimmedMotionKey> {
+                Ok(TrimmedMotionKey {
+                    ticks: ticks(pan[i].0)?,
+                    position: position(i),
+                    height: height[i].1 * 100.0,
+                })
+            };
+            let width_key = |i: usize| -> Result<(i64, f64)> {
+                Ok((ticks(width[i].0)?, width[i].1 * 100.0))
+            };
+            PictureEffect::TrimmedResize(TrimmedMotion {
+                motion: [motion(0)?, motion(1)?, motion(2)?],
+                width: [width_key(0)?, width_key(1)?, width_key(2)?],
+                fixed_width: !aligned_width,
+                crop: None,
+            })
+        };
+        // The prepared Motion component uses the first key of each axis as its base.
+        let base = Transform {
+            position: position(0).into(),
+            scale: scale(0).into(),
+            rotation: 0.0,
+            anchor: (0.0, 0.0),
+            crop: [0.0; 4],
+        };
+        Ok((base, picture))
+    }
+
     pub(crate) fn from_graph(
         effect: &Effect,
         rate: Rational,
@@ -306,7 +398,7 @@ impl LinearMotion {
             ));
         }
         Effect {
-            kind: "resolve.motion_linear".into(),
+            kind: NATIVE_LINEAR_KIND.into(),
             params: Value::Obj(params),
         }
     }
@@ -489,6 +581,66 @@ fn key_range(source_in: i64, length: i64) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
     use graph::picture_motion::{linear_effect, MotionKey};
+    use prproj::convert::prepared::PictureEffect;
+
+    #[test]
+    fn premiere_linear_keys_preserve_the_saved_source_grid_and_independent_scale() {
+        let native = LinearMotion::from_saved(
+            [
+                vec![(24, -0.15), (71, 0.20)],
+                vec![(24, -0.075), (71, 0.125)],
+                vec![(24, 0.8), (71, 1.35)],
+                vec![(24, 1.2), (71, 0.65)],
+            ],
+            None,
+            Reflection::default(),
+            24, 48, 120,
+        ).unwrap();
+        let unit = prproj::convert::model::TICKS_PER_SECOND / 24_000 * 1001;
+        let effect = native.readback();
+        let (_, PictureEffect::Resize([first, last])) =
+            LinearMotion::prepare_premiere(&effect, 24, 48, 120, unit).unwrap()
+        else {
+            panic!("expected two-key motion");
+        };
+        assert_eq!(first.ticks, 24 * unit);
+        assert_eq!(last.ticks, 71 * unit);
+        assert_eq!(first.position, [-0.15, 0.075]);
+        assert_eq!(last.position, [0.20, -0.125]);
+        assert_eq!(first.scale, [80.0, 120.0]);
+        assert_eq!(last.scale, [135.0, 65.0]);
+        assert!(LinearMotion::prepare_premiere(&effect, 25, 47, 120, unit).is_err());
+    }
+
+    #[test]
+    fn premiere_trimmed_linear_keys_keep_both_source_grids() {
+        let unit = prproj::convert::model::TICKS_PER_SECOND / 24_000 * 1001;
+        let effect = LinearMotion::from_saved(
+            [
+                vec![(26, -0.15), (39, 0.05), (55, 0.20)],
+                vec![(26, -0.075), (39, 0.025), (55, 0.125)],
+                vec![(9, 0.8), (31, 1.05), (55, 1.35)],
+                vec![(26, 1.2), (39, 0.9), (55, 0.65)],
+            ],
+            None,
+            Reflection::default(),
+            32, 24, 56,
+        ).unwrap().readback();
+        let (base, PictureEffect::TrimmedResize(trim)) =
+            LinearMotion::prepare_premiere(&effect, 32, 24, 56, unit).unwrap()
+        else {
+            panic!("expected three-key trimmed motion");
+        };
+        assert!(trim.fixed_width);
+        assert_eq!(base.position, (-0.15, 0.075));
+        assert_eq!(base.scale, (80.0, 120.0));
+        assert_eq!(trim.motion.map(|k| k.ticks), [26, 39, 55].map(|f| f * unit));
+        assert_eq!(trim.width, [(9 * unit, 80.0), (31 * unit, 105.0), (55 * unit, 135.0)]);
+        assert_eq!(trim.motion[1].position, [0.05, -0.025]);
+        assert_eq!(trim.motion[1].height, 90.0);
+        assert!(LinearMotion::prepare_premiere(&effect, 32, 24, 55, unit).is_err());
+        assert!(LinearMotion::prepare_premiere(&effect, 32, 23, 56, unit).is_err());
+    }
 
     #[test]
     fn resolve_linear_keys_use_the_exact_fractional_source_frame_grid() {

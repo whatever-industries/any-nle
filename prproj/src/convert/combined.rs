@@ -138,7 +138,7 @@ pub fn create_merged(
     };
     let ordered = combined_order(clip)?;
     let timebase = ticks_per_unit(video.rate);
-    let Some(display) = media.rewrap_formats.get(&video.path).and_then(|s|s.parse().ok()).or_else(||display_format(timebase)) else {
+    let Some(display) = media.picture_format_override(&video.path).and_then(|s|s.parse().ok()).or_else(||display_format(timebase)) else {
         return Err(other(format!("no observed display format for {} fps merged clips", video.rate)));
     };
     let Some(root) = project.root_item() else { return Err(other("project has no root item")) };
@@ -168,9 +168,13 @@ pub fn create_merged(
             ],
         )?;
     }
-    project.share_file_identity(video_item, video_copy)?;
-    for (&source, &copy) in audio_items.iter().zip(&audio_copies) {
-        project.share_file_identity(source, copy)?;
+    // Qualified direct parts already reference the same Media objects. Replacing
+    // their state with hash references would erase the only copy of each payload.
+    if !media.is_direct_dnxhr_picture(&video.path) {
+        project.share_file_identity(video_item, video_copy)?;
+        for (&source, &copy) in audio_items.iter().zip(&audio_copies) {
+            project.share_file_identity(source, copy)?;
+        }
     }
 
     let channels = audio_copies.len();
@@ -383,17 +387,17 @@ pub fn create_grouped(
     grouped_name: &str,
     ids: &mut dyn UuidSource,
 ) -> Result<ItemId> {
-    create_grouped_with_display(project,clip,video_item,audio_items,target_bin,grouped_name,None,ids)
+    create_grouped_with_media(project,clip,video_item,audio_items,target_bin,grouped_name,None,ids)
 }
 
-pub(crate) fn create_grouped_with_display(
+pub(crate) fn create_grouped_with_media(
     project: &mut Project,
     clip: &Clip,
     video_item: Option<ItemId>,
     audio_items: &[ItemId],
     target_bin: ItemId,
     grouped_name: &str,
-    display_override: Option<i64>,
+    media: Option<&MediaTable>,
     ids: &mut dyn UuidSource,
 ) -> Result<ItemId> {
     if audio_items.is_empty() || (video_item.is_none() && audio_items.len() < 2) {
@@ -410,6 +414,11 @@ pub(crate) fn create_grouped_with_display(
         return Err(other(format!("clip {}: no frame rate for an audio-only build", py_str_repr(&clip.name))));
     };
     let timebase = ticks_per_unit(rate);
+    let display_override = clip.video.as_ref()
+        .and_then(|video| media?.picture_format_override(&video.path))
+        .and_then(|format| format.parse().ok());
+    let discrete_direct_audio = clip.video.as_ref()
+        .is_some_and(|video| media.is_some_and(|media| media.is_direct_dnxhr_picture(&video.path)));
     let Some(display) = display_override.or_else(||display_format(timebase)) else {
         return Err(other(format!("no observed display format for {rate} fps grouped clips")));
     };
@@ -449,7 +458,7 @@ pub(crate) fn create_grouped_with_display(
         normalize_placement(project, placed, None)?;
     }
     let audio_tracks = project.audio_tracks(sequence).to_vec();
-    for (&track, &audio) in audio_tracks.iter().zip(audio_items) {
+    for (index, (&track, &audio)) in audio_tracks.iter().zip(audio_items).enumerate() {
         let placed = project.add_clip(track, audio, Time::new(0), ids)?;
         normalize_placement(project, placed, None)?;
         let element = project.track_item(placed).element;
@@ -464,6 +473,10 @@ pub(crate) fn create_grouped_with_display(
                 tree.remove(inner, node);
                 tree.set_text(inner, Some("\n\t\t"));
             }
+        }
+        if discrete_direct_audio {
+            // Send each source to its own bus channel. The outer edit still owns its pan.
+            set_clip_pan(project, placed, if index == 0 { Pan::Left } else { Pan::Right })?;
         }
     }
 
