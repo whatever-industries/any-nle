@@ -552,7 +552,9 @@ struct WriterInput<'a> {
     audio_edge_fades: &'a [super::prepared::PreparedAudioEdgeFade],
     audio_crossfades: &'a [super::prepared::PreparedAudioCrossfade],
     audio_mixers: &'a BTreeMap<usize, super::prepared::PreparedAudioMixer>,
+    track_states: &'a BTreeMap<usize, Vec<super::prepared::PreparedTrackState>>,
     picture_effects: &'a [PreparedPictureEffect],
+    edit_labels: &'a [super::prepared::PreparedEditLabel],
     direct_dnxhr_origins: &'a HashMap<String, i64>,
     multicams: &'a [super::multicam::PreparedMulticam],
     multicam_uses: &'a [super::multicam::PreparedMulticamUse],
@@ -601,6 +603,7 @@ struct Writer<'a> {
     audio_edge_fades: HashMap<(usize, usize, i64), &'a super::prepared::PreparedAudioEdgeFade>,
     audio_crossfades: HashMap<usize, Vec<&'a super::prepared::PreparedAudioCrossfade>>,
     picture_effects: HashMap<(usize, usize), (PictureEffect, [bool; 2])>,
+    edit_labels: HashMap<(usize, usize), Vec<super::prepared::PreparedEditLabel>>,
 }
 
 /// Index of `file` (a reference into `clip.audio`) by identity (Python `id(a)`).
@@ -1314,6 +1317,19 @@ impl Writer<'_> {
                 ("grouped", Some(v)) => Some(format!("0,0,{},{}", v.width, v.height)),
                 _ => None,
             }};
+            if let Some(labels) = self.edit_labels.get(&(sequence_index, i)) {
+                for label in labels {
+                    let track = match label.audio_track {
+                        Some(track) => track_at(&atracks, track)?,
+                        None => track_at(&vtracks, e.video_track.ok_or_else(|| other("label edit has no picture"))?)?,
+                    };
+                    let mut copies = placed.iter().copied()
+                        .filter(|&item| self.project.track_item(item).track == track);
+                    let copy = copies.next().filter(|_| copies.next().is_none())
+                        .ok_or_else(|| other("label owner did not produce one Premiere clip"))?;
+                    mk::set_edit_label(&mut self.project, copy, label.index)?;
+                }
+            }
             for &t in &placed {
                 let mut span = e.duration;
                 let mut original_speed = None;
@@ -1663,6 +1679,23 @@ impl Writer<'_> {
                 .push(format!("sequence {seq_name}: {} marker(s) on empty V{track_no} carried by an adjustment layer", ms.len()));
         }
         order_track_items(&mut self.project, sequence)?;
+        if let Some(states) = model.track_states.get(&sequence_index) {
+            for state in states {
+                let track = match state.audio_track {
+                    Some(lane) => track_at(&atracks, lane)?,
+                    None => track_at(&vtracks, 1)?,
+                };
+                if let Some(name) = &state.name {
+                    self.project.set_custom_track_name(track, name)?;
+                }
+                if state.locked {
+                    self.project.set_locked(track, true)?;
+                }
+                if state.picture_disabled {
+                    self.project.set_muted(track, true)?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1740,7 +1773,7 @@ pub fn prepare_project_with_effects(model: &Model, editorial: Editorial<'_>,
     super::prepared::validate_texts(texts, &model.sequences)?;
     super::prepared::validate_video_dissolves(video_dissolves, &model.sequences)?;
     super::prepared::validate_picture_effects(picture_effects, &model.sequences)?;
-    let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_mixers:&BTreeMap::new(),picture_effects,direct_dnxhr_origins,multicams:&[],multicam_uses:&[]};
+    let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),picture_effects,edit_labels:&[],direct_dnxhr_origins,multicams:&[],multicam_uses:&[]};
     prepare_view(&view,model,out_path,ids,media,native_av,None)
 }
 
@@ -1758,7 +1791,7 @@ fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_p
     if let Some(layout) = layout { layout.validate(&input.bins)?; }
     input.validate()?;
     let legacy=Model{project_name:input.project_name.clone(),options:input.options.clone(),clips:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Legacy(c)=>Some(c.clone()),_=>None}).collect(),bins:input.bins.iter().map(|b|super::model::Bin{name:b.name.clone(),clips:b.clips.iter().filter(|id|input.clips.iter().any(|c|matches!(c,super::prepared::PreparedClip::Legacy(c) if c.id==**id))).cloned().collect()}).collect(),sequences:input.sequences.iter().map(|s|{let mut s=s.clone();s.events.retain(|e|input.clips.iter().any(|c|matches!(c,super::prepared::PreparedClip::Legacy(c) if c.id==e.clip)));s.markers.clear();s}).collect()};
-    let view=WriterInput{options:&input.options,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_mixers:&input.audio_mixers,picture_effects:&input.picture_effects,direct_dnxhr_origins:&input.direct_dnxhr_origins,multicams:&input.multicams,multicam_uses:&input.multicam_uses};
+    let view=WriterInput{options:&input.options,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_mixers:&input.audio_mixers,track_states:&input.track_states,picture_effects:&input.picture_effects,edit_labels:&input.edit_labels,direct_dnxhr_origins:&input.direct_dnxhr_origins,multicams:&input.multicams,multicam_uses:&input.multicam_uses};
     prepare_view(&view,&legacy,out_path,ids,media,native_av,layout)
 }
 fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
@@ -1957,6 +1990,10 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         audio_crossfades,
         audio_edge_fades: model.audio_edge_fades.iter()
             .map(|fade| ((fade.sequence, fade.event, fade.track), fade)).collect(),
+        edit_labels: model.edit_labels.iter().fold(HashMap::new(), |mut by_edit, &label| {
+            by_edit.entry((label.sequence, label.event)).or_insert_with(Vec::new).push(label);
+            by_edit
+        }),
         picture_effects: model.picture_effects.iter()
             .map(|e| ((e.sequence, e.event), (e.effect, e.reflection_before_motion))).collect(),
     };

@@ -172,12 +172,33 @@ pub struct PreparedProjectInput {
     pub audio_edge_fades: Vec<PreparedAudioEdgeFade>,
     pub audio_crossfades: Vec<PreparedAudioCrossfade>,
     pub audio_mixers: BTreeMap<usize, PreparedAudioMixer>,
+    pub track_states: BTreeMap<usize, Vec<PreparedTrackState>>,
     pub picture_effects: Vec<PreparedPictureEffect>,
+    /// A label on one placed clip, independent of its source item.
+    pub edit_labels: Vec<PreparedEditLabel>,
     /// Verified direct DNxHR LB clip IDs and their physical media start ticks.
     /// The legacy clip fields carry the effective logging timecode.
     pub direct_dnxhr_origins: std::collections::HashMap<String, i64>,
     pub multicams: Vec<super::multicam::PreparedMulticam>,
     pub multicam_uses: Vec<super::multicam::PreparedMulticamUse>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedEditLabel {
+    pub sequence: usize,
+    pub event: usize,
+    /// None selects picture. Some selects a discrete mono audio lane.
+    pub audio_track: Option<i64>,
+    pub index: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedTrackState {
+    /// None selects V1. Some selects the one-based mono audio lane.
+    pub audio_track: Option<i64>,
+    pub name: Option<String>,
+    pub locked: bool,
+    pub picture_disabled: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -505,7 +526,9 @@ impl PreparedProjectInput {
             audio_edge_fades: Vec::new(),
             audio_crossfades: Vec::new(),
             audio_mixers: BTreeMap::new(),
+            track_states: BTreeMap::new(),
             picture_effects: Vec::new(),
+            edit_labels: Vec::new(),
             direct_dnxhr_origins: Default::default(),
             multicams: Vec::new(),
             multicam_uses: Vec::new(),
@@ -551,6 +574,45 @@ impl PreparedProjectInput {
         validate_video_dissolves(&self.video_dissolves, &self.sequences)?;
         validate_picture_effects(&self.picture_effects, &self.sequences)?;
         let fail = |s: &str| ModelError(s.into());
+        for (&sequence, states) in &self.track_states {
+            let seq = self.sequences.get(sequence).ok_or_else(|| fail("unknown sequence for track state"))?;
+            let mut seen = HashSet::new();
+            if states.is_empty() || states.len() > 3 || states.iter().any(|state| {
+                let has_lane = match state.audio_track {
+                    None => seq.events.iter().any(|edit| edit.video_track == Some(1)),
+                    Some(lane @ (1 | 2)) => !state.picture_disabled
+                        && seq.events.iter().any(|edit| edit.audio_tracks.contains(&lane))
+                        && seq.events.iter().all(|edit| edit.stereo.iter().all(|s| s.audio_track != lane)),
+                    _ => false,
+                };
+                !has_lane || !seen.insert(state.audio_track)
+                    || state.name.as_ref().is_some_and(|name| {
+                        name.is_empty() || name.len() > 255 || name.chars().any(char::is_control)
+                    })
+                    || state.name.is_none() && !state.locked && !state.picture_disabled
+            }) {
+                return Err(fail("invalid prepared track state or lane"));
+            }
+        }
+        if self.edit_labels.len() > MAX_ITEMS {
+            return Err(fail("prepared edit label count exceeds limit"));
+        }
+        let mut labeled = HashSet::new();
+        for label in &self.edit_labels {
+            let event = self.sequences.get(label.sequence)
+                .and_then(|sequence| sequence.events.get(label.event))
+                .ok_or_else(|| fail("unknown prepared label edit"))?;
+            let on_edit = match label.audio_track {
+                None => event.video_track.is_some(),
+                Some(track) => event.audio_tracks.iter().filter(|&&n| n == track).count() == 1
+                    && event.stereo.iter().all(|edit| edit.audio_track != track),
+            };
+            if !on_edit || usize::from(label.index) >= super::colors::LABEL_NAMES.len()
+                || !labeled.insert((label.sequence, label.event, label.audio_track))
+            {
+                return Err(fail("prepared label needs one unique edit lane and a Premiere palette index"));
+            }
+        }
         // Count every retained nested payload without allocating another text/value tree.
         // This conservative bounded representation is separate from peak RSS.
         use std::fmt::Write;

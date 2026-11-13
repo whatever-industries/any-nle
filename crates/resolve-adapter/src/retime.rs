@@ -25,14 +25,16 @@ impl PictureSpeed {
     }
 
     pub(crate) fn graph(self, record: i64) -> Option<Speed> {
-        let (ratio, frames) = match self {
-            Self::Half if record % 2 == 0 => ((2, 1), record / 2),
-            Self::Reverse => ((-1, 1), record),
-            _ => return None,
+        if record <= 0 {
+            return None;
+        }
+        let (ratio, denominator) = match self {
+            Self::Half => ((2, 1), 48),
+            Self::Reverse => ((-1, 1), 24),
         };
-        (frames > 0).then_some(Speed {
+        Some(Speed {
             ratio,
-            source_duration: Rational::new(frames.into(), 24)?,
+            source_duration: Rational::new(record.into(), denominator)?,
         })
     }
 
@@ -42,6 +44,9 @@ impl PictureSpeed {
         };
         let mode =
             Self::from_ratio(speed.ratio).filter(|mode| mode.graph(length).as_ref() == Some(speed));
+        if mode == Some(Self::Half) && length % 2 != 0 {
+            return Err("writing odd-length Resolve half-speed edits requires native qualification".into());
+        }
         if rate != Rational::integer(24)
             || edit.video_track != Some(1)
             || !edit.audio_tracks.is_empty()
@@ -121,6 +126,19 @@ impl PictureSpeed {
         let speed = self.graph(length).ok_or("invalid Resolve retime length")?;
         frames_on(speed.source_duration, Rational::integer(24))
     }
+
+    /// Number of source pictures touched by the saved nearest-frame map.
+    /// For an odd half-speed edit the final picture is displayed once,
+    /// although the time range is only half a source frame into it.
+    pub(crate) fn sampled_source_frames(self, length: i64) -> Result<i64> {
+        if length <= 0 {
+            return Err("invalid Resolve retime length".into());
+        }
+        Ok(match self {
+            Self::Half => length / 2 + length % 2,
+            Self::Reverse => length,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +153,12 @@ mod tests {
         assert_eq!(half.file_source_in(25, 24, 96), None);
         assert_eq!(half.source_length(24).unwrap(), 12);
         assert!(half.source_length(23).is_err());
+        assert_eq!(half.graph(23).unwrap().source_duration, Rational::new(23, 48).unwrap());
+        assert_eq!(half.sampled_source_frames(23).unwrap(), 12);
+        assert_eq!(half.sampled_source_frames(24).unwrap(), 12);
+        assert_eq!(half.sampled_source_frames(25).unwrap(), 13);
+        assert_eq!(half.sampled_source_frames(1).unwrap(), 1);
+        assert!(half.sampled_source_frames(0).is_err());
         let reverse = PictureSpeed::Reverse;
         assert_eq!(reverse.record_source_in(12, 24, 96), Some(60));
         assert_eq!(reverse.file_source_in(60, 24, 96), Some(12));

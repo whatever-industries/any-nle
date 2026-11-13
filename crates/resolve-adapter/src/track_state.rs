@@ -6,11 +6,12 @@ use graph::{
 };
 
 pub(crate) const ADAPTER: &str = "resolve.track_state";
+pub(crate) const PREMIERE_ADAPTER: &str = "premiere.track_state";
 pub(crate) const LOSS: (&str, &str) = (
     "track_state",
     "Resolve track state is retained in source metadata",
 );
-const LANES: [(StreamKind, i64); 3] = [
+pub(crate) const LANES: [(StreamKind, i64); 3] = [
     (StreamKind::Video, 1),
     (StreamKind::Audio, 1),
     (StreamKind::Audio, 2),
@@ -28,10 +29,26 @@ pub(crate) struct TrackState(pub(crate) [Track; 3]);
 
 impl TrackState {
     pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<Option<Self>> {
-        let Some(data) = graph.sidecar(ADAPTER, &sequence.id) else {
-            return Ok(None);
-        };
-        let invalid = || format!("{}: unsupported Resolve track state", sequence.id);
+        Self::parse(graph.sidecar(ADAPTER, &sequence.id), sequence)
+    }
+
+    pub(crate) fn prepare_for_resolve(
+        graph: &SourceGraph,
+        sequence: &SourceSequence,
+    ) -> Result<Option<Self>> {
+        let resolve = graph.sidecar(ADAPTER, &sequence.id);
+        let premiere = graph.sidecar(PREMIERE_ADAPTER, &sequence.id);
+        if premiere.is_some() && (resolve.is_some() || !sequence.clock.as_ref()
+            .is_some_and(|clock| clock.provenance.route == "Premiere sequence ticks"))
+        {
+            return Err(format!("{}: conflicting or unqualified Premiere track state", sequence.id).into());
+        }
+        Self::parse(resolve.or(premiere), sequence)
+    }
+
+    fn parse(data: Option<&Value>, sequence: &SourceSequence) -> Result<Option<Self>> {
+        let Some(data) = data else { return Ok(None) };
+        let invalid = || format!("{}: unsupported timeline track state", sequence.id);
         let Value::Arr(rows) = data else {
             return Err(invalid().into());
         };
@@ -42,7 +59,7 @@ impl TrackState {
             .eq(LANES)
         {
             return Err(format!(
-                "{}: Resolve track names and locks require V1 and two mono tracks",
+                "{}: track names, locks and picture output require V1 and two mono tracks",
                 sequence.id
             )
             .into());

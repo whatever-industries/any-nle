@@ -51,6 +51,42 @@ impl Solid {
             ),
         ])
     }
+
+    pub(crate) fn from_receipt(row: &Value) -> Result<(i64, Self)> {
+        let (
+            Some(Value::Int(start)),
+            Some(Value::Int(duration)),
+            Some(Value::Arr(rgb)),
+            Some(Value::Int(track)),
+        ) = (
+            row.get("start_frames"),
+            row.get("duration_frames"),
+            row.get("rgb16"),
+            row.get("video_track"),
+        )
+        else {
+            return Err("incomplete Resolve Solid Color generator".into());
+        };
+        if !matches!(row.get("kind"), Some(Value::Str(kind)) if kind == "Solid Color")
+            || *track <= 0
+            || *start < 0
+            || *duration <= 0
+            || start.checked_add(*duration).is_none()
+        {
+            return Err("invalid Resolve Solid Color span or track".into());
+        }
+        let [Value::Int(r), Value::Int(g), Value::Int(b)] = rgb.as_slice() else {
+            return Err("invalid Resolve generator color".into());
+        };
+        Ok((
+            *track,
+            Self {
+                start: *start,
+                duration: *duration,
+                rgb: [u16::try_from(*r)?, u16::try_from(*g)?, u16::try_from(*b)?],
+            },
+        ))
+    }
 }
 
 pub(crate) fn prepare(graph: &SourceGraph, seq: &SourceSequence) -> Result<Option<Solid>> {
@@ -63,26 +99,9 @@ pub(crate) fn prepare(graph: &SourceGraph, seq: &SourceSequence) -> Result<Optio
     let [row] = rows.as_slice() else {
         return Err("expected one Resolve Solid Color generator".into());
     };
-    let (Some(Value::Int(start)), Some(Value::Int(duration)), Some(Value::Arr(rgb))) = (
-        row.get("start_frames"),
-        row.get("duration_frames"),
-        row.get("rgb16"),
-    ) else {
-        return Err("incomplete Resolve Solid Color generator".into());
-    };
-    if !matches!(row.get("kind"), Some(Value::Str(kind)) if kind == "Solid Color")
-        || row.get("video_track") != Some(&Value::Int(1))
-        || *start < 0
-        || *duration <= 0
-    {
+    let (track, solid) = Solid::from_receipt(row)?;
+    if track != 1 {
         return Err("expected a positive Resolve Solid Color V1 span".into());
     }
-    let [Value::Int(r), Value::Int(g), Value::Int(b)] = rgb.as_slice() else {
-        return Err("invalid Resolve generator color".into());
-    };
-    Ok(Some(Solid {
-        start: *start,
-        duration: *duration,
-        rgb: [u16::try_from(*r)?, u16::try_from(*g)?, u16::try_from(*b)?],
-    }))
+    Ok(Some(solid))
 }

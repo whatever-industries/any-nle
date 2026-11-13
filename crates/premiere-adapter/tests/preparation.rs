@@ -874,6 +874,59 @@ fn off_clock_marker_duration_or_source_does_not_block_timeline() {
         assert!(p.losses.iter().any(|l| l.aspect == "marker_timing"));
     }
 }
+
+#[test]
+fn resolve_sequence_marker_palette_survives_graph_reload() {
+    let mut graph = fixture();
+    let template = graph.sequences[0].markers[0].clone();
+    let colors = [
+        ("Green", "Green", Some(0)),
+        ("Red", "Red", Some(1)),
+        ("Blue", "Blue", Some(6)),
+        ("Cyan", "Cyan", Some(7)),
+        ("Yellow", "Yellow", Some(4)),
+        ("Lavender", "Magenta", Some(2)),
+        ("Sand", "Orange", Some(3)),
+        ("Cream", "White", Some(5)),
+        ("Pink", "", None),
+    ];
+    graph.sequences[0].markers = colors.iter().enumerate().map(|(i, (source, _, _))| {
+        let start = Q::new(i as i128, 24).unwrap();
+        SourceMarker {
+            name: "Same name".into(),
+            comment: "One\nDeux café".into(),
+            color: Some(graph::Label { palette: "resolve".into(), name: (*source).into() }),
+            start: Some(start),
+            owner_local: Some(start),
+            owner: MarkerOwner::Sequence,
+            owner_occurrence: format!("test:sequence/marker/{i}"),
+            duration: Q::new(1, 24).unwrap(),
+            track: None,
+            source: None,
+            ..template.clone()
+        }
+    }).collect();
+    let saved = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    for input in [&graph, &saved] {
+        let result = premiere_adapter::prepare_resolve_originals(input, &options()).unwrap();
+        let markers = &result.input.sequences[0].markers;
+        assert_eq!(markers.len(), colors.len());
+        let frame = prproj::convert::model::TICKS_PER_SECOND / 24;
+        for (i, (marker, &(_, name, index))) in markers.iter().zip(&colors).enumerate() {
+            assert_eq!(marker.color, name);
+            assert_eq!(prproj::convert::colors::marker_color(&marker.color, &[]), index);
+            assert_eq!(marker.start, i as i64 * frame);
+            assert_eq!(marker.duration, frame);
+            assert_eq!(marker.comment, "One\nDeux café");
+        }
+        let losses: Vec<_> = result.losses.iter().filter(|l| l.aspect == "marker_color").collect();
+        assert_eq!(losses.len(), 4);
+        for (i, entry) in (5..9).zip(losses) {
+            assert!(entry.reason.starts_with(&format!("test:sequence/marker/{i}:")));
+        }
+    }
+}
+
 #[test]
 fn unrepresentable_item_streams_are_reported() {
     let mut g = fixture();

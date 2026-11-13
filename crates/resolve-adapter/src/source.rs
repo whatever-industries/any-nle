@@ -1668,7 +1668,10 @@ fn direct(
             return Err("invalid Resolve retime in-point".into());
         };
         edit.source_in = source_in;
-        leaf_range_matches(master, node, grid, edit.source_in, speed.source_length(edit.length)?, owner, graph)?;
+        leaf_range_matches(
+            master, node, grid, edit.source_in, speed.sampled_source_frames(edit.length)?,
+            owner, graph,
+        )?;
     } else if !leaf_matches(master, node, grid, edit, owner, graph, blobs)? {
         return Ok(None);
     }
@@ -1731,12 +1734,11 @@ fn direct(
         if let Some(saved) = node.maybe("FieldsBlob")?.filter(|saved| !saved.is_empty()) {
             if let Some(data) = fairlight::clip_plugins(saved, blobs)? {
                 graph.sidecars.push(Sidecar {
-                    adapter: "resolve.clip_fairlight".into(),
+                    adapter: fairlight::CLIP_ADAPTER.into(),
                     object: placement.id.clone(),
                     data,
                 });
-                loss(graph, &placement.id, "clip_fairlight",
-                     "Resolve clip plug-in state retained in graph; destination mapping is unqualified");
+                loss(graph, &placement.id, "clip_fairlight", fairlight::CLIP_LOSS);
             }
         }
     }
@@ -1883,7 +1885,7 @@ fn capture_grade(node: &Node, id: &str, graph: &mut SourceGraph, blobs: &mut Blo
 
 fn receipt_grade_hash(graph: &mut SourceGraph, id: &str, version: &str, hash: &str) {
     graph.sidecars.push(Sidecar {
-        adapter: "resolve.grade".into(),
+        adapter: crate::grade::OPAQUE_ADAPTER.into(),
         object: id.into(),
         data: Value::Obj(vec![
             ("version_id".into(), text(version)),

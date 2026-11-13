@@ -926,7 +926,7 @@ pub(crate) fn prepare_project(
                 );
             }
             let mixer = mixer::DirectMixer::prepare(graph, sequence)?;
-            let track_state = crate::track_state::TrackState::prepare(graph, sequence)?;
+            let track_state = crate::track_state::TrackState::prepare_for_resolve(graph, sequence)?;
             if track_state.is_some() && (picture_only || compound || second_picture || third_mono) {
                 return Err("Resolve track names and locks require a registered V1/A1/A2 timeline".into());
             }

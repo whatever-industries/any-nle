@@ -19,6 +19,23 @@ pub(crate) struct TimelineMarks([Option<i64>; 4]);
 
 impl TimelineMarks {
     pub(crate) fn prepare(graph: &SourceGraph, id: &str, length: i64) -> Result<Option<Self>> {
+        let Some(Self(values)) = Self::saved(graph, id, length)? else {
+            return Ok(None);
+        };
+        if values[..2] != values[2..] {
+            return Err(format!(
+                "{id}: independent Resolve audio and video marks change on import"
+            )
+            .into());
+        }
+        if values[0] == Some(0) {
+            return Err(format!("{id}: Resolve drops a frame-zero In mark on import").into());
+        }
+        Ok(Some(Self(values)))
+    }
+
+    /// Read the saved range, including values that do not survive a Resolve import.
+    pub(crate) fn saved(graph: &SourceGraph, id: &str, length: i64) -> Result<Option<Self>> {
         let Some(data) = graph.sidecar(ADAPTER, id).and_then(|row| row.get(FIELD)) else {
             return Ok(None);
         };
@@ -53,16 +70,11 @@ impl TimelineMarks {
         {
             return Err(invalid().into());
         }
-        if values[..2] != values[2..] {
-            return Err(format!(
-                "{id}: independent Resolve audio and video marks change on import"
-            )
-            .into());
-        }
-        if values[0] == Some(0) {
-            return Err(format!("{id}: Resolve drops a frame-zero In mark on import").into());
-        }
         Ok(values.iter().any(Option::is_some).then_some(Self(values)))
+    }
+
+    pub(crate) fn frames(self) -> [Option<i64>; 4] {
+        self.0
     }
 
     pub(crate) fn fields(self) -> impl Iterator<Item = (&'static str, i64)> {

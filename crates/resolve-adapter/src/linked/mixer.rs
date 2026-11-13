@@ -365,7 +365,18 @@ impl StripProcessing {
             })
     }
 
-    fn from_receipt(value: &Value, track: &Value) -> Result<Self> {
+    /// Archive comparisons need positive evidence of each supported saved
+    /// cell. The writer also accepts older receipts that omit default cells.
+    pub(crate) fn observes_saved_cells(strip: &Value, bus: bool) -> bool {
+        let Some(rows) = strip.get("eq_dynamics_fields") else {
+            return false;
+        };
+        PROCESSING_ROWS.iter().filter(|row| !bus || row.bus_ordinal().is_some()).all(|row| {
+            matches!(rows.get(&row.saved_key()), Some(Value::Int(_)))
+        })
+    }
+
+    pub(crate) fn from_receipt(value: &Value, track: &Value) -> Result<Self> {
         let raw = track
             .get("eq_dynamics_fields")
             .ok_or("missing saved Fairlight processing rows")?;

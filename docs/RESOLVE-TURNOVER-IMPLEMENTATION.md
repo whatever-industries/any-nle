@@ -76,6 +76,57 @@ Resolve imported the AAF at the same timeline origin and reopened it
 with zero timeline markers. That import did not reconnect the originals
 in the tested setup, so it does not qualify AAF media or audio behavior.
 
+## Premiere timeline In/Out
+
+The Premiere 27 reader retains saved `MZ.InPoint` and `MZ.OutPoint` ticks in a
+`premiere.timeline_marks` sidecar on the sequence. Whole-frame values also
+carry their saved frame number. Subframe values retain their exact ticks, and
+the unset sentinel produces no mark. Resolve turnover reports each mark as an
+omission and requires `--accept-losses` before writing. Premiere export tests
+must establish the saved Out boundary before the route writes a destination
+range. Timeline In/Out is separate from work area, clip trims and timecode origin.
+
+## Premiere timeline track state
+
+The Premiere 27 reader records custom track names, edit locks and the
+V1 output toggle in `premiere.track_state`. Each record is attached
+to the selected sequence and identifies a lane by kind and number.
+On the internal V1/A1/A2 linked profile, the Resolve writer uses the
+same track preparation as Resolve round trips. It writes the timeline
+fields and the Fairlight mirrors for audio names and edit locks.
+Disabling V1 leaves all picture edits and both mono routes in the project.
+
+Sync lock is distinct from edit lock. A disabled Premiere sync lock
+remains in `premiere.track_sync_lock` and requires approval to omit.
+Audio mute and non-neutral Premiere mixer controls still block the
+route. Invalid or duplicate track flags also block output.
+
+Offline variants of a retained Premiere 27 save kept accented text,
+duplicate audio track names, edit locks and a disabled V1. The archive
+read-back retained the original sequence origin, six edit ranges,
+physical WAV selectors and five sequence markers. Reopening and
+rendering the converted project in Resolve remain pending.
+
+## Premiere timeline clip labels
+
+For Premiere 27 projects, graph/2 records the timeline edit's saved label
+slot and packed color in `premiere.clip_label`. When both fields agree with
+the source templates, the edit uses the destination default. Resolve receives
+an explicit clip color for a distinct edit label, even when two edits share
+one master. The route uses the saved Premiere slot to choose a standard
+Resolve color and reports substitutions or a nonstandard saved swatch by
+edit. Unrecognized label fields require approval to omit. Duplicate label
+fields block preparation. Media Pool labels are outside this mapping.
+
+The offline control changes six timeline label pairs on a copy of the
+retained Premiere 27 project. Five write as edit-owned Resolve colors and
+the unknown slot remains in graph/2 with an omission report. Resolve Studio
+21.2 build 00006 kept all five labels and one uncolored neighbor after import,
+save, close and reopen. Re-export retained both mono channel selectors, all six
+edit ranges and the nonzero timeline start. The Premiere label changes were
+made to a disposable project copy; a separate Premiere 27 authoring check
+for changed labels remains open.
+
 ## Premiere clip components
 
 For Premiere 27 project version 46, `--graph` includes a

@@ -10,6 +10,9 @@ use std::{
 };
 
 const PROVENANCE: &str = "drpkit:af3cedc0 documented record layout";
+pub(super) const CLIP_ADAPTER: &str = "resolve.clip_fairlight";
+pub(super) const CLIP_LOSS: &str =
+    "Resolve clip plug-in state retained in graph; destination mapping is unqualified";
 const FADER: &[u8] = &[1, 0, 0, 0, 1, 0, 0, 0];
 const BUS_KIND: &[u8] = &[0, 0, 0, 0, 7, 0, 0, 0];
 const BUS_TABLE: &[u8] = &[1, 0, 0, 0, 0x1d, 0, 0, 0];
@@ -570,13 +573,11 @@ pub(super) fn clip_plugins(encoded: &str, blobs: &mut Blobs) -> Result<Option<Va
             })
         })
         .collect();
-    Ok((!plugins.is_empty()).then(|| {
-        Value::Obj(vec![
-            ("provenance".into(), Value::Str(PROVENANCE.into())),
-            ("clip_fx_sha256".into(), digest(&raw)),
-            ("plugins".into(), Value::Arr(plugins)),
-        ])
-    }))
+    Ok(Some(Value::Obj(vec![
+        ("provenance".into(), Value::Str(PROVENANCE.into())),
+        ("clip_fx_sha256".into(), digest(&raw)),
+        ("plugins".into(), Value::Arr(plugins)),
+    ])))
 }
 
 #[cfg(test)]

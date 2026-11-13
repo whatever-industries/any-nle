@@ -49,7 +49,7 @@ use retains the original range and any gap or unresolved binding.
 Sequence markers preserve relative position, duration, title, note, all
 16 Resolve marker colors, and saved custom data. The writer verifies
 these values and the sequence owner before publication. Clip-owned marker
-clocks and cross-editor palette equivalents remain open.
+clocks remain open. [Premiere marker palette](#resolve-to-premiere-sequence-marker-colors)
 
 The linked writer preserves matching audio and video timeline In/Out
 marks, including In-only and Out-only selections. These are timeline-relative
@@ -205,10 +205,91 @@ resolve-source-probe --diff LEFT LEFT_TIMELINE_ID RIGHT RIGHT_TIMELINE_ID OUTPUT
 resolve-source-probe --diff-blob LEFT LEFT_OBJECT_ID RIGHT RIGHT_OBJECT_ID FIELD OUTPUT.json
 ```
 
+### Replay retained reports
+
+Build `resolve-source-probe` and run the private offline regression set with
+a fresh output directory.
+
+```sh
+python3 scripts/verify_resolve_reports.py --probe /path/to/resolve-source-probe \
+  --manifest /path/to/private/resolve-report-fixtures.json --output /path/to/new-output \
+  --ffmpeg /path/to/ffmpeg --ffprobe /path/to/ffprobe
+```
+
+The `anynle.resolve-report-fixtures/1` JSON manifest has a `files` object
+mapping paths to SHA-256 digests and a nonempty `cases` array. Each case
+has a unique `name`, `mode` (`diff` or `conform`), `left` and `right`
+keys from `files`, exact `left_id` and `right_id` timeline selectors,
+and the SHA-256 of the reviewed report bytes in `report_sha256`. Conform
+cases can also set `all_frames` and supply a `renders` array with two
+pinned paths. Relative file paths are relative to the manifest. Backend
+paths are required for cases with renders. Keep this manifest and the
+fixture data private. A successful run writes `verified.json` after
+rechecking the inputs.
+
+### Timeline report scope
+
 Use exact sequence IDs from the DRP reader or qualified DRT graph output.
 The timeline report compares clocks, canvas, track layout, edit ranges,
 saved media timing and locators, physical audio selectors, timeline
 markers, picture controls, clip volume and the qualified Cross Dissolve.
+For V1 and two mono lanes, it also compares custom track names, edit
+locks and V1 output by lane, independently of saved track UUIDs.
+On that layout it compares qualified saved mono track faders, track
+mute, and the main bus fader separately from clip volume. Missing
+neutral mixer observations and conflicting controls produce gaps.
+Retained archive pairs isolated A1 and A2 fader changes of −3 and −6 dB,
+a main bus change of −3.7 dB, and an A1-only mute. A conflicting mute
+fixture remained inconclusive. The probe also checks qualified static
+track pan and bypass, direct output assignments, stereo bus count, and
+Bus 2 gain and mute. Track pan is reported as a signed percentage and bus numbers are
+one-based. Retained archives isolated a pan change, a change from one
+bus to two with A2 assigned to Bus 2, and separate Bus 2 gain and mute
+changes. A one-cell bypass control left the pan value unchanged.
+A mismatched Bus 2 mute mirror stayed inconclusive. The probe compares
+the supported static EQ and dynamics settings by saved track or bus,
+including saved values of disabled controls. Retained archives isolate
+A1 bell gain, A2 compressor settings, and EQ on each stereo bus.
+Missing or inconsistent rows and out-of-profile values are gaps.
+Unmapped Fairlight state remains a separate gap; these results describe
+saved settings, not automation, plug-ins, or rendered sound.
+The probe compares saved video and audio In/Out marks separately, including a
+frame-zero In and independent audio/video ranges that may change on
+Resolve import. Malformed marks and conflicting track state are reported
+as gaps. These comparisons concern saved values, not rendered output.
+For paired edits the report also compares decoded speed and source
+duration, frame maps when available, and the saved Resolve clip-color
+code. A code outside the known palette is a gap. For paired picture
+edits, the report also compares the supported single-node primary gain
+and identifies an added or removed grade. It validates the value
+against the saved node body and treats other grade profiles as
+inconclusive. Paired audio edits compare saved Voice Isolation and
+Dialogue Leveler records by effect ID, including raw flags and decoded
+parameters. Changed clip FX payloads also report a gap for any settings
+outside the decoded fields. Plain subtitle cues
+are compared by track and exact record start, including text and
+duration. A moved cue appears as a removal and addition; an unresolved
+subtitle track or cue leaves the caption comparison inconclusive.
+Solid Color and Text+ pair by kind, track, and exact record start.
+The report compares their durations, the generator's saved 16-bit RGB,
+and the title's text and decoded literal controls. A changed Text+
+composition hash also produces a gap because the remaining Fusion
+settings can affect the picture. The retained controls detected a
+red-to-green generator change and a Text+ size change with the same text.
+For qualified 24 fps V1 nests, the report compares the saved parent
+range, child trim, child origin, and child sequence identity. It pairs
+occurrences by ID or by a unique record start. Same-named children remain
+distinct. If both archives rewrote the child IDs and lack a shared
+identity, the binding is inconclusive. Select the child timelines
+directly to compare their contents.
+
+Multicam picture and audio uses pair independently by saved occurrence
+ID or by a unique track and record position. The probe checks each
+selector against its saved angle and the resulting file edit, including
+trim, media path and physical audio channel. Explicit angle gaps remain
+part of the comparison. Unpaired or contradictory bindings are
+inconclusive. The retained picture switch reports a change from Camera 1
+to Camera 2 while both mono lanes retain Camera 1 and their saved channels.
 It pairs shared edit IDs of the same kind first, then unique slots by track
 and exact record start. An edit that moves and receives a new ID appears
 as a removal and an addition. Audio selectors use zero-based audio cache
@@ -239,7 +320,7 @@ evidence.
 ## Check conform at V1 cuts
 
 ```text
-resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json
+resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json [--all-frames]
 resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json --renders REFERENCE.mov CANDIDATE.mov FFMPEG FFPROBE
 ```
 
@@ -253,6 +334,44 @@ originals linked in place. Unknown mappings are inconclusive, and a
 confirmed mismatch stays visible alongside gaps. Qualified dissolve
 windows use half-open frame intervals, and samples inside them are
 excluded.
+
+At 24 fps, saved 50% forward and 100% reverse edits also contribute
+source-frame samples. Half speed repeats each source picture twice
+except the final picture of an odd-length edit, which appears once.
+Reverse samples from the last picture in the saved source range first.
+An explicit graph/2 frame map provides file-relative frame numbers
+directly, including when the source and timeline rates differ. The
+probe checks the source rates as well as the selected frame numbers.
+Other speed profiles and unresolved saved timing remain inconclusive.
+
+For qualified one-level picture nests at 24 fps, the probe follows the
+saved child trim into the child timeline. It reports the parent nest ID,
+the child edit ID, and the selected file frame. Cut sampling includes
+child cuts and boundaries of unsupported child intervals that fall inside
+the parent edit. A saved child V1 gap is a gap in a full scan. Child
+dissolves and other unsupported coverage stay inconclusive over their
+projected intervals. The retained two-timeline,
+two-compound control and reopened writer output matched across all 40
+source-frame selections and rendered pictures.
+
+For qualified Resolve V1 multicam edits, the probe checks the saved angle
+against its file edit and reports the multicam occurrence ID. Explicit
+gaps in the selected angle count as saved V1 gaps in a full scan.
+Ambiguous selectors and conflicting bindings stay inconclusive. The
+retained 72-frame switch from camera A to camera B detected 24 frames
+of newly covered picture and a source change on the other 48 frames.
+
+Use `--all-frames` to compare every timeline position from frame zero
+through the longer saved extent. The report identifies the sampling mode
+and records an extent difference even when the shared frames agree.
+This covers single-edit timelines and catches changes within an edit.
+The mode requires known extents, is limited to 16,384 frames, and works
+with `--renders` and `--moves`. Dissolve windows stay excluded. Inside
+both known extents, two saved V1 gaps match. A saved gap opposite a V1
+edit is a coverage difference, even when the edit's source binding is
+unresolved. Unknown edit coverage remains inconclusive. The optional
+render check compares the actual pictures at known gaps, where other
+tracks can contribute to the rendered result.
 
 For the optional picture check, supply same-profile full-timeline MOV
 renders beginning at record frame zero. The probe checks their decoded
@@ -393,6 +512,12 @@ timing, routing and topology remain explicit. The public routes are unchanged.
   for the linked forward clip and end-relative In/Out for reverse. The
   corrected Premiere files matched all 48 source frame selections after
   Save As, close, and reopen.
+  The reader also preserves an odd record length on this saved 50%
+  nearest-frame map. In the retained 23-frame Resolve render, source
+  pictures 12–22 each appear twice and picture 23 appears once. Graph/2
+  retains the exact 23/48-second source span, and the reader requires all
+  12 sampled pictures to be available. Writing an odd-length half-speed
+  edit in either destination still requires native qualification.
 - **Plain captions:** One Resolve subtitle track with editable default
   styling maps to graph/2 `SourceText`. The saved XML and visible burn-in
   checks passed for two adjacent accented cues, one multiline, on a
@@ -434,7 +559,7 @@ timing, routing and topology remain explicit. The public routes are unchanged.
 ### Write linked audio to Premiere
 
 ```text
-resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj
+resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj [--accept-losses]
 ```
 
 The internal reverse route accepts same-rate progressive square-pixel
@@ -445,6 +570,11 @@ channel, including independent trims when both lanes reference one
 stereo file. Premiere gets discrete mono source views for fresh
 insertion. The 24 fps picture-only speed and caption profile remains
 available through the same command.
+
+The probe reports timeline In/Out marks and any unrecognized clip label
+codes before creating a project. Use `--accept-losses` to proceed with
+those omissions. The source graph retains the original values. Timing,
+media, routing, and unsupported processing still use the normal refusal checks.
 
 Source capture and project writing are checked with the retained 24 fps
 separate-file control and the two 23.976 stereo-file controls. The
@@ -567,6 +697,66 @@ controls and malformed files block the internal write. Other volume
 curves, keys outside the edit, keys combined with fractional or custom
 fades, mixer automation, additional buses and custom
 routing remain outside this Premiere profile. Originals stay in place.
+
+### Resolve to Premiere timeline clip labels
+
+The internal route writes all 16 known Resolve clip colors to individual
+Premiere timeline edits. Two edits of one media item can keep different
+colors. The shared master and bin labels keep their existing defaults.
+Resolve and Premiere use different palettes, and a Premiere installation
+can have customized label colors. The writer uses Premiere's standard label
+names and reports each named substitution on the source edit ID.
+
+| Resolve | Premiere |
+|---|---|
+| Green, Teal, Blue, Purple, Tan, Brown, Violet, Yellow | Same label name |
+| Pink | Rose |
+| Apricot, Orange | Mango |
+| Beige | Tan |
+| Chocolate | Brown |
+| Lime | Green |
+| Navy | Blue |
+| Olive | Forest |
+
+Offline verification covered four reopened Resolve controls, 16 labeled
+edits, eight unlabeled neighbors, and repeated uses of one picture master.
+Premiere 27 Save As and reopen is pending. Timeline In/Out and Media Pool
+label mapping remain separate.
+
+### Resolve to Premiere track state
+
+The internal linked V1/A1/A2 route uses the selected sequence's
+`resolve.track_state` sidecar. It writes each custom name, edit lock,
+and V1 output state on the matching Premiere track. Names may repeat
+across lanes. Turning off V1 writes the Premiere video track output
+toggle and keeps all its clips. It does not write an audio fader mute.
+
+The retained 24 fps Resolve controls cover names and locks independently
+and in combination, plus V1 disabled with and without a lock. The
+written Premiere files retain the exact edit ranges, source paths, and
+WAV selectors. The tested single-bus mixer retains its independent
+left and right track pans. Conflicting timeline and mixer state,
+unsupported audio mute combined with lock, and the two-bus profile
+still block output. Premiere 27 Save As, reopen, and picture and PCM
+comparisons remain pending.
+
+### Resolve to Premiere sequence marker colors
+
+The internal linked Premiere writer uses Premiere's named colors for Resolve
+sequence markers in Green, Red, Blue, Cyan and Yellow. It maps Lavender to
+Magenta, Sand to Orange, and Cream to White, reporting each substitution by
+marker occurrence. Other Resolve colors use Premiere's default and are reported.
+The graph keeps the original Resolve palette name and any saved custom data.
+Premiere receives the marker's title, note, record-relative start, and saved
+duration, including Resolve's one-frame duration for a point marker. The writer
+reports custom data that only the graph retains.
+
+An offline check used two retained Resolve 21.2 saves at 24 fps with a
+nonzero timeline start. The written Premiere files contained all five and
+fourteen sequence markers respectively. The five-marker control kept both
+four-frame ranges and the multiline accented note. The palette control
+exercised all eight Premiere color indices. Premiere 27 Save As and reopen
+is the remaining native check for this direction.
 
 ### Resolve to Premiere static picture controls
 

@@ -1,4 +1,5 @@
 //! Resolve reference-audio multicam source interpretation.
+pub(super) mod selection;
 use super::*;
 use graph::source::{
     Multicam, MulticamAlternative, MulticamLane, MulticamPiece, MulticamUse, SourceBinding,
@@ -380,7 +381,7 @@ pub(super) fn placement(
                 binding.placements.push(id.into());
             }
             if start != edit.source_in || end != edit.source_in + edit.length {
-                binding.reason = Some("selected Resolve angle includes an observed gap".into());
+                binding.reason = Some(selection::OBSERVED_GAP.into());
             }
         }
     }

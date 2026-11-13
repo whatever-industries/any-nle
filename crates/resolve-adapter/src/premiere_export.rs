@@ -4,7 +4,7 @@ use crate::{
     dissolve,
     linked::{
         self,
-        mixer::{neutral_when_present, StripProcessing, PROCESSING_RECEIPT},
+        mixer::{neutral_when_present, DirectMixer, StripProcessing, PROCESSING_RECEIPT},
         MediaSpec, Profile,
     },
     media::{check_wav_extent, media_digest},
@@ -24,9 +24,10 @@ use graph::{
 };
 use prproj::{
     convert::{
+        colors::LABEL_NAMES,
         model::{Options, TICKS_PER_SECOND},
         prepared::{PictureEffect, PreparedAudioCrossfade, PreparedAudioEdgeFade, PreparedAudioMixer,
-            PreparedPictureEffect, PreparedVideoDissolve},
+            PreparedEditLabel, PreparedPictureEffect, PreparedTrackState, PreparedVideoDissolve},
         writer::prepare_typed_project,
     },
     RandomUuids,
@@ -37,10 +38,20 @@ use std::{
 };
 
 pub fn write(
+    graph: SourceGraph,
+    sequence_id: &str,
+    ffprobe: &Path,
+    output: &Path,
+) -> Result<Vec<graph::Loss>> {
+    write_with_options(graph, sequence_id, ffprobe, output, false)
+}
+
+pub fn write_with_options(
     mut graph: SourceGraph,
     sequence_id: &str,
     ffprobe: &Path,
     output: &Path,
+    accept_metadata_losses: bool,
 ) -> Result<Vec<graph::Loss>> {
     graph.validate()?;
     let index = graph
@@ -49,7 +60,14 @@ pub fn write(
         .position(|seq| seq.id == sequence_id)
         .ok_or("selected Resolve sequence is absent")?;
     let sequence = &graph.sequences[index];
-    let mut mixer = validate_sequence(&graph, sequence)?;
+    let track_state = crate::track_state::TrackState::prepare(&graph, sequence)?;
+    let (mut mixer, mapped_direct_mixer) = validate_sequence(&graph, sequence, track_state.is_some())?;
+    let mut metadata_losses = omitted_timeline_marks(&graph, sequence)?;
+    let omitted_marks = metadata_losses.iter().any(|loss| loss.aspect == crate::timeline_marks::LOSS.0);
+    let labels = prepare_edit_labels(&graph, sequence, &mut metadata_losses)?;
+    let handled_labels: HashSet<_> = labels.iter().map(|label| label.owner.as_str())
+        .chain(metadata_losses.iter().filter(|loss| loss.aspect == "clip_label")
+            .map(|loss| loss.object.as_str())).collect();
     let transition = dissolve::prepare_native(&graph, sequence)?
         .map(|fade| {
             let d = fade.prepared;
@@ -82,6 +100,16 @@ pub fn write(
         .losses
         .iter()
         .find(|loss| {
+            if loss.object == sequence_id && loss.aspect == "marker_color" {
+                return false;
+            }
+            if (omitted_marks && crate::timeline_marks::TimelineMarks::recover(loss, sequence_id))
+                || (handled_labels.contains(loss.object.as_str())
+                    && crate::clip_label::ClipLabel::recover(loss))
+                || (track_state.is_some() && crate::track_state::TrackState::recover(loss, sequence_id))
+            {
+                return false;
+            }
             if transition.as_ref().is_some_and(|(d, ..)| d.recover(loss, sequence_id)) {
                 return false;
             }
@@ -89,11 +117,43 @@ pub fn write(
             let recovered = loss.object == sequence_id
                 && ((mixer.mix_level_db.is_some() && control == MAIN_BUS_LOSS)
                     || (!mixer.muted_tracks.is_empty() && control == TRACK_MUTE_LOSS)
-                    || (mixer.mono_track_pans.is_some() && control == FAIRLIGHT_LOSS));
+                    || ((mixer.mono_track_pans.is_some() || mapped_direct_mixer) && control == FAIRLIGHT_LOSS));
             (loss.object == "project" || owned.contains(&loss.object)) && !recovered
         })
     {
         return Err(format!("Resolve source loss on {}: {}", loss.object, loss.reason).into());
+    }
+    if !accept_metadata_losses && !metadata_losses.is_empty() {
+        let details = metadata_losses.iter()
+            .map(|loss| format!("{}: {}", loss.object, loss.reason))
+            .collect::<Vec<_>>().join("\n");
+        return Err(format!("Resolve metadata requires --accept-losses before conversion:\n{details}").into());
+    }
+    destination_losses.extend(metadata_losses);
+    destination_losses.extend(
+        graph.losses.iter().filter(|loss| {
+            loss.object == sequence_id && loss.aspect == "marker_color"
+        }).cloned(),
+    );
+    if let Some(Value::Arr(rows)) = graph
+        .sidecar(ADAPTER, sequence_id)
+        .and_then(|data| data.get("markers"))
+    {
+        for row in rows {
+            if let (Some(Value::Int(frame)), Some(Value::Str(custom))) =
+                (row.get("frame"), row.get("custom_data"))
+            {
+                if !custom.is_empty() {
+                    destination_losses.push(Loss {
+                        object: sequence_id.into(),
+                        aspect: "marker_custom_data".into(),
+                        reason: format!(
+                            "{sequence_id}/marker/{frame}: Resolve custom data retained in source graph"
+                        ),
+                    });
+                }
+            }
+        }
     }
     prepare_track_pan(&mut graph.sequences[0], &mut mixer, &mut destination_losses);
     graph.media.retain(|media| used_media.contains(&media.id));
@@ -111,6 +171,31 @@ pub fn write(
     let motions = prepare_discrete_tracks(&mut graph)?;
 
     let mut prepared = premiere_adapter::prepare_resolve_originals(&graph, &Options::default())?;
+    if let Some(state) = track_state {
+        let states = state.0.into_iter().enumerate().filter_map(|(lane, track)| {
+            (!track.name.is_empty() || track.locked || track.disabled).then(|| PreparedTrackState {
+                audio_track: (lane != 0).then_some(lane as i64),
+                name: (!track.name.is_empty()).then_some(track.name),
+                locked: track.locked,
+                picture_disabled: track.disabled,
+            })
+        }).collect();
+        prepared.input.track_states.insert(0, states);
+    }
+    for label in labels {
+        let &(sequence, event) = prepared.ownership.get(&label.owner)
+            .ok_or_else(|| format!("{}: Resolve label lost its prepared edit", label.owner))?;
+        prepared.input.edit_labels.push(PreparedEditLabel {
+            sequence, event, audio_track: label.audio_track, index: label.index,
+        });
+        if label.source != label.destination {
+            destination_losses.push(Loss {
+                object: label.owner,
+                aspect: "clip_label_palette".into(),
+                reason: format!("Resolve {} mapped to Premiere {}", label.source, label.destination),
+            });
+        }
+    }
     for (owner, effect) in motions {
         let &(sequence, event) = prepared.ownership.get(&owner)
             .ok_or_else(|| format!("{owner}: Resolve Linear motion lost its prepared edit"))?;
@@ -177,7 +262,96 @@ pub fn write(
     Ok(destination_losses)
 }
 
-fn validate_sequence(graph: &SourceGraph, sequence: &SourceSequence) -> Result<PreparedAudioMixer> {
+fn omitted_timeline_marks(graph: &SourceGraph, sequence: &SourceSequence) -> Result<Vec<Loss>> {
+    let mut losses = Vec::new();
+    if let Some(marks) = graph.sidecar(ADAPTER, &sequence.id)
+        .and_then(|data| data.get(crate::timeline_marks::FIELD))
+    {
+        let Value::Obj(fields) = marks else {
+            return Err(format!("{}: malformed Resolve timeline mark receipt", sequence.id).into());
+        };
+        if fields.iter().any(|(name, _)| {
+            !crate::timeline_marks::TAGS.iter().any(|(_, field)| name == field)
+        }) {
+            return Err(format!("{}: unknown Resolve timeline mark field", sequence.id).into());
+        }
+        for (_, field) in crate::timeline_marks::TAGS {
+            let Some((_, value)) = fields.iter().find(|(name, _)| name == field) else {
+                continue;
+            };
+            if matches!(value, Value::Str(text) if text.is_empty()) {
+                continue;
+            }
+            let description = match value {
+                Value::Str(frame) if frame.bytes().all(|b| b.is_ascii_digit()) => {
+                    format!("{field} at Resolve frame {frame}")
+                }
+                _ => format!("{field} with an unqualified saved value"),
+            };
+            losses.push(Loss {
+                object: sequence.id.clone(),
+                aspect: crate::timeline_marks::LOSS.0.into(),
+                reason: format!("{description} omitted from Premiere"),
+            });
+        }
+    }
+    Ok(losses)
+}
+
+struct EditLabel {
+    owner: String,
+    audio_track: Option<i64>,
+    index: u8,
+    source: &'static str,
+    destination: &'static str,
+}
+
+fn prepare_edit_labels(
+    graph: &SourceGraph,
+    sequence: &SourceSequence,
+    omissions: &mut Vec<Loss>,
+) -> Result<Vec<EditLabel>> {
+    let saved: HashMap<_, _> = graph.sidecars.iter()
+        .filter(|sidecar| sidecar.adapter == crate::clip_label::ADAPTER)
+        .map(|sidecar| (sidecar.object.as_str(), &sidecar.data))
+        .collect();
+    let mut labels = Vec::new();
+    for edit in &sequence.placements {
+        let Some(label) = saved.get(edit.id.as_str()) else {
+            continue;
+        };
+        if let Some(Value::Int(code)) = label.get("saved_code") {
+            if let Some((source, destination)) = crate::clip_label::ClipLabel::premiere(*code) {
+                let index = LABEL_NAMES.iter().position(|&name| name == destination)
+                    .ok_or("Resolve label mapping names an unknown Premiere palette entry")?;
+                labels.push(EditLabel {
+                    owner: edit.id.clone(),
+                    audio_track: edit.audio_tracks.first().copied(),
+                    index: index as u8,
+                    source,
+                    destination,
+                });
+                continue;
+            }
+        }
+        let description = match label.get("saved_code") {
+            Some(Value::Int(code)) => format!("Resolve clip label code {code}"),
+            _ => "Resolve clip label with an unqualified saved value".into(),
+        };
+        omissions.push(Loss {
+            object: edit.id.clone(),
+            aspect: "clip_label".into(),
+            reason: format!("{description} omitted from Premiere"),
+        });
+    }
+    Ok(labels)
+}
+
+fn validate_sequence(
+    graph: &SourceGraph,
+    sequence: &SourceSequence,
+    has_track_state: bool,
+) -> Result<(PreparedAudioMixer, bool)> {
     let sequence_id = sequence.id.as_str();
     let has_audio = sequence
         .placements
@@ -202,7 +376,31 @@ fn validate_sequence(graph: &SourceGraph, sequence: &SourceSequence) -> Result<P
     });
     let sequence_receipt = graph.sidecar(ADAPTER, sequence_id);
     let fairlight = graph.sidecar(FAIRLIGHT_ADAPTER, sequence_id);
-    let mono_track_pans = prepare_mono_track_pans(fairlight, sequence_id)?;
+    let mut mono_track_pans = prepare_mono_track_pans(fairlight, sequence_id)?;
+    let mut mapped_direct_mixer = false;
+    if has_track_state && has_audio && fairlight.is_some_and(|r| r.get(DIRECT_PROFILE).is_some()) {
+        // Resolve saves a separate Fairlight mirror when a track is renamed or
+        // locked. Reuse the direct-mixer validation; only its existing
+        // single-bus, static-pan equivalent is writable in Premiere.
+        if let Some(direct) = DirectMixer::prepare(graph, sequence)? {
+            if direct.buses != 1 || direct.output != [0; 2]
+                || direct.pan_bypassed != [false; 2] || direct.soloed != [false; 2]
+                || direct.processing != [StripProcessing::DEFAULT; 2]
+                || direct.bus_processing != [StripProcessing::DEFAULT; 2]
+                || direct.bus_pre_gain != [0; 2]
+            {
+                return Err(format!("{sequence_id}: unsupported Resolve track state with Fairlight routing or processing").into());
+            }
+            let pans = direct.pan.map(|pan| f64::from(pan) / 10.0);
+            if mono_track_pans.is_some_and(|linked| linked != pans) {
+                return Err(format!("{sequence_id}: Resolve track pan receipts disagree").into());
+            }
+            mono_track_pans = Some(pans);
+        } else if mono_track_pans.is_some() {
+            return Err(format!("{sequence_id}: Resolve track pan receipts disagree").into());
+        }
+        mapped_direct_mixer = true;
+    }
     if !(sequence.rate == Rational::integer(24)
         || (has_audio || has_linear_motion) && (sequence.rate.num(), sequence.rate.den()) == (24000, 1001))
         || sequence.frame_size != Some((1920, 1080))
@@ -230,10 +428,9 @@ fn validate_sequence(graph: &SourceGraph, sequence: &SourceSequence) -> Result<P
             .sidecar(crate::generator::ADAPTER, sequence_id)
             .is_some()
         || graph.sidecar("resolve.nested_uses", sequence_id).is_some()
-        || graph
-            .sidecar(crate::track_state::ADAPTER, sequence_id)
-            .is_some()
-        || fairlight.is_some_and(|r| r.get(DIRECT_PROFILE).is_some()) && mono_track_pans.is_none()
+        || has_track_state && !has_audio
+        || fairlight.is_some_and(|r| r.get(DIRECT_PROFILE).is_some())
+            && mono_track_pans.is_none() && !mapped_direct_mixer
         || mono_track_pans.is_some() && !has_audio
         || graph
             .multicam_uses
@@ -346,11 +543,11 @@ fn validate_sequence(graph: &SourceGraph, sequence: &SourceSequence) -> Result<P
             return Err(format!("{}: overlapping edits on Resolve lane {lane}", pair[1].2).into());
         }
     }
-    Ok(PreparedAudioMixer {
+    Ok((PreparedAudioMixer {
         mix_level_db: mix_level,
         muted_tracks,
         mono_track_pans: mono_track_pans.map(|pans| pans.map(Some)),
-    })
+    }, mapped_direct_mixer))
 }
 
 fn prepare_track_pan(sequence: &mut SourceSequence, mixer: &mut PreparedAudioMixer, losses: &mut Vec<Loss>) {
@@ -785,6 +982,12 @@ fn prepare_discrete_tracks(graph: &mut SourceGraph) -> Result<Vec<(String, Pictu
             .speed
             .as_ref()
             .map_or(edit.duration, |speed| speed.source_duration);
+        if kind == StreamKind::Video
+            && edit.speed.as_ref().is_some_and(|speed| speed.ratio == (2, 1))
+            && frames_on(source_duration, time_grid).is_err()
+        {
+            return Err(format!("{}: writing a half-speed edit with a fractional source span in Premiere requires native qualification", edit.id).into());
+        }
         let end = edit
             .source_in
             .checked_add(source_duration)

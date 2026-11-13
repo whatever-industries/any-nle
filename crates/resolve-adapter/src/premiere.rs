@@ -3,7 +3,8 @@ mod components;
 mod controls;
 mod markers;
 mod metadata;
-pub(crate) use metadata::LOSS as CLIP_METADATA_LOSS;
+pub(crate) use metadata::{LABEL_LOSS as CLIP_LABEL_LOSS, LOSS as CLIP_METADATA_LOSS,
+    SYNC_LOCK_LOSS, TIMELINE_MARK_LOSS};
 
 use crate::{
     linked::{self, MediaSpec, Profile, ProjectSpec, TimelineSpec},
@@ -200,6 +201,7 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
     let mut seen_items = HashMap::new();
     let capture_components = components::is_current_project(project)?;
     let mut component_budget = components::Budget::default();
+    let mut track_state = metadata::TrackStateCapture::default();
     let mut spec = ProjectSpec {
         root_bin_id: Some("premiere:root".into()),
         timelines: vec![TimelineSpec {
@@ -233,8 +235,12 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
             if !(1..=expected).contains(&index) || !track_indexes.insert(index) {
                 return Err("expected active V1 and independent A1/A2 Premiere tracks".into());
             }
-            if project.is_muted(track_id)? {
+            if (kind == StreamKind::Audio || !capture_components) && project.is_muted(track_id)? {
                 return Err("muted Premiere track requires a verified Resolve mix mapping".into());
+            }
+            if capture_components {
+                metadata::capture_track_state(&project.doc.tree, track.element, kind, index,
+                    &id, &mut track_state)?;
             }
             if kind == StreamKind::Audio {
                 check_neutral_mixer(project, track.element)?;
@@ -310,6 +316,10 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                     .get(native.element, "ObjectID")
                     .ok_or("Premiere edit lacks ObjectID")?;
                 let placement_id = format!("premiere:edit:{occurrence}");
+                if capture_components {
+                    metadata::capture_edit_label(project, native.clip, source, &placement_id, &mut graph)
+                        .map_err(|error| format!("Premiere label on {placement_id}: {error}"))?;
+                }
                 let mut effects = Vec::new();
                 for component in &native.components {
                     let name = project.component_match_name(*component);
@@ -518,6 +528,22 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         return Err("Premiere marker count exceeds edit limit".into());
     }
     markers::capture(&project.doc.tree, markers, &mut out, &mut graph.sidecars, &mut graph.losses);
+    if capture_components {
+        metadata::capture_timeline_marks(project, data.element, &id, frame_ticks, &mut graph)?;
+    }
+    graph.losses.extend(track_state.losses);
+    for (adapter, rows) in [
+        (crate::track_state::PREMIERE_ADAPTER, track_state.mapped),
+        (SYNC_LOCK_LOSS, track_state.sync_unlocked),
+    ] {
+        if !rows.is_empty() {
+            graph.sidecars.push(Sidecar {
+                adapter: adapter.into(),
+                object: id.clone(),
+                data: Value::Arr(rows),
+            });
+        }
+    }
     graph.sidecars.push(Sidecar {
         adapter: "premiere.source".into(),
         object: id,

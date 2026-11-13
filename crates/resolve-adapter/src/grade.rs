@@ -4,6 +4,7 @@ use graph::{source::SourceGraph, Value};
 use sha2::{Digest, Sha256};
 
 pub(crate) const ADAPTER: &str = "resolve.primary_gain";
+pub(crate) const OPAQUE_ADAPTER: &str = "resolve.grade";
 const MASTER_VALUE: std::ops::Range<usize> = 141..145;
 const NODE_FINGERPRINT: &str = "1eecb1c098d6a5195c07e02f9cc9f4a15d129f6f66156f63115ea769350e05a3";
 
@@ -28,10 +29,7 @@ pub(crate) fn decode(body: &[u8]) -> Option<(f32, Vec<u8>)> {
     (hex::encode(Sha256::digest(&neutral)) == NODE_FINGERPRINT).then_some((value, neutral))
 }
 
-pub(crate) fn prepare(graph: &SourceGraph, occurrence: &str) -> Result<Option<(f32, String)>> {
-    let Some(row) = graph.sidecar(ADAPTER, occurrence) else {
-        return Ok(None);
-    };
+fn read_receipt(row: &Value) -> Result<(f32, f32, Vec<u8>)> {
     let gain = match row.get("gain") {
         Some(Value::Float(gain)) => *gain,
         Some(Value::Int(gain @ 0..=2)) => *gain as f64,
@@ -48,9 +46,25 @@ pub(crate) fn prepare(graph: &SourceGraph, occurrence: &str) -> Result<Option<(f
     {
         return Err("unsupported Resolve primary gain value or node".into());
     }
-    let (_, mut payload) =
+    let (saved, payload) =
         decode(&hex::decode(body)?).ok_or("unqualified Resolve grade node body")?;
-    let gain = gain as f32;
+    Ok((gain as f32, saved, payload))
+}
+
+/// Unlike a writer request, a saved observation must agree with its node body.
+pub(crate) fn saved_gain(row: &Value) -> Result<f32> {
+    let (gain, saved, _) = read_receipt(row)?;
+    if gain != saved {
+        return Err("Resolve primary gain disagrees with the saved node body".into());
+    }
+    Ok(gain)
+}
+
+pub(crate) fn prepare(graph: &SourceGraph, occurrence: &str) -> Result<Option<(f32, String)>> {
+    let Some(row) = graph.sidecar(ADAPTER, occurrence) else {
+        return Ok(None);
+    };
+    let (gain, _, mut payload) = read_receipt(row)?;
     payload[MASTER_VALUE].copy_from_slice(&gain.to_le_bytes());
     let mut encoded = vec![0x81];
     encoded.extend(zstd::bulk::compress(&payload, 1)?);

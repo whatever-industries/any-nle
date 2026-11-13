@@ -1,10 +1,23 @@
 //! Read-only comparisons of selected Resolve timeline facts and saved bytes.
 mod blob;
+mod clip_fairlight;
+mod graphics;
+mod mixer;
+mod multicam;
+mod nests;
 
 use super::{archive_is_drt, drt, read, report, ADAPTER};
-use crate::{audio, dissolve, Result};
+use crate::{
+    audio,
+    clip_label::{self, ClipLabel},
+    dissolve,
+    grade,
+    timeline_marks::TimelineMarks,
+    track_state::{self, TrackState},
+    Result,
+};
 use graph::{
-    source::{SourceClock, SourceGraph, SourceItem, SourceMedia, SourceSequence},
+    source::{SourceClock, SourceGraph, SourceItem, SourceMedia, SourceSequence, TextKind},
     Loss, MarkerOwner, Placement, Rational, StreamKind, Value,
 };
 use serde_json::{json, Value as Json};
@@ -46,7 +59,7 @@ pub fn blobs(
     )
 }
 
-fn check_id(id: &str) -> Result<()> {
+pub(super) fn check_id(id: &str) -> Result<()> {
     if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
         return Err("expected an exact Resolve object UUID".into());
     }
@@ -120,9 +133,12 @@ struct Timeline<'a> {
     items: HashMap<&'a str, &'a SourceItem>,
     media: HashMap<&'a str, &'a SourceMedia>,
     receipts: HashMap<&'a str, &'a Value>,
+    clip_labels: HashMap<&'a str, &'a Value>,
+    grades: HashMap<(&'a str, &'a str), &'a Value>,
+    unknown_grades: HashSet<&'a str>,
+    clip_plugins: HashMap<&'a str, &'a Value>,
     losses: Vec<&'a Loss>,
     unknown_effects: HashSet<&'a str>,
-    may_omit_edits: bool,
 }
 
 impl<'a> Timeline<'a> {
@@ -151,6 +167,7 @@ impl<'a> Timeline<'a> {
             .map(|u| u.id.as_str())
             .collect();
         let placements: HashSet<_> = seq.placements.iter().map(|p| p.id.as_str()).collect();
+        let texts: HashSet<_> = seq.texts.iter().map(|t| t.id.as_str()).collect();
         let losses: Vec<_> = graph
             .losses
             .iter()
@@ -161,6 +178,7 @@ impl<'a> Timeline<'a> {
                     || media_ids.contains(owner)
                     || placements.contains(owner)
                     || uses.contains(owner)
+                    || texts.contains(owner)
             })
             .collect();
         let unknown_effects = losses
@@ -177,19 +195,10 @@ impl<'a> Timeline<'a> {
                 }
             })
             .collect();
-        let may_omit_edits = losses.iter().any(|loss| {
-            (loss.object == id || uses.contains(loss.object.as_str()))
-                && matches!(
-                    loss.aspect.as_str(),
-                    "track"
-                        | "tracks"
-                        | "placement"
-                        | "media"
-                        | "timing"
-                        | "audio_routing"
-                        | "multicam_binding"
-                )
-        }) || seq.placements.iter().any(|p| lane(p).is_none());
+        let unknown_grades = losses.iter()
+            .filter(|loss| loss.aspect == "grade")
+            .map(|loss| loss.object.as_str())
+            .collect();
         Ok(Self {
             graph,
             seq,
@@ -206,14 +215,57 @@ impl<'a> Timeline<'a> {
                 .filter(|s| s.adapter == ADAPTER)
                 .map(|s| (s.object.as_str(), &s.data))
                 .collect(),
+            clip_labels: graph
+                .sidecars
+                .iter()
+                .filter(|s| s.adapter == clip_label::ADAPTER && placements.contains(s.object.as_str()))
+                .map(|s| (s.object.as_str(), &s.data))
+                .collect(),
+            grades: graph.sidecars.iter()
+                .filter(|row| matches!(row.adapter.as_str(), grade::ADAPTER | grade::OPAQUE_ADAPTER)
+                    && placements.contains(row.object.as_str()))
+                .map(|row| ((row.object.as_str(), row.adapter.as_str()), &row.data))
+                .collect(),
+            unknown_grades,
+            clip_plugins: graph.sidecars.iter()
+                .filter(|row| row.adapter == super::fairlight::CLIP_ADAPTER
+                    && placements.contains(row.object.as_str()))
+                .map(|row| (row.object.as_str(), &row.data))
+                .collect(),
             losses,
             unknown_effects,
-            may_omit_edits,
         })
     }
 
     fn receipt(&self, id: &str, key: &str) -> Option<&'a Value> {
         self.receipts.get(id)?.get(key)
+    }
+
+    fn track_state(&self) -> Result<Option<TrackState>> {
+        if self.losses.iter().any(|loss| {
+            loss.object == self.seq.id
+                && matches!(loss.aspect.as_str(), "track" | "tracks" | "track_state")
+                && !TrackState::recover(loss, &self.seq.id)
+        }) {
+            return Err("unresolved Resolve track layout or conflicting saved state".into());
+        }
+        TrackState::prepare(self.graph, self.seq)
+    }
+
+    fn timeline_marks(&self) -> Result<Option<TimelineMarks>> {
+        let Some(Value::Int(length)) = self.receipt(&self.seq.id, "record_length") else {
+            return Err("unknown Resolve timeline extent".into());
+        };
+        TimelineMarks::saved(self.graph, &self.seq.id, *length)
+    }
+
+    fn clip_label(&self, edit: &Placement) -> Result<Json> {
+        match self.clip_labels.get(edit.id.as_str()) {
+            None => Ok(Json::Null),
+            Some(receipt) => ClipLabel::saved_code(receipt)
+                .map(|code| json!(code))
+                .ok_or_else(|| "unqualified saved Resolve clip label".into()),
+        }
     }
 
     fn binding(&self, p: &Placement) -> Option<Json> {
@@ -297,10 +349,35 @@ fn compare_timelines(left: &Timeline<'_>, right: &Timeline<'_>, diff: &mut Diff)
         right.receipt(&b.id, "record_length").map(graph_value),
     );
     diff.change("tracks", &scope, tracks(a), tracks(b));
+    let a_state = left.track_state();
+    let b_state = right.track_state();
+    compare_track_state(&a_state, &b_state, &scope, diff);
+    let compared_mixer = mixer::compare(left, right, &scope, diff);
+    let a_marks = left.timeline_marks();
+    let b_marks = right.timeline_marks();
+    compare_timeline_marks(&a_marks, &b_marks, &scope, diff);
+    compare_captions(left, right, &scope, diff);
+    graphics::compare(left, right, diff);
+    let (left_nests, right_nests) = nests::compare(left, right, diff);
+    let multicam = multicam::compare(left, right, diff);
 
-    let pairs = pair_edits(left, right, diff);
+    let mut pairs = pair_edits(
+        left,
+        right,
+        may_omit_edits(left, &left_nests),
+        may_omit_edits(right, &right_nests),
+        (&multicam.left_leaves, &multicam.right_leaves),
+        diff,
+    );
+    pairs.extend(multicam.leaf_pairs);
+    let mut compared_audio_left = HashSet::new();
+    let mut compared_audio_right = HashSet::new();
     for &(a, b) in &pairs {
         compare_edits(left, a, right, b, diff);
+        if a.video_track.is_none() && b.video_track.is_none() {
+            compared_audio_left.insert(a.id.as_str());
+            compared_audio_right.insert(b.id.as_str());
+        }
     }
     let a_dissolve = dissolve::prepare(left.graph, a);
     let b_dissolve = dissolve::prepare(right.graph, b);
@@ -308,12 +385,20 @@ fn compare_timelines(left: &Timeline<'_>, right: &Timeline<'_>, diff: &mut Diff)
         left,
         "left",
         a_dissolve.as_ref().ok().and_then(Option::as_ref),
+        compared_mixer,
+        &left_nests,
+        &multicam.left_gaps,
+        &compared_audio_left,
         diff,
     );
     report_losses(
         right,
         "right",
         b_dissolve.as_ref().ok().and_then(Option::as_ref),
+        compared_mixer,
+        &right_nests,
+        &multicam.right_gaps,
+        &compared_audio_right,
         diff,
     );
     compare_transition(left, a_dissolve, right, b_dissolve, &pairs, &scope, diff);
@@ -330,12 +415,33 @@ fn report_losses(
     t: &Timeline<'_>,
     side: &str,
     transition: Option<&dissolve::Dissolve>,
+    compared_mixer: bool,
+    compared_nests: &HashSet<&str>,
+    proven_angle_gaps: &HashSet<&str>,
+    compared_audio: &HashSet<&str>,
     diff: &mut Diff,
 ) {
     for loss in &t.losses {
         let signature = (loss.aspect.as_str(), loss.reason.as_str());
         if matches!(signature, audio::KEY_LOSS | audio::FADE_LOSS | audio::CUSTOM_FADE_LOSS | audio::KEYED_FADE_LOSS)
             || transition.is_some_and(|value| value.recover(loss, &t.seq.id))
+            // The dedicated comparisons report these saved values or give a
+            // specific gap. These generic losses only concern destination writing.
+            || TrackState::recover(loss, &t.seq.id)
+            || TimelineMarks::recover(loss, &t.seq.id)
+            || compared_mixer && mixer::compared_loss(t, loss)
+            || nests::compared_loss(t, loss, compared_nests)
+            || loss.aspect == "clip_fairlight" && loss.reason == super::fairlight::CLIP_LOSS
+                && compared_audio.contains(loss.object.as_str())
+                && t.clip_plugins.contains_key(loss.object.as_str())
+            || loss.aspect == "multicam_binding"
+                && loss.reason == super::multicam::selection::OBSERVED_GAP
+                && proven_angle_gaps.contains(loss.object.as_str())
+            || ClipLabel::recover(loss)
+                && t.clip_labels.get(loss.object.as_str())
+                    .and_then(|row| ClipLabel::saved_code(row)).is_some()
+            || loss.aspect == "text_appearance" && loss.reason == super::title::APPEARANCE_LOSS
+                && t.seq.texts.iter().any(|text| text.id == loss.object && text.kind == TextKind::Graphic)
         {
             continue;
         }
@@ -344,6 +450,59 @@ fn report_losses(
             &json!({"side":side, "owner_id":loss.object}),
             &loss.reason,
         );
+    }
+}
+
+fn compare_track_state(
+    left: &Result<Option<TrackState>>,
+    right: &Result<Option<TrackState>>,
+    scope: &Json,
+    diff: &mut Diff,
+) {
+    if let (Ok(a), Ok(b)) = (left, right) {
+        let neutral = TrackState(Default::default());
+        let a = a.as_ref().unwrap_or(&neutral);
+        let b = b.as_ref().unwrap_or(&neutral);
+        for ((kind, track), (a, b)) in track_state::LANES.into_iter().zip(a.0.iter().zip(&b.0))
+        {
+            let lane = json!({"kind":kind.as_str(), "track":track});
+            diff.change("track_name", &lane, json!(a.name), json!(b.name));
+            diff.change("track_lock", &lane, json!(a.locked), json!(b.locked));
+            if kind == StreamKind::Video {
+                diff.change("track_output_disabled", &lane, json!(a.disabled), json!(b.disabled));
+            }
+        }
+    } else {
+        receipt_gaps(left, right, "track_state", scope, diff);
+    }
+}
+
+fn compare_timeline_marks(
+    left: &Result<Option<TimelineMarks>>,
+    right: &Result<Option<TimelineMarks>>,
+    scope: &Json,
+    diff: &mut Diff,
+) {
+    if let (Ok(a), Ok(b)) = (left, right) {
+        let a = a.map(TimelineMarks::frames).unwrap_or_default();
+        let b = b.map(TimelineMarks::frames).unwrap_or_default();
+        for ((_, field), (a, b)) in crate::timeline_marks::TAGS.into_iter().zip(a.into_iter().zip(b)) {
+            diff.change("timeline_mark", &json!({"mark":field}), json!(a), json!(b));
+        }
+    } else {
+        receipt_gaps(left, right, "timeline_marks", scope, diff);
+    }
+}
+
+fn receipt_gaps<T>(left: &Result<T>, right: &Result<T>, field: &str, scope: &Json, diff: &mut Diff) {
+    for (side, result) in [("left", left), ("right", right)] {
+        if let Err(error) = result {
+            let context = json!({
+                "side":side,
+                "timeline_id":scope[if side == "left" { "left_timeline_id" } else { "right_timeline_id" }],
+            });
+            diff.gap(field, &context, &error.to_string());
+        }
     }
 }
 
@@ -382,6 +541,47 @@ fn tracks(seq: &SourceSequence) -> Json {
     json!(tracks)
 }
 
+type CaptionSlot = (i64, Rational);
+type Captions<'a> = BTreeMap<CaptionSlot, (&'a str, Rational)>;
+
+fn captions<'a>(t: &Timeline<'a>) -> Option<Captions<'a>> {
+    // A failed subtitle read can omit a whole track or just one cue.
+    if t.losses.iter().any(|loss| loss.object == t.seq.id
+        && (loss.aspect == "text"
+            || loss.aspect == "tracks" && loss.reason == "unsupported Resolve subtitle track"))
+    {
+        return None;
+    }
+    let mut result = BTreeMap::new();
+    for cue in &t.seq.texts {
+        if cue.kind != TextKind::Caption {
+            continue;
+        }
+        if cue.reason.is_some() || result
+            .insert((cue.track, cue.record_start?), (cue.content.as_deref()?, cue.duration?))
+            .is_some()
+        {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn compare_captions(left: &Timeline<'_>, right: &Timeline<'_>, scope: &Json, diff: &mut Diff) {
+    let (Some(left), Some(right)) = (captions(left), captions(right)) else {
+        diff.gap("caption", scope, "a saved subtitle track or cue could not be fully resolved");
+        return;
+    };
+    let slots: BTreeSet<_> = left.keys().chain(right.keys()).copied().collect();
+    let value = |cue: Option<&(&str, Rational)>| {
+        cue.map_or(Json::Null, |(text, duration)| json!({"text":text,"duration":exact(*duration)}))
+    };
+    for slot @ (track, start) in slots {
+        diff.change("caption", &json!({"track":track,"record_start":exact(start)}),
+            value(left.get(&slot)), value(right.get(&slot)));
+    }
+}
+
 fn lane(p: &Placement) -> Option<(&'static str, i64)> {
     match (p.video_track, p.audio_tracks.as_slice()) {
         (Some(v), []) => Some(("video", v)),
@@ -392,9 +592,9 @@ fn lane(p: &Placement) -> Option<(&'static str, i64)> {
 
 type Slot = (&'static str, i64, i64, i64);
 
-fn slots(seq: &SourceSequence) -> BTreeMap<Slot, Vec<&Placement>> {
+fn slots<'a>(seq: &'a SourceSequence, excluded: &HashSet<&str>) -> BTreeMap<Slot, Vec<&'a Placement>> {
     let mut slots = BTreeMap::<_, Vec<_>>::new();
-    for p in &seq.placements {
+    for p in seq.placements.iter().filter(|p| !excluded.contains(p.id.as_str())) {
         if let Some((kind, track)) = lane(p) {
             slots
                 .entry((kind, track, p.record_start.num(), p.record_start.den()))
@@ -405,9 +605,27 @@ fn slots(seq: &SourceSequence) -> BTreeMap<Slot, Vec<&Placement>> {
     slots
 }
 
+fn may_omit_edits(timeline: &Timeline<'_>, compared_nests: &HashSet<&str>) -> bool {
+    let multicam_uses: HashSet<_> = timeline.graph.multicam_uses.iter()
+        .filter(|usage| usage.sequence == timeline.seq.id)
+        .map(|usage| usage.id.as_str())
+        .collect();
+    timeline.losses.iter().any(|loss| {
+        (loss.object == timeline.seq.id || multicam_uses.contains(loss.object.as_str()))
+            && matches!(
+                loss.aspect.as_str(),
+                "track" | "tracks" | "placement" | "media" | "timing" | "audio_routing" | "multicam_binding"
+            )
+            && !nests::compared_loss(timeline, loss, compared_nests)
+    }) || timeline.seq.placements.iter().any(|p| lane(p).is_none())
+}
+
 fn pair_edits<'a>(
     left: &'a Timeline<'a>,
     right: &'a Timeline<'a>,
+    left_may_omit: bool,
+    right_may_omit: bool,
+    (left_leaves, right_leaves): (&HashSet<&str>, &HashSet<&str>),
     diff: &mut Diff,
 ) -> Vec<(&'a Placement, &'a Placement)> {
     let mut pairs = Vec::new();
@@ -418,9 +636,10 @@ fn pair_edits<'a>(
         .seq
         .placements
         .iter()
+        .filter(|p| !right_leaves.contains(p.id.as_str()))
         .map(|p| (p.id.as_str(), p))
         .collect();
-    for a in &left.seq.placements {
+    for a in left.seq.placements.iter().filter(|p| !left_leaves.contains(p.id.as_str())) {
         if let (Some((kind, _)), Some(b)) = (lane(a), right_ids.get(a.id.as_str())) {
             if lane(b).is_some_and(|(other, _)| kind == other) {
                 pairs.push((a, *b));
@@ -429,8 +648,8 @@ fn pair_edits<'a>(
             }
         }
     }
-    let left_slots = slots(left.seq);
-    let right_slots = slots(right.seq);
+    let left_slots = slots(left.seq, left_leaves);
+    let right_slots = slots(right.seq, right_leaves);
     let keys: BTreeSet<_> = left_slots
         .keys()
         .chain(right_slots.keys())
@@ -459,10 +678,10 @@ fn pair_edits<'a>(
         }
         match (open_a.as_slice(), open_b.as_slice()) {
             ([a], [b]) => pairs.push((a, b)),
-            ([a], []) if !right.may_omit_edits => {
+            ([a], []) if !right_may_omit => {
                 diff.change("edit", &context, edit_summary(a), Json::Null)
             }
-            ([], [b]) if !left.may_omit_edits => {
+            ([], [b]) if !left_may_omit => {
                 diff.change("edit", &context, Json::Null, edit_summary(b))
             }
             _ => diff.gap(
@@ -516,6 +735,22 @@ fn compare_edits(
         exact(a.source_in),
         exact(b.source_in),
     );
+    diff.change("edit.speed", &context, speed(a), speed(b));
+    if a.frame_map != b.frame_map {
+        diff.change("edit.frame_map", &context, json!(a.frame_map), json!(b.frame_map));
+    }
+    match (left.clip_label(a), right.clip_label(b)) {
+        (Ok(a), Ok(b)) => diff.change("edit.clip_label", &context, a, b),
+        (a, b) => {
+            for (side, result) in [("left", a), ("right", b)] {
+                if let Err(error) = result {
+                    let mut context = context.clone();
+                    context["side"] = json!(side);
+                    diff.gap("edit.clip_label", &context, &error.to_string());
+                }
+            }
+        }
+    }
     match (left.binding(a), right.binding(b)) {
         (Some(old), Some(new)) => {
             for key in ["locators", "source_offset", "start", "physical_audio"] {
@@ -555,6 +790,17 @@ fn compare_edits(
     let opaque = |t: &Timeline<'_>, p: &Placement| {
         t.unknown_effects.contains(p.id.as_str()) || t.unknown_effects.contains(t.seq.id.as_str())
     };
+    if a.video_track.is_some() && b.video_track.is_some() {
+        compare_grade(left, a, right, b, &context, diff);
+    }
+    if a.video_track.is_none() && b.video_track.is_none() {
+        clip_fairlight::compare(
+            left.clip_plugins.get(a.id.as_str()).copied(),
+            right.clip_plugins.get(b.id.as_str()).copied(),
+            &context,
+            diff,
+        );
+    }
     if !opaque(left, a) && !opaque(right, b) {
         diff.change("edit.picture_controls", &context, picture(a), picture(b));
         diff.change(
@@ -564,6 +810,47 @@ fn compare_edits(
             volume(right, b),
         );
     }
+}
+
+fn compare_grade(
+    left: &Timeline<'_>,
+    a: &Placement,
+    right: &Timeline<'_>,
+    b: &Placement,
+    context: &Json,
+    diff: &mut Diff,
+) {
+    let saved = |timeline: &Timeline<'_>, edit: &Placement| -> Result<Json> {
+        if timeline.unknown_grades.contains(edit.id.as_str())
+            || timeline.grades.contains_key(&(edit.id.as_str(), grade::OPAQUE_ADAPTER))
+        {
+            return Err("saved Resolve grade is outside the qualified primary gain profile".into());
+        }
+        match timeline.grades.get(&(edit.id.as_str(), grade::ADAPTER)) {
+            None => Ok(Json::Null),
+            Some(row) => Ok(json!(grade::saved_gain(row)?)),
+        }
+    };
+    let old = saved(left, a);
+    let new = saved(right, b);
+    match (old, new) {
+        (Ok(old), Ok(new)) => diff.change("edit.primary_gain", context, old, new),
+        (old, new) => {
+            for (side, result) in [("left", old), ("right", new)] {
+                if let Err(error) = result {
+                    let mut context = context.clone();
+                    context["side"] = json!(side);
+                    diff.gap("edit.primary_gain", &context, &error.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn speed(p: &Placement) -> Json {
+    p.speed.as_ref().map_or(Json::Null, |s| {
+        json!({"ratio":s.ratio, "source_duration":exact(s.source_duration)})
+    })
 }
 
 fn picture(p: &Placement) -> Json {
@@ -696,5 +983,27 @@ fn graph_value(v: &Value) -> Json {
         Value::Str(v) => json!(v),
         Value::Arr(v) => Json::Array(v.iter().map(graph_value).collect()),
         Value::Obj(v) => Json::Object(v.iter().map(|(k, v)| (k.clone(), graph_value(v))).collect()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::track_state::Track;
+
+    #[test]
+    fn renamed_locked_and_disabled_tracks_are_separate_changes() {
+        let state = TrackState([
+            Track { name: "Picture".into(), locked: true, disabled: true },
+            Track { name: "Sound".into(), ..Default::default() },
+            Track { name: "Sound".into(), ..Default::default() },
+        ]);
+        let mut diff = Diff::default();
+        compare_track_state(&Ok(None), &Ok(Some(state)), &Json::Null, &mut diff);
+        assert_eq!(diff.differences.iter().map(|r| r["field"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["track_name", "track_lock", "track_output_disabled", "track_name", "track_name"]);
+        assert_eq!(diff.differences[3]["context"], json!({"kind":"audio","track":1}));
+        assert_eq!(diff.differences[4]["context"], json!({"kind":"audio","track":2}));
+        assert!(diff.gaps.is_empty());
     }
 }

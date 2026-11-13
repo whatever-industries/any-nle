@@ -10,7 +10,7 @@ use crate::build::time::Time;
 use crate::error::{value, Result};
 use crate::ids::UuidSource;
 use crate::model::item::{add_item_ref, child_items};
-use crate::model::{ItemData, ItemId, ItemType, Project, SequenceId};
+use crate::model::{ItemData, ItemId, ItemType, Project, SequenceId, TrackItemId};
 
 pub const LABEL_PREFIX: &str = "BE.Prefs.LabelColors.";
 
@@ -35,6 +35,24 @@ pub fn set_label(project: &mut Project, item: ItemId, index: i64) -> Result<()> 
                 project.doc.tree.set_text(leaf, Some(text));
             }
         }
+    }
+    Ok(())
+}
+
+/// Set the label on the placed clip copy. The master and panel item are shared.
+pub(super) fn set_edit_label(project: &mut Project, item: TrackItemId, index: u8) -> Result<()> {
+    let clip = project.track_item(item).clip;
+    let tree = &mut project.doc.tree;
+    let Some(properties) = tree.find(clip, "Clip/Node/Properties")? else {
+        return value("placed clip has no label properties");
+    };
+    let packed = colors::LABEL_PACKED[usize::from(index)].to_string();
+    let name = format!("{LABEL_PREFIX}{index}");
+    for (tag, text) in [("asl.clip.label.color", packed), ("asl.clip.label.name", name)] {
+        let Some(leaf) = tree.find(properties, tag)? else {
+            return value("placed clip is missing a label field");
+        };
+        tree.set_text(leaf, Some(text));
     }
     Ok(())
 }

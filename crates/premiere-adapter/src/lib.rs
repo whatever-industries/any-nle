@@ -391,19 +391,45 @@ fn marker(m: &SourceMarker, losses: &mut Vec<Loss>, object: &str) -> R<Option<Ma
         );
         return Ok(None);
     }
-    if let Some(label) = m.color.as_ref().filter(|c| c.palette != "avid") {
-        loss(losses,object,"marker_color",format!("marker {:?}: palette {:?} color {:?} has no qualified Premiere mapping; default retained",m.name,label.palette,label.name));
-    }
+    let color = match m.color.as_ref() {
+        Some(label) if label.palette == "avid" => label.name.clone(),
+        Some(label) => {
+            let destination = match (m.owner, label.palette.as_str(), label.name.as_str()) {
+                (
+                    MarkerOwner::Sequence,
+                    "resolve",
+                    name @ ("Green" | "Red" | "Blue" | "Cyan" | "Yellow"),
+                ) => Some(name),
+                (MarkerOwner::Sequence, "resolve", "Lavender") => Some("Magenta"),
+                (MarkerOwner::Sequence, "resolve", "Sand") => Some("Orange"),
+                (MarkerOwner::Sequence, "resolve", "Cream") => Some("White"),
+                _ => None,
+            };
+            let change = match destination {
+                Some(name) if name == label.name => None,
+                Some(name) => Some(format!("mapped to Premiere {name}")),
+                None => Some("Premiere default retained".into()),
+            };
+            if let Some(change) = change {
+                loss(
+                    losses,
+                    object,
+                    "marker_color",
+                    format!(
+                        "{}: {} color {}: {change}",
+                        m.owner_occurrence, label.palette, label.name,
+                    ),
+                );
+            }
+            destination.unwrap_or_default().into()
+        }
+        None => String::new(),
+    };
     Ok(Some(Marker {
         name: m.name.clone(),
         comment: m.comment.clone(),
         user: m.user.clone(),
-        color: m
-            .color
-            .as_ref()
-            .filter(|c| c.palette == "avid")
-            .map(|c| c.name.clone())
-            .unwrap_or_default(),
+        color,
         start,
         duration,
         track: m.track.map(|t| {
@@ -917,7 +943,9 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         audio_edge_fades: Vec::new(),
         audio_crossfades: Vec::new(),
         audio_mixers: Default::default(),
+        track_states: Default::default(),
         picture_effects: Vec::new(),
+        edit_labels: Vec::new(),
         direct_dnxhr_origins,
         multicams: Vec::new(),
         multicam_uses: Vec::new(),

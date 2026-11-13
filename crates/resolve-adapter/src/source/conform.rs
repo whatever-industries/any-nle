@@ -1,15 +1,18 @@
 //! Offline checks of saved source frames and supplied pictures at V1 cuts.
 mod renders;
+mod nests;
+mod multicam;
 
 use super::{compare, metadata, read_drp_bytes, report, ADAPTER, OMITTED_TRACKS_ADAPTER};
 use crate::{
     dissolve,
     prepare::frames_on,
     relink::{self, Destinations},
+    retime::PictureSpeed,
     Result,
 };
 use graph::{
-    source::{SourceGraph, SourceMedia, SourceSequence},
+    source::{SourceGraph, SourceMedia, SourceSequence, TextKind},
     Placement, Rational, StreamKind, Value,
 };
 use serde::Serialize;
@@ -23,6 +26,10 @@ use std::{
 };
 
 const MAX_EDITS: usize = 8192;
+const MAX_FULL_SCAN_FRAMES: i64 = 16_384;
+const NO_V1_EDIT: &str = "no saved V1 edit covers this frame";
+const SAVED_V1_GAP: &str = "saved V1 gap";
+const UNQUALIFIED_V1: &str = "unqualified V1 coverage at this frame";
 
 pub use renders::Renders;
 
@@ -35,6 +42,7 @@ pub struct MoveOptions<'a> {
 pub struct Options<'a> {
     pub renders: Option<Renders<'a>>,
     pub moves: Option<MoveOptions<'a>>,
+    pub all_frames: bool,
 }
 
 pub fn write(
@@ -78,7 +86,7 @@ pub fn write(
     let moves = snapshots
         .as_ref()
         .map(|(_, _, verified, _)| &verified.destinations);
-    let mut result = compare(&left, &right, moves);
+    let mut result = compare(&left, &right, moves, options.all_frames)?;
     result.move_verification = snapshots.as_ref().map(|(_, _, _, mode)| *mode);
     result.picture = match options.renders {
         None => json!({"status": "not_requested"}),
@@ -129,6 +137,8 @@ struct Report<'a> {
     mapping_status: &'static str,
     mapping_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    sampling: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     move_verification: Option<&'static str>,
     excluded_dissolve_windows: Vec<Range<i64>>,
     samples: Vec<Sample<'a>>,
@@ -137,7 +147,8 @@ struct Report<'a> {
 
 #[derive(Serialize)]
 struct Sample<'a> {
-    cut: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cut: Option<i64>,
     record_frame: i64,
     status: &'static str,
     differences: Vec<&'static str>,
@@ -156,27 +167,69 @@ struct Sample<'a> {
 #[derive(Serialize)]
 struct Mapping<'a> {
     edit: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nest: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    multicam_use: Option<&'a str>,
     locator: &'a str,
     source_frame: i64,
+    #[serde(serialize_with = "serialize_rate")]
+    source_rate: Rational,
     physical_stream: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_timecode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reel: Option<&'a str>,
+}
+
+fn serialize_rate<S: serde::Serializer>(rate: &Rational, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    serializer.collect_str(rate)
 }
 
 struct Edit<'a> {
-    placement: &'a Placement,
+    nest: Option<&'a str>,
+    multicam_use: Option<&'a str>,
     range: Range<i64>,
-    source: std::result::Result<Source<'a>, &'static str>,
+    content: EditContent<'a>,
 }
 
+#[derive(Clone, Copy)]
+enum EditContent<'a> {
+    Media {
+        placement: &'a Placement,
+        elapsed_offset: i64,
+        source: std::result::Result<Source<'a>, &'static str>,
+    },
+    Gap,
+}
+
+#[derive(Clone, Copy)]
 struct Source<'a> {
     locator: &'a str,
-    first_frame: i64,
+    frames: SourceFrames<'a>,
+    rate: Rational,
     physical_stream: Option<i64>,
     source_timecode: Option<&'a str>,
     reel: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+enum SourceFrames<'a> {
+    Linear {
+        first: i64,
+        step: i64,
+        divisor: i64,
+    },
+    Explicit(&'a [i64]),
+}
+
+impl SourceFrames<'_> {
+    fn at(&self, elapsed: i64) -> i64 {
+        match self {
+            Self::Linear { first, step, divisor } => first + step * (elapsed / divisor),
+            Self::Explicit(frames) => frames[elapsed as usize],
+        }
+    }
 }
 
 struct Timeline<'a> {
@@ -184,6 +237,7 @@ struct Timeline<'a> {
     edits: Vec<Edit<'a>>,
     extent: Option<i64>,
     unqualified: Vec<Range<i64>>,
+    coverage_boundaries: Vec<i64>,
     dissolve: Option<Range<i64>>,
     issue: Option<&'static str>,
 }
@@ -194,11 +248,43 @@ fn timeline<'a>(graph: &'a SourceGraph, id: &str) -> Result<Timeline<'a>> {
         .iter()
         .find(|s| s.id == id)
         .ok_or_else(|| format!("conform timeline {id} was not found"))?;
+    let bindings = Bindings::new(graph);
+    let mut result = direct_timeline(graph, seq, &bindings)?;
+    nests::add(graph, &bindings, &mut result)?;
+    result.edits.sort_by_key(|edit| edit.range.start);
+    result.unqualified.sort_by_key(|range| range.start);
+    Ok(result)
+}
+
+struct Bindings<'a> {
+    items: HashMap<&'a str, &'a graph::source::SourceItem>,
+    media: HashMap<&'a str, &'a SourceMedia>,
+    metadata: HashMap<&'a str, &'a Value>,
+}
+
+impl<'a> Bindings<'a> {
+    fn new(graph: &'a SourceGraph) -> Self {
+        Self {
+            items: graph.items.iter().map(|item| (item.id.as_str(), item)).collect(),
+            media: graph.media.iter().map(|source| (source.id.as_str(), source)).collect(),
+            metadata: graph.sidecars.iter().filter(|row| row.adapter == metadata::ADAPTER)
+                .map(|row| (row.object.as_str(), &row.data)).collect(),
+        }
+    }
+}
+
+fn direct_timeline<'a>(
+    graph: &'a SourceGraph,
+    seq: &'a SourceSequence,
+    bindings: &Bindings<'a>,
+) -> Result<Timeline<'a>> {
+    let id = seq.id.as_str();
     let mut result = Timeline {
         sequence: seq,
         edits: Vec::new(),
         extent: None,
         unqualified: Vec::new(),
+        coverage_boundaries: Vec::new(),
         dissolve: None,
         issue: None,
     };
@@ -210,22 +296,6 @@ fn timeline<'a>(graph: &'a SourceGraph, id: &str) -> Result<Timeline<'a>> {
     if picture.clone().count() > MAX_EDITS {
         return Err("V1 edit count exceeds conform report limit".into());
     }
-    let items: HashMap<_, _> = graph
-        .items
-        .iter()
-        .map(|item| (item.id.as_str(), item))
-        .collect();
-    let media: HashMap<_, _> = graph
-        .media
-        .iter()
-        .map(|source| (source.id.as_str(), source))
-        .collect();
-    let saved_metadata: HashMap<_, _> = graph
-        .sidecars
-        .iter()
-        .filter(|row| row.adapter == metadata::ADAPTER)
-        .map(|row| (row.object.as_str(), &row.data))
-        .collect();
     let conflicting_locators: HashSet<_> = graph
         .losses
         .iter()
@@ -236,9 +306,9 @@ fn timeline<'a>(graph: &'a SourceGraph, id: &str) -> Result<Timeline<'a>> {
     for placement in picture {
         match range(placement.record_start, placement.duration) {
             Ok(range) => {
-                let item = items[placement.item.as_str()];
+                let item = bindings.items[placement.item.as_str()];
                 let mut video = item.media.iter().filter_map(|link| {
-                    let source = media[link.media.as_str()];
+                    let source = bindings.media[link.media.as_str()];
                     (source.kind == StreamKind::Video).then_some((source, link.source_offset))
                 });
                 let binding = match (video.next(), video.next()) {
@@ -251,20 +321,24 @@ fn timeline<'a>(graph: &'a SourceGraph, id: &str) -> Result<Timeline<'a>> {
                         source,
                         offset,
                         seq.rate,
-                        saved_metadata.get(item.id.as_str()).copied(),
+                        bindings.metadata.get(item.id.as_str()).copied(),
                     ),
                     _ => Err("picture binding does not identify one video stream"),
                 };
                 result.edits.push(Edit {
-                    placement,
+                    nest: None,
+                    multicam_use: None,
                     range,
-                    source: binding,
+                    content: EditContent::Media {
+                        placement,
+                        elapsed_offset: 0,
+                        source: binding,
+                    },
                 });
             }
             Err(_) => result.issue = Some("a V1 edit is outside the exact timeline frame grid"),
         }
     }
-    result.edits.sort_by_key(|edit| edit.range.start);
     let inferred_extent = seq
         .placements
         .iter()
@@ -288,6 +362,9 @@ fn timeline<'a>(graph: &'a SourceGraph, id: &str) -> Result<Timeline<'a>> {
         None => inferred_extent,
     };
     track_unknowns(graph, &mut result)?;
+    multicam::add(graph, &mut result)?;
+    result.edits.sort_by_key(|edit| edit.range.start);
+    result.unqualified.sort_by_key(|range| range.start);
     Ok(result)
 }
 
@@ -311,16 +388,13 @@ fn frame_range(start: Rational, length: Rational, rate: Rational) -> Result<Rang
 }
 
 fn saved_source<'a>(
-    edit: &Placement,
+    edit: &'a Placement,
     range: &Range<i64>,
     media: &'a SourceMedia,
     offset: Option<Rational>,
     rate: Rational,
     saved_metadata: Option<&'a Value>,
 ) -> std::result::Result<Source<'a>, &'static str> {
-    if edit.speed.is_some() || edit.frame_map.is_some() || media.rate != Some(rate) {
-        return Err("unsupported picture timing or source rate");
-    }
     let [path] = media.locations.as_slice() else {
         return Err("picture binding does not identify one saved locator");
     };
@@ -339,27 +413,52 @@ fn saved_source<'a>(
     {
         return Err("picture binding uses a relocated original");
     }
-    let offset = offset.ok_or("unknown item-to-file source offset")?;
-    let source_time = edit
-        .source_in
-        .checked_add(offset)
-        .ok_or("source offset overflow")?;
-    let first_frame = frames_on(source_time, rate)
-        .map_err(|_| "source time is outside the exact picture frame grid")?;
-    let count = frames_on(media.duration, rate).map_err(|_| "unknown whole-frame source extent")?;
-    if first_frame
-        .checked_add(range.end - range.start)
-        .is_none_or(|end| end > count)
-    {
-        return Err("picture edit exceeds the saved source extent");
-    }
+    let length = range.end - range.start;
+    let source_rate = media.rate.ok_or("unknown source picture rate")?;
+    let frames = if let Some(map) = &edit.frame_map {
+        // Graph/2 validates these as absolute file frames in the picture clock.
+        if edit.speed.is_some() || usize::try_from(length).ok() != Some(map.len()) {
+            return Err("ambiguous explicit picture timing");
+        }
+        SourceFrames::Explicit(map)
+    } else {
+        if source_rate != rate {
+            return Err("unsupported picture timing or source rate");
+        }
+        let count = frames_on(media.duration, source_rate)
+            .map_err(|_| "unknown whole-frame source extent")?;
+        let offset = offset.ok_or("unknown item-to-file source offset")?;
+        let source_time = edit.source_in.checked_add(offset).ok_or("source offset overflow")?;
+        let first = frames_on(source_time, rate)
+            .map_err(|_| "source time is outside the exact picture frame grid")?;
+        let (span, step, divisor) = match &edit.speed {
+            None => (length, 1, 1),
+            Some(speed) => {
+                let mode = PictureSpeed::from_ratio(speed.ratio)
+                    .filter(|mode| rate == Rational::integer(24) && mode.graph(length).as_ref() == Some(speed))
+                    .ok_or("unsupported constant picture speed or source span")?;
+                let sampled = mode.sampled_source_frames(length)
+                    .map_err(|_| "invalid constant picture speed extent")?;
+                match mode {
+                    PictureSpeed::Half => (sampled, 1, 2),
+                    PictureSpeed::Reverse => (sampled, -1, 1),
+                }
+            }
+        };
+        let end = first.checked_add(span)
+            .filter(|&end| first >= 0 && end <= count)
+            .ok_or("picture edit exceeds the saved source extent")?;
+        let first = if step < 0 { end - 1 } else { first };
+        SourceFrames::Linear { first, step, divisor }
+    };
     let saved = |field| match saved_metadata.and_then(|data| data.get(field)) {
         Some(Value::Str(value)) if !value.is_empty() => Some(value.as_str()),
         _ => None,
     };
     Ok(Source {
         locator: path,
-        first_frame,
+        frames,
+        rate: source_rate,
         physical_stream: media.original.as_ref().map(|file| file.stream_index),
         source_timecode: saved(metadata::TIMECODE),
         reel: saved(metadata::REEL),
@@ -370,6 +469,10 @@ fn track_unknowns(graph: &SourceGraph, timeline: &mut Timeline<'_>) -> Result<()
     let seq = timeline.sequence;
     let rate = seq.rate;
     let mut identified = HashSet::new();
+    let nest_ids: HashSet<_> = match graph.sidecar(crate::nests::ADAPTER, &seq.id) {
+        Some(Value::Arr(rows)) => rows.iter().filter_map(|row| crate::nests::string(row, "id")).collect(),
+        _ => HashSet::new(),
+    };
     if let Some(Value::Arr(rows)) = graph.sidecar(OMITTED_TRACKS_ADAPTER, &seq.id) {
         for row in rows {
             if matches!(row.get("kind"), Some(Value::Str(kind)) if kind == "audio") {
@@ -425,31 +528,76 @@ fn track_unknowns(graph: &SourceGraph, timeline: &mut Timeline<'_>) -> Result<()
         }
     }
     if let Some(Value::Arr(rows)) = graph.sidecar("resolve.timing", &seq.id) {
-        for row in rows {
-            if let Some(Value::Str(id)) = row.get("occurrence") {
-                identified.insert(("timing", id.as_str()));
+        let qualified: HashMap<_, _> = timeline.edits.iter().filter_map(|edit| {
+            match edit.content {
+                EditContent::Media { placement, source: Ok(_), .. } if placement.speed.is_some() => {
+                    Some((placement.id.as_str(), &edit.range))
+                }
+                _ => None,
             }
+        }).collect();
+        let unresolved: HashSet<_> = graph.losses.iter()
+            .filter(|loss| loss.object == seq.id && loss.aspect == "timing")
+            .filter_map(|loss| loss.reason.split_once(": ").map(|(id, _)| id))
+            .collect();
+        for row in rows {
+            let id = match row.get("occurrence") {
+                Some(Value::Str(id)) => {
+                    identified.insert(("timing", id.as_str()));
+                    Some(id.as_str())
+                }
+                _ => None,
+            };
             if let Some(range) = saved_range(row, origin).filter(|_| {
                 matches!(row.get("record_rate"), Some(Value::Str(saved)) if Rational::parse(saved) == Some(rate))
             }) {
+                if id.is_some_and(|id| {
+                    !unresolved.contains(id)
+                        && qualified.get(id).is_some_and(|qualified| **qualified == range)
+                        && matches!(row.get("source_rate"), Some(Value::Str(saved)) if Rational::parse(saved) == Some(rate))
+                }) {
+                    continue;
+                }
                 timeline.unqualified.push(range);
             } else {
                 timeline.issue = Some("unqualified saved edit timing");
             }
         }
     }
-    for group in graph
-        .multicam_uses
-        .iter()
-        .filter(|u| u.sequence == seq.id && u.kind == StreamKind::Video && u.track == 1)
-    {
-        match group
-            .record_start
-            .zip(group.duration)
+    // Resolve stores generators and titles outside the file-backed placements.
+    // An interval they occupy cannot be treated as empty V1.
+    if let Some(data) = graph.sidecar(crate::generator::ADAPTER, &seq.id) {
+        match data {
+            Value::Arr(rows) => {
+                for row in rows {
+                    match row.get("video_track") {
+                        Some(Value::Int(track)) if *track > 1 => continue,
+                        Some(Value::Int(1)) => {
+                            if let (Some(Value::Int(start)), Some(Value::Int(length))) =
+                                (row.get("start_frames"), row.get("duration_frames"))
+                            {
+                                if let Some(end) = start.checked_add(*length)
+                                    .filter(|end| *start >= 0 && *end > *start)
+                                {
+                                    timeline.unqualified.push(*start..end);
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    timeline.issue = Some("unqualified V1 generator coverage");
+                }
+            }
+            _ => timeline.issue = Some("unqualified V1 generator coverage"),
+        }
+    }
+    for title in seq.texts.iter().filter(|text| text.kind == TextKind::Graphic && text.track == 1) {
+        match title.record_start.zip(title.duration)
             .and_then(|(start, duration)| frame_range(start, duration, rate).ok())
         {
             Some(range) => timeline.unqualified.push(range),
-            None => timeline.issue = Some("unqualified multicam timing"),
+            None => timeline.issue = Some("unqualified V1 title coverage"),
         }
     }
     if graph.losses.iter().any(|loss| {
@@ -461,14 +609,13 @@ fn track_unknowns(graph: &SourceGraph, timeline: &mut Timeline<'_>) -> Result<()
             && !loss
                 .reason
                 .split_once(": ")
-                .is_some_and(|(id, _)| identified.contains(&(loss.aspect.as_str(), id)))
+                .is_some_and(|(id, reason)| {
+                    identified.contains(&(loss.aspect.as_str(), id))
+                        || (loss.aspect == "placement" && reason == crate::nests::LOSS && nest_ids.contains(id))
+                })
     }) {
         timeline.issue = Some("unlocated timeline observations may affect V1");
     }
-    if timeline.unqualified.len() > MAX_EDITS {
-        return Err("unqualified interval count exceeds conform report limit".into());
-    }
-    timeline.unqualified.sort_by_key(|range| range.start);
     Ok(())
 }
 
@@ -506,7 +653,7 @@ impl<'a, 'g> Cursor<'a, 'g> {
         &mut self,
         frame: i64,
         include_identity: bool,
-    ) -> (std::result::Result<Mapping<'g>, &'static str>, bool) {
+    ) -> (std::result::Result<Option<Mapping<'g>>, &'static str>, bool) {
         let track = self.timeline;
         if let Some(reason) = track.issue {
             return (Err(reason), false);
@@ -521,7 +668,7 @@ impl<'a, 'g> Cursor<'a, 'g> {
         }
         if frame < self.unknown_until {
             return (
-                Err("unqualified transition, edit timing, or multicam covers this frame"),
+                Err(UNQUALIFIED_V1),
                 false,
             );
         }
@@ -540,21 +687,28 @@ impl<'a, 'g> Cursor<'a, 'g> {
             return (Err("ambiguous overlapping V1 edits"), false);
         }
         let Some(&(_, index)) = self.active.first() else {
-            return (Err("no saved V1 edit covers this frame"), false);
+            return if track.extent.is_some_and(|end| frame < end) {
+                (Ok(None), false)
+            } else {
+                (Err(NO_V1_EDIT), false)
+            };
         };
         let edit = &track.edits[index];
-        let mapping = edit
-            .source
-            .as_ref()
-            .map(|source| Mapping {
-                edit: &edit.placement.id,
+        let EditContent::Media { placement, elapsed_offset, source } = edit.content else {
+            return (Ok(None), false);
+        };
+        let mapping = source
+            .map(|source| Some(Mapping {
+                edit: &placement.id,
+                nest: edit.nest,
+                multicam_use: edit.multicam_use,
                 locator: source.locator,
-                source_frame: source.first_frame + (frame - edit.range.start),
+                source_frame: source.frames.at(elapsed_offset + (frame - edit.range.start)),
+                source_rate: source.rate,
                 physical_stream: source.physical_stream,
                 source_timecode: source.source_timecode.filter(|_| include_identity),
                 reel: source.reel.filter(|_| include_identity),
-            })
-            .map_err(|reason| *reason);
+            }));
         (mapping, true)
     }
 }
@@ -563,7 +717,8 @@ fn compare<'g>(
     left: &Timeline<'g>,
     right: &Timeline<'g>,
     moves: Option<&'g Destinations>,
-) -> Report<'g> {
+    all_frames: bool,
+) -> Result<Report<'g>> {
     let a = left.sequence;
     let b = right.sequence;
     let mut result = Report {
@@ -575,6 +730,7 @@ fn compare<'g>(
         candidate_origin: b.start.map(|t| t.to_string()),
         mapping_status: "inconclusive",
         mapping_reason: None,
+        sampling: all_frames.then_some("all_frames"),
         move_verification: None,
         excluded_dissolve_windows: Vec::new(),
         samples: Vec::new(),
@@ -582,7 +738,7 @@ fn compare<'g>(
     };
     if a.rate != b.rate || !matches!((a.rate.num(), a.rate.den()), (24, 1) | (24000, 1001)) {
         result.mapping_reason = Some("expected matching supported timeline rates");
-        return result;
+        return Ok(result);
     }
     let origin = |seq: &SourceSequence| seq.start.and_then(|start| frames_on(start, seq.rate).ok());
     match (origin(a), origin(b)) {
@@ -590,11 +746,11 @@ fn compare<'g>(
         (Some(_), Some(_)) => {
             result.mapping_status = "different";
             result.mapping_reason = Some("saved timeline origins differ");
-            return result;
+            return Ok(result);
         }
         _ => {
             result.mapping_reason = Some("timeline origin is unknown or off-grid");
-            return result;
+            return Ok(result);
         }
     }
     for range in [&left.dissolve, &right.dissolve].into_iter().flatten() {
@@ -605,103 +761,132 @@ fn compare<'g>(
     result
         .excluded_dissolve_windows
         .sort_by_key(|range| range.start);
-    let end = [left, right]
-        .into_iter()
-        .flat_map(|timeline| {
-            timeline
-                .edits
-                .iter()
-                .map(|edit| edit.range.end)
-                .chain(timeline.extent)
-        })
-        .max()
-        .unwrap_or(0);
-    let cuts: BTreeSet<_> = left
-        .edits
-        .iter()
-        .chain(&right.edits)
-        .flat_map(|edit| [edit.range.start, edit.range.end])
-        .filter(|&frame| frame > 0 && frame < end)
-        .collect();
+    let (different_extent, samples) = if all_frames {
+        let (Some(a), Some(b)) = (left.extent, right.extent) else {
+            result.mapping_reason = Some("unknown full timeline extent");
+            return Ok(result);
+        };
+        let end = a.max(b);
+        if end > MAX_FULL_SCAN_FRAMES {
+            return Err(format!("full conform scan exceeds {MAX_FULL_SCAN_FRAMES} timeline frames").into());
+        }
+        let samples: Box<dyn Iterator<Item = (Option<i64>, i64)>> =
+            Box::new((0..end).map(|frame| (None, frame)));
+        (a != b, samples)
+    } else {
+        let end = [left, right]
+            .into_iter()
+            .flat_map(|timeline| {
+                timeline.edits.iter().map(|edit| edit.range.end).chain(timeline.extent)
+            })
+            .max()
+            .unwrap_or(0);
+        let cuts: BTreeSet<_> = left
+            .edits
+            .iter()
+            .chain(&right.edits)
+            .flat_map(|edit| [edit.range.start, edit.range.end])
+            .chain(left.coverage_boundaries.iter().chain(&right.coverage_boundaries).copied())
+            .filter(|&frame| frame > 0 && frame < end)
+            .collect();
+        let samples: Box<dyn Iterator<Item = (Option<i64>, i64)>> =
+            Box::new(cuts.into_iter().flat_map(|cut| [(Some(cut), cut - 1), (Some(cut), cut)]));
+        (false, samples)
+    };
     let (mut reference, mut candidate) = (Cursor::new(left), Cursor::new(right));
-    for cut in cuts {
-        for frame in [cut - 1, cut] {
-            let mut sample = Sample {
-                cut,
-                record_frame: frame,
-                status: "excluded_dissolve",
-                differences: Vec::new(),
-                unresolved_identity: Vec::new(),
-                expected_candidate_locator: None,
-                reference: None,
-                candidate: None,
-                reference_reason: None,
-                candidate_reason: None,
-                picture_eligible: false,
-            };
-            if !result
-                .excluded_dissolve_windows
-                .iter()
-                .any(|range| range.contains(&frame))
-            {
-                let (a, reference_picture) = reference.at(frame, moves.is_some());
-                let (b, candidate_picture) = candidate.at(frame, moves.is_some());
-                sample.picture_eligible = reference_picture && candidate_picture;
-                sample.expected_candidate_locator = moves.and_then(|moves| {
-                    a.as_ref()
-                        .ok()
-                        .map(|a| moves.get(a.locator).map_or(a.locator, String::as_str))
-                });
-                match (&a, &b) {
-                    (Ok(a), Ok(b)) => {
-                        if sample.expected_candidate_locator.unwrap_or(a.locator) != b.locator {
-                            sample.differences.push("locator");
-                        }
-                        if a.source_frame != b.source_frame {
-                            sample.differences.push("source_frame");
-                        }
-                        if matches!((a.physical_stream, b.physical_stream), (Some(x), Some(y)) if x != y)
-                        {
-                            sample.differences.push("physical_stream");
-                        }
-                        for (field, reference, candidate) in [
-                            ("source_timecode", a.source_timecode, b.source_timecode),
-                            ("reel", a.reel, b.reel),
-                        ] {
-                            if let Some(reference) = reference {
-                                match candidate {
-                                    Some(candidate) if candidate != reference => {
-                                        sample.differences.push(field)
-                                    }
-                                    Some(_) => {}
-                                    None => sample.unresolved_identity.push(field),
+    for (cut, frame) in samples {
+        let mut sample = Sample {
+            cut,
+            record_frame: frame,
+            status: "excluded_dissolve",
+            differences: Vec::new(),
+            unresolved_identity: Vec::new(),
+            expected_candidate_locator: None,
+            reference: None,
+            candidate: None,
+            reference_reason: None,
+            candidate_reason: None,
+            picture_eligible: false,
+        };
+        if !result
+            .excluded_dissolve_windows
+            .iter()
+            .any(|range| range.contains(&frame))
+        {
+            let (a, reference_edit) = reference.at(frame, moves.is_some());
+            let (b, candidate_edit) = candidate.at(frame, moves.is_some());
+            let reference_gap = all_frames && matches!(a, Ok(None));
+            let candidate_gap = all_frames && matches!(b, Ok(None));
+            sample.picture_eligible = (reference_edit || reference_gap)
+                && (candidate_edit || candidate_gap);
+            sample.expected_candidate_locator = moves.and_then(|moves| {
+                a.as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map(|a| moves.get(a.locator).map_or(a.locator, String::as_str))
+            });
+            match (&a, &b) {
+                (Ok(Some(a)), Ok(Some(b))) => {
+                    if sample.expected_candidate_locator.unwrap_or(a.locator) != b.locator {
+                        sample.differences.push("locator");
+                    }
+                    if a.source_frame != b.source_frame {
+                        sample.differences.push("source_frame");
+                    }
+                    if a.source_rate != b.source_rate {
+                        sample.differences.push("source_rate");
+                    }
+                    if matches!((a.physical_stream, b.physical_stream), (Some(x), Some(y)) if x != y)
+                    {
+                        sample.differences.push("physical_stream");
+                    }
+                    for (field, reference, candidate) in [
+                        ("source_timecode", a.source_timecode, b.source_timecode),
+                        ("reel", a.reel, b.reel),
+                    ] {
+                        if let Some(reference) = reference {
+                            match candidate {
+                                Some(candidate) if candidate != reference => {
+                                    sample.differences.push(field)
                                 }
+                                Some(_) => {}
+                                None => sample.unresolved_identity.push(field),
                             }
                         }
-                        sample.status = if !sample.differences.is_empty() {
-                            "different"
-                        } else if !sample.unresolved_identity.is_empty() {
-                            "inconclusive"
-                        } else {
-                            "match"
-                        };
                     }
-                    _ => sample.status = "inconclusive",
+                    sample.status = if !sample.differences.is_empty() {
+                        "different"
+                    } else if !sample.unresolved_identity.is_empty() {
+                        "inconclusive"
+                    } else {
+                        "match"
+                    };
                 }
-                (sample.reference, sample.reference_reason) = match a {
-                    Ok(mapping) => (Some(mapping), None),
-                    Err(reason) => (None, Some(reason)),
-                };
-                (sample.candidate, sample.candidate_reason) = match b {
-                    Ok(mapping) => (Some(mapping), None),
-                    Err(reason) => (None, Some(reason)),
-                };
+                _ if reference_gap && candidate_gap => sample.status = "match",
+                _ if (reference_gap && candidate_edit) || (candidate_gap && reference_edit) => {
+                    sample.differences.push("v1_coverage");
+                    sample.status = "different";
+                }
+                _ => sample.status = "inconclusive",
             }
-            result.samples.push(sample);
+            (sample.reference, sample.reference_reason) = match a {
+                Ok(Some(mapping)) => (Some(mapping), None),
+                Ok(None) => (None, Some(if reference_gap { SAVED_V1_GAP } else { NO_V1_EDIT })),
+                Err(reason) => (None, Some(reason)),
+            };
+            (sample.candidate, sample.candidate_reason) = match b {
+                Ok(Some(mapping)) => (Some(mapping), None),
+                Ok(None) => (None, Some(if candidate_gap { SAVED_V1_GAP } else { NO_V1_EDIT })),
+                Err(reason) => (None, Some(reason)),
+            };
         }
+        result.samples.push(sample);
     }
     let has = |status| result.samples.iter().any(|sample| sample.status == status);
-    result.mapping_status = if has("different") {
+    result.mapping_status = if different_extent {
+        result.mapping_reason = Some("saved timeline extents differ");
+        "different"
+    } else if has("different") {
         "different"
     } else if has("inconclusive") {
         "inconclusive"
@@ -711,7 +896,7 @@ fn compare<'g>(
         result.mapping_reason = Some("no comparable V1 samples");
         "inconclusive"
     };
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -743,10 +928,93 @@ mod tests {
     }
 
     #[test]
+    fn nested_trim_preserves_child_speed_phase_and_internal_cut() {
+        let mut graph = graph();
+        let child_id = "00000000-0000-0000-0000-000000000001";
+        let nest_id = "00000000-0000-0000-0000-000000000002";
+        let mut child = graph.sequences[0].clone();
+        child.id = child_id.into();
+        child.frame_size = Some((1920, 1080));
+        child.start = Some(Rational::integer(0));
+        child.clock = Some(super::super::clock(
+            child_id, "Sm2Sequence.MediaExtents", 0, child.rate,
+        ).unwrap());
+        child.placements[0].speed = PictureSpeed::Half.graph(24);
+        graph.sequences[0].frame_size = child.frame_size;
+        graph.sequences[0].placements.clear();
+        graph.sequences.push(child);
+        for (adapter, object, data) in [
+            (ADAPTER, "timeline", r#"{"record_length":25}"#.to_owned()),
+            (ADAPTER, child_id, r#"{"kind":"registered_timeline","media_pool_clip":"pool","record_origin":0,"record_length":48}"#.to_owned()),
+            (crate::nests::ADAPTER, "timeline", format!(
+                r#"[{{"id":"{nest_id}","profile":"{}","kind":"timeline","track_kind":"video","track":1,
+                    "record_rate":"24","child_rate":"24","child_origin_frames":0,"pool_id":"pool",
+                    "child_sequence":"{child_id}","record_start_frames":0,"record_duration_frames":25,"saved_source_in_frames":1}}]"#,
+                crate::nests::PROFILE,
+            )),
+        ] {
+            graph.sidecars.push(graph::Sidecar {
+                adapter: adapter.into(), object: object.into(), data: graph::json::parse(&data).unwrap(),
+            });
+        }
+        let left = timeline(&graph, "timeline").unwrap();
+        let full = compare(&left, &left, None, true).unwrap();
+        assert_eq!(full.mapping_status, "match");
+        let source = |index: usize| full.samples[index].reference.as_ref().unwrap();
+        assert_eq!((source(0).source_frame, source(1).source_frame), (2, 3));
+        assert_eq!((source(22).source_frame, source(23).source_frame), (13, 6));
+        assert_eq!(source(23).nest, Some(nest_id));
+        let cuts = compare(&left, &left, None, false).unwrap();
+        assert_eq!(cuts.samples.iter().map(|row| row.record_frame).collect::<Vec<_>>(), [22, 23]);
+
+        let mut gap = graph.clone();
+        gap.sequences[1].placements[0].duration = Rational::new(20, 24).unwrap();
+        gap.sequences[1].placements[0].speed = PictureSpeed::Half.graph(20);
+        let with_gap = timeline(&gap, "timeline").unwrap();
+        let full = compare(&with_gap, &with_gap, None, true).unwrap();
+        assert_eq!(full.mapping_status, "match");
+        assert!(full.samples[19..23].iter().all(|sample| {
+            sample.reference_reason == Some(SAVED_V1_GAP) && sample.picture_eligible
+        }));
+        let changed = compare(&with_gap, &left, None, true).unwrap();
+        assert_eq!(changed.mapping_status, "different");
+        assert_eq!(
+            changed.samples.iter().filter(|sample| sample.differences == ["v1_coverage"])
+                .map(|sample| sample.record_frame).collect::<Vec<_>>(),
+            [19, 20, 21, 22],
+        );
+        gap.sidecars.push(graph::Sidecar {
+            adapter: crate::generator::ADAPTER.into(),
+            object: child_id.into(),
+            data: Value::Arr(vec![crate::generator::Solid {
+                start: 21, duration: 2, rgb: [0, 0, 0],
+            }.receipt("child-solid", 1)]),
+        });
+        let with_generator = timeline(&gap, "timeline").unwrap();
+        let full = compare(&with_generator, &with_generator, None, true).unwrap();
+        assert_eq!(full.samples[19].reference_reason, Some(SAVED_V1_GAP));
+        assert!(full.samples[20..22].iter().all(|sample| {
+            sample.reference_reason == Some(UNQUALIFIED_V1) && !sample.picture_eligible
+        }));
+        assert_eq!(full.samples[22].reference_reason, Some(SAVED_V1_GAP));
+        let cuts = compare(&with_generator, &with_generator, None, false).unwrap();
+        assert!(cuts.samples.iter().any(|sample| sample.cut == Some(20)));
+
+        // A known interval with unqualified timing must never appear empty.
+        let Value::Arr(rows) = &mut graph.sidecars[2].data else { unreachable!() };
+        let Value::Obj(row) = &mut rows[0] else { unreachable!() };
+        row.retain(|(name, _)| name != "profile");
+        let unknown = timeline(&graph, "timeline").unwrap();
+        let full = compare(&unknown, &unknown, None, true).unwrap();
+        assert_eq!(full.mapping_status, "inconclusive");
+        assert!(full.samples.iter().all(|s| s.reference_reason == Some(UNQUALIFIED_V1)));
+    }
+
+    #[test]
     fn checks_file_relative_frames_and_retains_differences_alongside_gaps() {
         let reference = graph();
         let left = timeline(&reference, "timeline").unwrap();
-        let baseline = compare(&left, &left, None);
+        let baseline = compare(&left, &left, None, false).unwrap();
         assert_eq!(baseline.mapping_status, "match");
         assert_eq!(
             baseline.samples[0].reference.as_ref().unwrap().source_frame,
@@ -761,11 +1029,151 @@ mod tests {
         candidate.items[0].media[0].source_offset = None;
         candidate.media[1].locations[0] = "C:/Replacement/Counter.mov".into();
         let right = timeline(&candidate, "timeline").unwrap();
-        let report = compare(&left, &right, None);
+        let report = compare(&left, &right, None, false).unwrap();
         assert_eq!(report.mapping_status, "different");
         assert_eq!(report.samples[0].status, "inconclusive");
         assert!(report.samples[0].picture_eligible);
         assert_eq!(report.samples[1].differences, ["locator"]);
+    }
+
+    #[test]
+    fn full_scan_detects_an_interior_frame_change_that_cut_sampling_misses() {
+        let reference = graph();
+        let mut candidate = reference.clone();
+        let mut map: Vec<_> = (2..26).collect();
+        map[11] = 14;
+        candidate.sequences[0].placements[0].frame_map = Some(map);
+        candidate.validate().unwrap();
+        let left = timeline(&reference, "timeline").unwrap();
+        let mut right = timeline(&candidate, "timeline").unwrap();
+
+        let cuts = compare(&left, &right, None, false).unwrap();
+        assert_eq!(cuts.mapping_status, "match");
+        assert_eq!(cuts.samples[0].cut, Some(24));
+
+        let full = compare(&left, &right, None, true).unwrap();
+        assert_eq!(full.sampling, Some("all_frames"));
+        assert_eq!(full.mapping_status, "different");
+        assert_eq!(full.samples.len(), 48);
+        let changed: Vec<_> = full.samples.iter().filter(|row| row.status == "different").collect();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].record_frame, 11);
+        assert_eq!(changed[0].cut, None);
+        assert_eq!(changed[0].differences, ["source_frame"]);
+
+        right.extent = Some(49);
+        let different_length = compare(&left, &right, None, true).unwrap();
+        assert_eq!(different_length.mapping_reason, Some("saved timeline extents differ"));
+        right.extent = Some(MAX_FULL_SCAN_FRAMES + 1);
+        assert!(compare(&left, &right, None, true).is_err());
+    }
+
+    #[test]
+    fn full_scan_distinguishes_saved_gaps_from_missing_or_unresolved_edits() {
+        let mut reference = graph();
+        reference.sequences[0].placements[1].record_start = Rational::new(5, 4).unwrap();
+        let left = timeline(&reference, "timeline").unwrap();
+        let same = compare(&left, &left, None, true).unwrap();
+        assert_eq!(same.mapping_status, "match");
+        assert!(same.samples[24..30].iter().all(|row| {
+            row.status == "match" && row.picture_eligible
+                && row.reference_reason == Some(SAVED_V1_GAP)
+                && row.candidate_reason == Some(SAVED_V1_GAP)
+        }));
+
+        let mut candidate = reference.clone();
+        candidate.sequences[0].placements[0].duration = Rational::new(5, 4).unwrap();
+        candidate.items[0].media[0].source_offset = None;
+        candidate.validate().unwrap();
+        let right = timeline(&candidate, "timeline").unwrap();
+        let full = compare(&left, &right, None, true).unwrap();
+        assert_eq!(full.mapping_status, "different");
+        assert!(full.samples[24..30].iter().all(|row| {
+            row.differences == ["v1_coverage"] && row.picture_eligible && row.candidate.is_none()
+        }));
+        let cuts = compare(&left, &right, None, false).unwrap();
+        assert_eq!(cuts.mapping_status, "inconclusive");
+        assert_eq!(cuts.samples[1].reference_reason, Some(NO_V1_EDIT));
+
+        let mut generated = reference.clone();
+        generated.sidecars.push(graph::Sidecar {
+            adapter: crate::generator::ADAPTER.into(),
+            object: "timeline".into(),
+            data: Value::Arr(vec![crate::generator::Solid {
+                start: 24, duration: 6, rgb: [0, 0, 0],
+            }.receipt("black-solid", 1)]),
+        });
+        let uncertain = timeline(&generated, "timeline").unwrap();
+        let full = compare(&left, &uncertain, None, true).unwrap();
+        assert_eq!(full.mapping_status, "inconclusive");
+        assert!(full.samples[24..30].iter().all(|row| {
+            row.status == "inconclusive" && !row.picture_eligible && row.differences.is_empty()
+        }));
+    }
+
+    #[test]
+    fn checks_odd_half_speed_reverse_and_explicit_file_frames_at_a_cut() {
+        let mut reference = graph();
+        let edits = &mut reference.sequences[0].placements;
+        edits[0].duration = Rational::new(23, 24).unwrap();
+        edits[0].speed = PictureSpeed::Half.graph(23);
+        edits[1].record_start = edits[0].duration;
+        edits[1].speed = PictureSpeed::Reverse.graph(24);
+        reference.validate().unwrap();
+        let left = timeline(&reference, "timeline").unwrap();
+        let report = compare(&left, &left, None, false).unwrap();
+        assert_eq!(report.mapping_status, "match");
+        let source_frame = |row: &Sample<'_>| row.reference.as_ref().unwrap().source_frame;
+        assert_eq!(source_frame(&report.samples[0]), 13);
+        assert_eq!(source_frame(&report.samples[1]), 29);
+
+        let mut candidate = reference.clone();
+        let edit = &mut candidate.sequences[0].placements[0];
+        edit.speed = None;
+        edit.frame_map = Some((0..23).map(|i| 2 + i / 2).collect());
+        candidate.validate().unwrap();
+        let right = timeline(&candidate, "timeline").unwrap();
+        assert_eq!(compare(&left, &right, None, false).unwrap().mapping_status, "match");
+        candidate.sequences[0].placements[0].frame_map.as_mut().unwrap()[22] = 14;
+        let right = timeline(&candidate, "timeline").unwrap();
+        assert_eq!(compare(&left, &right, None, false).unwrap().samples[0].differences, ["source_frame"]);
+        candidate.sequences[0].placements[0].frame_map.as_mut().unwrap()[22] = 13;
+        candidate.media[0].rate = Rational::new(24000, 1001);
+        candidate.validate().unwrap();
+        let right = timeline(&candidate, "timeline").unwrap();
+        let report = compare(&left, &right, None, false).unwrap();
+        assert_eq!(report.samples[0].candidate.as_ref().unwrap().source_frame, 13);
+        assert_eq!(report.samples[0].differences, ["source_rate"]);
+    }
+
+    #[test]
+    fn saved_retime_receipt_must_agree_with_the_qualified_edit() {
+        let mut reference = graph();
+        reference.sequences[0].placements[0].speed = PictureSpeed::Half.graph(24);
+        reference.sidecars.push(graph::Sidecar {
+            adapter: "resolve.timing".into(),
+            object: "timeline".into(),
+            data: Value::Arr(vec![Value::Obj(vec![
+                ("occurrence".into(), Value::Str("out".into())),
+                ("saved_start".into(), Value::Str("86400".into())),
+                ("saved_duration".into(), Value::Str("24".into())),
+                ("record_rate".into(), Value::Str("24".into())),
+                ("source_rate".into(), Value::Str("24".into())),
+            ])]),
+        });
+        let left = timeline(&reference, "timeline").unwrap();
+        assert_eq!(compare(&left, &left, None, false).unwrap().samples[0].status, "match");
+
+        let mut candidate = reference.clone();
+        candidate.losses.push(graph::Loss {
+            object: "timeline".into(),
+            aspect: "timing".into(),
+            reason: "out: unqualified Resolve rate or retime map".into(),
+        });
+        let right = timeline(&candidate, "timeline").unwrap();
+        let report = compare(&left, &right, None, false).unwrap();
+        assert_eq!(report.samples[0].status, "inconclusive");
+        assert_eq!(report.samples[1].status, "match");
     }
 
     #[test]
@@ -785,7 +1193,7 @@ mod tests {
         candidate.media[1].locations[0] = destination.into();
         let moves = Destinations::from([("C:/B/Counter.mov".into(), destination.into())]);
         let right = timeline(&candidate, "timeline").unwrap();
-        let report = compare(&left, &right, Some(&moves));
+        let report = compare(&left, &right, Some(&moves), false).unwrap();
         assert_eq!(report.mapping_status, "match");
         assert_eq!(
             report.samples[1].expected_candidate_locator,
@@ -794,14 +1202,14 @@ mod tests {
 
         candidate.sidecars.clear();
         let right = timeline(&candidate, "timeline").unwrap();
-        let report = compare(&left, &right, Some(&moves));
+        let report = compare(&left, &right, Some(&moves), false).unwrap();
         assert_eq!(report.mapping_status, "inconclusive");
         assert_eq!(report.samples[1].unresolved_identity, ["source_timecode"]);
         assert!(report.samples[1].picture_eligible);
 
         candidate.sequences[0].placements[1].source_in = Rational::new(5, 24).unwrap();
         let right = timeline(&candidate, "timeline").unwrap();
-        let report = compare(&left, &right, Some(&moves));
+        let report = compare(&left, &right, Some(&moves), false).unwrap();
         assert_eq!(report.mapping_status, "different");
         assert_eq!(report.samples[1].differences, ["source_frame"]);
         assert_eq!(report.samples[1].unresolved_identity, ["source_timecode"]);

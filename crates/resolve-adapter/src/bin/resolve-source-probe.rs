@@ -23,12 +23,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     match args.as_slice() {
-        [mode, input, id, ffprobe, output] if mode == "--premiere" => {
+        [mode, input, id, ffprobe, output, flags @ ..] if mode == "--premiere" => {
+            let accept_metadata_losses = match flags {
+                [] => false,
+                [flag] if flag == "--accept-losses" => true,
+                _ => return Err("expected only --accept-losses after the Premiere output path".into()),
+            };
             let graph = graph::source::SourceGraph::from_json_text(&support::read(
                 Path::new(input), graph::MAX_GRAPH_BYTES,
             )?)?;
-            for loss in anynle_resolve_adapter::premiere_export::write(
-                graph, text(id)?, Path::new(ffprobe), Path::new(output),
+            for loss in anynle_resolve_adapter::premiere_export::write_with_options(
+                graph, text(id)?, Path::new(ffprobe), Path::new(output), accept_metadata_losses,
             )? {
                 eprintln!("{} ({}): {}", loss.object, loss.aspect, loss.reason);
             }
@@ -72,7 +77,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let graph = source::read(input)?;
             publish(Path::new(output), |file| Ok(graph.write_json(file)?))
         }
-        _ => Err("usage: resolve-source-probe INPUT.drp OUTPUT.graph.json\n       resolve-source-probe --inspect-archive INPUT OUTPUT.json\n       resolve-source-probe --inspect-drt INPUT.drt OUTPUT.json\n       resolve-source-probe --graph-drt INPUT.drt OUTPUT.graph.json\n       resolve-source-probe --diff LEFT LEFT_TIMELINE_ID RIGHT RIGHT_TIMELINE_ID OUTPUT.json\n       resolve-source-probe --diff-blob LEFT LEFT_OBJECT_ID RIGHT RIGHT_OBJECT_ID FIELD OUTPUT.json\n       resolve-source-probe --inventory-effects INPUT OUTPUT.json\n       resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj\n       resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json [--moves MOVES.json [--checksums MANIFEST.json]] [--renders REFERENCE.mov CANDIDATE.mov FFMPEG FFPROBE]".into()),
+        _ => Err("usage: resolve-source-probe INPUT.drp OUTPUT.graph.json\n       resolve-source-probe --inspect-archive INPUT OUTPUT.json\n       resolve-source-probe --inspect-drt INPUT.drt OUTPUT.json\n       resolve-source-probe --graph-drt INPUT.drt OUTPUT.graph.json\n       resolve-source-probe --diff LEFT LEFT_TIMELINE_ID RIGHT RIGHT_TIMELINE_ID OUTPUT.json\n       resolve-source-probe --diff-blob LEFT LEFT_OBJECT_ID RIGHT RIGHT_OBJECT_ID FIELD OUTPUT.json\n       resolve-source-probe --inventory-effects INPUT OUTPUT.json\n       resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj [--accept-losses]\n       resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json [--all-frames] [--moves MOVES.json [--checksums MANIFEST.json]] [--renders REFERENCE.mov CANDIDATE.mov FFMPEG FFPROBE]".into()),
     }
 }
 
@@ -84,6 +89,10 @@ fn conform_options(
     let mut checksums = None;
     while !args.is_empty() {
         args = match args {
+            [flag, rest @ ..] if flag == "--all-frames" && !options.all_frames => {
+                options.all_frames = true;
+                rest
+            }
             [flag, path, rest @ ..] if flag == "--moves" && moves.is_none() => {
                 moves = Some(Path::new(path));
                 rest

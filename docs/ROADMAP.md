@@ -156,6 +156,19 @@ source reference. [Turnover evidence](RESOLVE-TURNOVER-IMPLEMENTATION.md)
       native nests and multicam with explicit angle and audio selectors.
       Verify editable caption styling where both editors' behavior is
       understood. [Metadata crosswalk](PREMIERE-RESOLVE-METADATA.md#cross-editor-transfer)
+- [x] **Verify Premiere timeline clip labels after reopening in Resolve.** The
+      internal route wrote five edit colors and kept one neighbor uncolored.
+      Follow up with a Premiere 27 authoring control for changed labels.
+      [Timeline clip labels](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-timeline-clip-labels)
+- [ ] **Qualify Premiere timeline In/Out mapping to Resolve.** The source
+      reader retains saved ticks and reports the omission before writing.
+      Compare the two Premiere Out controls with the same 12-frame Resolve
+      range after reopen. [Premiere In/Out capture](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-timeline-inout)
+- [ ] **Reopen Premiere track state in Resolve.** The internal V1/A1/A2
+      route writes saved Premiere 27 names, edit locks, and V1 output.
+      Check both same-named mono tracks, black picture with V1 off,
+      and unchanged audio after reopen. Sync lock remains a reported omission.
+      [Track state](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-timeline-track-state)
 
 ### Resolve → Premiere
 
@@ -253,10 +266,29 @@ and plain captions.
       wider animated picture controls and transition profiles through
       the shared placements and endpoints. Report unmapped Fairlight
       bus routing, processing and Resolve grade controls by occurrence.
+- [ ] **Qualify sequence marker colors in Premiere 27.** Offline project
+      writing preserves exact Resolve marker positions and durations, with
+      five shared colors and three reported palette substitutions. Reopen
+      the two retained controls and check marker editability, color and range.
+      [Sequence marker colors](RESOLVE-SOURCE-READER.md#resolve-to-premiere-sequence-marker-colors)
 - [ ] **Widen native project transfer.** Bring over more linked profiles
       and timelines, bin ownership, markers, and logging. Qualify one
       editable nest and a multicam with explicit angle and audio selection.
       Check moved media and duplicate filenames using the shared identity work.
+- [ ] **Qualify Resolve edit labels in Premiere 27.** Offline project writing
+      binds all 16 source colors to individual picture and mono audio edits
+      and reports palette substitutions. Check their display and editability
+      after Save As and reopen. [Timeline clip labels](RESOLVE-SOURCE-READER.md#resolve-to-premiere-timeline-clip-labels)
+- [ ] **Qualify Resolve track names, locks and picture output in Premiere 27.**
+      Offline project writing retains V1 and two mono track names and locks,
+      and writes disabled V1 as Premiere's video track output toggle.
+      Reopen the combined and disabled-picture controls, compare picture
+      and isolated PCM, and confirm toggling V1 restores the saved edits.
+      [Track state](RESOLVE-SOURCE-READER.md#resolve-to-premiere-track-state)
+- [ ] **Map Resolve timeline In/Out marks.** The internal Premiere probe can
+      report and omit them with `--accept-losses`. Qualify the inclusive
+      Resolve Out frame against Premiere's saved controls before mapping it.
+      [Linked Premiere probe](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
 
 ### Premiere → Avid
 
@@ -265,12 +297,15 @@ merged clips and a separate relink step in Media Composer. Any NLE has no
 end-to-end Avid destination route yet. [Adobe AAF export](https://helpx.adobe.com/premiere/desktop/render-and-export/export-files/export-aaf-files.html)
 
 - [ ] **Establish the shared native Avid destination.** Use the existing
-      AVB writer research to create a disposable bin with one sequence,
-      linked picture and two discrete mono lanes. Prove source file or
-      managed package identity, edit and track IDs, nonzero source and
-      sequence timecode, and independent channel assignment after Media
-      Composer saves and reopens the bin. Reuse this graph/2 preparation and
-      writer for both incoming routes.
+      AVB writer research for both incoming graph/2 routes, with **Link to
+      originals** as the default. Start with one same-rate sequence using
+      linked ProRes MOV picture and separate left and right selections from
+      a stereo PCM WAV at independent, nonzero trims. Use Avid-authored
+      links to establish the saved UME picture identity and the actual WAV
+      link provider. Compare file paths, reel, source and sequence timecode,
+      trims, and both channel assignments after Media Composer saves and
+      reopens the bin. Qualify existing Avid-managed OP-Atom packages
+      separately by verified package and sibling identity.
       [Destination architecture](ARCHITECTURE.md#adr-0004-more-programs-go-through-one-neutral-graph-2026-10-26)
 - [ ] **Qualify the Premiere input against its AAF control.** Reuse the
       Premiere reader for exact source ranges, saved locators, and audio
@@ -1201,8 +1236,15 @@ the **Creates new media.** notice.
       The internal probe compares saved V1 source frames around cuts and
       can check the corresponding frames in supplied renders. The retained
       fixtures verified exact trims, dissolve exclusion, and independent
-      mapping and picture results. Database repair, automated relinking,
-      grade transfer, and wider timing are separate research leads.
+      mapping and picture results. Cut sampling also supports saved
+      half speed and reverse at 24 fps and explicit graph/2 frame maps.
+      The optional full-frame scan detects cadence changes between cuts
+      and covers single-edit timelines. Qualified one-level Resolve
+      picture nests contribute child cuts and file-relative frame selections.
+      Qualified V1 multicam edits contribute selected camera frames and
+      saved angle gaps.
+      Database repair, automated relinking, grade transfer, and additional
+      retiming profiles are separate research leads.
       [Conform checks](RESOLVE-SOURCE-READER.md#check-conform-at-v1-cuts)
 
 - [x] **davinci-project-repair saved timeline selection** (`cbfcf62`).
@@ -1234,7 +1276,25 @@ the **Creates new media.** notice.
       reports saved blob byte ranges by exact object ID. The retained
       cross-format pair matched on timeline content despite rewritten IDs
       and a changed envelope. The straight-cut control isolated one added
-      dissolve. [Probe and checks](RESOLVE-SOURCE-READER.md#compare-saved-timelines-and-blobs)
+      dissolve. The comparison also checks track names, locks, V1
+      output, and separate audio and video In/Out marks. It distinguishes
+      a dropped frame-zero In from unchanged edit bounds.
+      It also checks saved speed, plain subtitle cues, and clip colors
+      on their paired edit occurrences. For V1 with two mono lanes,
+      it checks saved track gain, track mute, and main bus gain
+      independently of clip volume. It also compares qualified static
+      track pan and bypass, direct bus assignment, and Bus 2 gain and
+      mute. Supported static Fairlight EQ and dynamics are compared per
+      saved track or bus; unmapped mixer state remains visible as a gap.
+      The probe also compares saved V1 nest trims and bindings, with
+      unresolved child identity reported when archive IDs are rewritten.
+      It pairs multicam uses by occurrence or record position and checks
+      saved picture and mono audio selectors and their file bindings.
+      It also compares Solid Color and literal Text+ controls by track
+      and record position, with gaps for changed Fusion composition bytes.
+      Paired picture edits report changes to the qualified clip-local
+      primary gain node. Other grade profiles remain inconclusive.
+      [Probe and checks](RESOLVE-SOURCE-READER.md#compare-saved-timelines-and-blobs)
       · [Pinned drpEditor workflow](https://github.com/theRealAi/drpEditor/blob/c5bec57146507741f9f70fd16622d4f302ab5865/docs/reverse_engineering.md)
       · [Pinned DRP Toolkit comparison](https://github.com/koosoli/DaVinci-Resolve-DRP-Toolkit/blob/aadefac4810de59249b8a1980be459b136d5f412/drp_toolkit/plugins/diff.py)
 - [x] **CiprianSpiridon/davinci-resolve-mcp DRT format review** (Python,
@@ -1298,6 +1358,11 @@ and render for each conversion direction.
       cadence after Save As and reopen.
       Freeze, ramps, mixed-rate and pitch-preserving audio are separate.
       [Time-map codec](https://github.com/samuelgursky/davinci-resolve-mcp/blob/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/drp-format/media-timemap.js)
+- [ ] **Qualify writing odd-length 50% edits.** The Resolve reader
+      preserves the exact fractional source span on the retained
+      23-frame case. Compare a written and reopened project in each
+      editor against all 23 reference pictures before enabling output.
+      [Picture retiming profile](RESOLVE-SOURCE-READER.md#editable-conversion-profiles)
 - [x] **Plain captions and Solid Color.** Read and write one default
       subtitle track; two adjacent accented cues survived native Resolve
       reopen and rendered visibly. Support one opaque Solid Color at the

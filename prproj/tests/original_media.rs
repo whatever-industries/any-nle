@@ -98,7 +98,9 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         audio_edge_fades: Vec::new(),
         audio_crossfades: Vec::new(),
         audio_mixers: Default::default(),
+        track_states: Default::default(),
         picture_effects: Vec::new(),
+        edit_labels: Vec::new(),
         direct_dnxhr_origins: Default::default(),
         project_name: "Synthetic".into(),
         options: Options::default(),
@@ -236,6 +238,110 @@ fn sequence(events: Vec<Event>) -> Sequence {
         audio_crossfades: vec![],
         start: 0,
     }
+}
+
+#[test]
+fn track_state_keeps_locked_edits_and_does_not_mute_audio() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("track-state.prproj");
+    let mut input = input(original("prores_hq"));
+    let mut wav = original("wav24mono");
+    wav.metadata.id = "sound".into();
+    input.clips.push(PreparedClip::Original(wav));
+    input.bins[0].clips.push("sound".into());
+    let mut picture = event();
+    picture.stereo.clear();
+    let mut a1 = picture.clone();
+    a1.clip = "sound".into();
+    a1.video_track = None;
+    a1.audio_tracks = vec![1];
+    let mut a2 = a1.clone();
+    a2.audio_tracks = vec![2];
+    input.sequences.push(sequence(vec![picture, a1, a2]));
+    let states = vec![
+        PreparedTrackState {
+            audio_track: None, name: Some("Image & café".into()), locked: true, picture_disabled: true,
+        },
+        PreparedTrackState {
+            audio_track: Some(1), name: Some("Dialogue".into()), locked: false, picture_disabled: false,
+        },
+        PreparedTrackState {
+            audio_track: Some(2), name: Some("Dialogue".into()), locked: true, picture_disabled: false,
+        },
+    ];
+    let mut invalid = states.clone();
+    invalid[2].audio_track = Some(1);
+    input.track_states.insert(0, invalid);
+    let mut ids = SeededUuids::new("track-state");
+    assert!(prepare_typed_project(&input, &path, &mut ids, &[], false).is_err());
+    assert!(!path.exists());
+    let mut invalid = states.clone();
+    invalid[2].picture_disabled = true;
+    input.track_states.insert(0, invalid);
+    assert!(input.validate().is_err());
+    input.track_states.insert(0, states.clone());
+    prepare_typed_project(&input, &path, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&path).unwrap();
+    let project = prproj::model::Project::from_document(doc, &path).unwrap();
+    let seq = project.sequences()[0];
+    let video = project.video_tracks(seq);
+    let audio = project.audio_tracks(seq);
+    for (lane, (track, state)) in [video[0], audio[0], audio[1]].into_iter().zip(states).enumerate() {
+        assert_eq!(project.track_clips(track).len(), 1);
+        assert_eq!(project.is_locked(track).unwrap(), state.locked);
+        assert_eq!(project.is_muted(track).unwrap(), state.picture_disabled);
+        let tag = if lane == 0 { "VideoClipTrack" } else { "AudioClipTrack" };
+        let tree = &project.doc.tree;
+        let index = if lane == 0 { 0 } else { lane - 1 };
+        let node = tree.findall(project.doc.root, tag).unwrap().into_iter()
+            .find(|&track| tree.findtext(track, "ClipTrack/Track/Index").unwrap() == Some(index.to_string()))
+            .unwrap();
+        assert_eq!(tree.findtext(node, "ClipTrack/Track/Node/Properties/MZ.TrackName").unwrap(), state.name);
+    }
+    assert!(!project.is_locked(video[1]).unwrap());
+    assert!(!project.is_muted(video[1]).unwrap());
+}
+
+#[test]
+fn edit_labels_change_only_the_selected_clip_copy() {
+    let scratch = Scratch::new();
+    let mut input = input(original("prores_hq"));
+    let mut first = event();
+    first.stereo.clear();
+    let mut second = first.clone();
+    second.record_start = TICKS_PER_SECOND;
+    input.sequences.push(sequence(vec![first, second]));
+
+    let output = scratch.0.join("labeled.prproj");
+    let label = PreparedEditLabel { sequence: 0, event: 1, audio_track: None, index: 13 };
+    input.edit_labels.extend([label, label]);
+    assert!(prepare_typed_project(&input, &output, &mut SeededUuids::new("label"), &[], false).is_err());
+    assert!(!output.exists());
+    input.edit_labels.pop();
+    input.edit_labels[0].audio_track = Some(1);
+    assert!(input.validate().is_err());
+    input.edit_labels[0] = label;
+    prepare_typed_project(&input, &output, &mut SeededUuids::new("label"), &[], false)
+        .unwrap().publish().unwrap();
+
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&output).unwrap()).unwrap();
+    let project = prproj::model::Project::from_document(doc, &output).unwrap();
+    let track = project.video_tracks(project.sequences()[0])[0];
+    let items = project.track_clips(track);
+    assert_eq!(items.len(), 2);
+    let labels = |clip| {
+        let tree = &project.doc.tree;
+        let properties = tree.find(clip, "Clip/Node/Properties").unwrap().unwrap();
+        ["asl.clip.label.name", "asl.clip.label.color"]
+            .map(|field| tree.findtext(properties, field).unwrap().unwrap())
+    };
+    let first = project.track_item(items[0]);
+    let second = project.track_item(items[1]);
+    let master_ref = project.doc.tree.find(second.subclip, "MasterClip").unwrap().unwrap();
+    let master = project.doc.resolve(master_ref).unwrap();
+    let clip_ref = project.doc.tree.find(master, "Clips/Clip").unwrap().unwrap();
+    assert_eq!(labels(first.clip), labels(project.doc.resolve(clip_ref).unwrap()));
+    assert_eq!(labels(second.clip), ["BE.Prefs.LabelColors.13", "2579725"]);
 }
 
 #[test]

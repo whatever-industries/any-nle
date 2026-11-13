@@ -181,7 +181,10 @@ pub(crate) const PREMIERE_CAPTION_LOSS: &str = "premiere.caption";
 pub(crate) fn is_reviewable_loss(loss: &graph::Loss) -> bool {
     matches!(
         loss.aspect.as_str(),
-        "premiere.appearance" | "premiere.marker" | "text_appearance" | crate::premiere::CLIP_METADATA_LOSS
+        "premiere.appearance" | "premiere.marker" | "text_appearance"
+            | crate::premiere::CLIP_METADATA_LOSS | crate::premiere::CLIP_LABEL_LOSS
+            | crate::premiere::TIMELINE_MARK_LOSS
+            | crate::premiere::SYNC_LOCK_LOSS
     )
 }
 

@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 
 const MAX_COMPOSITION: usize = 256 << 10;
+pub(super) const ADAPTER: &str = "resolve.text_plus";
+pub(super) const APPEARANCE_LOSS: &str = "Resolve Text+ composition requires a destination mapping";
 
 fn inflate(encoded: &[u8], declared: usize) -> Option<Vec<u8>> {
     if declared > MAX_COMPOSITION {
@@ -151,7 +153,7 @@ pub(super) fn capture(
     });
     observations::append(
         graph,
-        "resolve.text_plus",
+        ADAPTER,
         sequence.id.as_str(),
         Value::Obj({
             fields.push(("id".into(), text(node.id()?)));
@@ -162,7 +164,7 @@ pub(super) fn capture(
         graph,
         node.id()?,
         "text_appearance",
-        "Resolve Text+ composition requires a destination mapping",
+        APPEARANCE_LOSS,
     );
     Ok(())
 }

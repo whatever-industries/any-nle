@@ -11,7 +11,7 @@ use super::{ItemId, MediaType, Project, TrackId, TrackItemId};
 use crate::build::time::Time;
 use crate::error::{not_implemented, value, Result};
 use crate::ids::UuidSource;
-use crate::xml::mutations::{insert_leaf_before, remove_child, set_elided_flag};
+use crate::xml::mutations::{append_leaf, insert_leaf_before, remove_child, set_elided_flag};
 use crate::xml::{NodeId, PremiereDocument, ReferenceIndex};
 
 /// `_MUTE_START_KEYFRAME`: the static keyframe of a muted audio track's `Mute` parameter.
@@ -152,6 +152,23 @@ impl Project {
     pub fn set_locked(&mut self, track: TrackId, locked: bool) -> Result<()> {
         let element = self.track_element(track)?;
         set_elided_flag(&mut self.doc.tree, element, "IsLocked", locked, "true")
+    }
+
+    /// Set the saved timeline track label, independent of the lane index.
+    pub(crate) fn set_custom_track_name(&mut self, track: TrackId, name: &str) -> Result<()> {
+        let element = self.track_element(track)?;
+        let tree = &mut self.doc.tree;
+        let bags = tree.findall(element, "Node/Properties")?;
+        let [bag] = bags.as_slice() else {
+            return value("track has no unique property bag");
+        };
+        let names = tree.findall(*bag, "MZ.TrackName")?;
+        match names.as_slice() {
+            [] => { append_leaf(tree, *bag, "MZ.TrackName", name); }
+            [node] if tree.is_childless(*node) => tree.set_text(*node, Some(name)),
+            _ => return value("track has no unique name field"),
+        }
+        Ok(())
     }
 
     /// `Track.is_sync_locked` (on unless `IsSyncLocked` is `false`).
