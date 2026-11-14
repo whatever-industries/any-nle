@@ -192,6 +192,7 @@ dependencies = [
  "anynle-graph",
  "avid-reader",
  "hex",
+ "png",
  "sha2",
 ]
 

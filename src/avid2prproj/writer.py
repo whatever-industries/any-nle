@@ -6,6 +6,7 @@ shapes are observed in User fixtures.
 """
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from itertools import chain
@@ -729,30 +730,45 @@ def write_project(model: Model, out_path: Path, *, media_relinks=(), native_op1a
         for m, start, note in extra_markers:
             mk.add_sequence_marker(sequence, m, start, options, report, note)
         for track_no, ms in sorted(filler_video.items()):
-            # Markers on empty video track space ride one-frame (or marker-length) adjustment
-            # layers on that track; the layer's own time equals sequence time.
             if track_no > len(vtracks):
                 raise UnverifiedShape(f"sequence {seq.name!r}: filler marker on missing video track {track_no}")
-            length = max(m.start + max(m.duration, unit) for m in ms)
+            track = vtracks[track_no - 1]
+            starts, ends = [], []
+            for start, end in sorted((c.start.ticks, c.end.ticks) for c in track.clips):
+                starts.append(start)
+                ends.append(max(ends[-1], end) if ends else end)
+            carried, spans = [], {}
+            for m in ms:
+                end = m.start + max(m.duration, unit)
+                at = bisect_left(starts, end)
+                if at and ends[at - 1] > m.start:
+                    note = f"on empty V{track_no}; marker carrier would overlap picture"
+                    mk.add_sequence_marker(sequence, m, m.start, options, report, note)
+                    report.notes.append(f"sequence {seq.name!r}: marker {m.name!r} kept on sequence; V{track_no} carrier would overlap picture")
+                else:
+                    carried.append(m)
+                    spans[m.start] = max(spans.get(m.start, end), end)
+            if not carried:
+                continue
+            length = max(spans.values())
             layer = mk.create_adjustment_layer(project, root, f"{seq.name} V{track_no} markers", unit, seq.width, seq.height,
                                                (display_format(seq.rate) if rewrapped else DISPLAY_FORMATS.get(unit, 100)), length)
             _move_to_processed_clips(project, [layer], root if destination_layout is not None else None)
-            spans: dict[int, int] = {}
-            for m in ms:
+            for m in carried:
                 mk.add_clip_marker(layer, m, m.start, options, report)
-                spans[m.start] = max(spans.get(m.start, unit), m.duration or unit)
-            last_end = -1
-            for start in sorted(spans):
-                end = start + spans[start]
-                if start < last_end:
-                    continue  # already covered by the previous instance
-                placed = vtracks[track_no - 1].add_clip(layer, Time(start))
+            merged = []
+            for start, end in sorted(spans.items()):
+                if merged and start < merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            for start, end in merged:
+                placed = track.add_clip(layer, Time(start))
                 placed.in_point = Time(start)
                 placed.out_point = Time(end)
                 placed.end = Time(end)
                 normalize_placement(placed)
-                last_end = end
-            report.notes.append(f"sequence {seq.name!r}: {len(ms)} marker(s) on empty V{track_no} carried by an adjustment layer")
+            report.notes.append(f"sequence {seq.name!r}: {len(carried)} marker(s) on empty V{track_no} carried by an adjustment layer")
         _order_track_items(project, sequence)
     if media_relinks:
         from .rewrap import apply

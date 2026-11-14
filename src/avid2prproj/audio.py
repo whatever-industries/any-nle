@@ -149,7 +149,8 @@ def set_track_level(project, track, db: float) -> None:
 def add_crossfade(track, fade: AudioCrossfade, style: str = "constant_power") -> None:
     """An audio crossfade over the cut at `fade.cut`, positioned exactly:
     Start = cut - offset, End = Start + duration, Alignment = offset.
-    `style`: "constant_power" (py_premiere's Premiere 26.3-verified shape) or "custom_fade"
+    `style`: "constant_gain" for the qualified linear mono shape, "constant_power"
+    (py_premiere's Premiere 26.3-verified shape), or "custom_fade"
     (what Premiere 26.5.2 saved for a Constant Power crossfade: MatchName/DisplayName
     "Custom Fade" plus FadeShapeValue 14; PRPROJ-0013). Which one 26.5.2 needs is unconfirmed."""
     from py_premiere import Time
@@ -159,7 +160,16 @@ def add_crossfade(track, fade: AudioCrossfade, style: str = "constant_power") ->
         raise ValueError(f"no cut at {fade.cut} ticks on {track.name}")
     if fade.cut_offset > outgoing.duration.ticks or fade.duration - fade.cut_offset > incoming.duration.ticks:
         raise ValueError(f"crossfade at {fade.cut} is longer than the clips around it")
-    transition = track.add_transition(incoming, "Constant Power", at_start=True, duration=Time(fade.duration))
+    name = "Constant Power"
+    if style == "constant_gain":
+        from py_premiere.models.track import _handle_after, _handle_before
+        after = fade.duration - fade.cut_offset
+        if fade.cut_offset <= 0 or after <= 0:
+            raise ValueError("prepared audio crossfade endpoints do not match the written cut")
+        if fade.cut_offset > _handle_before(incoming) or after > _handle_after(outgoing):
+            raise ValueError("prepared audio crossfade exceeds the available source handles")
+        name = "Constant Gain"
+    transition = track.add_transition(incoming, name, at_start=True, duration=Time(fade.duration), name=name)
     element = transition._element
     span = element.find("TransitionTrackItem/TrackItem")
     start = fade.cut - fade.cut_offset
@@ -182,5 +192,9 @@ def add_crossfade(track, fade: AudioCrossfade, style: str = "constant_power") ->
             previous = list(element)[-2]
             shape.tail, previous.tail = previous.tail, previous.tail
         shape.text = "14"
+    elif style == "constant_gain":
+        from py_premiere.xml.mutations import append_leaf
+        for tag in ("FadeShapeType", "FadeShapeValue"):
+            append_leaf(element, tag, "0")
     elif style != "constant_power":
         raise ValueError(f"unknown crossfade style {style!r}")

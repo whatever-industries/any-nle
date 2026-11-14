@@ -30,7 +30,8 @@ The prototype admits straight cuts on 1080p24 or 1080p23.976, a saved
 whole-frame origin, picture-only ProRes HQ MOV and 48 kHz PCM16/24 WAV.
 It follows the saved audio selector through its source reference, checks
 cached timing against the file, and admits independent mono selections on
-two tracks with a neutral stereo mix. Source and record ranges must agree.
+two tracks feeding one stereo Mix bus. The static mixer profile below
+defines which mixer controls transfer. Source and record ranges must agree.
 Premiere source bins retain panel ownership and stable IDs. Captions keep
 their content, lane and exact record span in graph/2. The reader captures
 sequence Comment markers with exact ticks and preserves bounded native
@@ -98,14 +99,88 @@ Disabling V1 leaves all picture edits and both mono routes in the project.
 
 Sync lock is distinct from edit lock. A disabled Premiere sync lock
 remains in `premiere.track_sync_lock` and requires approval to omit.
-Audio mute and non-neutral Premiere mixer controls still block the
-route. Invalid or duplicate track flags also block output.
+Invalid or duplicate track flags block output. Audio track mute is
+handled through the saved fader control described below.
 
 Offline variants of a retained Premiere 27 save kept accented text,
 duplicate audio track names, edit locks and a disabled V1. The archive
 read-back retained the original sequence origin, six edit ranges,
-physical WAV selectors and five sequence markers. Reopening and
-rendering the converted project in Resolve remain pending.
+physical WAV selectors and five sequence markers.
+
+Both variants were imported as separate Resolve Studio 21.2.0 build
+00006 projects, saved, closed, reopened, and re-exported. Resolve
+kept both identically named mono tracks and their separate edit locks.
+The archive comparison found only the V1 output toggle. V1 off rendered
+all 48 frames black with both picture edits still in place. Each isolated
+audio lane had 96,000 identical PCM24 sample frames with picture on
+and off. The saved selectors still identify the two distinct channels.
+
+### Premiere static audio mixer
+
+For V1 and two independent mono WAV lanes, the turnover keeps static
+Audio Track Mixer volume and mute on each track. The Premiere Mix fader
+becomes Resolve's main stereo bus fader. Track and bus gain use tenths
+of a decibel from −6 through 0 dB. Mute is independent of track gain,
+clip volume, and the original channel selector. Mixer automation,
+contradictory saved values, and gains outside this profile block output.
+
+The 23.976 control used a retained Premiere 27 save with its clip-edge
+transitions removed from a disposable copy. Resolve Studio 21.2.0 build
+00006 reopened it with A1 muted, track levels of −3 and −6 dB, and a
+−3.7 dB main bus. The saved mix matched isolated A2 exactly across all
+96,096 PCM24 sample frames. Re-enabling A1 reproduced the unmuted
+control, and each lane matched its expected gain within one PCM24 code
+value relative to the unity control.
+
+The internal route also preserves editable static track pan from Premiere's
+mono-to-stereo panner on A1 and A2. The saved hard-right default and explicit
+values map to Resolve's signed tenths of a percent. A retained Premiere 27
+save reopened in Resolve with hard left and right on the correct lanes, A1
+muted, and the saved clip, track, and Mix levels intact. The centered,
+swapped, and ±50% controls varied only the saved track pan on disposable
+copies of that project. Across 96,096 sample frames per lane, swapping hard
+pan swapped the output channels exactly. The interior PCM matched the trimmed
+source and saved gain within one PCM24 code value. Resolve applied its
+previously measured 72-sample ramps at the edit edges.
+
+At ±50%, the quieter channel measured about 27% of the louder channel in
+Resolve and 41% in the retained Premiere control. Review reports the use of
+Resolve's pan law for intermediate settings. Animated pan, other mixer
+routing, and linked pan combined with custom track state remain outside
+this profile.
+
+### Premiere clip-edge Constant Gain
+
+On the internal two-mono WAV route, a Constant Gain transition
+with one saved endpoint becomes an editable Resolve fade on that clip.
+Graph/2 keeps the original transition ID and length on the owning edit.
+The reader checks the lane list, the clip's head or tail reference, the
+alignment, and the exact record interval. The visible trims stay the same.
+The profile covers 24 and 23.976 fps, including both edges of one clip and
+static clip volume. Other fade curves and a crossfade on the same lane
+require separate mappings. Clip pan and unqualified clip processing on a
+faded edit block the conversion.
+
+The Premiere 27.0.0 build 88 control reopened in Resolve Studio 21.2.0
+with a six-frame tail on A1 and an eight-frame head on A2 at 23.976 fps.
+Both 96,096-sample PCM24 lanes match a fade-free copy sample for sample
+outside their fade intervals. The interiors follow the linear-amplitude
+curve within one PCM24 code value. A separate source variant put a
+12-frame head and an 18-frame tail on A1 with static clip, track and Mix
+gain, track pan, and A2 mute. Both fades and the mixer controls survived
+reopen, with all 48 picture frames matching the unfaded control.
+
+For fractional fades, graph/2 keeps the original Premiere tick lengths.
+Resolve stores them as fractional frame counts. The internal writer requires
+the conversion to recover the exact source tick and admit at least one audio
+sample per fade. On a disposable copy of a Premiere 27 reopened save with
+clip panners removed, the 23.976 head and tail lengths of 64,714,012,088 and
+86,625,055,551 ticks survived Resolve reopen and conversion back to saved
+Premiere XML. The independent WAV channels and static clip levels survived.
+Across 96,096 PCM24 sample frames per lane, the audio outside each fade
+matched a fade-free copy exactly. The interior linear-curve residual was
+at most 10 code values for the head and one for the tail. Fractional fades
+with custom curve points or volume keys remain unqualified.
 
 ## Premiere timeline clip labels
 
@@ -127,12 +202,64 @@ edit ranges and the nonzero timeline start. The Premiere label changes were
 made to a disposable project copy; a separate Premiere 27 authoring check
 for changed labels remains open.
 
+## Premiere Cross Dissolve
+
+The internal 1080p23.976 turnover maps one eight-frame V1 Cross Dissolve
+(Legacy) with left or centered alignment to an editable Resolve Cross
+Dissolve. The reader requires the outgoing clip's saved tail reference
+and the incoming clip's saved head reference to agree with the transition
+and cut. Preparation verifies the source handles and preserves the
+visible trims. The turnover reports the blend sampling difference by
+transition occurrence.
+
+The two retained Premiere 27 saves cut at record frame 24. After saving,
+closing, reopening, and re-exporting in Resolve Studio 21.2.0 build
+00006, both retained the cut, original links, audio selectors, and
+blend intervals of frames 16–23 and 20–27. All 48 decoded frames in
+each project matched its corresponding native Resolve control. Each
+isolated audio lane matched the Resolve straight-cut control across
+all 96,096 PCM24 sample frames. Premiere starts each blend with the
+outgoing image, while the Resolve blend is already visible on that frame.
+
+## Premiere Constant Gain crossfade
+
+The internal 1080p24 turnover maps one centered eight-frame Constant
+Gain transition on A1 to an editable Resolve Cross Fade 0DB. It verifies
+both saved clip references, the fade settings, and four frames of linked
+WAV source on each side of the cut. The visible trims and separate mono
+assignments survive. Other fade types and transition endpoints with clip
+processing require separate qualification.
+
+The retained Premiere 27 save came from the earlier Resolve-to-Premiere
+crossfade trial. After save, close, reopen, and re-export in Resolve
+Studio 21.2.0 build 00006, the transition kept its frame-24 cut and
+the eight-frame interval starting at frame 20. Each isolated lane
+matched the corresponding native Resolve PCM24 render across all
+96,000 sample frames. A2 also matched the straight-cut control.
+
+### Combined picture and audio transitions
+
+A 1080p24 timeline can carry one qualified V1 Cross Dissolve and one
+qualified A1 Constant Gain crossfade. Each transition keeps its own
+cut, clip references, and handles. Two transitions on the same lane
+are outside this profile.
+
+An offline Premiere fixture combined a centered picture cut at frame
+20 and a centered audio cut at frame 24. After saving and reopening
+in Resolve Studio 21.2.0 build 00006, both eight-frame transitions
+survived with all five visible edits. All 48 decoded pictures matched
+the picture-only transition control. Both isolated PCM24 renders
+matched the audio-only transition control across 96,000 sample frames
+per lane. The linked Resolve writer also reproduces the combined
+project from the saved graph of either editor.
+
 ## Premiere clip components
 
 For Premiere 27 project version 46, `--graph` includes a
 `premiere.component_parameters` sidecar on each edit with supported, saved
-clip controls. It carries Motion Position, Scale, Scale Width and Uniform
-Scale and the Level parameter of the Internal Volume Mono clip component.
+clip controls. It carries Motion Position, Scale, Scale Width, Uniform
+Scale, Rotation and four crop edges, plus the Level parameter of the Internal Volume Mono
+clip component.
 Parameter IDs are scoped to the Motion owner. Audio Level is identified by
 its parameter slot and carrier within the mono clip-volume owner.
 
@@ -153,7 +280,7 @@ underlying record shapes are pinned to PRPROJ-0030 and PRPROJ-0013.
 The source reader puts qualified static Motion in the edit's graph/2
 `transform` and static mono Level in `volume_db`. Resolve preparation
 reads those fields from the saved graph and verified media bindings.
-Static Motion requires a matched 1920×1080 square-pixel clip, neutral
+The position and scale profile requires a matched 1920×1080 square-pixel clip, neutral
 anchor, rotation, anti-flicker and crop, and scale between 87.5% and
 112.5%. Static mono Level maps to −6 through +3 dB in exact tenths with
 neutral clip mute. Resolve writes it on an independent PCM WAV lane.
@@ -166,6 +293,41 @@ neutral first key, and both Position and Scale keys on the first and last
 visible source frame. Resolve preparation checks the keys on the verified
 source frame grid. Other appearance remains a per-edit loss and requires
 `--accept-losses`.
+
+### Premiere Linear rotation with independent width
+
+On 1080p24, three aligned Linear keys on Position X, Scale Width, and
+Rotation map to editable Pan, Zoom X, and Rotation Angle. Scale Height,
+Position Y, pivot, crop, and anti-flicker remain neutral. The first and
+last keys must match the visible source bounds. Graph/2 retains both the
+original Premiere keys and the interpreted curves. The Resolve writer
+uses the interpreted source-frame times, with Premiere's clockwise
+rotation converted to Resolve's opposite sign.
+
+The retained Premiere 27.0.0 build 88 save supplied the Motion values.
+A disposable copy added an explicit one-hour timeline origin for the
+turnover reader. After saving and reopening the exported archive in
+Resolve Studio 21.2.0.0006, all nine keys survived. All 13 decoded frames
+matched the earlier Avid-to-Resolve render of the same edit.
+
+### Premiere centered static crop, scale, and rotation
+
+At 1080p24, the turnover reads isolated centered rotation and the
+centered crop profile with independent scale and clockwise rotation.
+The crop edges stay in source space. Graph/2 carries the saved
+Premiere percentages in the component receipt and the corresponding
+frame fractions on the edit. The crop limit accounts for the rounding
+observed in Premiere 27's saved percentages.
+
+A disposable copy of the retained Premiere 27 save added an explicit
+one-hour timeline origin. After archive reopen in Resolve Studio
+21.2.0.0006, the four edits retained editable crop, zoom, and rotation.
+All four decoded frames matched the earlier Avid-to-Resolve control
+exactly. All 28 measured chart points agreed with Avid within 0.09 px.
+Animated crop, displaced pivots, and other effect stacks require
+separate qualification in this direction.
+
+### Static Motion and volume trial
 
 An offline static-only variant of the retained Premiere 27 save matched
 the baseline turnover and the replay from saved graph/2 and media

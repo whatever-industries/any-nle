@@ -1,21 +1,25 @@
-//! Audio edit volume from the PVOL control-code 1000 lane (AVB-0005).
+//! Mono audio edit volume and pan from PVOL control codes 1000 and 2000 (AVB-0005).
 use super::*;
 use crate::io::Reader;
-use crate::source::{Rate, SourceEvent, VolumeAutomation, VolumePoint};
+use crate::source::{Automation, PanPoint, Rate, SourceEvent, VolumePoint};
 
 const MAX_KEYS: usize = 4096;
+const VOLUME: i64 = 1000;
+const PAN: i64 = 2000;
 
 #[derive(Debug)]
-pub(super) struct Capture {
+pub(super) struct Capture<P> {
     position: i64,
     length: Option<i64>,
     rate: Option<Rate>,
-    automation: VolumeAutomation,
+    automation: Automation<P>,
 }
 
-impl Capture {
-    pub(super) fn resolve(self, single: bool, event: &SourceEvent) -> VolumeAutomation {
-        if matches!(self.automation, VolumeAutomation::Keys(_))
+impl<P> Capture<P> {
+    pub(super) fn resolve(
+        self, single: bool, event: &SourceEvent, owner_error: &'static str,
+    ) -> Automation<P> {
+        if matches!(self.automation, Automation::Keys(_))
             && (!single
                 || event.event.combined.is_some()
                 || event.event.speed.is_some()
@@ -26,32 +30,69 @@ impl Capture {
                         || r.source_rate != r.record_rate
                 }))
         {
-            return VolumeAutomation::Unsupported(
-                "volume owner is not one exact same-rate mono edit",
-            );
+            return Automation::Unsupported(owner_error);
         }
         self.automation
     }
 }
 
-pub(super) fn capture(
+pub(super) fn capture_volume(
     ctx: &Ctx<'_>,
     node: &Node,
     tracks: &[&Node],
     position: i64,
     charge: impl FnOnce(usize) -> bool,
-) -> Option<Capture> {
-    if !tracks.iter().any(|t| int(t, "control_code") == Some(1000)) {
+) -> Option<Capture<VolumePoint>> {
+    capture(ctx, node, tracks, position, VOLUME, charge, |frame_numerator, frame_denominator, gain_q29| {
+        (1..=i32::MAX as i64).contains(&gain_q29)
+            .then_some(VolumePoint { frame_numerator, frame_denominator, gain_q29 })
+    })
+}
+
+pub(super) fn capture_pan(
+    ctx: &Ctx<'_>,
+    node: &Node,
+    tracks: &[&Node],
+    position: i64,
+    charge: impl FnOnce(usize) -> bool,
+) -> Option<Capture<PanPoint>> {
+    capture(ctx, node, tracks, position, PAN, charge, |frame_numerator, frame_denominator, raw_pan| {
+        (0..=32768).contains(&raw_pan)
+            .then_some(PanPoint { frame_numerator, frame_denominator, raw_pan })
+    })
+}
+
+fn capture<P>(
+    ctx: &Ctx<'_>,
+    node: &Node,
+    tracks: &[&Node],
+    position: i64,
+    code: i64,
+    charge: impl FnOnce(usize) -> bool,
+    make_point: impl Fn(i64, i64, i64) -> Option<P>,
+) -> Option<Capture<P>> {
+    if !tracks.iter().any(|t| int(t, "control_code") == Some(code)) {
         return None;
     }
     let length = int(node, "length");
     let rate = float(node, "edit_rate").and_then(Rate::from_avid);
     let keys = (|| {
+        let length_frames = length?;
+        let mut previous: Option<(i64, i64)> = None;
+        let mut point = |num: i64, den: i64, raw| {
+            if den <= 0 || num < 0 || i128::from(num) > i128::from(length_frames) * i128::from(den)
+                || previous.is_some_and(|(n, d)| i128::from(n) * i128::from(den) >= i128::from(num) * i128::from(d))
+            {
+                return None;
+            }
+            previous = Some((num, den));
+            make_point(num, den, raw)
+        };
         let [input, control] = tracks else {
             return None;
         };
         if int(input, "control_code").is_some()
-            || int(control, "control_code") != Some(1000)
+            || int(control, "control_code") != Some(code)
             || control.get("control_sub_code").is_some()
             || int(node, "is_trim_gain_effect") != Some(0)
         {
@@ -74,7 +115,7 @@ pub(super) fn capture(
         let Some(Value::List(inline)) = ctrl.get("control_points") else {
             return None;
         };
-        let points = if inline.is_empty() {
+        if inline.is_empty() {
             let attrs = ctx.deref(ctrl.get("attributes"))?;
             let Some(Value::Attrs(entries)) = attrs.get("entries") else {
                 return None;
@@ -85,7 +126,7 @@ pub(super) fn capture(
             if key != "SUBFRAME_AUDIO_CTLPTS" {
                 return None;
             }
-            subframe(bytes, charge)?
+            subframe(bytes, charge, point)
         } else {
             if !matches!(ctrl.get("attributes"), None | Some(Value::Null))
                 || !(2..=MAX_KEYS).contains(&inline.len())
@@ -94,35 +135,25 @@ pub(super) fn capture(
                 return None;
             }
             let mut points = Vec::with_capacity(inline.len());
-            for point in inline {
-                points.push(inline_point(point)?);
+            for value in inline {
+                let (num, den, raw) = inline_point(value)?;
+                points.push(point(num, den, raw)?);
             }
-            points
-        };
-        let length = length?;
-        let valid = points.iter().all(|k| {
-            k.frame_denominator > 0
-                && k.frame_numerator >= 0
-                && k.frame_numerator as i128 <= length as i128 * k.frame_denominator as i128
-                && (1..=i32::MAX as i64).contains(&k.gain_q29)
-        }) && points.windows(2).all(|w| {
-            (w[0].frame_numerator as i128 * w[1].frame_denominator as i128)
-                < w[1].frame_numerator as i128 * w[0].frame_denominator as i128
-        });
-        valid.then_some(points)
+            Some(points)
+        }
     })();
     Some(Capture {
         position,
         length,
         rate,
         automation: keys.map_or(
-            VolumeAutomation::Unsupported("unqualified PVOL control layout, clock or key data"),
-            VolumeAutomation::Keys,
+            Automation::Unsupported("unqualified PVOL control layout, clock or key data"),
+            Automation::Keys,
         ),
     })
 }
 
-fn inline_point(value: &Value) -> Option<VolumePoint> {
+fn inline_point(value: &Value) -> Option<(i64, i64, i64)> {
     let Value::Node(point) = value else {
         return None;
     };
@@ -132,10 +163,10 @@ fn inline_point(value: &Value) -> Option<VolumePoint> {
     let [Value::Int(frame_numerator), Value::Int(frame_denominator)] = offset.as_slice() else {
         return None;
     };
-    let Value::List(gain) = point.get("value")? else {
+    let Value::List(value) = point.get("value")? else {
         return None;
     };
-    let [Value::Int(gain_q29), Value::Int(1)] = gain.as_slice() else {
+    let [Value::Int(raw), Value::Int(1)] = value.as_slice() else {
         return None;
     };
     if int(point, "time_scale") != Some(1)
@@ -144,14 +175,13 @@ fn inline_point(value: &Value) -> Option<VolumePoint> {
     {
         return None;
     }
-    Some(VolumePoint {
-        frame_numerator: *frame_numerator,
-        frame_denominator: 1,
-        gain_q29: *gain_q29,
-    })
+    Some((*frame_numerator, 1, *raw))
 }
 
-fn subframe(bytes: &[u8], charge: impl FnOnce(usize) -> bool) -> Option<Vec<VolumePoint>> {
+fn subframe<P>(
+    bytes: &[u8], charge: impl FnOnce(usize) -> bool,
+    mut point: impl FnMut(i64, i64, i64) -> Option<P>,
+) -> Option<Vec<P>> {
     // This payload uses little-endian integers and literal tags independently of AVB framing.
     let mut r = Reader::new(bytes, 0, false);
     if r.bytes(4).ok()? != b"LsPt" || r.u32().ok()? != 1 {
@@ -168,15 +198,11 @@ fn subframe(bytes: &[u8], charge: impl FnOnce(usize) -> bool) -> Option<Vec<Volu
         }
         let frame_numerator = i64::from(r.s32().ok()?);
         let frame_denominator = i64::from(r.u32().ok()?);
-        let gain_q29 = i64::from(r.u32().ok()?);
+        let raw = i64::from(r.u32().ok()?);
         if r.u32().ok()? != 1 || r.u32().ok()? != 0 || r.u8().ok()? != 1 {
             return None;
         }
-        points.push(VolumePoint {
-            frame_numerator,
-            frame_denominator,
-            gain_q29,
-        });
+        points.push(point(frame_numerator, frame_denominator, raw)?);
     }
     Some(points)
 }

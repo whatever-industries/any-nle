@@ -1176,10 +1176,10 @@ fn read_mixer_controls(
     } else {
         None
     };
-    let linked_mutes = track_flags.filter(|_| track_state.is_none());
-    let linked_pans = mixer.linked_track_pans(linked_mutes);
+    let qualified_mixer = metadata.as_ref().unwrap_or(&mixer);
+    let linked_pans = mixer.linked_track_pans(track_flags.filter(|_| track_state.is_none()));
     let typed_gain_mute = typed_mixer_profile
-        && (linked_pans.is_some() || metadata.as_ref().unwrap_or(&mixer).qualified(linked_mutes));
+        && (linked_pans.is_some() || qualified_mixer.qualified(track_flags));
     if let Some((mut data, requires_mapping)) = mixer.source_facts(&tracks, typed_gain_mute, metadata.as_ref()) {
         if let (Some(pans), Value::Obj(fields)) = (linked_pans, &mut data) {
             fields.push((mixer::LINKED_TRACK_PANS.into(), Value::Arr(
@@ -1203,13 +1203,13 @@ fn read_mixer_controls(
     if !typed_mixer_profile {
         return Ok(MixerControls::default());
     }
-    let faders = mixer.track_faders().unwrap_or_default();
-    let main_bus = mixer.main_bus_fader().unwrap_or_default();
-    let has_mute_state = flags_muted || mixer.has_mute_state();
+    let faders = qualified_mixer.track_faders().unwrap_or_default();
+    let main_bus = qualified_mixer.main_bus_fader().unwrap_or_default();
+    let has_mute_state = flags_muted || qualified_mixer.has_mute_state();
     if faders == [0, 0] && main_bus == 0 && !has_mute_state {
         return Ok(MixerControls::default());
     }
-    let mutes = mixer.track_mutes();
+    let mutes = qualified_mixer.track_mutes();
     if !typed_gain_mute
         || (has_mute_state && (mutes.is_none() || mutes != track_flags))
         || !faders.into_iter().all(mixer::valid_ticks)
@@ -1768,6 +1768,13 @@ fn direct(
                         placement.effects.push(motion.readback());
                         true
                     }
+                    Some(crate::video::PictureControl::LinearRoll(roll))
+                        if grid.rate == Rational::integer(24) =>
+                    {
+                        placement.effects.push(roll.readback());
+                        true
+                    }
+                    Some(crate::video::PictureControl::LinearRoll(_)) => false,
                     None => false,
                 }
             }
@@ -1795,16 +1802,6 @@ fn direct(
                             receipt(graph, &placement.id, envelope.receipt());
                             loss(graph, &placement.id, aspect, reason);
                         }
-                    }
-                    if let Some([head, tail]) = audio.fractional_fades {
-                        receipt(graph, &placement.id, vec![
-                            ("fade_clock", text("clip_edges")),
-                            ("fade_shape", text("linear_amplitude")),
-                            ("fade_in_fractional_frames", Value::Float(head)),
-                            ("fade_out_fractional_frames", Value::Float(tail)),
-                        ]);
-                        let (aspect, reason) = crate::audio::FRACTIONAL_FADE_LOSS;
-                        loss(graph, &placement.id, aspect, reason);
                     }
                     true
                 } else {

@@ -4,9 +4,9 @@
 //! (`data/motion_template.xml`); the chain loses DefaultMotion/DefaultMotionComponentID.
 
 use super::model::Transform;
-use super::prepared::PictureEffect;
-use crate::build::time::Time;
-use crate::model::{component::set_param_keyframes, enums::KeyframeInterpolation, validators::Num};
+use super::prepared::{CornerPin, PictureEffect, WarpRollInterpolation};
+use crate::build::{leaf, time::Time, top};
+use crate::model::{component::{set_flat_bezier_keyframes, set_param_keyframes}, enums::KeyframeInterpolation, validators::Num};
 use crate::build::fmt::{format_lumetri_value, int_str, py_repr};
 use crate::error::{value, Result};
 use crate::ids::UuidSource;
@@ -15,6 +15,7 @@ use crate::xml::mutations::remove_child;
 use crate::xml::NodeId;
 
 const TEMPLATE: &str = include_str!("../../data/motion_template.xml");
+const ROUNDED_CROP_TEMPLATE: &str = include_str!("../../data/rounded_crop_template.xml");
 const POSITION: usize = 0;
 const SCALE: usize = 1;
 const SCALE_WIDTH: usize = 2;
@@ -54,6 +55,7 @@ pub fn apply_motion(project: &mut Project, placed: TrackItemId, transform: &Tran
 pub(super) fn apply_motion_keys(project: &mut Project, placed: TrackItemId, transform: &Transform,
     effect: Option<PictureEffect>, uuids: &mut dyn UuidSource) -> Result<Vec<String>> {
     let keys = match effect { Some(PictureEffect::Resize(keys)) => Some(keys), _ => None };
+    let roll = match effect { Some(PictureEffect::WarpRoll { keys, interpolation }) => Some((keys, interpolation)), _ => None };
     let trimmed = match effect {
         Some(PictureEffect::TrimmedWarp(trim) | PictureEffect::TrimmedResize(trim)) => Some(trim),
         _ => None,
@@ -85,7 +87,7 @@ pub(super) fn apply_motion_keys(project: &mut Project, placed: TrackItemId, tran
     let (ax, ay) = transform.anchor;
     set(project, params[ANCHOR], &format!("{}:{}", coord(0.5 + ax)?, coord(0.5 + ay)?))?;
     let (sx, sy) = transform.scale;
-    let uniform = trimmed.is_none() && sx == sy && keys.is_none_or(|keys| keys.iter().all(|k| k.scale[0] == k.scale[1]));
+    let uniform = roll.is_none() && trimmed.is_none() && sx == sy && keys.is_none_or(|keys| keys.iter().all(|k| k.scale[0] == k.scale[1]));
     set(project, params[SCALE], &format_lumetri_value(sy)?)?;
     set(project, params[SCALE_WIDTH], &format_lumetri_value(if uniform { 100.0 } else { sx })?)?;
     set(project, params[UNIFORM], if uniform { "true" } else { "false" })?;
@@ -128,6 +130,23 @@ pub(super) fn apply_motion_keys(project: &mut Project, placed: TrackItemId, tran
             }
         }
     }
+    if let Some((keys, interpolation)) = roll {
+        let tree = &mut project.doc.tree;
+        write_position_keys(tree, params[POSITION], &keys.map(|k| (k.ticks, [k.x, 0.0])), interpolation)?;
+        if interpolation == WarpRollInterpolation::FlatBezier {
+            set_flat_bezier_keyframes(tree, params[SCALE_WIDTH], &keys.map(|k| (Time::new(k.ticks), Num::Float(k.width))))?;
+            set_flat_bezier_keyframes(tree, params[ROTATION], &keys.map(|k| (Time::new(k.ticks), Num::Float(k.rotation))))?;
+        } else {
+            let interpolation = if interpolation == WarpRollInterpolation::Hold {
+                KeyframeInterpolation::Hold
+            } else {
+                KeyframeInterpolation::Linear
+            };
+            let scalar = |ticks, value| (Time::new(ticks), Num::Float(value), interpolation);
+            set_param_keyframes(tree, params[SCALE_WIDTH], &keys.map(|k| scalar(k.ticks, k.width)))?;
+            set_param_keyframes(tree, params[ROTATION], &keys.map(|k| scalar(k.ticks, k.rotation)))?;
+        }
+    }
 
     let placed_element = project.track_item(placed).element;
     let Some(chain_ref) = project.doc.tree.find(placed_element, "ClipTrackItem/ComponentOwner/Components")? else {
@@ -144,6 +163,13 @@ pub(super) fn apply_motion_keys(project: &mut Project, placed: TrackItemId, tran
 }
 
 fn set_position_keys(tree: &mut crate::xml::Tree, param: NodeId, keys: &[(i64, [f64; 2])]) -> Result<()> {
+    write_position_keys(tree, param, keys, WarpRollInterpolation::Linear)
+}
+
+fn write_position_keys(
+    tree: &mut crate::xml::Tree, param: NodeId, keys: &[(i64, [f64; 2])],
+    interpolation: WarpRollInterpolation,
+) -> Result<()> {
     let segment = |(start, a): (i64, [f64; 2]), (end, b): (i64, [f64; 2])| {
         let dx = b[0] - a[0];
         let dy = b[1] - a[1];
@@ -153,6 +179,12 @@ fn set_position_keys(tree: &mut crate::xml::Tree, param: NodeId, keys: &[(i64, [
     let mut records = String::new();
     for (i, &(ticks, position)) in keys.iter().enumerate() {
         let [x, y] = position.map(|n| 0.5 + n);
+        if interpolation == WarpRollInterpolation::Hold {
+            // Hold disables temporal interpolation and spatial handles.
+            records.push_str(&format!("{},{}:{},4,0,0,0.16666666666666666,0,0.33333333333333331,5,4,0,0,0,0;",
+                ticks, coord(x)?, coord(y)?));
+            continue;
+        }
         let (slope_in, in_x, in_y) = i.checked_sub(1).map_or((0.0, 0.0, 0.0), |prev| {
             let (speed, dx, dy) = segment(keys[prev], keys[i]);
             (speed, -dx / 6.0, -dy / 6.0)
@@ -161,8 +193,14 @@ fn set_position_keys(tree: &mut crate::xml::Tree, param: NodeId, keys: &[(i64, [
             let (speed, dx, dy) = segment(keys[i], next);
             (speed, dx / 6.0, dy / 6.0)
         });
-        records.push_str(&format!("{},{}:{},0,0,{},0.16666666666666666,{},0.16666666666666666,5,4,{},{},{},{};",
-            ticks, coord(x)?, coord(y)?, slope_in, slope_out, in_x, in_y, out_x, out_y));
+        if interpolation == WarpRollInterpolation::FlatBezier {
+            // Keep a straight spatial path while easing progress along it.
+            records.push_str(&format!("{},{}:{},5,0,0,0.4,0,0.4,5,4,{},{},{},{};",
+                ticks, coord(x)?, coord(y)?, in_x, in_y, out_x, out_y));
+        } else {
+            records.push_str(&format!("{},{}:{},0,0,{},0.16666666666666666,{},0.16666666666666666,5,4,{},{},{},{};",
+                ticks, coord(x)?, coord(y)?, slope_in, slope_out, in_x, in_y, out_x, out_y));
+        }
     }
     let start = tree.child_by_tag(param, "StartKeyframe").ok_or_else(|| crate::Error::Value("Motion Position start value is missing".into()))?;
     crate::xml::mutations::insert_leaf_before(tree, param, "StartKeyframe", "IsTimeVarying", "true")?;
@@ -177,6 +215,10 @@ fn set_position_keys(tree: &mut crate::xml::Tree, param: NodeId, keys: &[(i64, [
 }
 
 pub(super) fn apply_flip(project: &mut Project, placed: TrackItemId, horizontal: bool, vertical: bool) -> Result<()> {
+    apply_flip_at(project, placed, horizontal, vertical, 3)
+}
+
+fn apply_flip_at(project: &mut Project, placed: TrackItemId, horizontal: bool, vertical: bool, first_id: usize) -> Result<()> {
     let element = project.track_item(placed).element;
     let reference = project.doc.tree.find1(element, "ClipTrackItem/ComponentOwner/Components")
         .ok_or_else(|| crate::Error::Value("flip placement has no component chain".into()))?;
@@ -189,12 +231,112 @@ pub(super) fn apply_flip(project: &mut Project, placed: TrackItemId, horizontal:
         let inner = tree.sub_element(component, "Component", &[("Version", "7")]);
         tree.set_text(inner, Some("\n\t\t\t"));
         tree.set_tail(inner, Some("\n\t\t"));
-        crate::build::leaf(tree, inner, "ID", &(i + 3).to_string(), "\n\t\t\t");
+        crate::build::leaf(tree, inner, "ID", &(i + first_id).to_string(), "\n\t\t\t");
         crate::build::leaf(tree, inner, "DisplayName", name, "\n\t\t");
         crate::build::leaf(tree, component, "VideoFilterType", "2", "\n\t\t");
         crate::build::leaf(tree, component, "MatchName", match_name, "\n\t");
         project.register(component)?;
         append_component(project, chain, component)?;
+    }
+    Ok(())
+}
+
+pub(super) fn apply_corner_pin(
+    project: &mut Project, placed: TrackItemId, pin: CornerPin, uuids: &mut dyn UuidSource,
+) -> Result<()> {
+    apply_corner_pin_at(project, placed, pin, uuids, 3)
+}
+
+pub(super) fn apply_corner_pin_with_flop(
+    project: &mut Project, placed: TrackItemId, pin: CornerPin, flop_before_pin: bool,
+    uuids: &mut dyn UuidSource,
+) -> Result<()> {
+    // Premiere renders these standard components in reverse saved-list order.
+    // Keep crop adjacent to the pin so it still acts in the pin's input space.
+    if flop_before_pin {
+        apply_corner_pin_at(project, placed, pin, uuids, 3)?;
+        apply_flip_at(project, placed, true, false, if pin.source_crop == [0.0; 4] { 4 } else { 5 })
+    } else {
+        apply_flip_at(project, placed, true, false, 3)?;
+        apply_corner_pin_at(project, placed, pin, uuids, 4)
+    }
+}
+
+fn apply_corner_pin_at(
+    project: &mut Project, placed: TrackItemId, pin: CornerPin, uuids: &mut dyn UuidSource,
+    first_id: usize,
+) -> Result<()> {
+    let item = project.track_item(placed).element;
+    let reference = project.doc.tree.find1(item, "ClipTrackItem/ComponentOwner/Components")
+        .ok_or_else(|| crate::Error::Value("Corner Pin placement has no component chain".into()))?;
+    let chain = project.doc.resolve(reference)?;
+    let [left, top_crop, right, bottom] = pin.source_crop;
+    let cropped = pin.source_crop != [0.0; 4];
+    let crop_component = if cropped {
+        let fragment = project.doc.tree.parse_fragment(ROUNDED_CROP_TEMPLATE)?;
+        let spliced = project.splice(fragment, uuids)?;
+        let crop = spliced.get("VideoFilterComponent")
+            .ok_or_else(|| crate::Error::Value("Rounded Crop template has no component".into()))?;
+        let mut changed = 0;
+        for reference in project.doc.tree.findall(crop, "Component/Params/Param")? {
+            let param = project.doc.resolve(reference)?;
+            let value = match project.doc.tree.findtext(param, "ParameterID")?.as_deref() {
+                Some("8182") => coord(left * 100.0)?,
+                Some("8183") => coord(right * 100.0)?,
+                Some("8184") => coord(top_crop * 100.0)?,
+                Some("8185") => coord(bottom * 100.0)?,
+                Some("8187") => "0".into(), // Square corners.
+                // Crop shrinks around the center. Move the matte to the center
+                // of the saved source rectangle without moving the picture.
+                Some("8188") => format!("{}:{}", coord((left - right) / 2.0)?, coord((top_crop - bottom) / 2.0)?),
+                _ => continue,
+            };
+            set(project, param, &value)?;
+            changed += 1;
+        }
+        if changed != 6 {
+            return value("Rounded Crop template is missing required controls");
+        }
+        let id = project.doc.tree.find1(crop, "Component/ID")
+            .ok_or_else(|| crate::Error::Value("Rounded Crop template has no component ID".into()))?;
+        project.doc.tree.set_text(id, Some((first_id + 1).to_string()));
+        Some(crop)
+    } else {
+        None
+    };
+    let [tl, tr, br, bl] = pin.corners;
+    let tree = &mut project.doc.tree;
+    let effect = top(tree, "VideoFilterComponent", "d10da199-beea-4dd1-b941-ed3a78766d50", "9", None);
+    let inner = tree.sub_element(effect, "Component", &[("Version", "7")]);
+    let params = tree.sub_element(inner, "Params", &[("Version", "1")]);
+    tree.set_text(inner, Some("\n\t\t\t"));
+    tree.set_tail(inner, Some("\n\t\t"));
+    tree.set_text(params, Some("\n\t\t\t\t"));
+    tree.set_tail(params, Some("\n\t\t\t"));
+    leaf(tree, inner, "ID", &first_id.to_string(), "\n\t\t\t");
+    leaf(tree, inner, "DisplayName", "Corner Pin", "\n\t\t");
+    leaf(tree, effect, "VideoFilterType", "2", "\n\t\t");
+    leaf(tree, effect, "MatchName", "AE.ADBE Corner Pin", "\n\t");
+    project.register(effect)?;
+    for (index, (name, [x, y])) in [
+        ("Upper Left", tl), ("Upper Right", tr), ("Lower Left", bl), ("Lower Right", br),
+    ].into_iter().enumerate() {
+        let tree = &mut project.doc.tree;
+        let param = top(tree, "PointComponentParam", "ca81d347-309b-44d2-acc7-1c572efb973c", "4", None);
+        leaf(tree, param, "Name", name, "\n\t\t");
+        leaf(tree, param, "ParameterID", &(index + 1).to_string(), "\n\t\t");
+        let start = format!("-91445760000000000,{}:{},0,0,0,0,0,0,5,4,0,0,0,0", coord(x)?, coord(y)?);
+        leaf(tree, param, "StartKeyframe", &start, "\n\t");
+        let id = project.register(param)?;
+        let tree = &mut project.doc.tree;
+        let reference = tree.sub_element(params, "Param", &[("Index", &index.to_string()), ("ObjectRef", &id)]);
+        tree.set_tail(reference, Some(if index == 3 { "\n\t\t\t" } else { "\n\t\t\t\t" }));
+    }
+    append_component(project, chain, effect)?;
+    // Premiere 27 renders this pair as crop then pin when the pin precedes
+    // Rounded Crop in the saved component list. The other order clips the output.
+    if let Some(crop) = crop_component {
+        append_component(project, chain, crop)?;
     }
     Ok(())
 }

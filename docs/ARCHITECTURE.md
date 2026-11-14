@@ -1,7 +1,10 @@
 # Architecture decisions
 
-Current source/target boundary: [ADR-0005](#adr-0005-qualified-source-graph-and-explicit-destination-preparation-2026-11-05).
-Earlier decisions below are dated history; the standalone legacy interfaces remain available.
+Start with [source graph and destination preparation](SOURCE-GRAPH-MIGRATION.md#boundaries)
+for the current pipeline and [CONTRIBUTING.md](../CONTRIBUTING.md#find-the-code)
+for the crate map. [ADR-0005](#adr-0005-qualified-source-graph-and-explicit-destination-preparation-2026-11-05)
+records the current boundary. The earlier decisions document the original
+design and the standalone compatibility interfaces.
 
 ## ADR-0001: The JSON edit model is the boundary; Rust is the long-term language (2026-10-14)
 

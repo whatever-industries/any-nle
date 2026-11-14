@@ -160,6 +160,36 @@ pub struct PreparedAudioCrossfade {
     pub before_cut: i64,
 }
 
+pub const MAX_AUDIO_PAN_KEYS: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioPanKey {
+    /// Absolute time on the file's Premiere source clock.
+    pub ticks: i64,
+    /// Normalized panner position from full left (0) to full right (1).
+    pub value: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedAudioPan {
+    pub sequence: usize,
+    pub event: usize,
+    pub track: i64,
+    pub keys: Vec<AudioPanKey>,
+}
+
+pub fn is_mono_pcm24_wav(clip: &OriginalClip) -> bool {
+    clip.container == "wav" && clip.video.is_none()
+        && clip.audio.as_ref().is_some_and(|audio| audio.channels == 1
+            && audio.sample_rate == 48_000 && audio.representation == SampleRepresentation::Pcm24)
+        && matches!((clip.channels.as_slice(), clip.groups.as_slice()),
+            ([channel], [group]) if group.as_slice() == [channel.avid_track])
+}
+
+pub fn qualifies_audio_pan(clip: &OriginalClip) -> bool {
+    is_mono_pcm24_wav(clip) && clip.channels[0].gain_db == 0.0
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedProjectInput {
     pub project_name: String,
@@ -171,16 +201,219 @@ pub struct PreparedProjectInput {
     pub video_dissolves: Vec<PreparedVideoDissolve>,
     pub audio_edge_fades: Vec<PreparedAudioEdgeFade>,
     pub audio_crossfades: Vec<PreparedAudioCrossfade>,
+    pub audio_pans: Vec<PreparedAudioPan>,
     pub audio_mixers: BTreeMap<usize, PreparedAudioMixer>,
     pub track_states: BTreeMap<usize, Vec<PreparedTrackState>>,
     pub picture_effects: Vec<PreparedPictureEffect>,
     /// A label on one placed clip, independent of its source item.
     pub edit_labels: Vec<PreparedEditLabel>,
-    /// Verified direct DNxHR LB clip IDs and their physical media start ticks.
+    /// Verified direct DNx OP-Atom clip IDs and their physical media start ticks.
     /// The legacy clip fields carry the effective logging timecode.
     pub direct_dnxhr_origins: std::collections::HashMap<String, i64>,
+    pub constant_speeds: Vec<PreparedConstantSpeed>,
     pub multicams: Vec<super::multicam::PreparedMulticam>,
     pub multicam_uses: Vec<super::multicam::PreparedMulticamUse>,
+    pub picture_subclips: Vec<PreparedPictureSubclip>,
+    pub av_subclips: Vec<PreparedAvSubclip>,
+    pub av_subclip_uses: Vec<PreparedAvSubclipUse>,
+    pub picture_nests: Vec<PreparedPictureNest>,
+    pub png_mattes: PreparedPngMattes,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PreparedPngMattes {
+    pub stills: Vec<PreparedPngStill>,
+    pub edits: Vec<PreparedPngEdit>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedPngStill {
+    pub bin: usize,
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub alpha: PngAlpha,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PngAlpha {
+    Ignore,
+    Straight { invert: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedPngEdit {
+    pub sequence: usize,
+    pub start: i64,
+    pub background: usize,
+    pub foreground: Option<usize>,
+}
+
+impl PreparedPngMattes {
+    pub(super) fn validate(&self, input: &PreparedProjectInput) -> Result<(), ModelError> {
+        let invalid = || ModelError("invalid PNG Matte Key source, edit clock or ownership".into());
+        if self.edits.is_empty() && self.stills.is_empty() {
+            return Ok(());
+        }
+        if input.options.bin_mode != "separate" || self.edits.is_empty()
+            || self.edits.len() > 10_000 || self.stills.len() > 10_000
+        {
+            return Err(invalid());
+        }
+        for still in &self.stills {
+            if still.bin >= input.bins.len() || !still.path.is_absolute()
+                || !still.path.extension().and_then(|s| s.to_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case("png"))
+            {
+                return Err(invalid());
+            }
+            super::model::check_text(&still.name, "imported PNG", 4096, false)?;
+        }
+        let mut occupied = HashSet::new();
+        let text_sequences: HashSet<_> = input.texts.iter().map(|t| t.sequence).collect();
+        let mut children = 0usize;
+        let rate = Fraction::new(24, 1);
+        let frame = ticks_per_unit(rate);
+        for edit in &self.edits {
+            let seq = input.sequences.get(edit.sequence).ok_or_else(invalid)?;
+            let background = self.stills.get(edit.background).ok_or_else(invalid)?;
+            if seq.rate != rate || (seq.width, seq.height) != (1920, 1080)
+                || seq.start < 0 || seq.start % frame != 0
+                || !seq.events.is_empty() || !seq.track_levels.is_empty() || !seq.audio_crossfades.is_empty()
+                || text_sequences.contains(&edit.sequence)
+                || edit.start < 0 || edit.start % frame != 0
+                || edit.start.checked_add(frame).and_then(|end| seq.start.checked_add(end)).is_none()
+                || !occupied.insert((edit.sequence, edit.start, 1))
+                || background.alpha != PngAlpha::Ignore
+            {
+                return Err(invalid());
+            }
+            if let Some(foreground) = edit.foreground {
+                match self.stills.get(foreground).ok_or_else(invalid)?.alpha {
+                    PngAlpha::Ignore if occupied.insert((edit.sequence, edit.start, 2)) => {}
+                    PngAlpha::Straight { .. } => children += 1,
+                    _ => return Err(invalid()),
+                }
+            }
+        }
+        if input.sequences.len() + children > 10_000 {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
+/// An editable picture retime whose signed playback rate and raw source
+/// coordinates have a qualified Premiere mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedConstantSpeed {
+    pub sequence: usize,
+    pub event: usize,
+    /// Signed source frames per output frame.
+    pub ratio: (i64, i64),
+}
+
+impl PreparedConstantSpeed {
+    pub(super) fn raw_trim(self, seq: &Sequence, event: &Event, clip: &Clip) -> Option<(i64, i64)> {
+        let video = clip.video.as_ref()?;
+        let rate = Fraction::new(24, 1);
+        let frame = ticks_per_unit(rate);
+        let (saved, source_frames) = match self.ratio {
+            (1, 2) => ((2, 1), 25),
+            (2, 1) => ((50, 99), 99),
+            (-1, 1) => ((-1, 1), 50),
+            _ => return None,
+        };
+        if seq.rate != rate || video.rate != rate || video.codec != "AVdn"
+            || (seq.width, seq.height) != (1920, 1080)
+            || (video.width, video.height) != (1920, 1080)
+            || video.start != 0 || video.duration % frame != 0
+            || event.video_track.is_none() || !event.audio_tracks.is_empty() || !event.stereo.is_empty()
+            || event.time_remap.is_some() || event.speed_ratio != Some(saved)
+            || event.source_duration != Some(source_frames * frame) || event.duration != 50 * frame
+            || event.record_start < 0 || event.record_start % frame != 0
+            || event.source_in < 0 || event.source_in % frame != 0
+        {
+            return None;
+        }
+        let end = event.source_in.checked_add(source_frames * frame)?;
+        if end > video.duration {
+            return None;
+        }
+        Some(if self.ratio.0 < 0 {
+            (video.duration - end, video.duration - event.source_in)
+        } else {
+            (event.source_in, end)
+        })
+    }
+}
+
+pub(super) fn validate_constant_speeds(
+    speeds: &[PreparedConstantSpeed], options: &Options, sequences: &[Sequence],
+    mut clip: impl FnMut(&str, &Sequence, &Event, PreparedConstantSpeed) -> bool,
+) -> Result<(), ModelError> {
+    let mut owners = HashSet::new();
+    for &speed in speeds {
+        let valid = options.bin_mode == "separate"
+            && owners.insert((speed.sequence, speed.event))
+            && sequences.get(speed.sequence).is_some_and(|seq| {
+                seq.events.get(speed.event).is_some_and(|event| clip(&event.clip, seq, event, speed))
+            });
+        if !valid {
+            return Err(ModelError("invalid prepared constant speed, source range, or edit owner".into()));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedPictureNest {
+    pub sequence: usize,
+    pub event: usize,
+}
+
+pub fn plain_picture_edit(edit: &Event) -> bool {
+    edit.video_track == Some(1) && edit.audio_tracks.is_empty() && edit.stereo.is_empty()
+        && edit.speed_ratio.is_none() && edit.source_duration.is_none() && edit.time_remap.is_none()
+        && edit.transform.is_none() && edit.matte.is_none() && edit.color_correction.is_none()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPictureSubclip {
+    pub bin: usize,
+    pub parent_clip: String,
+    pub name: String,
+    /// Exclusive file-relative bounds in Premiere ticks.
+    pub start: i64,
+    pub end: i64,
+}
+
+/// A reusable V1/A1/A2 item with file-relative bounds in Premiere ticks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedAvSubclip {
+    pub bin: usize,
+    pub parent_clip: String,
+    pub name: String,
+    pub start: i64,
+    pub end: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedAvSubclipUse {
+    pub sequence: usize,
+    pub event: usize,
+    /// None selects picture. Some selects a destination mono track.
+    pub audio_track: Option<i64>,
+    pub subclip: usize,
+}
+
+pub fn av_subclip_edit_fits(sequence: &Sequence, event: &Event, parent: &Clip, subclip: &PreparedAvSubclip) -> bool {
+    let Some(picture) = &parent.video else { return false };
+    let unit = ticks_per_unit(picture.rate);
+    event.clip == parent.id && sequence.rate == picture.rate
+        && event.speed_ratio.is_none() && event.time_remap.is_none() && event.stereo.is_empty()
+        && event.source_in >= subclip.start && event.source_in % unit == 0
+        && event.duration > 0 && event.duration % unit == 0
+        && event.source_in.checked_add(event.duration).is_some_and(|end| end <= subclip.end)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +452,21 @@ pub struct MotionKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WarpRollKey {
+    pub ticks: i64,
+    pub x: f64,
+    pub width: f64,
+    pub rotation: f64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarpRollInterpolation {
+    Linear,
+    Hold,
+    /// Zero slopes and temporal handles of 40% of the adjacent key span.
+    FlatBezier,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrimmedMotionKey {
     pub ticks: i64,
     pub position: [f64; 2],
@@ -243,10 +491,36 @@ impl TrimmedMotion {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PictureEffect {
     Flip { horizontal: bool, vertical: bool },
+    CornerPin(CornerPin),
+    /// One horizontal reflection and one static pin, in source render order.
+    CornerPinWithFlop { pin: CornerPin, flop_before_pin: bool },
     StaticMotion,
     Resize([MotionKey; 2]),
+    WarpRoll { keys: [WarpRollKey; 3], interpolation: WarpRollInterpolation },
     TrimmedWarp(TrimmedMotion),
     TrimmedResize(TrimmedMotion),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CornerPin {
+    /// Full-image edge coordinates in TL, TR, BR, BL order.
+    pub corners: [[f64; 2]; 4],
+    /// Left, top, right and bottom margins, before the pin.
+    pub source_crop: [f64; 4],
+}
+
+impl CornerPin {
+    pub fn is_valid(self) -> bool {
+        let [left, top, right, bottom] = self.source_crop;
+        self.source_crop.iter().all(|v| (0.0..1.0).contains(v))
+            && left + right < 1.0
+            && top + bottom < 1.0
+            && self.corners.iter().flatten().all(|v| (-1.0..=2.0).contains(v))
+            && (0..4).all(|i| {
+                let [a, b, c] = [self.corners[i], self.corners[(i + 1) % 4], self.corners[(i + 2) % 4]];
+                (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) > 1e-9
+            })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -271,6 +545,14 @@ pub(super) fn validate_picture_effects(effects: &[PreparedPictureEffect], sequen
             return Err(fail("a reflection before Motion needs a Motion stage"));
         }
         match p.effect {
+            PictureEffect::CornerPin(pin) | PictureEffect::CornerPinWithFlop { pin, .. } if pin.is_valid()
+                && sequence.rate == Fraction::new(24, 1)
+                && (sequence.width, sequence.height) == (1920, 1080)
+                && p.reflection_before_motion == [false; 2]
+                && event.transform.is_none() && event.matte.is_none() && event.color_correction.is_none()
+                && event.speed_ratio.is_none() && event.time_remap.is_none() => {}
+            PictureEffect::CornerPin(_) | PictureEffect::CornerPinWithFlop { .. } =>
+                return Err(fail("invalid static Corner Pin or unqualified effect stack")),
             PictureEffect::Flip { horizontal, vertical }
                 if (horizontal || vertical) && event.transform.is_none()
                     && event.matte.is_none() && event.color_correction.is_none() => {}
@@ -281,6 +563,21 @@ pub(super) fn validate_picture_effects(effects: &[PreparedPictureEffect], sequen
                 && t.crop[0] + t.crop[2] < 1.0 && t.crop[1] + t.crop[3] < 1.0)
                 && event.matte.is_none() && event.color_correction.is_none()
                 && event.speed_ratio.is_none() && event.time_remap.is_none() => {}
+            PictureEffect::WarpRoll { keys, .. } => {
+                let frame = ticks_per_unit(Fraction::new(24, 1));
+                let end = event.source_in.checked_add(event.duration).and_then(|n| n.checked_sub(frame));
+                let [a, b, c] = keys.map(|k| k.ticks);
+                if sequence.rate != Fraction::new(24, 1) || (sequence.width, sequence.height) != (1920, 1080)
+                    || event.transform.is_some() || event.matte.is_some() || event.color_correction.is_some()
+                    || event.speed_ratio.is_some() || event.time_remap.is_some() || p.reflection_before_motion != [false; 2]
+                    || a != event.source_in || a < 0 || Some(c) != end || !(a < b && b < c)
+                    || [a, b, c].iter().any(|v| v % frame != 0)
+                    || keys.iter().any(|k| !(-60.0/999.0..=90.0/999.0).contains(&k.x)
+                        || !(70.0..=100.0).contains(&k.width) || !(-15.0..=25.0).contains(&k.rotation))
+                {
+                    return Err(fail("invalid Warp Rotation keys or picture stack"));
+                }
+            }
             PictureEffect::Resize(keys) => {
                 check_rate(sequence.rate, "Resize sequence rate")?;
                 let frame = ticks_per_unit(sequence.rate);
@@ -450,6 +747,98 @@ pub fn validate_texts(texts: &[PreparedText], sequences: &[Sequence]) -> Result<
     Ok(())
 }
 impl PreparedProjectInput {
+    fn validate_picture_nests(&self, clips: &HashMap<&str, &PreparedClip>) -> Result<(), ModelError> {
+        let fail = || ModelError("invalid prepared picture nest, source clock, or edit owner".into());
+        if self.picture_nests.is_empty() {
+            return Ok(());
+        }
+        if self.options.bin_mode != "separate" || self.sequences.len().saturating_add(self.picture_nests.len()) > 10_000 {
+            return Err(fail());
+        }
+        let mut owners = HashSet::new();
+        for nest in &self.picture_nests {
+            if !owners.insert((nest.sequence, nest.event)) {
+                return Err(fail());
+            }
+            let seq = self.sequences.get(nest.sequence).ok_or_else(fail)?;
+            let event = seq.events.get(nest.event).ok_or_else(fail)?;
+            let Some(PreparedClip::Legacy(clip)) = clips.get(event.clip.as_str()).copied() else { return Err(fail()); };
+            let Some(video) = &clip.video else { return Err(fail()); };
+            let rate = Fraction::new(24_000, 1001);
+            let unit = ticks_per_unit(rate);
+            if !plain_picture_edit(event) || seq.rate != rate || video.rate != rate
+                || (seq.width, seq.height) != (1920, 1080) || (video.width, video.height) != (1920, 1080)
+                || seq.start <= 0 || seq.start % unit != 0
+                || event.record_start < 0 || event.record_start % unit != 0
+                || event.record_start.checked_add(event.duration).is_none()
+                || seq.start.checked_add(event.record_start).is_none()
+                || event.source_in < 0 || event.source_in % unit != 0
+                || event.duration <= 0 || event.duration % unit != 0
+                || event.source_in.checked_add(event.duration).is_none_or(|end| end > video.duration)
+                || !self.direct_dnxhr_origins.contains_key(&event.clip)
+            {
+                return Err(fail());
+            }
+        }
+        let used = |sequence, event| owners.contains(&(sequence, event));
+        if self.multicam_uses.iter().any(|e| used(e.sequence, e.event))
+            || self.av_subclip_uses.iter().any(|e| used(e.sequence, e.event))
+            || self.picture_effects.iter().any(|e| used(e.sequence, e.event))
+            || self.edit_labels.iter().any(|e| used(e.sequence, e.event))
+            || self.video_dissolves.iter().any(|e| used(e.sequence, e.incoming) || used(e.sequence, e.outgoing))
+            || self.sequences.iter().enumerate().any(|(si, seq)| seq.markers.iter().any(|m| {
+                m.owner == "edit" && m.event.and_then(|i| usize::try_from(i).ok()).is_some_and(|ei| used(si, ei))
+            }))
+        {
+            return Err(fail());
+        }
+        Ok(())
+    }
+
+    fn validate_audio_pans(&self, clips: &HashMap<&str, &PreparedClip>) -> Result<(), ModelError> {
+        if self.audio_pans.is_empty() {
+            return Ok(());
+        }
+        let fail = || ModelError("invalid prepared mono clip pan or source clock".into());
+        if self.audio_pans.len() > MAX_ITEMS {
+            return Err(fail());
+        }
+        let fades: HashSet<_> = self.audio_edge_fades.iter()
+            .map(|fade| (fade.sequence, fade.event, fade.track)).collect();
+        let crossfades: HashSet<_> = self.audio_crossfades.iter()
+            .flat_map(|fade| [fade.outgoing, fade.incoming].map(|edit| (fade.sequence, edit, fade.track)))
+            .collect();
+        let mut seen = HashSet::new();
+        for pan in &self.audio_pans {
+            let seq = self.sequences.get(pan.sequence).ok_or_else(fail)?;
+            let event = seq.events.get(pan.event).ok_or_else(fail)?;
+            let owner = (pan.sequence, pan.event, pan.track);
+            let end = event.source_in.checked_add(event.duration).ok_or_else(fail)?;
+            if self.options.bin_mode != "separate" || seq.rate != Fraction::new(24, 1)
+                || (seq.width, seq.height) != (1920, 1080)
+                || !seen.insert(owner) || fades.contains(&owner) || crossfades.contains(&owner)
+                || self.audio_mixers.get(&pan.sequence).and_then(|mixer| mixer.mono_track_pans).is_some()
+                || !matches!(clips.get(event.clip.as_str()), Some(PreparedClip::Original(clip))
+                    if qualifies_audio_pan(clip) && clip.audio.as_ref().is_some_and(|a| end <= a.duration))
+                || !(1..=99).contains(&pan.track) || event.audio_tracks != [pan.track]
+                || event.video_track.is_some() || !event.stereo.is_empty()
+                || event.speed_ratio.is_some() || event.source_duration.is_some() || event.time_remap.is_some()
+                || event.audio != EventAudio::default()
+                || event.audio_gains.iter().flatten().any(|gain| *gain != 0.0)
+                || event.audio_pans.iter().flatten().any(|pan| *pan != 0.0)
+                || event.source_in < 0 || event.duration <= 0
+                || seq.audio_crossfades.iter().any(|fade| fade.track == pan.track)
+                || !(2..=MAX_AUDIO_PAN_KEYS).contains(&pan.keys.len())
+                || pan.keys.iter().any(|key| !(event.source_in..=end).contains(&key.ticks)
+                    || !(0.0..=1.0).contains(&key.value))
+                || pan.keys.windows(2).any(|pair| pair[0].ticks >= pair[1].ticks)
+            {
+                return Err(fail());
+            }
+        }
+        Ok(())
+    }
+
     fn validate_audio_crossfades(&self, clips: &HashMap<&str, &PreparedClip>) -> Result<(), ModelError> {
         let fail = || ModelError("invalid prepared mono audio crossfade or source handles".into());
         if self.audio_crossfades.len() > MAX_ITEMS {
@@ -525,13 +914,20 @@ impl PreparedProjectInput {
             video_dissolves: Vec::new(),
             audio_edge_fades: Vec::new(),
             audio_crossfades: Vec::new(),
+            audio_pans: Vec::new(),
             audio_mixers: BTreeMap::new(),
             track_states: BTreeMap::new(),
             picture_effects: Vec::new(),
             edit_labels: Vec::new(),
             direct_dnxhr_origins: Default::default(),
+            constant_speeds: Vec::new(),
             multicams: Vec::new(),
             multicam_uses: Vec::new(),
+            picture_subclips: Vec::new(),
+            av_subclips: Vec::new(),
+            av_subclip_uses: Vec::new(),
+            picture_nests: Vec::new(),
+            png_mattes: PreparedPngMattes::default(),
         })
     }
     /// Strict legacy/native media subset for rewrap planning. Timeline references
@@ -570,6 +966,15 @@ impl PreparedProjectInput {
         Ok(model)
     }
     pub fn validate(&self) -> Result<(), ModelError> {
+        self.png_mattes.validate(self)?;
+        if !self.constant_speeds.is_empty() {
+            let clips: HashMap<_, _> = self.clips.iter().filter_map(|c| match c {
+                PreparedClip::Legacy(c) => Some((c.id.as_str(), c)),
+                PreparedClip::Original(_) => None,
+            }).collect();
+            validate_constant_speeds(&self.constant_speeds, &self.options, &self.sequences,
+                |id, seq, event, speed| clips.get(id).is_some_and(|clip| speed.raw_trim(seq, event, clip).is_some()))?;
+        }
         validate_texts(&self.texts, &self.sequences)?;
         validate_video_dissolves(&self.video_dissolves, &self.sequences)?;
         validate_picture_effects(&self.picture_effects, &self.sequences)?;
@@ -700,6 +1105,80 @@ impl PreparedProjectInput {
                 PreparedClip::Legacy(c) => super::model::validate_clip(c, "prepared legacy clip")?,
             }
         }
+        if self.picture_subclips.len() > MAX_ITEMS {
+            return Err(fail("prepared subclip collection limit"));
+        }
+        for subclip in &self.picture_subclips {
+            super::model::check_text(&subclip.name, "subclip name", 4096, false)?;
+            let video = match clips.get(subclip.parent_clip.as_str()).copied() {
+                Some(PreparedClip::Legacy(clip)) => clip.video.as_ref(),
+                _ => None,
+            }.ok_or_else(|| fail("subclip requires a prepared picture master"))?;
+            let unit = ticks_per_unit(video.rate);
+            if self.options.bin_mode != "separate"
+                || !self.direct_dnxhr_origins.contains_key(&subclip.parent_clip)
+                || subclip.bin >= self.bins.len()
+                || !(0 <= subclip.start && subclip.start < subclip.end && subclip.end <= video.duration)
+                || subclip.start % unit != 0
+                || subclip.end % unit != 0
+                || self.direct_dnxhr_origins[&subclip.parent_clip].checked_add(subclip.end).is_none()
+            {
+                return Err(fail("subclip requires a qualified linked picture range and bin"));
+            }
+        }
+        if self.av_subclips.len() > MAX_ITEMS || self.av_subclip_uses.len() > MAX_ITEMS {
+            return Err(fail("prepared A/V subclip collection limit"));
+        }
+        for subclip in &self.av_subclips {
+            super::model::check_text(&subclip.name, "A/V subclip name", 4096, false)?;
+            let Some(PreparedClip::Legacy(parent)) = clips.get(subclip.parent_clip.as_str()).copied() else {
+                return Err(fail("A/V subclip requires a prepared backing master"));
+            };
+            let Some(picture) = &parent.video else {
+                return Err(fail("A/V subclip requires backing picture"));
+            };
+            let frame = ticks_per_unit(picture.rate);
+            let uniform_pcm = matches!(parent.audio.as_slice(), [a, b]
+                if matches!(a.bits, 16 | 24) && a.bits == b.bits);
+            if self.options.bin_mode != "separate" || subclip.bin >= self.bins.len()
+                || !self.direct_dnxhr_origins.contains_key(&subclip.parent_clip)
+                || picture.rate != Fraction::new(24_000, 1001)
+                || !uniform_pcm
+                || !parent.markers.is_empty()
+                || !(0 <= subclip.start && subclip.start < subclip.end && subclip.end <= picture.duration)
+                || subclip.start % frame != 0 || subclip.end % frame != 0
+                || picture.start.checked_add(subclip.end - subclip.start).is_none()
+            {
+                return Err(fail("A/V subclip requires verified 23.976 linked managed media with two uniform PCM16 or PCM24 lanes"));
+            }
+        }
+        let mut subclip_lanes = HashSet::new();
+        let group_uses: HashSet<_> = self.multicam_uses.iter().map(|u| (u.sequence, u.event)).collect();
+        let marked_edits: HashSet<_> = self.sequences.iter().enumerate().flat_map(|(si, seq)| {
+            seq.markers.iter().filter(|m| m.owner == "edit" && !m.inherited)
+                .filter_map(move |m| Some((si, usize::try_from(m.event?).ok()?)))
+        }).collect();
+        for usage in &self.av_subclip_uses {
+            let subclip = self.av_subclips.get(usage.subclip)
+                .ok_or_else(|| fail("unknown prepared A/V subclip"))?;
+            let seq = self.sequences.get(usage.sequence)
+                .ok_or_else(|| fail("unknown prepared A/V subclip sequence"))?;
+            let event = seq.events.get(usage.event)
+                .ok_or_else(|| fail("unknown prepared A/V subclip edit"))?;
+            let PreparedClip::Legacy(parent) = clips[subclip.parent_clip.as_str()] else { unreachable!() };
+            let lane_exists = match usage.audio_track {
+                Some(track) => event.audio_tracks.iter().filter(|&&n| n == track).count() == 1
+                    && event_audio_files(parent, event).is_ok_and(|files| files.len() == event.audio_tracks.len()),
+                None => event.video_track.is_some(),
+            };
+            if !lane_exists || group_uses.contains(&(usage.sequence, usage.event))
+                || marked_edits.contains(&(usage.sequence, usage.event))
+                || !subclip_lanes.insert((usage.sequence, usage.event, usage.audio_track))
+                || !av_subclip_edit_fits(seq, event, parent, subclip)
+            {
+                return Err(fail("invalid or duplicate prepared A/V subclip edit"));
+            }
+        }
         let mut fade_owners = HashSet::new();
         for fade in &self.audio_edge_fades {
             let sequence = self.sequences.get(fade.sequence)
@@ -720,6 +1199,8 @@ impl PreparedProjectInput {
             }
         }
         self.validate_audio_crossfades(&clips)?;
+        self.validate_picture_nests(&clips)?;
+        self.validate_audio_pans(&clips)?;
         for b in &self.bins {
             super::model::check_text(&b.name, "prepared bin", 4096, false)?;
             for id in &b.clips {

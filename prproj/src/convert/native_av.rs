@@ -330,17 +330,56 @@ pub fn add_item(
     name: &str,
     ids: &mut dyn UuidSource,
 ) -> Result<ItemId> {
+    add_av_master(project, media, clip, name, None, ids)
+}
+
+/// Build a distinct master from the three qualified OP-Atom media objects.
+pub(super) fn add_linked_av_subclip(
+    project: &mut Project,
+    media: &mut MediaTable,
+    clip: &Clip,
+    subclip: &super::prepared::PreparedAvSubclip,
+    ids: &mut dyn UuidSource,
+) -> Result<ItemId> {
+    add_av_master(project, media, clip, &subclip.name, Some((subclip.start, subclip.end)), ids)
+}
+
+fn set_subclip_bounds(project: &mut Project, source: crate::xml::NodeId, bounds: Option<(i64, i64)>) -> Result<()> {
+    let Some((start, end)) = bounds else { return Ok(()) };
+    let tree = &mut project.doc.tree;
+    let content = tree.find1(source, "MediaSource/Content")
+        .ok_or_else(|| invalid("subclip source lacks a content bag"))?;
+    for (field, value) in [
+        ("StartBoundary", start.to_string()),
+        ("EndBoundary", end.to_string()),
+        ("BoundariesAreHard", "false".into()),
+    ] {
+        crate::xml::mutations::append_leaf(tree, content, field, &value);
+    }
+    Ok(())
+}
+
+fn add_av_master(
+    project: &mut Project,
+    media: &mut MediaTable,
+    clip: &Clip,
+    name: &str,
+    subclip: Option<(i64, i64)>,
+    ids: &mut dyn UuidSource,
+) -> Result<ItemId> {
     let v = clip
         .video
         .as_ref()
         .ok_or_else(|| invalid("missing picture"))?;
     let (video_uid, state) = ensure_video_media(project, media, v, clip, ids)?;
+    let boundaries = subclip.filter(|&(start, end)| start != 0 || end != v.duration);
     let e = m::new_movie_media_source(&mut project.doc.tree, &video_uid, v.duration);
+    set_subclip_bounds(project, e, boundaries)?;
     let source = project.register(e)?;
     let e = m::new_markers_collection(&mut project.doc.tree, &state);
     let markers = project.register(e)?;
     let info = op::ClipInfo {
-        name: &clip.name,
+        name: if subclip.is_some() { name } else { &clip.name },
         tape_name: clip.tape_name.as_deref(),
         material_umid: clip.material_umid.as_deref(),
     };
@@ -349,7 +388,7 @@ pub fn add_item(
         &mut project.doc.tree,
         &info,
         ticks_per_unit(v.rate),
-        v.duration,
+        subclip.map_or(v.duration, |(start, end)| end - start),
         "2",
         &format,
         v.start,
@@ -374,6 +413,7 @@ pub fn add_item(
     for a in &clip.audio {
         let (uid, _) = ensure_audio_media(project, media, a, clip, ids)?;
         let e = m::new_audio_media_source(&mut project.doc.tree, &uid, a.duration);
+        set_subclip_bounds(project, e, boundaries)?;
         sources.push(project.register(e)?);
     }
     let gs = groups(clip)?;
@@ -383,7 +423,7 @@ pub fn add_item(
             .filter(|a| a.avid_track < clip.audio[i].avid_track)
             .count()
     };
-    let mono_views = media.mono_views.contains(&v.path);
+    let mono_views = subclip.is_some() || media.mono_views.contains(&v.path);
     let mut chains = Vec::new();
     let mut vectors = Vec::new();
     if mono_views {

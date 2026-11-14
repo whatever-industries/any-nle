@@ -404,7 +404,7 @@ impl LinearMotion {
     }
 }
 
-fn linear_parameter(id: u64, curve: &Curve) -> Result<Vec<u8>> {
+pub(super) fn linear_parameter(id: u64, curve: &Curve) -> Result<Vec<u8>> {
     let mut scalar = vec![0x11];
     scalar.extend_from_slice(&curve[0].1.to_le_bytes());
     let mut param = parameter(id, &scalar);
@@ -567,7 +567,7 @@ fn trim_keys(
     Ok(curves)
 }
 
-fn key_range(source_in: i64, length: i64) -> Option<(u32, u32)> {
+pub(super) fn key_range(source_in: i64, length: i64) -> Option<(u32, u32)> {
     if length < 2 {
         return None;
     }

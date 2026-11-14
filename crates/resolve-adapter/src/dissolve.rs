@@ -1,8 +1,8 @@
-//! The native left-aligned V1 Cross Dissolve on the qualified 23.976 project profile.
+//! Qualified Resolve video dissolves and mono audio crossfades.
 use crate::{binary::unpack, prepare::frames_on, Result};
 use flate2::bufread::ZlibDecoder;
 use graph::{
-    source::{SourceGraph, SourceSequence},
+    source::{SourceGraph, SourceSequence, SourceTransition},
     Loss, Rational, StreamKind, Value,
 };
 use std::io::Read;
@@ -12,6 +12,7 @@ pub(crate) const INTERPRETATION: &str = "resolve.left_cross_dissolve_8";
 pub(crate) const CENTER_INTERPRETATION: &str = "resolve.center_cross_dissolve_8";
 pub(crate) const AUDIO_INTERPRETATION: &str = "resolve.center_cross_fade_0db_8";
 pub(crate) const AUDIO_TYPE: &str = "Cross Fade 0DB";
+pub(crate) const PREMIERE_AUDIO_STYLE: &str = "premiere.Constant Gain";
 pub(crate) const AUDIO_FIELDS: &str =
     "00000002000000158012120000002c789c636660642016000000da0005";
 const AUDIO_FIELDS_SHA: &str =
@@ -103,24 +104,45 @@ pub(crate) struct SourceDissolve<'a> {
 
 /// The common graph stores source handles as overlapping placements. Resolve
 /// stores the incoming preroll in its transition and abuts the visible edits.
-pub(crate) fn from_source(sequence: &SourceSequence) -> Result<Option<SourceDissolve<'_>>> {
-    let transition = match sequence.transitions.as_slice() {
-        [] => return Ok(None),
-        [transition] => transition,
-        _ => return Err("Resolve source dissolve profile requires one transition".into()),
-    };
+pub(crate) fn from_source(sequence: &SourceSequence) -> Result<Vec<SourceDissolve<'_>>> {
+    let mut seen = [false; 2];
+    let mut prepared = Vec::with_capacity(2);
+    for transition in &sequence.transitions {
+        let lane = usize::from(transition.kind == StreamKind::Audio);
+        if std::mem::replace(&mut seen[lane], true) {
+            return Err(format!(
+                "Resolve transition {}: expected one transition per supported lane",
+                transition.id
+            ).into());
+        }
+        prepared.push(prepare_source(sequence, transition)?);
+    }
+    Ok(prepared)
+}
+
+fn prepare_source<'a>(
+    sequence: &'a SourceSequence,
+    transition: &SourceTransition,
+) -> Result<SourceDissolve<'a>> {
     let refuse = |why| format!("Resolve transition {}: {why}", transition.id);
     let before = frames_on(transition.cut_offset, sequence.rate)?;
-    if !supported_rate(sequence.rate)
+    let audio = transition.kind == StreamKind::Audio;
+    let qualified = if audio {
+        sequence.rate == Rational::integer(24)
+            && transition.style == PREMIERE_AUDIO_STYLE
+            && before == 4
+    } else {
+        supported_rate(sequence.rate)
+            && matches!(transition.style.as_str(), "avid.EFF2_BLEND_DISSOLVE" | "premiere.ADBE Cross Dissolve")
+            && matches!(before, 4 | DURATION)
+    };
+    if !qualified
         || transition.track != 1
-        || transition.kind != StreamKind::Video
-        || !matches!(transition.style.as_str(), "avid.EFF2_BLEND_DISSOLVE" | "premiere.ADBE Cross Dissolve")
         || frames_on(transition.duration, sequence.rate)? != DURATION
-        || !matches!(before, 4 | DURATION)
         || transition.outgoing.reason.is_some()
         || transition.incoming.reason.is_some()
     {
-        return Err(refuse("expected an eight-frame left-aligned or centered V1 dissolve").into());
+        return Err(refuse("expected an eight-frame V1 dissolve or centered 24 fps A1 Constant Gain").into());
     }
     let ([out], [input]) = (
         transition.outgoing.placements.as_slice(), transition.incoming.placements.as_slice()
@@ -128,8 +150,9 @@ pub(crate) fn from_source(sequence: &SourceSequence) -> Result<Option<SourceDiss
         return Err(refuse("ambiguous endpoints").into());
     };
     let find = |id: &str| {
-        sequence.placements.iter().find(|p| p.id == id && p.video_track == Some(1))
-            .ok_or_else(|| refuse("missing V1 endpoint"))
+        sequence.placements.iter().find(|p| {
+            p.id == id && if audio { p.audio_tracks.as_slice() == [1] } else { p.video_track == Some(1) }
+        }).ok_or_else(|| refuse("missing transition endpoint on its saved lane"))
     };
     let outgoing = find(out)?;
     let incoming = find(input)?;
@@ -142,15 +165,16 @@ pub(crate) fn from_source(sequence: &SourceSequence) -> Result<Option<SourceDiss
         || incoming.duration <= transition.cut_offset
         || [outgoing, incoming].iter().any(|p| {
             p.transform.is_some() || !p.effects.is_empty() || p.speed.is_some() || p.frame_map.is_some()
+                || (audio && (p.gain_db != 0.0 || p.volume_db.is_some() || !p.volume_keys.is_empty()))
         })
     {
         return Err(refuse("expected plain endpoints spanning the saved interval and a visible incoming edit").into());
     }
-    Ok(Some(SourceDissolve {
-        prepared: Dissolve { cut, before, id: transition.id.clone(), audio: false },
-        incoming: input,
-        outgoing: out,
-    }))
+    Ok(SourceDissolve {
+        prepared: Dissolve { cut, before, id: transition.id.clone(), audio },
+        incoming: &incoming.id,
+        outgoing: &outgoing.id,
+    })
 }
 
 impl Dissolve {
@@ -171,20 +195,48 @@ pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<
 }
 
 pub(crate) fn prepare_native<'a>(graph: &'a SourceGraph, sequence: &SourceSequence) -> Result<Option<SourceDissolve<'a>>> {
+    let mut transitions = prepare_all_native(graph, sequence)?;
+    if transitions.len() > 1 {
+        return Err("this destination requires one transition on the selected timeline".into());
+    }
+    Ok(transitions.pop())
+}
+
+pub(crate) fn prepare_all_native<'a>(
+    graph: &'a SourceGraph,
+    sequence: &SourceSequence,
+) -> Result<Vec<SourceDissolve<'a>>> {
     let Some(data) = graph.sidecar(ADAPTER, &sequence.id) else {
-        return Ok(None);
+        return Ok(vec![]);
     };
     let Value::Arr(rows) = data else {
         return Err("invalid Resolve transition receipt".into());
     };
+    if rows.is_empty() || rows.len() > 2 {
+        return Err("expected one transition per supported Resolve lane".into());
+    }
+    let mut seen = [false; 2];
+    let mut prepared = Vec::with_capacity(rows.len());
+    for row in rows {
+        let transition = prepare_native_row(graph, sequence, row)?;
+        let lane = usize::from(transition.prepared.audio);
+        if std::mem::replace(&mut seen[lane], true) {
+            return Err(format!(
+                "Resolve transition {}: expected one transition per supported lane",
+                transition.prepared.id
+            ).into());
+        }
+        prepared.push(transition);
+    }
+    Ok(prepared)
+}
+
+fn prepare_native_row<'a>(
+    graph: &SourceGraph,
+    sequence: &SourceSequence,
+    row: &'a Value,
+) -> Result<SourceDissolve<'a>> {
     let id = |row| str_field(row, "id").unwrap_or("<missing ID>");
-    let [row] = rows.as_slice() else {
-        let first = rows.first().map(id).unwrap_or("<missing ID>");
-        return Err(format!(
-            "Resolve transition {first}: expected one transition on the selected timeline"
-        )
-        .into());
-    };
     let unsupported = |reason| format!("Resolve transition {}: {reason}", id(row));
     let clock = sequence
         .clock
@@ -307,11 +359,11 @@ pub(crate) fn prepare_native<'a>(graph: &'a SourceGraph, sequence: &SourceSequen
     {
         return Err(unsupported("missing transition track owner").into());
     }
-    Ok(Some(SourceDissolve {
+    Ok(SourceDissolve {
         prepared: Dissolve { cut, before, id: id(row).into(), audio },
         incoming,
         outgoing,
-    }))
+    })
 }
 
 pub(crate) fn supported_rate(rate: Rational) -> bool {

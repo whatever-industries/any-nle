@@ -82,16 +82,18 @@ pub struct MediaTable {
 pub(crate) struct DirectDnxhrFile {
     pub origin: i64,
     pub picture: bool,
+    pub drop_frame: bool,
+    pub dnxhr: bool,
 }
 
 impl MediaTable {
     pub(super) fn is_direct_dnxhr_picture(&self, path: &str) -> bool {
-        self.direct_dnxhr.get(path).is_some_and(|file| file.picture)
+        self.direct_dnxhr.get(path).is_some_and(|file| file.picture && file.dnxhr)
     }
 
     pub(super) fn picture_format_override(&self, path: &str) -> Option<&str> {
-        if self.is_direct_dnxhr_picture(path) {
-            Some("110")
+        if let Some(file) = self.direct_dnxhr.get(path).filter(|file| file.picture) {
+            Some(if file.drop_frame { "102" } else { "110" })
         } else {
             self.rewrap_formats.get(path).map(String::as_str)
         }
@@ -148,6 +150,30 @@ pub fn add_video_item(
     name: Option<&str>,
     ids: &mut dyn UuidSource,
 ) -> Result<ItemId, OpatomError> {
+    add_video_with_bounds(project, media, video, clip, name, None, ids)
+}
+
+pub(super) fn add_video_subclip(
+    project: &mut Project,
+    media: &mut MediaTable,
+    video: &VideoFile,
+    clip: &Clip,
+    subclip: &super::prepared::PreparedPictureSubclip,
+    ids: &mut dyn UuidSource,
+) -> Result<ItemId, OpatomError> {
+    add_video_with_bounds(project, media, video, clip, Some(&subclip.name),
+        Some((subclip.start, subclip.end)), ids)
+}
+
+fn add_video_with_bounds(
+    project: &mut Project,
+    media: &mut MediaTable,
+    video: &VideoFile,
+    clip: &Clip,
+    name: Option<&str>,
+    bounds: Option<(i64, i64)>,
+    ids: &mut dyn UuidSource,
+) -> Result<ItemId, OpatomError> {
     let timecode_format = media.picture_format_override(&video.path)
         .unwrap_or(if video.rate == Fraction::new(24, 1) { "100" } else { "" })
         .to_string();
@@ -155,14 +181,33 @@ pub fn add_video_item(
         return Err(UnverifiedShape(format!("no Premiere-observed media timecode format for {} fps OP-Atom video yet", video.rate)).into());
     }
     let name = item_name(name, clip);
-    let info = clip_info(clip);
+    let mut info = clip_info(clip);
     let frame_rate = ticks_per_unit(video.rate);
     let (media_uid, content_state) = ensure_video_media(project, media, video, clip, ids)?;
     let e = m::new_movie_media_source(&mut project.doc.tree, &media_uid, video.duration);
+    if let Some((start, end)) = bounds {
+        let tree = &mut project.doc.tree;
+        let content = tree.find1(e, "MediaSource/Content").ok_or_else(|| {
+            Error::Value("picture subclip source lacks a content bag".into())
+        })?;
+        crate::xml::mutations::append_leaf(tree, content, "StartBoundary", &start.to_string());
+        crate::xml::mutations::append_leaf(tree, content, "EndBoundary", &end.to_string());
+        info.name = name;
+    }
     let source_id = project.register(e)?;
     let e = m::new_markers_collection(&mut project.doc.tree, &content_state);
     let markers_id = project.register(e)?;
-    let e = op::logging(&mut project.doc.tree, &info, frame_rate, video.duration, "2", &timecode_format, video.start);
+    let (logging_start, logging_duration) = if let Some((start, end)) = bounds {
+        let file_origin = media.direct_dnxhr.get(&video.path)
+            .ok_or_else(|| Error::Value("picture subclip lacks a qualified file clock".into()))?
+            .origin;
+        let logging_start = file_origin.checked_add(start)
+            .ok_or_else(|| Error::Value("picture subclip logging timecode overflows".into()))?;
+        (logging_start, end - start)
+    } else {
+        (video.start, video.duration)
+    };
+    let e = op::logging(&mut project.doc.tree, &info, frame_rate, logging_duration, "2", &timecode_format, logging_start);
     let logging_id = project.register(e)?;
     let e = m::new_movie_template_clip(&mut project.doc.tree, ids, &markers_id, &source_id, op::VIDEO_LABEL.0, op::VIDEO_LABEL.1);
     let clip_id = project.register(e)?;
@@ -174,7 +219,8 @@ pub fn add_video_item(
     let item_uid = ids.uuid4().to_string();
     let e = m::new_clip_item(&mut project.doc.tree, &item_uid, &master_uid, name, op::VIDEO_LABEL.0);
     let item = project.register_uid(e, &item_uid)?;
-    Ok(project.attach_imported_item(item, &item_uid, master, &[&clip_id], &video.path, video.duration)?)
+    Ok(project.attach_imported_item(item, &item_uid, master, &[&clip_id], &video.path,
+        logging_duration)?)
 }
 
 /// `add_audio_item(project, audio, clip, item_name)`.
@@ -243,7 +289,7 @@ pub(crate) fn ensure_video_media(project: &mut Project, media: &mut MediaTable, 
         let media_uid = ids.uuid4().to_string();
         let content_state = ids.uuid4().to_string();
         let direct = media.direct_dnxhr.get(&video.path);
-        let codec = if direct.is_some_and(|file| file.picture) { "AVdh" } else { &video.codec };
+        let codec = if media.is_direct_dnxhr_picture(&video.path) { "AVdh" } else { &video.codec };
         let vi = op::VideoInfo { frame_rate_ticks: frame_rate, duration: video.duration, width: video.width, height: video.height, codec };
         let stream = op::video_stream(&mut project.doc.tree, &vi)?;
         let stream_id = project.register(stream)?;

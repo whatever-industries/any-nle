@@ -21,15 +21,16 @@ use super::avid_color;
 use super::colors;
 use super::combined::{
     combined_order, create_grouped_with_media as create_grouped, create_merged, create_stereo_nest, declare_stereo_chain, display_format,
-    group_for_channel, move_to_processed_clips, narrow_to_group, parts_bin, set_clip_pan, Pan,
+    group_for_channel, move_to_processed_clips, narrow_to_group, parts_bin, set_clip_pan, set_clip_pan_keys, Pan,
 };
 use super::lumetri::{apply_lumetri_lut, cube_text};
 use super::markers as mk;
 use super::matte::apply_matte;
-use super::motion::{apply_flip, apply_motion_keys};
+use super::motion::{apply_corner_pin, apply_corner_pin_with_flop, apply_flip, apply_motion_keys};
+use super::multicam::PreparedGroupAudio;
 use super::time_remap::set_time_remap;
 use super::metadata;
-use super::prepared::{PictureEffect, PreparedPictureEffect, PreparedText, PreparedVideoDissolve};
+use super::prepared::{PictureEffect, PreparedPictureEffect, PreparedPictureNest, PreparedText, PreparedVideoDissolve};
 use super::model::{event_audio_files, py_str_repr, ticks_per_unit, Clip, ColorCorrection, Event, EventAudio, Fraction, Marker, Model, ModelError, Sequence};
 use super::opatom::{add_audio_item, add_video_item, source_item_names, DirectDnxhrFile, MediaTable, OpatomError, UnverifiedShape};
 use super::placement::normalize_placement;
@@ -44,6 +45,8 @@ use crate::model::{ItemId, Project, SequenceId, TrackId, TrackItemId};
 #[path = "writer_destination_layout.rs"]
 mod destination_layout;
 pub use destination_layout::DestinationBinLayout;
+#[path = "writer_png_mattes.rs"]
+mod png_mattes;
 
 /// Lumetri LUT edge length.
 pub const LUT_SIZE: i64 = 33;
@@ -551,13 +554,20 @@ struct WriterInput<'a> {
     video_dissolves: &'a [PreparedVideoDissolve],
     audio_edge_fades: &'a [super::prepared::PreparedAudioEdgeFade],
     audio_crossfades: &'a [super::prepared::PreparedAudioCrossfade],
+    audio_pans: &'a [super::prepared::PreparedAudioPan],
     audio_mixers: &'a BTreeMap<usize, super::prepared::PreparedAudioMixer>,
     track_states: &'a BTreeMap<usize, Vec<super::prepared::PreparedTrackState>>,
     picture_effects: &'a [PreparedPictureEffect],
     edit_labels: &'a [super::prepared::PreparedEditLabel],
     direct_dnxhr_origins: &'a HashMap<String, i64>,
+    constant_speeds: &'a [super::prepared::PreparedConstantSpeed],
     multicams: &'a [super::multicam::PreparedMulticam],
     multicam_uses: &'a [super::multicam::PreparedMulticamUse],
+    picture_subclips: &'a [super::prepared::PreparedPictureSubclip],
+    av_subclips: &'a [super::prepared::PreparedAvSubclip],
+    av_subclip_uses: &'a [super::prepared::PreparedAvSubclipUse],
+    picture_nests: &'a [PreparedPictureNest],
+    png_mattes: &'a super::prepared::PreparedPngMattes,
 }
 impl WriterInput<'_> {
     fn picture_clock(&self, clip: &str) -> Option<(super::model::Fraction, i64)> {
@@ -599,9 +609,16 @@ struct Writer<'a> {
     clip_bins: HashMap<String, Option<ItemId>>,
     multicam_items: Vec<ItemId>,
     multicam_uses: HashMap<(usize, usize), &'a super::multicam::PreparedMulticamUse>,
+    av_subclip_items: Vec<ItemId>,
+    av_subclip_uses: HashMap<(usize, usize, Option<i64>), usize>,
+    picture_nests: HashSet<(usize, usize)>,
+    png_items: Vec<ItemId>,
+    png_edits: HashMap<usize, Vec<&'a super::prepared::PreparedPngEdit>>,
+    constant_speeds: HashMap<(usize, usize), super::prepared::PreparedConstantSpeed>,
     video_dissolves: HashMap<usize, Vec<&'a PreparedVideoDissolve>>,
     audio_edge_fades: HashMap<(usize, usize, i64), &'a super::prepared::PreparedAudioEdgeFade>,
     audio_crossfades: HashMap<usize, Vec<&'a super::prepared::PreparedAudioCrossfade>>,
+    audio_pans: HashMap<(usize, usize, i64), &'a super::prepared::PreparedAudioPan>,
     picture_effects: HashMap<(usize, usize), (PictureEffect, [bool; 2])>,
     edit_labels: HashMap<(usize, usize), Vec<super::prepared::PreparedEditLabel>>,
 }
@@ -1027,6 +1044,28 @@ impl Writer<'_> {
         Ok(Payload::Parts { video: video_item, audio: audio_items, stereo: stereo_builds })
     }
 
+    fn nest_picture(&mut self, seq: &Sequence, edit: &Event, event: usize, source: ItemId, preset: &str) -> Result<ItemId> {
+        // Collapse stores a trimmed inline input, so create a child for just
+        // the saved interval. The child clock labels its parent position.
+        let name = format!("{} — Submaster {}", seq.name, event + 1);
+        let child = self.project.add_sequence(&name, preset, None, self.ids)?;
+        if let Some(parent) = self.sequence_parent {
+            let item = self.project.sequence_item(child).ok_or_else(|| other("nest has no project-panel item"))?;
+            self.project.move_item(item, parent)?;
+        }
+        self.project.set_zero_point(child, Time::new(add(seq.start, edit.record_start)?))?;
+        let track = track_at(self.project.video_tracks(child), 1)?;
+        let item = self.project.add_clip(track, source, Time::new(0), self.ids)?;
+        self.project.set_in_point(item, Time::new(edit.source_in))?;
+        self.project.set_out_point(item, Time::new(add(edit.source_in, edit.duration)?))?;
+        self.project.set_end(item, Time::new(edit.duration))?;
+        normalize_placement(&mut self.project, item, None)?;
+        // add_clip starts with the whole file's extent. Reset the child
+        // source documents to the actual saved interval before nesting it.
+        self.project.set_nested_source_duration(child, edit.duration)?;
+        self.project.sequence_item(child).ok_or_else(|| other("nest has no project-panel item"))
+    }
+
     fn write_sequence(&mut self, seq: &Sequence, sequence_index: usize) -> Result<()> {
         let model = self.model;
         let options = &model.options;
@@ -1076,6 +1115,12 @@ impl Writer<'_> {
         }
         let vtracks = self.project.video_tracks(sequence).to_vec();
         let atracks = self.project.audio_tracks(sequence).to_vec();
+        if let Some(edits) = self.png_edits.get(&sequence_index) {
+            png_mattes::place(
+                &mut self.project, sequence, seq, &preset, self.sequence_parent,
+                &self.model.png_mattes.stills, &self.png_items, edits, self.ids,
+            )?;
+        }
         let mut captions = Vec::new();
         for t in model.texts.iter().filter(|t| t.sequence == sequence_index) {
             match t.kind {
@@ -1114,6 +1159,7 @@ impl Writer<'_> {
             .flat_map(|fade| [(fade.outgoing, fade.track), (fade.incoming, fade.track)]).collect();
         let mut crossfade_items = HashMap::new();
         for (i, e) in seq.events.iter().enumerate() {
+            let plain_nest = self.picture_nests.contains(&(sequence_index, i));
             let group_use = self.multicam_uses.get(&(sequence_index, i)).copied();
             let prepared_picture = self.picture_effects.get(&(sequence_index, i)).copied();
             let picture_effect = prepared_picture.map(|(effect, _)| effect);
@@ -1135,6 +1181,7 @@ impl Writer<'_> {
             let clip = model.clips.get(e.clip.as_str());
             let original=model.originals.get(e.clip.as_str()).copied();
             let mut placed: Vec<TrackItemId> = Vec::new();
+            let mut linked_group_audio = Vec::new();
             if let Some(u) = group_use {
                 let source = self.multicam_items[u.group];
                 if let Some(v) = e.video_track {
@@ -1142,13 +1189,26 @@ impl Writer<'_> {
                 }
                 let clip = clip.ok_or_else(|| other("multicam leaf registry mismatch"))?;
                 let files = event_audio_files(clip, e)?;
-                for (j, (&channel, &track)) in u.audio.iter().zip(&e.audio_tracks).enumerate() {
-                    let item = self.project.add_clip(track_at(&atracks,track)?, source, start, self.ids)?;
-                    self.project.narrow_merged_channel(item, channel as i64)?;
-                    // The inner clip carries the leaf gain. Only an edit override's
-                    // difference belongs on this outer audio placement.
+                for (j, (&audio, &track)) in u.audio.iter().zip(&e.audio_tracks).enumerate() {
+                    let target = track_at(&atracks, track)?;
+                    let gain = edit_value(&e.audio_gains, j)?;
                     let original_gain = files[j].gain_db;
-                    master_gain.insert(item, edit_value(&e.audio_gains,j)?.map_or(0.0, |g| g - original_gain));
+                    let (item, applied_gain) = match audio {
+                        PreparedGroupAudio::Group(channel) => {
+                            let item = self.project.add_clip(target, source, start, self.ids)?;
+                            self.project.narrow_merged_channel(item, channel as i64)?;
+                            // The Group source already applies the leaf gain.
+                            (item, gain.map_or(0.0, |g| g - original_gain))
+                        }
+                        PreparedGroupAudio::LinkedAlternate(_) => {
+                            let sibling = self.items[&e.clip].1.get(identity(clip, files[j]))
+                                .copied().ok_or_else(|| other("linked alternate Group audio sibling is missing"))?;
+                            let item = self.project.add_clip(target, sibling, start, self.ids)?;
+                            linked_group_audio.push(item);
+                            (item, gain.unwrap_or(original_gain))
+                        }
+                    };
+                    master_gain.insert(item, applied_gain);
                     edit_pan.insert(item, (edit_value(&e.audio_pans,j)?,track));
                     placed.push(item);
                 }
@@ -1267,13 +1327,31 @@ impl Writer<'_> {
                         event_items.push(*by_file.get(&k).ok_or_else(|| other("KeyError"))?);
                     }
                     if let Some(v) = e.video_track {
-                        let Some(video_item) = *video_item else {
+                        let subclip = self.av_subclip_uses.get(&(sequence_index, i, None))
+                            .map(|&index| self.av_subclip_items[index]);
+                        let Some(video_item) = subclip.or(*video_item) else {
                             return Err(other("'NoneType' object has no attribute '_sequence_uid'"));
+                        };
+                        let video_item = if plain_nest {
+                            self.nest_picture(seq, e, i, video_item, &preset)?
+                        } else {
+                            video_item
                         };
                         placed.push(self.project.add_clip(track_at(&vtracks, v)?, video_item, start, self.ids)?);
                     }
                     for (j, ((&audio_item, &track), f)) in event_items.iter().zip(&e.audio_tracks).zip(&event_files).enumerate() {
-                        let item = self.project.add_clip(track_at(&atracks, track)?, audio_item, start, self.ids)?;
+                        let target = track_at(&atracks, track)?;
+                        let item = if let Some(&subclip) = self.av_subclip_uses.get(&(sequence_index, i, Some(track))) {
+                            let source = self.av_subclip_items[subclip];
+                            let group = match f.avid_track {
+                                Some(1) => 0,
+                                Some(2) => 1,
+                                _ => return Err(other("A/V subclip requires an exact mono source label")),
+                            };
+                            super::native_av::place_audio(&mut self.project, target, source, group, start, self.ids)?
+                        } else {
+                            self.project.add_clip(target, audio_item, start, self.ids)?
+                        };
                         // An edit's own Avid gain is its effective gain (Avid copies the master's
                         // at cut-in); without one, the master clip's gain applies, as Premiere
                         // copies it.
@@ -1332,20 +1410,26 @@ impl Writer<'_> {
             }
             for &t in &placed {
                 let mut span = e.duration;
-                let mut original_speed = None;
-                let mut original_speed_start = None;
+                let mut raw_speed = None;
+                let mut raw_start = None;
                 if let Some(ratio) = e.speed_ratio {
                     span = e
                         .source_duration
                         .ok_or_else(|| other("unsupported operand type(s) for +: 'int' and 'NoneType'"))?;
-                    if let Some(original) = original {
+                    if let Some(&speed) = self.constant_speeds.get(&(sequence_index, i)) {
+                        let (start, end) = clip.and_then(|clip| speed.raw_trim(seq, e, clip))
+                            .ok_or_else(|| other("qualified constant-speed trim is out of range"))?;
+                        span = end - start;
+                        raw_start = Some(start);
+                        raw_speed = Some((speed.ratio.1 * speed.ratio.0.signum(), speed.ratio.0.abs()));
+                    } else if let Some(original) = original {
                         // Premiere 27 plays original-file cuts from the raw In.
                         // In reverse the raw trim is measured from media end.
-                        original_speed = Some(ratio);
+                        raw_speed = Some(ratio);
                         if ratio.0 < 0 {
                             let available = original.video.as_ref()
                                 .ok_or_else(|| other("retimed original lacks picture"))?.duration;
-                            original_speed_start = Some(available.checked_sub(e.source_in)
+                            raw_start = Some(available.checked_sub(e.source_in)
                                 .and_then(|v| v.checked_sub(span)).filter(|&v| v >= 0)
                                 .ok_or_else(|| other("reverse original trim exceeds source"))?);
                         }
@@ -1354,11 +1438,11 @@ impl Writer<'_> {
                     }
                 }
                 // A remapped clip's In/Out are positions on its remap curve (see writer.py).
-                let start = if let Some(u) = group_use { u.source_in } else if e.time_remap.is_some() { ticks_per_unit(seq.rate) } else { original_speed_start.unwrap_or(e.source_in) };
+                let start = if plain_nest { 0 } else if let Some(u) = group_use.filter(|_| !linked_group_audio.contains(&t)) { u.source_in } else if e.time_remap.is_some() { ticks_per_unit(seq.rate) } else { raw_start.unwrap_or(e.source_in) };
                 self.project.set_in_point(t, Time::new(start))?;
                 self.project.set_out_point(t, Time::new(add(start, span)?))?;
                 // Preserve raw file coordinates; the legacy setter scales by speed.
-                if let Some(ratio) = original_speed {
+                if let Some(ratio) = raw_speed {
                     set_playback_speed(&mut self.project, t, ratio)?;
                 }
                 self.project.set_end(t, Time::new(add(e.record_start, e.duration)?))?;
@@ -1455,6 +1539,18 @@ impl Writer<'_> {
                     ));
                 }
             }
+            if let Some(PictureEffect::WarpRoll { keys: [first, ..], .. }) = picture_effect {
+                let transform = super::model::Transform {
+                    position: (first.x, 0.0), scale: (first.width, 100.0),
+                    rotation: first.rotation, anchor: (0.0, 0.0), crop: [0.0; 4],
+                    not_converted: Vec::new(),
+                };
+                for &t in &placed {
+                    if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
+                        apply_motion_keys(&mut self.project, t, &transform, picture_effect, self.ids)?;
+                    }
+                }
+            }
             let [horizontal, vertical] = match prepared_picture {
                 Some((PictureEffect::Flip { horizontal, vertical }, _)) => [horizontal, vertical],
                 Some((_, axes)) => axes,
@@ -1464,6 +1560,20 @@ impl Writer<'_> {
                 for &t in &placed {
                     if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
                         apply_flip(&mut self.project, t, horizontal, vertical)?;
+                    }
+                }
+            }
+            if let Some(PictureEffect::CornerPin(pin)) = picture_effect {
+                for &t in &placed {
+                    if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
+                        apply_corner_pin(&mut self.project, t, pin, self.ids)?;
+                    }
+                }
+            }
+            if let Some(PictureEffect::CornerPinWithFlop { pin, flop_before_pin }) = picture_effect {
+                for &t in &placed {
+                    if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
+                        apply_corner_pin_with_flop(&mut self.project, t, pin, flop_before_pin, self.ids)?;
                     }
                 }
             }
@@ -1538,15 +1648,23 @@ impl Writer<'_> {
                         return Err(other("audio crossfade endpoint produced more than one item"));
                     }
                 }
-                if let (None, Some(track)) = (pan, track) {
-                    if options.match_avid_default_pan {
-                        pan = Some(if track.rem_euclid(2) != 0 { -100.0 } else { 100.0 }); // Avid default: odd tracks left, even right
-                    } else {
-                        default_panned += 1;
+                let pan_keys = track.and_then(|track| self.audio_pans.get(&(sequence_index, i, track)));
+                if let Some(curve) = pan_keys {
+                    if self.project.sequence(sequence).audio_channel_count != Some(2) {
+                        return Err(other("clip pan keys require a stereo Premiere output"));
                     }
-                }
-                if let Some(p) = pan.filter(|&p| p != 0.0) {
-                    set_clip_pan(&mut self.project, t, Pan::Percent(p))?;
+                    set_clip_pan_keys(&mut self.project, t, &curve.keys)?;
+                } else {
+                    if let (None, Some(track)) = (pan, track) {
+                        if options.match_avid_default_pan {
+                            pan = Some(if track.rem_euclid(2) != 0 { -100.0 } else { 100.0 }); // Avid default: odd tracks left, even right
+                        } else {
+                            default_panned += 1;
+                        }
+                    }
+                    if let Some(p) = pan.filter(|&p| p != 0.0) {
+                        set_clip_pan(&mut self.project, t, Pan::Percent(p))?;
+                    }
                 }
                 if let Some((track, fade)) = track.and_then(|track| {
                     self.audio_edge_fades.get(&(sequence_index, i, track)).map(|fade| (track, fade))
@@ -1604,7 +1722,7 @@ impl Writer<'_> {
                 .ok_or_else(|| other("missing incoming audio crossfade item"))?;
             let cut = seq.events[fade.incoming].record_start;
             self.project.add_prepared_audio_crossfade(track_at(&atracks, fade.track)?, out, inc,
-                cut - fade.before_cut, add(cut, fade.duration - fade.before_cut)?, fade.before_cut)?;
+                cut - fade.before_cut, add(cut, fade.duration - fade.before_cut)?, fade.before_cut, true)?;
         }
         for d in self.video_dissolves.get(&sequence_index).into_iter().flatten() {
             let out = *dissolve_items.get(&d.outgoing).ok_or_else(|| other("missing outgoing dissolve item"))?;
@@ -1633,15 +1751,34 @@ impl Writer<'_> {
             mk::add_sequence_marker(&mut self.project, sequence, m, *start, options, &mut self.report.notes, note, self.ids)?;
         }
         for (&track_no, ms) in &filler_video {
-            // Markers on empty video track space ride one-frame (or marker-length) adjustment
-            // layers on that track; the layer's own time equals sequence time.
             if track_no > vtracks.len() as i64 {
                 return Err(UnverifiedShape(format!("sequence {seq_name}: filler marker on missing video track {track_no}")).into());
             }
-            let mut length = i64::MIN;
-            for m in ms {
-                length = length.max(add(m.start, m.duration.max(unit))?);
+            let track = track_at(&vtracks, track_no)?;
+            let mut picture: Vec<_> = self.project.track_clips(track).iter().map(|&clip|
+                Ok((self.project.start(clip)?.ticks, self.project.end(clip)?.ticks))
+            ).collect::<Result<_>>()?;
+            picture.sort_unstable();
+            let mut furthest = i64::MIN;
+            for (_, end) in &mut picture {
+                furthest = furthest.max(*end);
+                *end = furthest;
             }
+            let mut carried = Vec::new();
+            let mut spans: BTreeMap<i64, i64> = BTreeMap::new();
+            for &m in ms {
+                let end = add(m.start, m.duration.max(unit))?;
+                let at = picture.partition_point(|&(start, _)| start < end);
+                if at > 0 && picture[at - 1].1 > m.start {
+                    let note = format!("on empty V{track_no}; marker carrier would overlap picture");
+                    mk::add_sequence_marker(&mut self.project, sequence, m, m.start, options, &mut self.report.notes, &note, self.ids)?;
+                    self.report.notes.push(format!("sequence {seq_name}: marker {} kept on sequence; V{track_no} carrier would overlap picture", py_str_repr(&m.name)));
+                } else {
+                    carried.push(m);
+                    spans.entry(m.start).and_modify(|old| *old = (*old).max(end)).or_insert(end);
+                }
+            }
+            let Some(length) = spans.values().copied().max() else { continue };
             let layer = mk::create_adjustment_layer(
                 &mut self.project,
                 self.root,
@@ -1654,29 +1791,29 @@ impl Writer<'_> {
                 self.ids,
             )?;
             move_to_processed_clips(&mut self.project, &[layer], self.sequence_parent, self.ids)?;
-            let mut spans: BTreeMap<i64, i64> = BTreeMap::new();
-            for m in ms {
+            for m in &carried {
                 self.add_clip_marker(layer, m, m.start)?;
-                let current = spans.get(&m.start).copied().unwrap_or(unit);
-                let span = if m.duration != 0 { m.duration } else { unit };
-                spans.insert(m.start, current.max(span));
             }
-            let mut last_end = -1;
-            for (&start, &span) in &spans {
-                let end = add(start, span)?;
-                if start < last_end {
-                    continue; // already covered by the previous instance
+            // Merge only overlapping spans. Extending the carrier preserves
+            // every marker's end without duplicating any marker at a cut.
+            let mut merged: Vec<(i64, i64)> = Vec::new();
+            for (start, end) in spans {
+                if let Some((_, previous_end)) = merged.last_mut().filter(|(_, e)| start < *e) {
+                    *previous_end = (*previous_end).max(end);
+                } else {
+                    merged.push((start, end));
                 }
-                let placed = self.project.add_clip(track_at(&vtracks, track_no)?, layer, Time::new(start), self.ids)?;
+            }
+            for (start, end) in merged {
+                let placed = self.project.add_clip(track, layer, Time::new(start), self.ids)?;
                 self.project.set_in_point(placed, Time::new(start))?;
                 self.project.set_out_point(placed, Time::new(end))?;
                 self.project.set_end(placed, Time::new(end))?;
                 normalize_placement(&mut self.project, placed, None)?;
-                last_end = end;
             }
             self.report
                 .notes
-                .push(format!("sequence {seq_name}: {} marker(s) on empty V{track_no} carried by an adjustment layer", ms.len()));
+                .push(format!("sequence {seq_name}: {} marker(s) on empty V{track_no} carried by an adjustment layer", carried.len()));
         }
         order_track_items(&mut self.project, sequence)?;
         if let Some(states) = model.track_states.get(&sequence_index) {
@@ -1754,7 +1891,7 @@ pub fn prepare_project_with_texts(model: &Model, texts: &[super::prepared::Prepa
 pub fn prepare_project_with_editorial(model: &Model, texts: &[super::prepared::PreparedText],
     video_dissolves: &[PreparedVideoDissolve], out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
     media: &[super::rewrap::MediaRelink], native_av: bool) -> Result<PreparedProject> {
-    prepare_project_with_effects(model, Editorial { texts, video_dissolves, picture_effects: &[], direct_dnxhr_origins: &HashMap::new() },
+    prepare_project_with_effects(model, Editorial { texts, video_dissolves, picture_effects: &[], direct_dnxhr_origins: &HashMap::new(), constant_speeds: &[] },
         out_path, ids, media, native_av)
 }
 
@@ -1763,36 +1900,45 @@ pub struct Editorial<'a> {
     pub video_dissolves: &'a [PreparedVideoDissolve],
     pub picture_effects: &'a [PreparedPictureEffect],
     pub direct_dnxhr_origins: &'a HashMap<String, i64>,
+    pub constant_speeds: &'a [super::prepared::PreparedConstantSpeed],
 }
 
 pub fn prepare_project_with_effects(model: &Model, editorial: Editorial<'_>,
     out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
     media: &[super::rewrap::MediaRelink], native_av: bool) -> Result<PreparedProject> {
     super::model::validate_model(model)?;
-    let Editorial { texts, video_dissolves, picture_effects, direct_dnxhr_origins } = editorial;
+    let Editorial { texts, video_dissolves, picture_effects, direct_dnxhr_origins, constant_speeds } = editorial;
     super::prepared::validate_texts(texts, &model.sequences)?;
     super::prepared::validate_video_dissolves(video_dissolves, &model.sequences)?;
     super::prepared::validate_picture_effects(picture_effects, &model.sequences)?;
-    let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),picture_effects,edit_labels:&[],direct_dnxhr_origins,multicams:&[],multicam_uses:&[]};
-    prepare_view(&view,model,out_path,ids,media,native_av,None)
+    super::prepared::validate_constant_speeds(constant_speeds, &model.options, &model.sequences,
+        |id, seq, event, speed| model.clips.get(id).is_some_and(|clip| speed.raw_trim(seq, event, clip).is_some()))?;
+    let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),picture_effects,edit_labels:&[],direct_dnxhr_origins,constant_speeds,multicams:&[],multicam_uses:&[],picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
+    prepare_view(&view,model,out_path,ids,media,native_av,None,&HashSet::new())
 }
 
 /// Validated typed input for mixed original-file and legacy media; model/1 remains strict.
 pub fn prepare_typed_project(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool)->Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,media,native_av,None)
+    prepare_typed_project_impl(input,out_path,ids,media,native_av,None,&HashSet::new())
 }
 
 /// Prepare selected source bins under one import root and their relative folder hierarchy.
 /// Layout validation completes before UUID allocation or project construction.
 pub fn prepare_typed_project_with_layout(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:&DestinationBinLayout)->Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,media,native_av,Some(layout))
+    prepare_typed_project_impl(input,out_path,ids,media,native_av,Some(layout),&HashSet::new())
 }
-fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>)->Result<PreparedProject> {
+pub fn prepare_offline_project(
+    input: &super::prepared::PreparedProjectInput, out_path: impl AsRef<Path>,
+    ids: &mut dyn UuidSource, layout: Option<&DestinationBinLayout>, offline: &HashSet<&str>,
+) -> Result<PreparedProject> {
+    prepare_typed_project_impl(input,out_path,ids,&[],false,layout,offline)
+}
+fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>)->Result<PreparedProject> {
     if let Some(layout) = layout { layout.validate(&input.bins)?; }
     input.validate()?;
     let legacy=Model{project_name:input.project_name.clone(),options:input.options.clone(),clips:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Legacy(c)=>Some(c.clone()),_=>None}).collect(),bins:input.bins.iter().map(|b|super::model::Bin{name:b.name.clone(),clips:b.clips.iter().filter(|id|input.clips.iter().any(|c|matches!(c,super::prepared::PreparedClip::Legacy(c) if c.id==**id))).cloned().collect()}).collect(),sequences:input.sequences.iter().map(|s|{let mut s=s.clone();s.events.retain(|e|input.clips.iter().any(|c|matches!(c,super::prepared::PreparedClip::Legacy(c) if c.id==e.clip)));s.markers.clear();s}).collect()};
-    let view=WriterInput{options:&input.options,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_mixers:&input.audio_mixers,track_states:&input.track_states,picture_effects:&input.picture_effects,edit_labels:&input.edit_labels,direct_dnxhr_origins:&input.direct_dnxhr_origins,multicams:&input.multicams,multicam_uses:&input.multicam_uses};
-    prepare_view(&view,&legacy,out_path,ids,media,native_av,layout)
+    let view=WriterInput{options:&input.options,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,picture_effects:&input.picture_effects,edit_labels:&input.edit_labels,direct_dnxhr_origins:&input.direct_dnxhr_origins,constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,png_mattes:&input.png_mattes};
+    prepare_view(&view,&legacy,out_path,ids,media,native_av,layout,offline)
 }
 fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
     if model.video_dissolves.is_empty() { return Ok(()); }
@@ -1823,8 +1969,6 @@ fn direct_dnxhr_files(
     if native_av || !media.is_empty() {
         return Err(other("direct DNxHR OP-Atom cannot use rewrap bindings"));
     }
-    let rate = super::model::Fraction::new(24000, 1001);
-    let unit = ticks_per_unit(rate);
     let mut files = HashMap::new();
     for (id, &origin) in model.direct_dnxhr_origins {
         let c = model.clips.get(id).ok_or_else(|| other("direct DNxHR OP-Atom clip ID is unavailable"))?;
@@ -1832,18 +1976,28 @@ fn direct_dnxhr_files(
         let [a, b] = c.audio.as_slice() else {
             return Err(other("direct DNxHR OP-Atom requires two independent mono siblings"));
         };
-        if v.codec != "AVdn" || (v.width, v.height) != (1920, 1080) || v.rate != rate
+        let (drop_frame, dnxhr) = match (v.rate.num, v.rate.den, a.bits) {
+            (24_000, 1001, 24) => (false, true),
+            (24_000, 1001, 16) if model.options.bin_mode == "separate" => (false, false),
+            (30_000, 1001, 24) if model.options.bin_mode == "separate" && c.time_display == Some(102) => (true, false),
+            _ => return Err(other("unsupported direct DNx OP-Atom rate or bin mode")),
+        };
+        let unit = ticks_per_unit(v.rate);
+        if v.codec != "AVdn" || (v.width, v.height) != (1920, 1080)
             || origin < 0 || origin % unit != 0
             || v.start < 0 || v.start % unit != 0 || v.duration <= 0 || v.duration % unit != 0
+            || drop_frame && (origin != v.start || origin / unit >= 2_589_408
+                || v.duration % (super::model::TICKS_PER_SECOND / 48_000) != 0)
+            || a.bits == 16 && (origin != v.start || origin / unit >= 24 * 60 * 60 * 24)
             || !matches!((a.avid_track, b.avid_track), (Some(1), Some(2)) | (Some(2), Some(1)))
             || !c.stereo_pairs.is_empty() || !c.multichannel_groups.is_empty()
-            || [a, b].iter().any(|s| s.sample_rate != 48000 || s.bits != 24 || s.start != v.start || s.duration != v.duration)
+            || [a, b].iter().any(|s| s.sample_rate != 48000 || s.bits != a.bits || s.start != v.start || s.duration != v.duration)
             || v.path == a.path || v.path == b.path || a.path == b.path
         {
             return Err(other("invalid direct DNxHR OP-Atom clip profile"));
         }
         for (path, is_picture) in [(&v.path, true), (&a.path, false), (&b.path, false)] {
-            let profile = (DirectDnxhrFile { origin, picture: is_picture }, v.start, v.duration);
+            let profile = (DirectDnxhrFile { origin, picture: is_picture, drop_frame, dnxhr }, v.start, v.duration);
             if files.insert(path, profile).is_some_and(|prior| prior != profile) {
                 return Err(other("shared direct DNxHR OP-Atom media has conflicting file facts"));
             }
@@ -1856,17 +2010,31 @@ fn direct_dnxhr_files(
             return Err(other("direct DNxHR OP-Atom media is shared with an unqualified clip"));
         }
     }
-    if model.sequences.iter().any(|s| s.rate != rate
-        && s.events.iter().any(|e| model.direct_dnxhr_origins.contains_key(&e.clip))) {
-        return Err(other("direct DNxHR OP-Atom needs a same-rate 23.976 sequence"));
+    if model.sequences.iter().any(|s| s.events.iter().any(|e| {
+        model.direct_dnxhr_origins.contains_key(&e.clip)
+            && model.clips[&e.clip].video.as_ref().is_some_and(|v| s.rate != v.rate)
+    })) {
+        return Err(other("direct DNx OP-Atom needs a same-rate sequence"));
     }
     Ok(files.into_iter().map(|(path, (file, _, _))| (path.clone(), file)).collect())
 }
 
-fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>)->Result<PreparedProject> {
+fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>)->Result<PreparedProject> {
     let direct_dnxhr = direct_dnxhr_files(model, media, native_av)?;
     dissolve_handles(model)?;
     for p in model.picture_effects {
+        if matches!(p.effect, PictureEffect::CornerPin(_)) {
+            let seq = &model.sequences[p.sequence];
+            let edit = &seq.events[p.event];
+            let unit = ticks_per_unit(seq.rate);
+            if !model.picture_clock(&edit.clip).is_some_and(|(rate, duration)| rate == seq.rate
+                && edit.source_in >= 0 && edit.source_in % unit == 0
+                && edit.duration > 0 && edit.duration % unit == 0
+                && edit.source_in.checked_add(edit.duration).is_some_and(|end| end <= duration))
+            {
+                return Err(other("Corner Pin needs same-rate picture containing the edit"));
+            }
+        }
         if let PictureEffect::TrimmedWarp(trim) | PictureEffect::TrimmedResize(trim) = p.effect {
             let seq = &model.sequences[p.sequence];
             let clip = &seq.events[p.event].clip;
@@ -1876,16 +2044,20 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         }
     }
     if !model.multicams.is_empty() {
-        if !native_av {
-            return Err(other("multicam_native_route_required: editable Groups require native OP1a bindings"));
-        }
         let picture_bindings: HashMap<_, _> = media.iter().filter(|m|m.audio_stream.is_none())
             .map(|m|(m.source_path.as_str(), m.target_path.as_str())).collect();
         for g in model.multicams {
             for c in &g.cameras {
-                let path = &model.clips[&c.clip].video.as_ref().ok_or_else(|| other("multicam camera has no picture"))?.path;
-                if !picture_bindings.get(path.as_str()).is_some_and(|p|p.to_ascii_lowercase().ends_with(".mxf")) {
-                    return Err(other("multicam_native_route_required: camera picture needs an OP1a MXF binding"));
+                let video = model.clips[&c.clip].video.as_ref().ok_or_else(|| other("multicam camera has no picture"))?;
+                if native_av {
+                    if !picture_bindings.get(video.path.as_str()).is_some_and(|p|p.to_ascii_lowercase().ends_with(".mxf")) {
+                        return Err(other("multicam_native_route_required: camera picture needs an OP1a MXF binding"));
+                    }
+                } else if model.options.bin_mode != "separate"
+                    || !model.direct_dnxhr_origins.contains_key(&c.clip)
+                    || video.rate != super::multicam::RATE
+                {
+                    return Err(other("multicam_native_route_required: editable Groups need qualified direct DNxHR LB mono siblings in Separate files mode or native OP1a bindings"));
                 }
             }
         }
@@ -1986,10 +2158,22 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         clip_bins: HashMap::new(),
         multicam_items: Vec::new(),
         multicam_uses: model.multicam_uses.iter().map(|u| ((u.sequence,u.event),u)).collect(),
+        av_subclip_items: Vec::new(),
+        av_subclip_uses: model.av_subclip_uses.iter()
+            .map(|u| ((u.sequence, u.event, u.audio_track), u.subclip)).collect(),
+        picture_nests: model.picture_nests.iter().map(|n| (n.sequence, n.event)).collect(),
+        png_items: Vec::new(),
+        png_edits: model.png_mattes.edits.iter().fold(HashMap::new(), |mut index, edit| {
+            index.entry(edit.sequence).or_insert_with(Vec::new).push(edit);
+            index
+        }),
+        constant_speeds: model.constant_speeds.iter().map(|&s| ((s.sequence, s.event), s)).collect(),
         video_dissolves,
         audio_crossfades,
         audio_edge_fades: model.audio_edge_fades.iter()
             .map(|fade| ((fade.sequence, fade.event, fade.track), fade)).collect(),
+        audio_pans: model.audio_pans.iter()
+            .map(|pan| ((pan.sequence, pan.event, pan.track), pan)).collect(),
         edit_labels: model.edit_labels.iter().fold(HashMap::new(), |mut by_edit, &label| {
             by_edit.entry((label.sequence, label.event)).or_insert_with(Vec::new).push(label);
             by_edit
@@ -2000,7 +2184,7 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
     // Borrow component names rather than cloning every complete prefix. This
     // index is linear in the validated references, including repeated paths.
     let mut folders: HashMap<(ItemId, &str), ItemId> = HashMap::new();
-    let mut group_targets = Vec::new();
+    let mut compound_targets = Vec::new();
     for (index, b) in model.bins.iter().enumerate() {
         let mut parent = root;
         if let Some(layout) = layout {
@@ -2011,7 +2195,11 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
             }
         }
         let target = writer.project.add_bin(parent, &b.name, writer.ids)?;
-        if !model.multicams.is_empty() { group_targets.push(target); }
+        if !model.multicams.is_empty() || !model.picture_subclips.is_empty() || !model.av_subclips.is_empty()
+            || !model.png_mattes.stills.is_empty()
+        {
+            compound_targets.push(target);
+        }
         for clip_id in &b.clips {
             if writer.items.contains_key(clip_id) {
                 writer.report.notes.push(format!("clip {} listed in several bins; imported once into the first", py_str_repr(clip_id)));
@@ -2019,6 +2207,18 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
             }
             writer.import_clip(clip_id, Some(target))?;
         }
+    }
+    if !model.png_mattes.stills.is_empty() {
+        writer.png_items = png_mattes::import(
+            &mut writer.project, &model.png_mattes.stills, &compound_targets, writer.ids,
+        )?;
+        let keys = model.png_mattes.edits.iter().filter(|e| e.foreground.is_some_and(|i| {
+            matches!(model.png_mattes.stills[i].alpha, super::prepared::PngAlpha::Straight { .. })
+        })).count();
+        writer.report.notes.push(format!(
+            "Linked {} PNG still interpretations and rebuilt {keys} editable Matte Key nests",
+            writer.png_items.len()
+        ));
     }
     for seq in model.sequences {
         for e in &seq.events {
@@ -2028,6 +2228,36 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
             }
         }
     }
+    for subclip in model.picture_subclips {
+        let parent = &model.clips[&subclip.parent_clip];
+        let video = parent.video.as_ref().ok_or_else(|| other("picture subclip parent has no video"))?;
+        writer.project.import_target = Some(compound_targets[subclip.bin]);
+        let result = super::opatom::add_video_subclip(
+            &mut writer.project, &mut writer.media, video, parent, subclip, writer.ids,
+        );
+        writer.project.import_target = None;
+        result?;
+    }
+    if !model.picture_subclips.is_empty() {
+        writer.report.notes.push(format!(
+            "{} reusable linked picture subclip(s)", model.picture_subclips.len()
+        ));
+    }
+    for subclip in model.av_subclips {
+        let parent = &model.clips[&subclip.parent_clip];
+        writer.project.import_target = Some(compound_targets[subclip.bin]);
+        let item = super::native_av::add_linked_av_subclip(
+            &mut writer.project, &mut writer.media, parent, subclip, writer.ids,
+        );
+        writer.project.import_target = None;
+        writer.av_subclip_items.push(item?);
+    }
+    if !model.av_subclips.is_empty() {
+        writer.report.notes.push(format!(
+            "{} reusable linked A/V subclip(s), {} timeline lane reference(s)",
+            model.av_subclips.len(), model.av_subclip_uses.len()
+        ));
+    }
     for group in model.multicams {
         for camera in &group.cameras {
             if !writer.items.contains_key(&camera.clip) {
@@ -2035,19 +2265,23 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
             }
         }
         let leaf = |c: &super::multicam::PreparedCamera| -> Result<_> {
-            let item = writer.items[&c.clip].0.ok_or_else(|| other("multicam camera item not imported"))?;
-            Ok((item, &model.clips[&c.clip]))
+            let (picture, siblings) = &writer.items[&c.clip];
+            let picture = picture.ok_or_else(|| other("multicam camera item not imported"))?;
+            Ok((picture, siblings.as_slice(), &model.clips[&c.clip]))
         };
         let leaves = [leaf(&group.cameras[0])?, leaf(&group.cameras[1])?];
-        let item = super::multicam::build(&mut writer.project, group, leaves, group_targets[group.bin], writer.ids)?;
+        let item = super::multicam::build(&mut writer.project, group, leaves, compound_targets[group.bin], writer.ids)?;
         writer.multicam_items.push(item);
     }
     if !model.multicams.is_empty() {
         writer.report.notes.push(format!("{} editable Premiere multicam source item(s); two cameras, independent fixed first-camera mono output lanes", model.multicams.len()));
-        writer.report.unverified.push("Editable Group scope: two continuous same-rate DNx cameras with fixed two-mono PCM24 audio; User acceptance pending. Audio-angle switching, retimed or discontinuous alternatives, and wider audio are outside this profile.".into());
+        writer.report.unverified.push("Editable Group scope: two continuous same-rate DNx cameras with two mono PCM24 lanes; User acceptance pending. Alternate audio on the qualified linked route is a direct mono clip. Retimed or discontinuous alternatives and wider audio are outside this profile.".into());
     }
     for (si, seq) in model.sequences.iter().enumerate() {
         writer.write_sequence(seq, si)?;
+    }
+    if !model.picture_nests.is_empty() {
+        writer.report.notes.push(format!("{} editable picture Submaster nest(s); child source trimmed to the saved Avid interval", model.picture_nests.len()));
     }
     if !media.is_empty() {
         if native_av {
@@ -2056,6 +2290,23 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
             super::rewrap::apply(&mut writer.project, media)?;
         }
         writer.report.unverified.push("OP1a media binding: explicit flattened source channels; native read-back covers retained fixtures, not every profile or clip-construction mode".into());
+    }
+    if !offline.is_empty() {
+        let root = writer.project.doc.root;
+        let tree = &mut writer.project.doc.tree;
+        let mut marked = HashSet::new();
+        for node in tree.children(root).to_vec() {
+            if tree.tag(node) != "Media" { continue; }
+            let Some(path) = tree.findtext(node, "FilePath")? else { continue; };
+            if !offline.contains(path.as_str()) { continue; }
+            marked.insert(path);
+            let reason = tree.new_element("OfflineReason");
+            tree.set_text(reason, Some("5"));
+            crate::xml::mutations::append_uniform_child(tree, node, reason)?;
+        }
+        if marked.len() != offline.len() {
+            return Err(other("offline media is missing a Premiere locator"));
+        }
     }
     let saved=writer.project.prepare_new_save(&out_path)?;
     let prepared=PreparedProject {saved:Some(saved),out_path,report:writer.report,assets:writer.assets,

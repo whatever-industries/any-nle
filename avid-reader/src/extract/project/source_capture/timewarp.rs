@@ -225,6 +225,126 @@ fn no_properties(node: &Node) -> bool {
     matches!(node.get("pp"), Some(Value::List(props)) if props.is_empty())
 }
 
+/// The three 50-frame constant controls with native picture references (AVB-0010).
+/// The stored span ratio and the signed Speed value describe different things.
+pub(super) fn constant_speed(
+    ctx: &Ctx<'_>, effect: &Node, input: &Node, stored: (i64, i64),
+) -> Option<(i64, i64)> {
+    const LENGTH: i64 = 50;
+    let (num, den, source_length, first_position, end_position) = match stored {
+        (2, 1) => (1, 2, 25, 0, 25),
+        (50, 99) => (2, 1, 99, 0, 100),
+        (-1, 1) => (-1, 1, 50, 49, -1),
+        _ => return None,
+    };
+    if effect.get("effect_id").and_then(Value::as_str) != Some("EFF_ADV_MOTION_CTL")
+        || float(effect, "edit_rate") != Some(24.0)
+        || int(effect, "media_kind_id") != Some(KIND_PICTURE)
+        || int(effect, "length") != Some(LENGTH)
+        || int(effect, "mc_mode") != Some(0)
+        || int(effect, "num_scalars") != Some(0)
+        || int(effect, "phase_offset") != Some(0)
+        || float(effect, "offset_adjust") != Some(0.0)
+        || effect.get("new_source_calculation") != Some(&Value::Bool(true))
+        || !null(effect, "source_param_list")
+        || int(input, "length") != Some(source_length)
+        || float(input, "edit_rate") != Some(24.0)
+        || int(input, "media_kind_id") != Some(KIND_PICTURE)
+        || !std::ptr::eq(direct_input(ctx, effect)?, input)
+        || !master_picture_matches(ctx, input)
+    {
+        return None;
+    }
+    let attrs = borrowed_attrs(ctx, effect);
+    for (key, expected) in [
+        ("_MFX_INPUT_FORMAT", 2), ("_MFX_OUTPUT_FORMAT", 2),
+        ("_SFX_RENDER", 0), ("_SFX_IGNORE_RENDER_SETTING", 0),
+        ("_NEW_SHAPE_REFERENCE_FRAME", 1),
+    ] {
+        if unique_attribute(attrs, key).and_then(Value::as_int) != Some(expected) {
+            return None;
+        }
+    }
+    match (num, attrs.iter().filter(|(key, _)| key == "_MFX_GRAPH_ENABLED").count()) {
+        (-1, 0) => (),
+        (1 | 2, 1) if unique_attribute(attrs, "_MFX_GRAPH_ENABLED").and_then(Value::as_int) == Some(1) => (),
+        _ => return None,
+    }
+    if attrs.iter().any(|(k, _)| !matches!(k.as_str(),
+        "_MFX_INPUT_FORMAT" | "_MFX_OUTPUT_FORMAT" | "_SFX_RENDER" |
+        "_SFX_IGNORE_RENDER_SETTING" | "_NEW_SHAPE_REFERENCE_FRAME" |
+        "_MFX_GRAPH_ENABLED" | "_MFX_VIEW_SPD_TOP" | "_MFX_VIEW_SPD_BOTTOM" |
+        "_TMP_CRM"))
+    {
+        return None;
+    }
+    let list = ctx.deref(effect.get("param_list")).filter(|n| n.class == *b"PRLS")?;
+    let Value::RefList(items) = list.get("items")? else { return None };
+    if items.len() != if num < 0 { 3 } else { 4 } {
+        return None;
+    }
+    let mut controls = [None; 4];
+    for reference in items {
+        let item = ctx.deref(Some(reference))?;
+        let (slot, ty) = match uuid(item)?.as_str() {
+            SPEED => (0, 2),
+            POSITION => (1, 2),
+            AUXILIARY => (2, 1),
+            EDITABLE_POSITION if num > 0 => (3, 2),
+            _ => return None,
+        };
+        let extrap = if slot == 3 { 2 } else { 1 };
+        if controls[slot].replace(curve(ctx, item, ty, LENGTH, 24.0, extrap)?).is_some() {
+            return None;
+        }
+    }
+    if let Some(editable) = controls[3] {
+        let keys = points(editable)?;
+        let edge_x = 4.800000000000001;
+        let expected = [
+            (0, 0.0, [-edge_x, -2.45], [edge_x, 2.45]),
+            (12, 6.125, [-edge_x, -1.5891891891891894], [10.0, 3.310810810810811]),
+            (37, 42.875, [-10.0, -3.310810810810811], [edge_x, 1.5891891891891894]),
+            (49, 49.0, [-edge_x, -2.45], [edge_x, 2.45]),
+        ];
+        if int(editable, "interp_kind") != Some(6) || keys.len() != 4
+            || !expected.into_iter().zip(keys).all(|((frame, value, incoming, outgoing), key)| {
+                    preset_key(key, frame).is_some_and(|k| {
+                        k.value == value && k.incoming == incoming && k.outgoing == outgoing
+                    })
+                })
+        {
+            return None;
+        }
+    }
+    let speed = controls[0]?;
+    let [only_speed] = points(speed)? else { return None };
+    let only_speed = point(only_speed, 0)?;
+    let position = controls[1]?;
+    let [first, end] = points(position)? else { return None };
+    let auxiliary = controls[2]?;
+    let [aux] = points(auxiliary)? else { return None };
+    let aux = point(aux, 0)?;
+    let Value::List(props) = only_speed.get("pp")? else { return None };
+    let has_speed_properties = [(14, first_position as f64), (5, -5.0), (6, 0.0),
+        (7, 5.0), (8, 0.0)].into_iter().all(|(code, expected)| {
+        props.iter().any(|p| matches!(p, Value::Node(n) if int(n, "code") == Some(code)
+            && int(n, "type") == Some(2) && float(n, "value") == Some(expected)))
+    });
+    (int(speed, "interp_kind") == Some(6)
+        && float(only_speed, "value") == Some(num as f64 / den as f64)
+        && props.len() == 6 && has_speed_properties
+        && props.iter().any(|p| matches!(p, Value::Node(n) if int(n, "code") == Some(9)
+            && int(n, "type") == Some(1) && int(n, "value") == Some(1)))
+        && int(position, "interp_kind") == Some(3)
+        && [(first, 0, first_position), (end, 2 * LENGTH, end_position)]
+            .into_iter().all(|(p, t, value)| point(p, t)
+                .is_some_and(|p| no_properties(p) && float(p, "value") == Some(value as f64)))
+        && int(auxiliary, "interp_kind") == Some(2)
+        && no_properties(aux) && int(aux, "value") == Some(0))
+    .then_some((num, den))
+}
+
 fn speed_point(value: &Value, end: bool) -> Option<f64> {
     let node = point(value, if end { (FRAMES - 1) * 2 } else { 0 })?;
     let Some(Value::List(props)) = node.get("pp") else {

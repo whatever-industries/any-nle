@@ -264,9 +264,10 @@ fn set_static_scalar(project: &mut Project, param: NodeId, scalar: f64) {
 
 /// `add_crossfade(track, fade, style)`: an audio crossfade over the cut at `fade.cut`,
 /// positioned exactly: Start = cut - offset, End = Start + duration, Alignment = offset.
-/// `style`: `"constant_power"` (py_premiere's 26.3-verified shape) or `"custom_fade"` (what
+/// `"constant_gain"` uses the saved linear shape and verifies the exact asymmetric handles.
+/// `"constant_power"` is py_premiere's 26.3-verified shape. `"custom_fade"` is what
 /// Premiere 26.5.2 saved for a Constant Power crossfade: "Custom Fade" names plus
-/// `FadeShapeValue` 14; PRPROJ-0013).
+/// `FadeShapeValue` 14; PRPROJ-0013.
 pub fn add_crossfade(project: &mut Project, track: TrackId, fade: &AudioCrossfade, style: &str) -> Result<()> {
     let clips: Vec<TrackItemId> = project.track_clips(track).to_vec();
     let mut outgoing = None;
@@ -288,6 +289,14 @@ pub fn add_crossfade(project: &mut Project, track: TrackId, fade: &AudioCrossfad
     };
     if fade.cut_offset > project.duration(outgoing)?.ticks || fade.duration - fade.cut_offset > project.duration(incoming)?.ticks {
         return value(format!("crossfade at {} is longer than the clips around it", fade.cut));
+    }
+    if style == "constant_gain" {
+        let start = fade.cut.checked_sub(fade.cut_offset);
+        let end = fade.cut.checked_add(fade.duration - fade.cut_offset);
+        let (Some(start), Some(end)) = (start, end) else {
+            return value("Constant Gain crossfade span overflows");
+        };
+        return project.add_prepared_audio_crossfade(track, outgoing, incoming, start, end, fade.cut_offset, false);
     }
     let element = project.add_transition(track, incoming, "Constant Power", true, Some(Time::new(fade.duration)), None)?;
     let tree = &mut project.doc.tree;

@@ -73,3 +73,45 @@ structures. Proxies, separately linked Resolve audio, other Resolve pool object
 classes, missing paths, and contradictory media references require separate
 support. This is a relink of an existing native project. Cross-editor conform
 and other media or project profiles have their own qualification.
+
+## Avid offline output
+
+Choose **Allow offline media** with Separate files, Grouped, or Merged. Use
+`--allow-offline-media` for direct conversion, or set `allow_offline_media`
+in a saved job. Review identifies the offline media. The converter writes
+`OUTPUT.prproj.anynle-relink.json` next to the project when any source is
+offline. Rewrap requires all of its input files before it creates media.
+
+Create a JSON array of `original` and `destination` pairs. Copy `original`
+from the report's `path` field, which can be a package-based placeholder.
+Use the absolute current file path for `destination`. Each managed MXF
+sibling has its own mapping. Both channels of a linked original share
+one mapping.
+
+Any NLE keeps the exact saved path for an offline linked original. A managed
+MXF may have only a file-package identity in the bin: the source camera file's
+logging path cannot locate the separately managed picture and audio files.
+If the media is available, adding its Avid MediaFiles folder and rerunning
+Review lets Any NLE resolve each MXF by package before conversion. If it cannot
+resolve a source, use the report to verify its destination before locating it
+in Premiere. In the tested Separate split edit, Premiere 27 left some uses
+offline after Link Media and reopen, so check the timeline as well as the bin.
+
+```sh
+any-nle verify-offline-relink OUTPUT.prproj.anynle-relink.json MOVES.json
+```
+
+The verifier checks managed package identity, the effective file clock and
+essence extent. For a linked original it checks the filename, stream layout,
+and file-relative timing. Saved clip logging timecode remains separate from
+the physical file origin. The check reads files in place and prints the
+verified mappings. Use them when selecting files in Premiere's **Link Media**
+dialog. [Adobe Link Media guide](https://helpx.adobe.com/premiere/desktop/organize-media/ingest-proxy-workflow/relink-offline-clips.html)
+
+For duplicate saved original basenames, supply `--checksums TRUSTED.json`
+with `schema` set to `anynle.offline-checksums/1` and an `originals` array
+of `path` and `sha256` pairs. The path is the report's offline locator. Use
+hashes captured while the known-good originals were available. Without the
+option, the verifier does no full-file hashing. The qualified offline
+profiles and Premiere read-back status are tracked in the
+[roadmap](ROADMAP.md#offline-output-and-relink).

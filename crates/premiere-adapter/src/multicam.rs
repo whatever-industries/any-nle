@@ -2,7 +2,7 @@
 use super::*;
 use graph::source::{MulticamAlternative, MulticamPiece};
 use prproj::convert::multicam::{
-    PreparedCamera, PreparedMulticam, PreparedMulticamUse, MAX_GROUPS, RATE,
+    PreparedCamera, PreparedGroupAudio, PreparedMulticam, PreparedMulticamUse, MAX_GROUPS, RATE,
 };
 
 fn refusal(id: &str, reason: &str) -> GraphError {
@@ -30,6 +30,7 @@ pub(super) fn prepare(
     g: &SourceGraph,
     input: &mut PreparedProjectInput,
     ownership: &HashMap<String, (usize, usize)>,
+    clock: ClockProfile,
     diagnostics: &mut Vec<String>,
     losses: &mut Vec<Loss>,
 ) -> R<()> {
@@ -39,6 +40,15 @@ pub(super) fn prepare(
     if g.multicams.len() > MAX_GROUPS || g.multicam_uses.len() > model::MAX_ITEMS {
         return Err(refusal("project", "prepared group/use count exceeds limit"));
     }
+    let direct = clock == ClockProfile::LegacyImport;
+    if direct && input.options.bin_mode != "separate" {
+        return Err(error("multicam_native_route_required: linked editable Groups require Separate files"));
+    }
+    let pcm24_direct: HashSet<_> = input.clips.iter().filter_map(|clip| match clip {
+        PreparedClip::Legacy(c) if input.direct_dnxhr_origins.contains_key(&c.id)
+            && c.audio.iter().all(|a| a.bits == 24) => Some(c.id.as_str()),
+        _ => None,
+    }).collect();
     let mut indices = HashMap::new();
     let mut bin_indices = HashMap::new();
     let known: HashSet<_> = g.multicams.iter().map(|m| m.id.as_str()).collect();
@@ -82,6 +92,7 @@ pub(super) fn prepare(
             ));
         }
         let mut cameras = Vec::with_capacity(2);
+        let mut audio_alternatives = [[0; 2]; 2];
         for (i, alt) in video.alternatives.iter().enumerate() {
             let picture = real_piece(alt, &m.id)?;
             if picture.stream != Some(1) {
@@ -124,9 +135,17 @@ pub(super) fn prepare(
                     ));
                 }
                 labels[j] = label;
+                audio_alternatives[j][i] = index;
+            }
+            let clip = clip_id(picture.item.as_deref().unwrap());
+            if direct && !pcm24_direct.contains(clip.as_str()) {
+                return Err(refusal(&m.id, &format!(
+                    "linked camera {} requires qualified DNxHR LB and two original mono PCM24 siblings",
+                    i + 1
+                )));
             }
             cameras.push(PreparedCamera {
-                clip: clip_id(picture.item.as_deref().unwrap()),
+                clip,
                 start: ticks(picture.start, "camera start")?,
                 source_in: ticks(
                     picture
@@ -147,7 +166,7 @@ pub(super) fn prepare(
             "group duration",
         )?;
         indices.insert(m.id.as_str(), input.multicams.len());
-        audio_lanes.push([(a1.index, a1.selected), (a2.index, a2.selected)]);
+        audio_lanes.push([(a1.index, audio_alternatives[0]), (a2.index, audio_alternatives[1])]);
         input.multicams.push(PreparedMulticam {
             id: m.id.clone(),
             name: m.name.clone(),
@@ -219,7 +238,7 @@ pub(super) fn prepare(
                 group,
                 source_in,
                 video: None,
-                audio: vec![usize::MAX; e.audio_tracks.len()],
+                audio: vec![PreparedGroupAudio::Group(usize::MAX); e.audio_tracks.len()],
             });
             i
         });
@@ -247,15 +266,24 @@ pub(super) fn prepare(
                 }
             }
             StreamKind::Audio => {
-                let channel = audio_lanes[group].iter().position(|&(lane, selection)| {
-                    u.lane == Some(lane) && selection == Some(selected)
-                }).ok_or_else(|| refusal(&u.id, "changing or independently selected group audio needs separate qualification"))?;
+                let (channel, (_, alternatives)) = audio_lanes[group].iter().enumerate()
+                    .find(|(_, (lane, _))| u.lane == Some(*lane))
+                    .ok_or_else(|| refusal(&u.id, "audio selection has no exact Group lane"))?;
+                let choice = if selected == alternatives[0] {
+                    PreparedGroupAudio::Group(channel)
+                } else if direct && selected == alternatives[1] {
+                    loss(losses, &u.id, "group_audio_editability",
+                        "alternate Group audio is a direct mono clip in Premiere; the picture angle remains editable");
+                    PreparedGroupAudio::LinkedAlternate(channel)
+                } else {
+                    return Err(refusal(&u.id, "changing or independently selected group audio needs the qualified direct link route"));
+                };
                 let slot = e
                     .audio_tracks
                     .iter()
                     .position(|&t| t == u.track)
                     .ok_or_else(|| refusal(&u.id, "audio selection has no exact prepared track"))?;
-                if std::mem::replace(&mut use_.audio[slot], channel) != usize::MAX {
+                if std::mem::replace(&mut use_.audio[slot], choice) != PreparedGroupAudio::Group(usize::MAX) {
                     return Err(refusal(&u.id, "duplicate group audio binding"));
                 }
             }
@@ -284,6 +312,6 @@ pub(super) fn prepare(
             loss(losses, &s.object, "group_metadata", "native Group marks/markers remain in source facts; editable Premiere output does not reproduce them");
         }
     }
-    diagnostics.push(format!("{} editable two-camera Premiere source item(s), {} bound event(s); fixed first-camera mono audio, picture angle remains editable", input.multicams.len(), input.multicam_uses.len()));
+    diagnostics.push(format!("{} editable two-camera Premiere source item(s), {} bound event(s); picture angle remains editable", input.multicams.len(), input.multicam_uses.len()));
     Ok(())
 }

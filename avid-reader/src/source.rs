@@ -94,12 +94,58 @@ impl std::error::Error for SourceReadError {}
 #[derive(Debug)]
 pub struct SourceProject {
     pub masters: Vec<SourceMaster>,
+    pub imported_stills: Vec<SourceImportedStill>,
+    pub subclips: Vec<SourceSubclip>,
     pub groups: Vec<SourceGroup>,
     pub sequences: Vec<SourceSequence>,
     pub skipped: Vec<Skipped>,
     pub duplicates: Vec<(String, usize)>,
     /// Accounted retained facts, not a process RSS or decoder-allocation measurement.
     pub accounted_bytes: usize,
+}
+/// Saved picture master and original PNG locator, independent of managed codec support.
+#[derive(Debug)]
+pub struct SourceImportedStill {
+    pub id: String,
+    pub bin: usize,
+    pub master: crate::io::MobId,
+    pub track: i64,
+    pub file_mob: crate::io::MobId,
+    pub file_track: i64,
+    pub rate: Option<Rate>,
+    pub master_length: Option<i64>,
+    /// Offset and span of the master's SourceClip. These describe the saved edit.
+    pub file_in: Option<i64>,
+    pub source_length: Option<i64>,
+    pub import_aspect: Option<i64>,
+    pub color_level: Option<i64>,
+    pub import: MatteImport,
+}
+/// One saved usage-2 bin occurrence. Range attributes and component offsets
+/// are native observations on their respective owners.
+#[derive(Debug)]
+pub struct SourceSubclip {
+    pub id: String,
+    pub bin: usize,
+    pub mob: Option<crate::io::MobId>,
+    pub name: String,
+    pub rate: Option<Rate>,
+    pub backing_length: Option<i64>,
+    pub start: Observed<i64>,
+    pub end: Observed<i64>,
+    pub tracks: Vec<SourceSubclipTrack>,
+}
+
+#[derive(Debug)]
+pub struct SourceSubclipTrack {
+    pub label: Option<i64>,
+    pub component_class: Option<[u8; 4]>,
+    pub kind: Option<i64>,
+    pub rate: Option<Rate>,
+    pub length: Option<i64>,
+    pub target_mob: Option<crate::io::MobId>,
+    pub target_track: Option<i64>,
+    pub target_offset: Option<i64>,
 }
 #[derive(Debug)]
 pub struct SourceMaster {
@@ -113,10 +159,30 @@ pub struct SourceMaster {
     pub marker_witnesses: Vec<MasterMarkerWitness>,
     /// Same order as master.tracks; nested FILE locators and raw descriptor facts.
     pub originals: Vec<Option<OriginalTrack>>,
+    /// Saved direct file-to-physical timecode routes, in master track order.
+    pub file_clocks: Vec<Option<SavedFileClock>>,
+    /// Observed on the directly referenced picture file mob, in master track order.
+    pub input_transforms: Vec<SourceInputTransform>,
     /// Picture master selected by a qualified traditional Freeze Frame owner.
     pub rendered_freeze: bool,
     /// Upstream precompute identity for a timeline-bound AudioSuite Gain master.
     pub rendered_gain: Option<crate::io::MobId>,
+}
+#[derive(Debug)]
+pub struct SourceInputTransform {
+    pub track: i64,
+    pub file_mob: crate::io::MobId,
+    pub value: Observed<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedFileClock {
+    pub package: crate::io::MobId,
+    pub rate: Rate,
+    pub count: i64,
+    pub offset: i64,
+    pub base: i64,
+    pub drop: bool,
+    pub file_track: i64,
 }
 /// Saved original-file facts, independent of current path availability or codec admission.
 #[derive(Clone, Debug, PartialEq)]
@@ -128,6 +194,7 @@ pub struct OriginalTrack {
     pub channels: Option<i64>,
     pub sample_rate: Option<f64>,
     pub stored_quantization_bits: Option<i64>,
+    pub display_raster: Option<(i64, i64)>,
     /// Referenced file-mob track label; not a decoder stream or channel ordinal.
     pub file_track: Option<i64>,
     /// Evidence for the observed automatic adapter's linked AAC origin.
@@ -175,6 +242,7 @@ pub struct SourceEvent {
     pub range: Option<QualifiedRange>,
     pub reason: Option<String>,
     pub volume_automation: Option<VolumeAutomation>,
+    pub pan_automation: Option<PanAutomation>,
     pub picture_extension: Option<PictureExtension>,
     /// Full-span picture effects in input-to-output order, if the chain is resolved.
     pub picture_chain: Vec<PictureStage>,
@@ -182,6 +250,10 @@ pub struct SourceEvent {
     pub motion_adapter_phase: Option<i64>,
     /// Visible source frame offsets from the qualified range start for a saved Timewarp map.
     pub saved_timewarp: Option<Vec<i64>>,
+    /// Signed playback ratio established by the saved constant Speed and Position controls.
+    pub constant_speed: Option<(i64, i64)>,
+    /// A top-level, neutral Collapse over one full-span picture edit.
+    pub plain_submaster: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct ResizeKey {
@@ -212,11 +284,26 @@ pub struct LinearTrimKey {
     pub height: f64,
 }
 #[derive(Clone, Copy, Debug)]
+pub struct WarpRollKey {
+    pub frame: i64,
+    pub x: f64,
+    pub width: f64,
+    pub rotation: f64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarpRollInterpolation {
+    Shelf,
+    Linear,
+    Bezier,
+    Spline,
+}
+#[derive(Clone, Copy, Debug)]
 pub enum PictureExtension {
     Flip { native_id: &'static str, horizontal: bool, vertical: bool },
     Resize([ResizeKey; 2]),
     ResizeCrop([ResizeKey; 2]),
     Warp([ResizeKey; 2]),
+    WarpRoll { keys: [WarpRollKey; 3], interpolation: WarpRollInterpolation },
     WarpTrim(LinearTrim),
     ResizeTrim(LinearTrim),
     UnsupportedTransform(&'static str),
@@ -233,7 +320,7 @@ impl PictureExtension {
     }
 
     pub fn requires_square_pixels(self) -> bool {
-        matches!(self, Self::ResizeCrop(_) | Self::Warp(_) | Self::WarpTrim(_) | Self::ResizeTrim(_))
+        matches!(self, Self::ResizeCrop(_) | Self::Warp(_) | Self::WarpRoll { .. } | Self::WarpTrim(_) | Self::ResizeTrim(_))
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -242,11 +329,19 @@ pub struct VolumePoint {
     pub frame_denominator: i64,
     pub gain_q29: i64,
 }
+#[derive(Clone, Copy, Debug)]
+pub struct PanPoint {
+    pub frame_numerator: i64,
+    pub frame_denominator: i64,
+    pub raw_pan: i64,
+}
 #[derive(Debug)]
-pub enum VolumeAutomation {
-    Keys(Vec<VolumePoint>),
+pub enum Automation<P> {
+    Keys(Vec<P>),
     Unsupported(&'static str),
 }
+pub type VolumeAutomation = Automation<VolumePoint>;
+pub type PanAutomation = Automation<PanPoint>;
 #[derive(Debug)]
 pub struct SourceTransition {
     pub id: String,
@@ -257,6 +352,8 @@ pub struct SourceTransition {
     pub cutpoint: Observed<i64>,
     pub rate: Option<Rate>,
     pub effect: Option<String>,
+    pub audio_curve_attribute: Option<i64>,
+    pub audio_curve_parameter: Option<i64>,
     pub outgoing: Binding,
     pub incoming: Binding,
 }
@@ -278,7 +375,40 @@ pub struct SourceMarker {
 pub enum SourceIssueKind {
     Route,
     RouteTiming,
+    MatteKey { length: Option<i64> },
+    ColorAdapter { length: Option<i64> },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatteInput {
+    pub mob: crate::io::MobId,
+    pub track: i64,
+    pub start: i64,
+    pub length: i64,
+    pub rate: Rate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatteBackground {
+    LowerTrack,
+    Explicit,
+    Unresolved,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatteInputs {
+    pub background: MatteBackground,
+    pub fill: Option<MatteInput>,
+    pub matte: Option<MatteInput>,
+}
+
+/// Saved import settings on the master shared by the fill and matte.
+#[derive(Debug)]
+pub struct MatteImport {
+    pub ignore_alpha: Option<bool>,
+    pub invert_alpha: Option<bool>,
+    pub locators: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct SourceIssue {
     pub owner: String,
@@ -289,6 +419,16 @@ pub struct SourceIssue {
     pub record_rate: Option<Rate>,
     pub kind: i64,
     pub track: i64,
+    pub matte_inputs: Option<MatteInputs>,
+    pub matte_import: Option<MatteImport>,
+    /// Saved control/route match only. Media identity and destination composition
+    /// still require verification; a match does not remove the source loss.
+    pub picture_profile: Option<SourcePictureProfile>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourcePictureProfile {
+    ImportedPngMatte,
+    EmptyColorAdapter,
 }
 #[derive(Debug)]
 pub struct SourceSequence {
@@ -317,6 +457,7 @@ pub struct SequenceClock {
     pub count: u64,
     pub rate: Rate,
     pub display_base: u16,
+    pub drop: bool,
     pub track_ordinal: usize,
 }
 

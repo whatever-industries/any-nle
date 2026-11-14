@@ -5,7 +5,8 @@ use crate::audio::{
 };
 use crate::video::{
     motion::{Curve, LinearMotion, CONTROLS, KEY_BYTES, KEY_FLAGS as VIDEO_KEY_FLAGS},
-    PictureControl, Reflection, CROP, FLIP_X, FLIP_Y, SCALE_X, SCALE_Y, X, Y,
+    roll::{self, LinearRoll},
+    PictureControl, Reflection, ANCHOR, CROP, FLIP_X, FLIP_Y, ROTATION, SCALE_X, SCALE_Y, X, Y,
 };
 use encoding::{fields, Wire};
 use graph::Transform;
@@ -44,13 +45,34 @@ pub(super) fn picture_control(
     if reflection.active() && crop.is_none() && motion[..first_reflection_slot].iter().all(|slot| slot.is_empty()) {
         return Ok(Some(PictureControl::Reflection(reflection)));
     }
-    if motion[5..first_reflection_slot].iter().any(|slot| !slot.is_empty()) {
+    if motion[ANCHOR.0 + 1..first_reflection_slot].iter().any(|slot| !slot.is_empty()) {
         return Ok(None);
     }
     if !matches!(motion[2], [] | [8, 44, 26, 4, 10, 2, 40, 0]) {
         return Ok(None);
     }
-    if !motion[2].is_empty() {
+    let has_anchor = !motion[ANCHOR.0].is_empty();
+    if has_anchor && !motion[2].is_empty() {
+        return Ok(None);
+    }
+    if !motion[2].is_empty()
+        && !motion[ROTATION.0].is_empty()
+        && crop.is_none()
+        && !reflection.active()
+        && motion[SCALE_Y.0].is_empty()
+        && motion[Y.0].is_empty()
+    {
+        let [pan, zoom, angle] = roll::CONTROLS;
+        if let (Some(pan), Some(zoom), Some(angle)) = (
+            linear_curve(motion[pan.0], pan.1, (0.0, 3))?,
+            linear_curve(motion[zoom.0], zoom.1, (1.0, 3))?,
+            linear_curve(motion[angle.0], angle.1, (0.0, 3))?,
+        ) {
+            return Ok(LinearRoll::from_saved([pan, zoom, angle], source_in, length, available)
+                .map(PictureControl::LinearRoll));
+        }
+    }
+    if !motion[2].is_empty() && motion[ROTATION.0].is_empty() {
         let mut curves: [Curve; 4] = Default::default();
         let mut all_animated = true;
         for (((slot, id), neutral), curve) in CONTROLS
@@ -84,11 +106,12 @@ pub(super) fn picture_control(
                 .map(PictureControl::LinearMotion));
         }
     }
-    let (Some(x), Some(y), Some(sx), Some(sy)) = (
+    let (Some(x), Some(y), Some(sx), Some(sy), Some(rotation)) = (
         static_slot(&motion, X, 0.0)?,
         static_slot(&motion, Y, 0.0)?,
         static_slot(&motion, SCALE_X, 1.0)?,
         static_slot(&motion, SCALE_Y, 1.0)?,
+        static_slot(&motion, ROTATION, 0.0)?,
     ) else {
         return Ok(None);
     };
@@ -107,18 +130,32 @@ pub(super) fn picture_control(
             *edge = value;
         }
     }
+    let Some(anchor) = anchor_slot(motion[ANCHOR.0])? else {
+        return Ok(None);
+    };
+    if has_anchor && (x != 0.0 || y != 0.0) {
+        return Ok(None);
+    }
     let t = Transform {
-        position: (x, -y),
+        position: if has_anchor { anchor } else { (x, -y) },
         scale: (sx * 100.0, sy * 100.0),
-        rotation: 0.0,
-        anchor: (0.0, 0.0),
+        rotation: if rotation == 0.0 { 0.0 } else { -rotation },
+        anchor,
         crop: edges,
     };
+    let centered_crop = crate::video::centered_crop_profile(&t);
+    if has_anchor && !crate::video::rotation_axis_profile(&t) {
+        return Ok(None);
+    }
+    if rotation != 0.0 && !motion[2].is_empty() && !centered_crop {
+        return Ok(None);
+    }
     if reflection.active() {
         return Ok(crate::video::encode_with_reflection(&t, reflection).ok()
             .map(|_| PictureControl::ReflectedTransform(t, reflection)));
     }
-    Ok(crate::video::validate_static_geometry(&t).ok().map(|_| PictureControl::Transform(t)))
+    Ok((has_anchor || centered_crop || crate::video::validate_static_geometry(&t).is_ok())
+        .then_some(PictureControl::Transform(t)))
 }
 
 fn source_crop_slots(crop: &[u8]) -> Result<Option<Vec<&[u8]>>> {
@@ -185,11 +222,38 @@ fn static_slot(slots: &[&[u8]], (slot, id): (usize, u64), neutral: f64) -> Resul
     }
 }
 
+fn anchor_slot(data: &[u8]) -> Result<Option<(f64, f64)>> {
+    if data.is_empty() {
+        return Ok(Some((0.0, 0.0)));
+    }
+    let params = fields(data)?;
+    let [(1, Wire::Int(id)), (3, Wire::Bytes(curve))] = params.as_slice() else {
+        return Ok(None);
+    };
+    if *id != ANCHOR.1 {
+        return Ok(None);
+    }
+    let keys = fields(curve)?;
+    let [(1, Wire::Bytes(key))] = keys.as_slice() else {
+        return Ok(None);
+    };
+    let point = fields(key)?;
+    let [(7, Wire::Bytes(xy))] = point.as_slice() else {
+        return Ok(None);
+    };
+    if xy.len() != 16 {
+        return Ok(None);
+    }
+    let (x, y) = xy.split_at(8);
+    let x = f64::from_be_bytes(x.try_into()?);
+    let y = f64::from_be_bytes(y.try_into()?);
+    Ok((x.is_finite() && y.is_finite()).then_some((x, if y == 0.0 { 0.0 } else { -y })))
+}
+
 #[derive(Default)]
 pub(super) struct ClipAudio {
     pub(super) envelope: Option<Envelope>,
     pub(super) pan: Option<f64>,
-    pub(super) fractional_fades: Option<[f64; 2]>,
 }
 
 pub(super) fn clip_audio(
@@ -206,11 +270,10 @@ pub(super) fn clip_audio(
     };
     let mut audio = ClipAudio::default();
     let pan = if let Some(slots) = section_slots(first, EFFECT, 0)? {
-        let Some((envelope, fractional_fades)) = clip_envelope(&slots, edit)? else {
+        let Some(envelope) = clip_envelope(&slots, edit)? else {
             return Ok(None);
         };
         audio.envelope = Some(envelope);
-        audio.fractional_fades = fractional_fades;
         second
     } else if second.is_none() {
         Some(first)
@@ -232,7 +295,7 @@ pub(super) fn clip_audio(
     Ok(Some(audio))
 }
 
-fn clip_envelope(slots: &[&[u8]], edit: Edit) -> Result<Option<(Envelope, Option<[f64; 2]>)>> {
+fn clip_envelope(slots: &[&[u8]], edit: Edit) -> Result<Option<Envelope>> {
     let [volume, head, tail, in_shape, out_shape] = slots else {
         return Ok(None);
     };
@@ -254,14 +317,6 @@ fn clip_envelope(slots: &[&[u8]], edit: Edit) -> Result<Option<(Envelope, Option
         ) else {
             return Ok(None);
         };
-        if head.fract() != 0.0 || tail.fract() != 0.0 {
-            if !in_shape.is_empty() || !out_shape.is_empty()
-                || matches!(volume, Some(Volume::Keys(_))) || head + tail > edit.length as f64
-            {
-                return Ok(None);
-            }
-            return Ok(Some((Envelope { volume, fades: None }, Some([head, tail]))));
-        }
         let head_point = fade_point(in_shape, HEAD_POINT)?
             .and_then(|(position, level)| FadePoint::new(position, level));
         let tail_point = fade_point(out_shape, TAIL_POINT)?
@@ -269,13 +324,15 @@ fn clip_envelope(slots: &[&[u8]], edit: Edit) -> Result<Option<(Envelope, Option
         if (!in_shape.is_empty() && head_point.is_none()) || (!out_shape.is_empty() && tail_point.is_none()) {
             return Ok(None);
         }
-        let fades = Fades { head: head as i64, tail: tail as i64, head_point, tail_point };
-        if !fades.valid_for(edit.length) {
+        let fades = Fades { head, tail, head_point, tail_point };
+        if !fades.valid_for(edit.length)
+            || (fades.fractional() && matches!(volume, Some(Volume::Keys(_))))
+        {
             return Ok(None);
         }
         Some(fades)
     };
-    Ok((volume.is_some() || fades.is_some()).then_some((Envelope { volume, fades }, None)))
+    Ok((volume.is_some() || fades.is_some()).then_some(Envelope { volume, fades }))
 }
 
 /// Capture documented custom fade control points without assigning a
@@ -455,6 +512,106 @@ pub(super) fn report_group_controls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopened_warp_roll_keeps_linear_keys_and_rejects_other_interpolation() {
+        let native = concat!(
+            "00000002000000a98128b52ffd20f6fd040014070af301080438004a45082a1a0b0a091166e63f5234ffffff",
+            "d0000c0066e63f05000c00f03f0c000c009a99e93f4a004a08082c1a040a0228004a45082803ec813331c0a",
+            "ebf0271a1e62410b79ebf4a004a45082f002e402e4005000c0039c00c000c0024404a004a004a004a004a004a",
+            "001500603008040c068160004c90880b63c28da1c6026501899c0400c9594102880c02018341107003b453004b",
+        );
+        let decode = |blob| picture_control(blob, &mut Blobs::default(), 0, 13, 240).unwrap();
+        let Some(PictureControl::LinearRoll(roll)) = decode(native) else {
+            panic!("expected reopened Linear Warp rotation");
+        };
+        let effect = roll.readback();
+        assert_eq!(effect.params.get("rotation"), Some(&Value::Arr(
+            [(0, 15.0), (5, -25.0), (12, 10.0)].into_iter().map(|(frame, angle)| {
+                Value::Arr(vec![Value::Int(frame), Value::Float(angle)])
+            }).collect()
+        )));
+        assert_eq!(LinearRoll::from_graph(&effect, 0, 13, 240).unwrap(), roll);
+        assert!(LinearRoll::from_graph(&effect, 1, 13, 240).is_err());
+        assert!(LinearRoll::from_graph(&effect, 0, 13, 12).is_err());
+
+        use prproj::convert::prepared::{PictureEffect, WarpRollInterpolation};
+        let PictureEffect::WarpRoll { keys, interpolation: WarpRollInterpolation::Linear } =
+            roll.prepare_premiere().unwrap()
+        else {
+            panic!("expected editable Premiere Motion with Linear keys");
+        };
+        assert_eq!(keys.map(|key| key.ticks), [0, 52_920_000_000, 127_008_000_000]);
+        assert_eq!(keys.map(|key| key.x), [-60.0 / 999.0, 90.0 / 999.0, -30.0 / 999.0]);
+        assert_eq!(keys.map(|key| key.width), [70.0, 100.0, 80.0]);
+        assert_eq!(keys.map(|key| key.rotation), [-15.0, 25.0, -10.0]);
+
+        let mut body = crate::binary::unpack(native).unwrap();
+        let key = [8, 47, 26, 11, 10, 9, 17];
+        let offset = body.windows(key.len()).position(|bytes| bytes == key).unwrap();
+        let flag = offset + key.len() + 8 + 6 + 4;
+        assert_eq!(&body[flag..flag + 4], &VIDEO_KEY_FLAGS.to_le_bytes());
+        body[flag] = 1;
+        let altered = crate::binary::pack(&body).unwrap();
+        assert!(decode(&altered).is_none());
+    }
+
+    #[test]
+    fn native_xy_pivot_round_trips_with_no_pan_or_tilt() {
+        let native = "00000002000000468128b52ffd2045e5010014030a43080438004a0f082f1a0b0a091100003ec04a1808301a140a123a1000003fb9a02900419a034a004a004a004a004a000300601408a8cd1901";
+        let decode = |encoded| picture_control(encoded, &mut Blobs::default(), 0, 1, 48).unwrap();
+        let Some(PictureControl::Transform(transform)) = decode(native) else {
+            panic!("expected static Rotation Angle and Anchor Point");
+        };
+        assert_eq!(transform.rotation, 30.0);
+        assert!((transform.anchor.1 + 100.0 / 999.0).abs() < f64::EPSILON);
+        assert_eq!(transform.position, transform.anchor);
+        assert_eq!(transform.anchor.0, 0.0);
+        let encoded = crate::video::encode(&transform).unwrap().unwrap();
+        assert_eq!(decode(&encoded), Some(PictureControl::Transform(transform.clone())));
+
+        let mut translated = transform;
+        translated.position.0 = 0.01;
+        assert!(crate::video::encode(&translated).is_err());
+    }
+
+    #[test]
+    fn native_centered_crop_with_zoom_and_roll_keeps_source_edges() {
+        let native = "000000020000008e8128b52ffd20a1250400d2461a24902b1df7fb44e49c21d0ebdf1903ff3fe627822445976f4c6dc357b59101d809d9dc560678bc6e5ed42ad37238af194a41024494735e398ef0a2666938af1acc012117c570fe718f25ec3d70e13c1e8f06c516a4b0afd3eeee4a09e7b5d30601268010cea35b9eb00a004012b844b325a304e612e06c8813a650876936480060";
+        let retain = "00000002000000968128b52ffd20aa65040062471c25902b1df7fbc4a6a6d1f8f4d5ecbfdd9dee950892145d4e30b52d56fc8bc8443b217bed2d030b62aebd45f1f3fc66a64892546d61fd5e22036a3918b47e35503045d24461fd622c846c5458c27a073a86b8899108ebf3f984986bef607fab18638c94c1fadd4881c7015ec1fa84cd0f170a004012b844b325a304e612e06c8813a650876936480060";
+        let decode = |encoded| picture_control(encoded, &mut Blobs::default(), 0, 1, 48).unwrap();
+        let Some(PictureControl::Transform(transform)) = decode(native) else {
+            panic!("expected native crop, zoom and rotation");
+        };
+        assert_eq!(transform.rotation, 30.0);
+        assert_eq!(transform.scale, (60.0, 90.0));
+        for (edge, expected) in transform.crop.into_iter().zip([100.0, 80.0, 150.0, 120.0]) {
+            assert!((edge - expected / 999.0).abs() < f64::EPSILON);
+        }
+        let encoded = crate::video::encode(&transform).unwrap().unwrap();
+        assert_eq!(decode(&encoded), Some(PictureControl::Transform(transform)));
+        assert!(decode(retain).is_none());
+    }
+
+    #[test]
+    fn native_static_rotation_preserves_angle_and_refuses_unqualified_geometry() {
+        let native = "000000020000002e800a2b080438004a004a004a004a004a004a0f082f1a0b0a09110000000000003e404a004a004a004a004a004a00";
+        let decode = |encoded| picture_control(encoded, &mut Blobs::default(), 0, 1, 48).unwrap();
+        let Some(PictureControl::Transform(transform)) = decode(native) else {
+            panic!("expected native Rotation Angle");
+        };
+        assert_eq!(transform.rotation, -30.0);
+        let encoded = crate::video::encode(&transform).unwrap().unwrap();
+        assert_eq!(decode(&encoded), Some(PictureControl::Transform(transform.clone())));
+
+        let wrong_id = native.replacen("082f", "0830", 1);
+        assert!(decode(&wrong_id).is_none());
+        let mut unqualified = transform.clone();
+        unqualified.position.0 = 0.02;
+        assert!(crate::video::encode(&unqualified).is_err());
+        let reflection = Reflection { horizontal: true, vertical: false };
+        assert!(crate::video::encode_with_reflection(&transform, reflection).is_err());
+    }
 
     #[test]
     fn reopened_linear_motion_keeps_neutral_start_keys_without_scalar_bases() {
@@ -736,6 +893,28 @@ mod tests {
     }
 
     #[test]
+    fn fractional_fade_replays_exact_ticks_from_the_saved_envelope() {
+        let frame_ticks = 10_594_584_000;
+        let expected = [64_714_012_088, 86_625_055_551];
+        let envelope = Envelope {
+            volume: Some(Volume::Static(-6.0)),
+            fades: Some(Fades {
+                head: expected[0] as f64 / frame_ticks as f64,
+                tail: expected[1] as f64 / frame_ticks as f64,
+                head_point: None,
+                tail_point: None,
+            }),
+        };
+        let encoded = envelope.encode().unwrap();
+        let edit = Edit { start: 10, source_in: 3, length: 48 };
+        let saved = clip_audio(&encoded, &mut Blobs::default(), edit).unwrap()
+            .unwrap().envelope.unwrap();
+        assert_eq!(saved, envelope);
+        assert_eq!(saved.fades.unwrap().ticks(edit.length, frame_ticks), Some(expected));
+        assert_eq!(saved.recovered_loss(), Some(crate::audio::FRACTIONAL_FADE_LOSS));
+    }
+
+    #[test]
     fn direct_audio_fades_are_clip_edge_lengths_and_keys_keep_source_frames() {
         let fades = "000000020000002f800a2c087c38004a004a0f08611a0b0a091100000000000014404a0f08621a0b0a091100000000000022404a004a00";
         let keys = "00000002000000428128b52ffd2045c50100c4020a43087c38004a35085f1a0b0a09110018c05224ffffffe008000c0018c013000c0008404a004a004a004a000510008303191cc8b504";
@@ -765,7 +944,7 @@ mod tests {
         for source_in in [2, 6] {
             assert!(matches!(
                 read(fades, source_in, 28),
-                Some(Envelope { volume: None, fades: Some(Fades { head: 5, tail: 9, .. }) })
+                Some(Envelope { volume: None, fades: Some(Fades { head: 5.0, tail: 9.0, .. }) })
             ));
             let Some(Envelope { volume: Some(Volume::Keys(points)), fades: None }) = read(keys, source_in, 28) else {
                 panic!("expected exact source-coordinate volume keys");

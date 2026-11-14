@@ -19,19 +19,25 @@ use prproj::{RandomUuids, SeededUuids, UuidSource};
 pub(crate) const USAGE: &str = "usage:
   any-nle run --job SETTINGS.json [--output NEW.prproj] [--new-media NEW_DIR]
       Run a saved native-wizard job with the same read-only preparation and explicit execution.
+  any-nle verify-offline-relink REPORT.json MOVES.json [--checksums TRUSTED.json] [--ffprobe PATH]
+      Verify proposed files before using Premiere's Link Media. Writes no files.
   any-nle convert --from avid BIN.avb... --media DIR [--media DIR...] [--project NAME]
                   --to premiere OUTPUT.prproj [--policy POLICY.json] [--bin-mode separate|grouped|merged]
                   [--match-avid-default-pan] [--graph GRAPH.json] [--seed SEED]
+                  [--link-originals [--map-original-root SAVED_ROOT CURRENT_ROOT]...]
+                  [--allow-offline-media]
                   [--rewrap-op1a NEW_DIR | --rewrap-op1a-prompt | --rewrap-media NEW_DIR] [--rewrap-dry-run] [--rewrap-native-master] [--ffmpeg PATH] [--ffprobe PATH]
       Convert Avid bins to a Premiere project. Prints what was converted, the reader's problems
       and every loss. --graph saves the qualified source anynle.graph/2 (Premiere route).
+      --link-originals: Resolve qualified saved file links alongside direct Avid media; --media is optional for original-only bins.
+      --map-original-root: Map a saved path prefix to an absolute current folder. Repeat as needed.
       --rewrap-media NEW_DIR: Creates new media. DNx to MXF OP1a; qualified ProRes to MOV. Requires --rewrap-native-master.
       --rewrap-op1a: Creates new media. Copies supported OP-Atom streams into NEW_DIR.
       --rewrap-op1a-prompt: macOS folder picker and space review before creating media.
       --rewrap-dry-run: preview only; creates no media/project/graph. Requires a rewrap destination option.
       --rewrap-native-master: experimental file-backed AV masters preserving bin audio groups; replaces bin mode.
       Qualified MXF rates (including 23.976), DNxHD/DNxHR 8-bit 4:2:2 + up to 32 mono PCM48k inputs.
-      Requires FFmpeg/ffprobe 8.1; bounded native read-backs pass; wider qualification is pending.
+      Rewrap requires FFmpeg/ffprobe 8.1; bounded native read-backs pass.
   any-nle convert --from avid BIN.avb... --media DIR [--media DIR...] [--project NAME]
                   --to fcpxml OUTPUT.fcpxml [--graph GRAPH.json]
       Convert Avid bins to FCPXML 1.9 (DaVinci Resolve, Final Cut Pro).
@@ -75,6 +81,9 @@ pub(crate) struct Args {
     pub(crate) rewrap_native_master: bool,
     pub(crate) ffmpeg: Option<PathBuf>,
     pub(crate) ffprobe: Option<PathBuf>,
+    pub(crate) link_originals: bool,
+    pub(crate) allow_offline_media: bool,
+    pub(crate) original_mappings: Vec<avid_adapter::original::RootMapping>,
 }
 
 pub(crate) fn parse(rest: &[String]) -> Result<Args, String> {
@@ -107,11 +116,25 @@ pub(crate) fn parse(rest: &[String]) -> Result<Args, String> {
             a.match_pan = true;
             continue;
         }
+        if arg == "--link-originals" {
+            if a.link_originals {
+                return Err("--link-originals given twice".into());
+            }
+            a.link_originals = true;
+            continue;
+        }
+        if arg == "--allow-offline-media" {
+            if a.allow_offline_media {
+                return Err("--allow-offline-media given twice".into());
+            }
+            a.allow_offline_media = true;
+            continue;
+        }
         let value = it
             .next()
             .cloned()
             .ok_or_else(|| format!("{arg} needs a value"))?;
-        if matches!(arg.as_str(), "--rewrap-op1a" | "--rewrap-media" | "--ffmpeg" | "--ffprobe")
+        if matches!(arg.as_str(), "--rewrap-op1a" | "--rewrap-media" | "--ffmpeg" | "--ffprobe" | "--map-original-root")
             && value.starts_with("--")
         {
             return Err(format!("{arg} needs a path, not another option"));
@@ -136,6 +159,20 @@ pub(crate) fn parse(rest: &[String]) -> Result<Args, String> {
             "--bin-mode" => a.bin_mode = Some(value),
             "--graph" => a.graph_out = Some(PathBuf::from(value)),
             "--seed" => a.seed = Some(value),
+            "--map-original-root" => {
+                let current = it.next().filter(|path| !path.starts_with("--"))
+                    .ok_or("--map-original-root needs SAVED_ROOT CURRENT_ROOT")?;
+                let current_root = PathBuf::from(current);
+                if !current_root.is_absolute()
+                    || current_root.components().any(|c| c == std::path::Component::ParentDir)
+                {
+                    return Err("--map-original-root needs an absolute CURRENT_ROOT without parent escapes".into());
+                }
+                a.original_mappings.push(avid_adapter::original::RootMapping {
+                    saved_root: value.into(),
+                    current_root,
+                });
+            }
             "--rewrap-op1a" | "--rewrap-media" => {
                 if a.rewrap.is_some() {
                     return Err("rewrap destination given more than once; choose one media mode".into());
@@ -162,13 +199,25 @@ pub(crate) fn parse(rest: &[String]) -> Result<Args, String> {
         return Err("choose an explicit rewrap directory or --rewrap-op1a-prompt, not both".into());
     }
     if !a.wants_rewrap()
-        && (a.rewrap_dry_run || a.rewrap_native_master || a.ffmpeg.is_some() || a.ffprobe.is_some())
+        && (a.rewrap_dry_run || a.rewrap_native_master || a.ffmpeg.is_some())
     {
         return Err("rewrap settings require --rewrap-op1a NEW_DIR, --rewrap-media NEW_DIR or --rewrap-op1a-prompt".into());
+    }
+    if a.ffprobe.is_some() && !a.wants_rewrap() && !a.link_originals && !a.allow_offline_media {
+        return Err("--ffprobe requires a rewrap option or --link-originals".into());
     }
     if a.rewrap_media && !a.rewrap_native_master { return Err("--rewrap-media requires --rewrap-native-master".into()); }
     if a.rewrap_native_master && a.bin_mode.is_some() {
         return Err("--rewrap-native-master replaces bin mode; omit --bin-mode".into());
+    }
+    if a.allow_offline_media && (a.wants_rewrap() || a.to.as_deref() != Some("premiere")) {
+        return Err("--allow-offline-media requires direct Avid → Premiere conversion in Separate, Grouped or Merged mode".into());
+    }
+    if !a.original_mappings.is_empty() && !a.link_originals && !a.allow_offline_media {
+        return Err("--map-original-root requires --link-originals or --allow-offline-media".into());
+    }
+    if a.link_originals && (a.wants_rewrap() || a.to.as_deref() != Some("premiere")) {
+        return Err("--link-originals requires direct convert --to premiere without rewrap".into());
     }
     Ok(a)
 }
@@ -252,21 +301,18 @@ pub(crate) fn read_avid_legacy(a: &Args) -> Result<(Graph, Vec<String>), String>
     Ok((graph, problems))
 }
 
-pub(crate) fn read_avid_source(
-    a: &Args,
-) -> Result<
-    (
-        graph::source::SourceGraph,
-        Vec<String>,
-        Vec<avid_reader::source::SourceInput>,
-    ),
-    String,
-> {
+struct AvidRead {
+    result: avid_adapter::ReadResult,
+    inputs: Vec<avid_reader::source::SourceInput>,
+    skipped_bins: Vec<PathBuf>,
+}
+
+fn read_avid_source(a: &Args) -> Result<AvidRead, String> {
     if a.from.as_deref() != Some("avid") {
         return Err("--from: only avid is supported so far".into());
     }
-    if a.bins.is_empty() || a.media.is_empty() {
-        return Err("give at least one BIN.avb and one --media folder".into());
+    if a.bins.is_empty() || (a.media.is_empty() && !a.link_originals && !a.allow_offline_media) {
+        return Err("give at least one BIN.avb and a --media folder or --link-originals".into());
     }
     let selected = avid_reader::inputs::unique_bins(&a.bins);
     let inputs = source_input::pin(&selected.paths)?;
@@ -282,12 +328,44 @@ pub(crate) fn read_avid_source(
     let project = a.project.clone().unwrap_or_else(|| names[0].clone());
     let roots: Vec<PathBuf> = a.media.iter().map(PathBuf::from).collect();
     let ffprobe = a.ffprobe.as_deref().unwrap_or_else(|| Path::new("ffprobe"));
-    let result = avid_adapter::read_with_ffprobe(&inputs, &roots, &project, &names, ffprobe)?;
+    let result = if a.link_originals || a.allow_offline_media {
+        let tools = crate::backend_bundle::resolve(None, a.ffprobe.as_deref(), false)?;
+        avid_adapter::read_with_media_policy(
+            &inputs, &roots, &project, &names,
+            &avid_adapter::original::OriginalOptions {
+                root_mappings: a.original_mappings.clone(),
+                ffprobe: tools.ffprobe,
+            }, a.allow_offline_media, &mut |_, _| Ok(()), &mut || Ok(()),
+        ).map_err(avid_adapter::SourceReadIssue::into_message)?
+    } else {
+        avid_adapter::read_with_ffprobe(&inputs, &roots, &project, &names, ffprobe)?
+    };
     source_input::recheck(&inputs)?;
-    let mut problems = result.diagnostics;
-    problems.extend(result.scan_issues);
-    problems.extend(result.audio_group_issues);
+    // Enforce the encoded ceiling before any conversion outputs, even without a snapshot.
+    result.graph.encoded_len().map_err(|e| e.to_string())?;
+    Ok(AvidRead { result, inputs, skipped_bins: selected.skipped })
+}
+
+fn source_notes(a: &Args, read: &mut AvidRead, matte: &crate::png_mattes::Plan) -> Result<Vec<String>, String> {
+    let result = &mut read.result;
+    if a.link_originals || a.allow_offline_media {
+        let issues = result.scan_issues.iter().chain(&result.audio_group_issues);
+        let unresolved = result.graph.losses.iter().filter(|loss| loss.aspect == "source_master" && matte.keeps_loss(loss));
+        let blockers: Vec<_> = issues.cloned().chain(unresolved.map(|loss| {
+            format!("{}: {}", loss.object, loss.reason)
+        })).collect();
+        if !blockers.is_empty() {
+            return Err(format!("Linked media preparation failed:\n  {}", blockers.join("\n  ")));
+        }
+    } else if a.to.as_deref() == Some("premiere") && result.has_unresolved_original_links {
+        return Err("Selected bins contain unresolved original-file links. Use --link-originals for direct linking, or use a saved job to combine original links and rewrap.".into());
+    }
+    let mut problems = std::mem::take(&mut result.diagnostics);
+    problems.retain(|note| matte.keeps_reader_note(note));
+    problems.append(&mut result.scan_issues);
+    problems.append(&mut result.audio_group_issues);
     if a.wants_rewrap() {
+        problems.extend(result.missing_managed_audio.iter().cloned());
         // Retain the existing strict rewrap policy: an omitted source route or
         // unsupported source control cannot disappear behind a reduced model.
         let text_ids: std::collections::HashSet<&str> = result.graph.sequences.iter()
@@ -297,10 +375,10 @@ pub(crate) fn read_avid_source(
                 .graph
                 .losses
                 .iter()
-                // Text appearance is intentionally represented by destination
-                // defaults. It cannot change essence selection or routing; keep
-                // reporting it, without treating it as a media-preflight error.
-                .filter(|l| l.aspect != "text_appearance" || !text_ids.contains(l.object.as_str()))
+                // These notices describe omitted appearance. Source selection
+                // and routing are validated separately by the media preflight.
+                .filter(|l| (l.aspect != "text_appearance" || !text_ids.contains(l.object.as_str()))
+                    && l.aspect != "source_color_adapter")
                 .map(|l| format!("{} [{}]: {}", l.object, l.aspect, l.reason)),
         );
         if !problems.is_empty() {
@@ -308,14 +386,11 @@ pub(crate) fn read_avid_source(
         }
     }
     problems.extend(
-        selected
-            .skipped
+        read.skipped_bins
             .iter()
             .map(|p| format!("repeated bin path skipped: {}", p.display())),
     );
-    // Enforce the encoded ceiling before any conversion outputs, even without a snapshot.
-    result.graph.encoded_len().map_err(|e| e.to_string())?;
-    Ok((result.graph, problems, inputs))
+    Ok(problems)
 }
 
 pub(crate) fn policy(a: &Args) -> Result<AvidToPremiere, String> {
@@ -396,10 +471,20 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     output::preflight(&output, a.graph_out.as_deref())?;
     let policy = policy(a)?;
     let route = if a.rewrap_media {PremiereRoute::NativeMedia}else{PremiereRoute::resolve(a.rewrap_native_master, policy.bin_mode)};
-    let (graph, problems, inputs) = read_avid_source(a)?;
+    let mut read = read_avid_source(a)?;
+    let mut matte = crate::png_mattes::prepare(
+        &read.result, &a.original_mappings, !a.wants_rewrap() && policy.bin_mode == BinMode::Separate,
+        &mut || Ok(()),
+    )?;
+    let has_matte = !matte.picture.edits.is_empty();
+    let problems = source_notes(a, &mut read, &matte)?;
+    let AvidRead { result, inputs, .. } = read;
+    let avid_adapter::ReadResult { graph, mut original_inputs, .. } = result;
+    original_inputs.append(&mut matte.inputs);
     if let Some(issue) = crate::job::sequence_timing_blocker(&graph) {
         return Err(issue.cli_summary());
     }
+    crate::offline::check_edit_routes(&graph)?;
     let gain = rewrap::gain_paths(&graph);
     if !gain.is_empty() && !a.rewrap_media {
         return Err("AudioSuite Gain requires --rewrap-media and --rewrap-native-master to copy the saved render to WAV".into());
@@ -416,24 +501,33 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         a.rewrap.clone()
     };
     let policy_losses = policy.losses_source(&graph);
+    let source_losses: Vec<_> = graph.losses.iter()
+        .filter(|loss| loss.aspect != "subclip_bin_item"
+            && loss.aspect != avid_adapter::PAN_AUTOMATION_LOSS && matte.keeps_loss(loss))
+        .cloned().collect();
     let clock = if a.wants_rewrap() { premiere_adapter::ClockProfile::VerifiedRewrap }
         else { premiere_adapter::ClockProfile::LegacyImport };
-    let (model, texts, video_dissolves, picture_effects, direct_dnxhr_origins, mut typed, preparation_notes, bridge_losses) =
-        if !gain.is_empty() || !graph.multicams.is_empty() || !graph.multicam_uses.is_empty() {
-            if matches!(route, PremiereRoute::Bin(_)) {
-                return Err("multicam_native_route_required: editable Groups require the native OP1a rewrap route".into());
+    let (model, texts, video_dissolves, picture_effects, direct_dnxhr_origins, constant_speeds, mut typed, preparation_notes, bridge_losses) =
+        if has_matte || a.link_originals || a.allow_offline_media || !gain.is_empty() || !graph.multicams.is_empty() || !graph.multicam_uses.is_empty() {
+            if !a.link_originals && !a.allow_offline_media
+                && (!graph.multicams.is_empty() || !graph.multicam_uses.is_empty()) && matches!(route, PremiereRoute::Bin(_)) {
+                return Err("multicam_native_route_required: use --link-originals with Separate files or select the native rewrap route for editable Groups".into());
             }
-            let p = premiere_adapter::prepare_originals(&graph, &policy.to_options(), clock)
+            let mut p = premiere_adapter::prepare_originals(&graph, &policy.to_options(), clock)
                 .map_err(|e| format!("Premiere preparation failed: {e}"))?;
+            matte.apply(&mut p.input, &graph)?;
+            p.losses.retain(|loss| matte.keeps_loss(loss));
             let media = p.input.build_native_media_model().map_err(|e| e.to_string())?;
-            (media, Vec::new(), Vec::new(), Vec::new(), Default::default(), Some(p.input), p.diagnostics, p.losses)
+            (media, Vec::new(), Vec::new(), Vec::new(), Default::default(), Vec::new(), Some(p.input), p.diagnostics, p.losses)
         } else {
             let p = premiere_adapter::prepare(&graph, &policy.to_options(), clock)
                 .map_err(|e| format!("Premiere preparation failed: {e}"))?;
-            (p.model, p.texts, p.video_dissolves, p.picture_effects, p.direct_dnxhr_origins, None, p.diagnostics, p.losses)
+            (p.model, p.texts, p.video_dissolves, p.picture_effects, p.direct_dnxhr_origins, p.constant_speeds, None, p.diagnostics, p.losses)
         };
     let prepared_event_count: usize = typed.as_ref().map_or(&model.sequences, |p| &p.sequences)
-        .iter().map(|s| s.events.len()).sum();
+        .iter().map(|s| s.events.len()).sum::<usize>()
+        + typed.as_ref().map_or(0, |p| p.png_mattes.edits.len());
+    let prepared_stills = typed.as_ref().map_or(0, |p| p.png_mattes.stills.len());
     let native_media = a.rewrap_media.then(|| rewrap::NativeMediaPreparation {
         model: &model,
         writer_input: typed.as_mut(),
@@ -474,13 +568,26 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         Some(s) => Box::new(SeededUuids::new(s)),
         None => Box::new(RandomUuids::new()),
     };
+    let offline = crate::offline::paths(&graph);
+    let offline_relink = crate::offline::report(&graph, &output)?;
+    if let Some((path, _)) = &offline_relink {
+        output::preflight(&output, Some(path))?;
+        if let Some(snapshot) = &a.graph_out {
+            output::preflight(snapshot, Some(path))?;
+        }
+    }
     let mut prepared = match &typed {
-        Some(p) => prproj::convert::writer::prepare_typed_project(p, &output, ids.as_mut(), &bindings, true),
+        Some(p) if !offline.is_empty() => prproj::convert::writer::prepare_offline_project(p, &output, ids.as_mut(), None, &offline),
+        Some(p) => prproj::convert::writer::prepare_typed_project(p, &output, ids.as_mut(), &bindings, !(has_matte || a.link_originals || a.allow_offline_media)),
         None => route.prepare(&model, &output, ids.as_mut(), &bindings, prproj::convert::writer::Editorial {
             texts: &texts, video_dissolves: &video_dissolves, picture_effects: &picture_effects,
             direct_dnxhr_origins: &direct_dnxhr_origins,
+            constant_speeds: &constant_speeds,
         }),
     }.map_err(|e| format!("Premiere document preparation failed: {e}"))?;
+    if let Some((path, _)) = &offline_relink {
+        prepared.check_reserved_output(path).map_err(|e| e.to_string())?;
+    }
     drop(typed);
     if let Some(path) = &a.graph_out {
         prepared
@@ -495,7 +602,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         for note in &preparation_notes {
             println!("Preparation note: {note}");
         }
-        print_losses("Not converted (from the source)", &graph.losses);
+        print_losses("Not converted (from the source)", &source_losses);
         print_losses("Not converted (colour policy)", &policy_losses);
         print_losses("Not converted (writer input)", &bridge_losses);
         println!("Dry run: no media, project or graph created.");
@@ -541,6 +648,9 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             None,
         )
     })?;
+    source_input::recheck_checked(&original_inputs, &mut || Ok(())).map_err(|e| {
+        publication_failure("original media stability check failed", e, &prepared, preparation.as_ref(), None)
+    })?;
     prepared.publish_assets().map_err(|e| {
         publication_failure(
             "asset publication failed",
@@ -572,6 +682,13 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             published_snapshot,
         )
     })?;
+    if let Some((path, text)) = &offline_relink {
+        output::write_snapshot(path, text).map_err(|e| {
+            format!("Project published at {}; offline relink report failed at {}: {e}",
+                output.display(), path.display())
+        })?;
+        println!("Offline relink report: {}", path.display());
+    }
     if let Some(plan) = &preparation {
         plan.record_project_with_mode(&output,plan.mode(route.receipt_mode())).map_err(|e|{
             // record_project already records the completed outcome accurately.
@@ -582,7 +699,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     println!(
         "any-nle: wrote {} ({} clip(s), {} bin(s), {} sequence(s), {} edit(s); {})",
         output.display(),
-        graph.items.len(),
+        graph.items.len() + prepared_stills,
         graph.bins.len(),
         graph.sequences.len(),
         placements,
@@ -597,7 +714,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             println!("  {p}");
         }
     }
-    print_losses("Not converted (from the source)", &graph.losses);
+    print_losses("Not converted (from the source)", &source_losses);
     print_losses("Not converted (colour policy)", &policy_losses);
     print_losses("Not converted (writer input)", &bridge_losses);
     for (title, lines) in [
@@ -693,12 +810,13 @@ pub(crate) fn main() -> ExitCode {
     let Some((command, rest)) = argv.split_first() else {
         return usage("");
     };
-    if command != "convert"
+    if !matches!(command.as_str(), "convert" | "verify-offline-relink")
         && rest
             .iter()
-            .any(|a| a.starts_with("--rewrap") || a == "--ffmpeg" || a == "--ffprobe")
+            .any(|a| a.starts_with("--rewrap") || matches!(a.as_str(),
+                "--ffmpeg" | "--ffprobe" | "--link-originals" | "--map-original-root" | "--allow-offline-media"))
     {
-        return usage("rewrap options are only supported by convert --to premiere");
+        return usage("media preparation options are only supported by convert --to premiere");
     }
     let result = match command.as_str() {
         "-h" | "--help" => {
@@ -724,20 +842,43 @@ pub(crate) fn main() -> ExitCode {
             print!("{}", AvidToPremiere::default().to_json_text());
             Ok(())
         }
+        "verify-offline-relink" => {
+            let [report, moves, options @ ..] = rest else {
+                return usage("verify-offline-relink needs REPORT.json and MOVES.json");
+            };
+            let mut checksums = None;
+            let mut ffprobe = None;
+            let mut pairs = options.chunks_exact(2);
+            for pair in &mut pairs {
+                let slot = match pair[0].as_str() {
+                    "--checksums" => &mut checksums,
+                    "--ffprobe" => &mut ffprobe,
+                    _ => return usage("unknown verify-offline-relink option"),
+                };
+                if slot.replace(Path::new(&pair[1])).is_some() {
+                    return usage("duplicate verify-offline-relink option");
+                }
+            }
+            if !pairs.remainder().is_empty() {
+                return usage("verify-offline-relink option needs a path");
+            }
+            crate::backend_bundle::resolve(None, ffprobe, false).and_then(|tools| {
+                crate::offline::verify(Path::new(report), Path::new(moves), checksums, &tools.ffprobe)
+            })
+        },
         "convert" => match parse(rest) {
             Ok(a) => convert(&a),
             Err(e) => return usage(&e),
         },
         "graph" => match parse(rest) {
             Ok(a) => read_avid_source(&a)
-                .map(|(g, problems, _inputs)| {
-                    for p in problems {
+                .and_then(|mut read| {
+                    for p in source_notes(&a, &mut read, &crate::png_mattes::Plan::default())? {
                         eprintln!("  {p}");
                     }
-                    g.write_json(&mut std::io::stdout().lock())
+                    read.result.graph.write_json(&mut std::io::stdout().lock())
                         .map_err(|e| e.to_string())
-                })
-                .and_then(|r| r),
+                }),
             Err(e) => return usage(&e),
         },
         "colours" | "colors" => match rest.split_first() {

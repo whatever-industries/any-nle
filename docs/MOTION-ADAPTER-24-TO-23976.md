@@ -40,6 +40,35 @@ Evidence: CONV-0044 pins AVB-0040 for native Avid measurements and PRPROJ-0034
 for Premiere read-back, with AVB-0010/0021 and PRPROJ-0028 as context. The
 original returns and native export measurements are held in local evidence.
 
+### Premiere 27 direct-link read-back
+
+The same saved Avid timeline converts in Separate mode with its original
+DNxHR LB picture, both mono PCM24 sibling MXFs, and the H.264/AAC MP4 linked
+in place. Premiere 27.0.0 build 88 kept all four files online after Save As,
+close and reopen. The rendered sequence contains 1,174 frames. In the UME
+section all 1,102 numbered frames match the Avid cadence, including the
+skip at record frame 1,024. The audio starts at file sample 98,096. Each
+UME lane matches 2,206,204 Avid Direct Out samples with the Avid pan
+option, including the 300-sample silent tail. The Separate saved job also
+writes the timeline.
+
+Avid Media Composer 25.12.0.58863 exported the same edit with AAF Edit
+Protocol and linked picture and audio. The Premiere 27 Save As and
+reopen kept the three MXFs and the MP4 picture online. Both conversions'
+72 managed picture frames decode identically, and both select the same
+1,102 numbered UME frames as Avid. The AAF contains an Audio Warp operation
+and one input on each sound lane. Premiere's reopened import has no UME
+audio edit on either lane and renders silence throughout that section.
+Premiere's Events panel showed no warning in the reopened project. Grouped and Merged
+projects retained all four paths and twelve placements on reopen. Fresh
+insertion from the Separate bin item retained both original channels at
+48 kHz, with 2,304,000 samples per channel. The fresh-insertion export
+verified channel identity against independently decoded AAC.
+The local macOS package also converted the fixture through Review. The
+reopened project retained all 12 placements, and the full 2,350,348-sample
+PCM24 render per channel matched the direct CLI render.
+Source and media references
+
 ## Automatic 23.976 to 24
 
 The reciprocal route accepts the observed default progressive adapter on a
@@ -67,3 +96,13 @@ read-back covers the saved default adapter and its measured track origins.
 Wider source profiles, promoted or nested adapters, other rate pairs and
 other platforms require their own qualification. CONV-0045 pins AVB-0041
 and PRPROJ-0035 for this reverse-direction result.
+
+### Premiere 27 replay of 23.976 to 24
+
+Premiere 27.0.0 build 88 kept the original MP4, editable picture remap
+and both sound edits after Save As, close and reopen. Both picture
+counters verify the same 1,104 source-frame selections, including the
+repeat. Both channels match the prior Premiere render across all
+2,208,000 sample frames, including the silent 1,698-frame tail. The
+768 AAC padding samples in the Avid reference remain outside the
+MP4's declared playable range.

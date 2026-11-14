@@ -36,17 +36,17 @@ and each bound edit before writing, using the full Group identity and the existi
 source placement bindings. Audio alternatives resolve by leaf identity, channel
 label and span; an audio alternative index does not imply a video camera index.
 Each camera must have one continuous qualified media piece with exact frame edges;
-observed filler may surround it. Both fixed audio lanes must match the first
+observed filler may surround it. Both default audio lanes must match the first
 camera's saved extent. Missing, ambiguous, mixed-clock or discontinuous alternatives
-and switching audio selectors refuse with a named reason.
+refuse with a named reason. The rewrap route still requires fixed audio selectors.
 
 The group item is a native sequence-backed multicam with two video tracks, both
 cameras' audio, two exposed mono groups, and the alternate camera audio muted in
 the source. The picture selector and group-local In/Out are written per edited use.
 Separate audio placements retain their channel groups across picture changes. Both
 leaf masters are planned even when an angle is unused, and each verified file is
-rewrapped once. The CLI native rewrap and the typed job writer share construction.
-Other Premiere routes refuse Group input rather than falling back to selected leaves.
+rewrapped once on the native rewrap route. The CLI and saved jobs share construction.
+The Separate files route can also link the qualified original camera MXFs.
 
 The first profile caps prepared groups at 256 and uses the existing event limits
 and accounted input bounds. Model/1, graph/1, the Python model/1 oracle, ordinary
@@ -77,7 +77,6 @@ This is separate from Group routing; no new record clock was inferred.
   input media files and four pre-existing Premiere project files match their retained
   hashes. Pre-existing projects remained open.
 
-The next meaningful expansion is changing the audio source independently of picture.
 Missing-audio cameras, wider or paired layouts, retimed/mixed-rate members, multipart
 MultiGroups, sequence clock correction and broader playback remain separate gates.
 
@@ -86,5 +85,47 @@ Private receipts live under `local/outputs/multicam-translation-2026-11-08/`.
 `2a7b52b45d259ffa2021fbd5d41bc28d72b01aaf6687303f2fb6bd8185513c3d`;
 `editable-output-v1/NATIVE-VERIFICATION.json` SHA256
 `802701d6eeba93db41bcfcbf3b0e8c296a8572bf719c2a2330aafff130681b23`.
-Same-author native research and recheck; no claim of independent review, continuous
-loop coverage, speaker output or User compatibility approval.
+These were same-author native checks. Continuous looping and User acceptance
+remain open.
+
+## Link the original OP-Atom camera files
+
+Choose **Separate files** in a saved job or use `convert --link-originals
+--bin-mode separate` with the managed media root. The writer admits two
+1080p23.976 DNxHR LB cameras, each with two discrete PCM24/48 kHz mono MXFs,
+qualified file and logging clocks, and the existing continuous Group layout.
+The reusable Group links all six original files. The saved picture angle
+remains editable and the Group's default mono outputs use the first camera.
+A missing or unqualified sibling, an unresolved Group relationship or a
+wider layout remains outside this profile.
+
+Premiere 27.0.0 build 88 retained the six linked paths, 01:00:00:00 start,
+A/B/A picture selections, and both mono assignments after Save As and
+reopen. All 145 decoded frames matched Premiere's linked AAF import.
+Both imports rendered the original silent audio. A separate graph-authored
+control used online MXFs with distinguishable PCM. Both reopened lanes
+matched the flat direct-link reference over 48,048 samples each. A picture
+selector variant kept both lanes sample-identical. A fresh bin insertion
+created one picture edit and two mono edits and kept them on reopen.
+CONV-0095
+
+### Independent mono audio edits
+
+An exact saved alternate audio selection on the Separate files route writes
+a direct mono timeline clip linked to the selected camera's original MXF.
+The clip uses its own file-relative trim, gain and pan. The picture remains
+an editable Group, and first-camera audio still uses the Group output. The
+converter reports which audio occurrence loses in-Group angle switching.
+
+Premiere 27 build 88 reopened two graph-authored A/B/A controls. Each changed
+only A1 over record frames 8–15. Both isolated 48,048-sample lanes matched a
+flat direct-link control byte for byte. In one test the switch silenced only
+that span. In the reciprocal test the same span played camera B's signal
+while A2 stayed silent. All 24 decoded picture frames in the first test
+matched the fixed-audio control. A private AVB variant changed only the
+middle A1 selector byte. The AVB reader resolved camera B's mono leaf
+and nonzero trim through the normal conversion entry points. Premiere
+reopened the result, and all 145 picture frames matched the retained
+fixed-audio AAF. Both lanes in that AVB use silent sources. A newly
+authored Avid Group and its linked AAF remain pending for this profile.
+CONV-0096

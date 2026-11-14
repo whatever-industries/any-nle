@@ -48,6 +48,8 @@ impl ClipMode {
 #[serde(deny_unknown_fields)]
 pub struct Choices {
     pub mode: ClipMode,
+    #[serde(default)]
+    pub allow_offline_media: bool,
     pub include_dependencies: bool,
     pub include_trash_attic: bool,
     pub policy_json: String,
@@ -58,6 +60,7 @@ impl Default for Choices {
     fn default() -> Self {
         Self {
             mode: ClipMode::Rewrap,
+            allow_offline_media: false,
             include_dependencies: true,
             include_trash_attic: false,
             policy_json: AvidToPremiere::default().to_json_text(),
@@ -311,6 +314,21 @@ mod tests {
         assert!(!w.can_convert());
         assert!(!w.accept_review(0));
         assert!(w.accept_review(1));
+    }
+    #[test]
+    fn offline_selection_and_clip_mode_each_invalidate_review() {
+        let mut w = Wizard::default();
+        w.choices.mode = ClipMode::Separate;
+        let separate = w.snapshot();
+        assert!(w.accept_review(0));
+        w.choices.allow_offline_media = true;
+        assert!(w.changed_since(&separate));
+        assert!(!w.can_convert());
+        assert!(w.accept_review(1));
+        let offline = w.snapshot();
+        w.choices.mode = ClipMode::Grouped;
+        assert!(w.changed_since(&offline));
+        assert!(!w.can_convert());
     }
     #[test]
     fn bin_selection_is_deduplicated_case_insensitive_and_never_includes_locks() {

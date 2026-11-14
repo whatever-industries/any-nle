@@ -45,8 +45,14 @@ pub struct PreparedMulticamUse {
     pub group: usize,
     pub source_in: i64,
     pub video: Option<usize>,
-    /// Group output channel per audio track in the prepared event's order.
-    pub audio: Vec<usize>,
+    /// Source per audio track in the prepared event's order.
+    pub audio: Vec<PreparedGroupAudio>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PreparedGroupAudio {
+    Group(usize),
+    LinkedAlternate(usize),
 }
 
 fn fail(reason: &str) -> ModelError {
@@ -63,7 +69,7 @@ fn write_fail(reason: &str) -> WriteError {
 pub(super) fn build(
     project: &mut Project,
     g: &PreparedMulticam,
-    leaves: [(ItemId, &Clip); 2],
+    leaves: [(ItemId, &[ItemId], &Clip); 2],
     target: ItemId,
     ids: &mut dyn UuidSource,
 ) -> WriteResult<ItemId> {
@@ -92,7 +98,7 @@ pub(super) fn build(
     let video = project.video_tracks(seq).to_vec();
     let audio = project.audio_tracks(seq).to_vec();
     super::combined::premiere_balances(project, sequence_element)?;
-    for (i, (camera, (leaf, clip))) in g.cameras.iter().zip(leaves).enumerate() {
+    for (i, (camera, (leaf, siblings, clip))) in g.cameras.iter().zip(leaves).enumerate() {
         let start = Time::new(camera.start);
         let mut placed = vec![project.add_clip(video[i], leaf, start, ids)?];
         let groups = super::native_av::groups(clip)?;
@@ -102,12 +108,17 @@ pub(super) fn build(
                 .iter()
                 .position(|a| a.avid_track == Some(label))
                 .ok_or_else(|| write_fail("camera audio label missing"))?;
-            let group = groups
-                .iter()
-                .position(|g| g.as_slice() == [file])
-                .ok_or_else(|| write_fail("camera has no qualified mono group"))?;
             let track = audio[2 * i + j];
-            let item = super::native_av::place_audio(project, track, leaf, group, start, ids)?;
+            let item = if siblings.is_empty() {
+                let group = groups
+                    .iter()
+                    .position(|g| g.as_slice() == [file])
+                    .ok_or_else(|| write_fail("camera has no qualified mono group"))?;
+                super::native_av::place_audio(project, track, leaf, group, start, ids)?
+            } else {
+                let sibling = *siblings.get(file).ok_or_else(|| write_fail("linked camera mono item missing"))?;
+                project.add_clip(track, sibling, start, ids)?
+            };
             super::audio::set_clip_gain(project, item, clip.audio[file].gain_db)?;
             if i == 0 {
                 let pan = if j == 0 {
@@ -226,7 +237,7 @@ pub(super) fn validate(
         let mut latest = 0;
         for c in &g.cameras {
             let Some(PreparedClip::Legacy(leaf)) = clips.get(c.clip.as_str()).copied() else {
-                return Err(fail("group requires rewrapped native leaf masters"));
+                return Err(fail("group requires managed Avid leaf masters"));
             };
             let Some(v) = &leaf.video else {
                 return Err(fail("camera has no picture"));
@@ -334,16 +345,23 @@ pub(super) fn validate(
             }
         }
         if !u.audio.is_empty() {
-            let c = &g.cameras[0];
-            if !matches(c)
-                || u.audio.len() != e.audio_channels.len()
+            if u.audio.len() != e.audio_channels.len()
                 || u.audio
                     .iter()
                     .zip(&e.audio_channels)
-                    .any(|(&channel, label)| c.audio_labels.get(channel) != Some(label))
+                    .any(|(&audio, label)| {
+                        let (camera, channel) = match audio {
+                            PreparedGroupAudio::Group(channel) => (0, channel),
+                            PreparedGroupAudio::LinkedAlternate(channel) => (1, channel),
+                        };
+                        let c = &g.cameras[camera];
+                        !matches(c) || c.audio_labels.get(channel) != Some(label)
+                            || (camera == 1 && (input.options.bin_mode != "separate"
+                                || !input.direct_dnxhr_origins.contains_key(&c.clip)))
+                    })
             {
                 return Err(fail(
-                    "fixed audio choice contradicts the bound leaf placement",
+                    "audio choice contradicts the bound leaf placement",
                 ));
             }
         }

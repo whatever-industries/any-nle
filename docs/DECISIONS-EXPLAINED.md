@@ -5,7 +5,9 @@ be shown in the app (tooltips, the options dialog, the import report) and in the
 entry: what the user sees, what Any NLE does, and why. Technical evidence lives in the
 research repo (finding IDs in brackets) and `research-dependencies.json` (CONV IDs).
 
-Status: started 2026-10-14. Entries marked *(planned)* describe agreed behaviour not yet built.
+This guide includes dated decisions and their original scope. Start with the
+[wizard guide](GUI-WIZARD.md) for the controls on the current branch and the
+[media roadmap](ROADMAP.md#linked-media-conversion-parity) for route status.
 
 ---
 
@@ -26,15 +28,15 @@ Most of the choices below follow from a few basic differences:
 
 ---
 
-## One translation hub for every program *(built for Avid -> Premiere; more programs planned)*
+## One translation hub for every program
 
-Any NLE does not translate Avid straight into Premiere. It first describes your project in its
-own neutral terms (clips, bins, edits, audio levels, markers, effects), then writes that
-description out for the target program. Each new program then only needs to be taught once, in
-each direction, instead of once for every other program it might talk to. Choices that only make
-sense for a particular pair, such as which Premiere label an Avid clip colour becomes, are kept
-separate, in the settings you see in the import wizard. Anything that cannot be carried across
-is listed in the import report with the clip or edit it belongs to. [ADR-0004; GRAPH-MODEL.md]
+Any NLE reads source clips, bins, edits, and controls into a shared graph.
+Destination preparation uses those facts to build a native project. Avid to
+Premiere uses this path, and the internal Resolve tools use the same graph
+contract. Editor-specific choices, such as the Premiere label for an Avid clip
+color, stay in policy or destination preparation. Review and conversion
+reports identify losses by clip or edit when the source provides that identity.
+[Source graph and destination preparation](SOURCE-GRAPH-MIGRATION.md#boundaries)
 
 ---
 
@@ -147,12 +149,12 @@ found)**, does the same for audio.
 
 ## Conversion decisions (automatic)
 
-### Names and metadata [PRPROJ-0015; CONV-0014]
+### Names and metadata [PRPROJ-0015, CONV-0014, CONV-0129]
 
-Clip names come from the Avid bin's Name, not file names. Avid columns land in the matching
-Premiere fields: Camroll -> Tape Name, Take -> Shot, Comments -> Comment, Source File ->
-Description, Scene -> Scene; everything else goes into Log Note as one line ("Column: value |
-…"), because Premiere does not show multi-line Log Notes.
+Clip names come from the Avid bin's Name. Camroll maps to Camera Roll, Take
+to Shot, Comments to Comment, Source File to Description, and Scene to
+Scene. The linked media keeps its own Tape Name. Other copied fields go
+into one Log Note line as labelled values so multiple fields stay legible.
 
 ### Timecode [PRPROJ-0016, PRPROJ-0017; CONV-0015, CONV-0016]
 
@@ -209,7 +211,7 @@ markers belong to its source: every use of the clip shows the same ones.
 | on a master clip or subclip | a marker on the bin clip, so every use shows it |
 | copied into a sequence from the source | nothing extra: the source clip already shows it |
 | added on a timeline clip | a marker on that edit: the edit uses its own subclip of the same media, carrying the source's markers plus its own |
-| on filler in a video track | a one-frame adjustment layer carrying the marker (an empty adjustment layer changes nothing) |
+| on filler in a video track | a one-frame or ranged adjustment layer carrying the marker; overlapping ranges share a carrier. If the carrier would overlap picture on that track, the marker keeps its full range on the sequence. |
 | on filler in an audio track | a sequence marker (adjustment layers are video-only) |
 
 When an edit's own marker and a source marker sit on the same frame, the edit's marker wins by
@@ -748,9 +750,11 @@ otherwise supported codec profile or establish native application acceptance.
 
 Saved-path mappings understand normalized POSIX paths, Windows drive roots and UNC roots
 independently of the current host. A foreign saved prefix is usable only with an explicit
-current root. Multiple distinct existing candidates refuse; mapping is never a basename
-search. The resolved bytes still require codec, clock, routing and content checks. This
-synthetic path-resolution coverage does not establish Windows or Linux editor acceptance.
+current root. Each saved locator must resolve unambiguously. A mapping also refuses
+when two distinct saved originals would resolve to the same current path. Multiple
+items or audio channels can reuse a file when they share its saved locator. The
+resolved bytes still require codec, clock, routing and content checks. This coverage
+is for saved path resolution. Native Windows and Linux read-back remains open.
 
 The copied command encodes settings as one base64 argument to preserve literal filenames
 across shells; it is not encryption. Save job settings is an explicit local file operation

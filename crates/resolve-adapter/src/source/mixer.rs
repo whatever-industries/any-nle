@@ -687,15 +687,32 @@ impl Mixer {
     }
 
     pub(crate) fn write(
-        mut self,
+        self,
         tracks: [i32; 2],
         main_bus: i32,
         mutes: [bool; 2],
     ) -> Result<String> {
+        self.write_faders(tracks, main_bus, mutes, None)
+    }
+
+    pub(crate) fn write_linked_faders(
+        self,
+        faders: crate::linked::mixer::StaticFaders,
+    ) -> Result<String> {
+        self.write_faders(faders.tracks, faders.bus, faders.muted, Some(faders.pans))
+    }
+
+    fn write_faders(
+        mut self,
+        tracks: [i32; 2],
+        main_bus: i32,
+        mutes: [bool; 2],
+        pans: Option<[i32; 2]>,
+    ) -> Result<String> {
         if self.track_faders() != Some([0, 0])
             || self.main_bus_fader() != Some(0)
             || self.track_mutes() != Some([false; 2])
-            || self.neutral_digest() != SKELETON
+            || if pans.is_some() { !self.qualified(Some([false; 2])) } else { self.neutral_digest() != SKELETON }
         {
             return Err("expected the qualified neutral Fairlight mixer".into());
         }
@@ -706,6 +723,16 @@ impl Mixer {
         for field in TRACK_MUTES {
             for (slot, mute) in self.model[field].chunks_exact_mut(4).zip(mutes) {
                 slot.copy_from_slice(&i32::from(mute).to_le_bytes());
+            }
+        }
+        if let Some(pans) = pans.filter(|&pans| pans != [0; 2]) {
+            let row = self.model.get_mut(DIRECT_PAN - 12..DIRECT_PAN + 8)
+                .ok_or("missing Fairlight track pan row")?;
+            if row != [1, 4, 2, 0, 0].map(u32::to_le_bytes).concat() {
+                return Err("expected neutral Fairlight track pan".into());
+            }
+            for (slot, pan) in row[12..].chunks_exact_mut(4).zip(pans) {
+                slot.copy_from_slice(&pan.to_le_bytes());
             }
         }
         self.encode()

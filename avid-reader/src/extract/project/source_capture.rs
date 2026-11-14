@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::mem::size_of;
 use std::rc::Rc;
 mod groups;
+mod matte;
 mod timewarp;
 pub(super) use timewarp::{direct_input as timewarp_input, is_sampled_effect, uses_editable_position};
 
@@ -156,6 +157,26 @@ fn borrowed_attrs<'a>(ctx: &Ctx<'a>, node: &Node) -> &'a [(String, Value)] {
         _ => &[],
     }
 }
+fn saved_input_transform(ctx: &Ctx<'_>, file: &Node, budget: &SharedBudget) -> Option<Observed<String>> {
+    const MAX_TRANSFORM_BYTES: usize = 16 * 1024;
+    if int(file, "mob_type_id") != Some(MOB_SOURCE) {
+        return None;
+    }
+    let mut values = borrowed_attrs(ctx, file).iter()
+        .filter(|(key, _)| key == "_COLOR_INPUT_TRANSFORMATION");
+    let (_, value) = values.next()?;
+    let reason = if values.next().is_some() {
+        "duplicate Avid source color transformation attributes"
+    } else if let Some(text) = value.as_str() {
+        if !text.is_empty() && text.len() <= MAX_TRANSFORM_BYTES {
+            return Some(Observed::Known(copy_text(budget, text)));
+        }
+        "empty or oversized Avid source color transformation"
+    } else {
+        "Avid source color transformation is not saved as text"
+    };
+    Some(Observed::Unresolved(copy_text(budget, reason)))
+}
 fn each_marker<'a>(ctx: &Ctx<'a>, node: &Node, mut action: impl FnMut(&'a Node)) {
     for (key, value) in borrowed_attrs(ctx, node) {
         if key != "_TMP_CRM" {
@@ -278,6 +299,9 @@ fn color_cost(c: &ColorCorrection) -> usize {
         ),
     )
 }
+fn picture_cost(picture: &PictureEffect) -> usize {
+    sum([size_of::<PictureEffect>(), color_cost(&picture.params)])
+}
 fn matte_cost(m: &AniMatteData) -> usize {
     sum(
         std::iter::once(array::<crate::animatte::AniMatteState>(m.states.capacity()))
@@ -337,8 +361,11 @@ pub(super) struct MasterMeta {
     pub(super) offsets: Vec<Observed<i64>>,
     pub(super) marker_witnesses: Vec<MasterMarkerWitness>,
     pub(super) originals: Vec<Option<OriginalTrack>>,
+    pub(super) file_clocks: Vec<Option<SavedFileClock>>,
+    pub(super) input_transforms: Vec<SourceInputTransform>,
     pub(super) rendered_freeze: bool,
     pub(super) rendered_gain: Option<MobId>,
+    pub(super) imported_still: Option<SourceImportedStill>,
 }
 impl InputContext {
     pub(super) fn failed(&self) -> bool {
@@ -365,6 +392,7 @@ impl InputContext {
             ]),
             Item::Skipped(s) => sum([s.name.capacity(), s.reason.capacity()]),
             Item::Sequence(_) => 0,
+            Item::Subclip(_) => 0,
             Item::Group(_) => 0,
             Item::GroupDependency { name, .. } => name.capacity(),
         };
@@ -373,12 +401,54 @@ impl InputContext {
         }
         values.push(item);
     }
+    pub(super) fn subclip(&self, ctx: &Ctx<'_>, mob: &Node, item: usize) -> SourceSubclip {
+        let budget = &self.budget;
+        let id = formatted(budget, format_args!("{}/bin/{}/item/{}", self.revision, self.bin, item));
+        let attribute = |name| {
+            let mut values = borrowed_attrs(ctx, mob).iter().filter(|(key, _)| key == name);
+            match (values.next(), values.next()) {
+                (Some((_, value)), None) => known(value.as_int(), budget, "non-integer attribute"),
+                (None, _) => known(None, budget, "attribute absent"),
+                (_, Some(_)) => known(None, budget, "duplicate attribute"),
+            }
+        };
+        let mut tracks = Vec::new();
+        for track in ctx.tracks(mob) {
+            if !reserve(budget, &mut tracks, 1) {
+                break;
+            }
+            let component = ctx.deref(track.get("component"));
+            let source = component.filter(|c| c.class == *b"SCLP");
+            tracks.push(SourceSubclipTrack {
+                label: int(track, "index"),
+                component_class: component.map(|c| c.class),
+                kind: component.and_then(|c| int(c, "media_kind_id")),
+                rate: component.and_then(|c| float(c, "edit_rate")).and_then(Rate::from_avid),
+                length: component.and_then(|c| int(c, "length")),
+                target_mob: source.and_then(mob_id),
+                target_track: source.and_then(|c| int(c, "track_id")),
+                target_offset: source.and_then(|c| int(c, "start_time")),
+            });
+        }
+        SourceSubclip {
+            id,
+            bin: self.bin,
+            mob: mob_id(mob),
+            name: copy_text(budget, mob.get("name").and_then(Value::as_str).unwrap_or("")),
+            rate: float(mob, "edit_rate").and_then(Rate::from_avid),
+            backing_length: int(mob, "length"),
+            start: attribute("_START"),
+            end: attribute("_END"),
+            tracks,
+        }
+    }
     pub(super) fn master_meta(
         &self,
         ctx: &Ctx<'_>,
         mob: &Node,
         item: usize,
         master: Option<&MasterClip>,
+        ambiguous: &std::collections::HashSet<MobId>,
     ) -> MasterMeta {
         let id = formatted(
             &self.budget,
@@ -387,6 +457,8 @@ impl InputContext {
         let mut offsets = Vec::new();
         let mut marker_witnesses = Vec::new();
         let mut originals = Vec::new();
+        let mut file_clocks = Vec::new();
+        let mut input_transforms = Vec::new();
         if let Some(master) = master {
             for native in &master.tracks {
                 let mut matched = None;
@@ -422,8 +494,20 @@ impl InputContext {
                 offsets.push(offset);
                 if !reserve(&self.budget, &mut originals, 1) { break; }
                 let file = ctx.mobs.get(&native.file_mob);
+                if native.kind == KIND_PICTURE && !ambiguous.contains(&native.file_mob) {
+                    if let Some(value) = file.and_then(|file| saved_input_transform(ctx, file, &self.budget)) {
+                        if !reserve(&self.budget, &mut input_transforms, 1) { break; }
+                        input_transforms.push(SourceInputTransform {
+                            track: native.index,
+                            file_mob: native.file_mob,
+                            value,
+                        });
+                    }
+                }
                 let file_track = matched.and_then(|t| ctx.only_source_clip(t).ok()).and_then(|c| int(c, "track_id"));
                 let descriptor = file.and_then(|m| ctx.deref(m.get("descriptor")));
+                if !reserve(&self.budget, &mut file_clocks, 1) { break; }
+                file_clocks.push(file.and_then(|file| saved_file_clock(ctx, file, native, file_track?)));
                 let original = descriptor.and_then(|d| {
                     let mut locators = Vec::new();
                     let mut current = Some(d);
@@ -473,6 +557,7 @@ impl InputContext {
                         channels: int(d, "channels"),
                         sample_rate: float(d, "sample_rate"),
                         stored_quantization_bits: int(d, "quantization_bits"),
+                        display_raster: int(d, "display_width").zip(int(d, "display_height")),
                         file_track,
                         motion_audio_track_start,
                     })
@@ -505,6 +590,7 @@ impl InputContext {
                 );
             }
         }
+        let imported_still = self.imported_still(ctx, mob, &id, ambiguous);
         MasterMeta {
             rendered_freeze: false,
             rendered_gain: None,
@@ -512,7 +598,56 @@ impl InputContext {
             offsets,
             marker_witnesses,
             originals,
+            file_clocks,
+            input_transforms,
+            imported_still,
         }
+    }
+    fn imported_still(
+        &self, ctx: &Ctx<'_>, mob: &Node, id: &str, ambiguous: &HashSet<MobId>,
+    ) -> Option<SourceImportedStill> {
+        let master = mob_id(mob)?;
+        if ambiguous.contains(&master) || int(mob, "usage_code") != Some(0) {
+            return None;
+        }
+        let attrs = import_settings(ctx, mob)?;
+        if unique_attribute(attrs, "_IMPORTPICTSEQ").and_then(Value::as_int) != Some(0) {
+            return None;
+        }
+        let Value::List(tracks) = mob.get("tracks")? else { return None };
+        let [Value::Node(track)] = tracks.as_slice() else { return None };
+        let label = int(track, "index").filter(|&n| n > 0)?;
+        let clip = ctx.deref(track.get("component"))?;
+        if clip.class != *b"SCLP" || int(clip, "media_kind_id") != Some(KIND_PICTURE) {
+            return None;
+        }
+        let file_mob = mob_id(clip)?;
+        let file_track = int(clip, "track_id").filter(|&n| n > 0)?;
+        let file = ctx.mobs.get(&file_mob)?;
+        if ambiguous.contains(&file_mob) || int(file, "mob_type_id") != Some(MOB_SOURCE) {
+            return None;
+        }
+        let import = picture_import(ctx, attrs, &self.budget);
+        if import.locators.is_empty() || import.locators.iter().any(|path| {
+            !path.rsplit_once('.').is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("png"))
+        }) {
+            return None;
+        }
+        Some(SourceImportedStill {
+            id: copy_text(&self.budget, id),
+            bin: self.bin,
+            master,
+            track: label,
+            file_mob,
+            file_track,
+            rate: float(mob, "edit_rate").and_then(Rate::from_avid),
+            master_length: int(mob, "length"),
+            file_in: int(clip, "start_time"),
+            source_length: int(clip, "length"),
+            import_aspect: unique_attribute(attrs, "_IMPORTASPECT").and_then(Value::as_int),
+            color_level: unique_attribute(attrs, "_COLORLEVEL").and_then(Value::as_int),
+            import,
+        })
     }
     pub(super) fn sequence_capture(&self, mob: &Node, item: usize) -> Capture {
         charge(
@@ -528,6 +663,54 @@ impl InputContext {
             self.budget.clone(),
         )
     }
+}
+
+fn saved_file_clock(
+    ctx: &Ctx<'_>, file: &Node, native: &MediaTrack, file_track: i64,
+) -> Option<SavedFileClock> {
+    let file_tracks = ctx.tracks(file);
+    let [track] = file_tracks.as_slice() else { return None; };
+    if int(track, "index") != Some(file_track) { return None; }
+    let clip = ctx.deref(track.get("component"))?;
+    if clip.class != *b"SCLP" || int(clip, "media_kind_id") != Some(native.kind)
+        || int(clip, "length") != Some(native.clip_length)
+    {
+        return None;
+    }
+    let rate = float(clip, "edit_rate").and_then(Rate::from_avid)?;
+    let package = mob_id(clip)?;
+    let physical = ctx.mobs.get(&package)?;
+    if int(physical, "mob_type_id") != Some(MOB_SOURCE)
+        || float(physical, "edit_rate").and_then(Rate::from_avid) != Some(rate)
+    {
+        return None;
+    }
+    let mut tc = ctx.tracks(physical).into_iter()
+        .filter(|t| int(t, "index") == Some(1))
+        .filter_map(|t| ctx.deref(t.get("component")))
+        .filter(|c| int(c, "media_kind_id") == Some(KIND_TIMECODE));
+    let owner = tc.next()?;
+    if tc.next().is_some() { return None; }
+    let segments = ctx.segments(owner);
+    let mut segments = segments.into_iter().filter(|(_, s)| int(s, "length").is_some_and(|n| n > 0));
+    let (0, segment) = segments.next()? else { return None; };
+    if segments.next().is_some() { return None; }
+    if segment.class != *b"TCCP"
+        || float(segment, "edit_rate").and_then(Rate::from_avid) != Some(rate)
+    {
+        return None;
+    }
+    let count = int(segment, "start")?;
+    let offset = int(clip, "start_time")?;
+    if count < 0 || offset < 0
+        || offset.checked_add(native.clip_length)? > int(segment, "length")?
+    {
+        return None;
+    }
+    Some(SavedFileClock {
+        package, rate, count, offset, base: int(segment, "fps")?,
+        drop: int(segment, "flags")? & 1 != 0, file_track,
+    })
 }
 
 struct Scope {
@@ -562,6 +745,8 @@ struct TransitionFact {
     cutpoint: Observed<i64>,
     rate: Option<Rate>,
     effect: Option<String>,
+    audio_curve_attribute: Option<i64>,
+    audio_curve_parameter: Option<i64>,
     outgoing: Option<String>,
     incoming: Option<String>,
 }
@@ -579,6 +764,7 @@ struct QueryFact {
     motion: Option<(i64, i64)>,
     motion_adapter_phase: Option<i64>,
     saved_timewarp: Option<Vec<i64>>,
+    constant_speed: Option<(i64, i64)>,
 }
 pub(super) fn automatic_adapter_attrs<'a>(ctx: &Ctx<'a>, node: &Node) -> Option<&'a [(String, Value)]> {
     match ctx.deref(node.get("attributes"))?.get("entries")? {
@@ -676,12 +862,16 @@ impl std::fmt::Debug for Capture {
     }
 }
 impl Capture {
-    pub(super) fn capture_volume(
+    pub(super) fn capture_pvol(
         &mut self, ctx: &Ctx<'_>, node: &Node, tracks: &[&Node], position: i64,
-    ) -> Option<super::volume::Capture> {
-        super::volume::capture(ctx, node, tracks, position, |points| {
+    ) -> (Option<super::volume::Capture<VolumePoint>>, Option<super::volume::Capture<PanPoint>>) {
+        let volume = super::volume::capture_volume(ctx, node, tracks, position, |points| {
             charge(&self.budget, points * size_of::<VolumePoint>())
-        })
+        });
+        let pan = super::volume::capture_pan(ctx, node, tracks, position, |points| {
+            charge(&self.budget, points * size_of::<PanPoint>())
+        });
+        (volume, pan)
     }
     fn new(id: String, rate: Option<Rate>, budget: SharedBudget) -> Self {
         charge(&budget, size_of::<Self>());
@@ -723,6 +913,10 @@ impl Capture {
                 format_args!("{}/component/{}", self.id, self.roots),
             ),
         }
+    }
+    pub(super) fn direct_submaster(&self) -> bool {
+        matches!(self.stack.as_slice(), [parent, effect]
+            if self.scopes[*parent].class == *b"SEQU" && self.scopes[*effect].position_known)
     }
     pub(super) fn enter(
         &mut self,
@@ -916,19 +1110,32 @@ impl Capture {
         if track == 1 {
             if self.primary_timecode_seen {
                 self.clock = None;
-            } else if qualified
-                && (rate == Rate::new(24000, 1001) || rate == Rate::new(24, 1))
-                && int(component, "fps") == Some(24)
-                && int(component, "flags") == Some(0)
-            {
-                // Both exact rates use a 24-count non-drop clock in this profile.
-                if let Some(count) = int(component, "start").filter(|n| (0..24 * 60 * 60 * 24).contains(n)) {
-                    self.clock = rate.map(|rate| SequenceClock {
-                        count: count as u64,
-                        rate,
-                        display_base: 24,
-                        track_ordinal: ordinal,
-                    });
+            } else if qualified {
+                let profile = match (rate, int(component, "fps"), int(component, "flags")) {
+                    (Some(rate), Some(24), Some(0))
+                        if rate == Rate::new(24_000, 1001).unwrap()
+                            || rate == Rate::new(24, 1).unwrap() =>
+                    {
+                        Some((rate, 24, false, 24 * 60 * 60 * 24))
+                    }
+                    (Some(rate), Some(30), Some(1))
+                        if rate == Rate::new(30_000, 1001).unwrap() =>
+                    {
+                        // Two labels are omitted in 54 minutes per hour.
+                        Some((rate, 30, true, (30 * 60 * 60 - 2 * 54) * 24))
+                    }
+                    _ => None,
+                };
+                if let Some((rate, display_base, drop, day)) = profile {
+                    self.clock = int(component, "start")
+                        .filter(|count| (0..day).contains(count))
+                        .map(|count| SequenceClock {
+                            count: count as u64,
+                            rate,
+                            display_base,
+                            drop,
+                            track_ordinal: ordinal,
+                        });
                 }
             }
             self.primary_timecode_seen = true;
@@ -964,6 +1171,7 @@ impl Capture {
     }
     pub(super) fn transition(
         &mut self,
+        ctx: &Ctx<'_>,
         node: &Node,
         position: i64,
         kind: i64,
@@ -997,6 +1205,32 @@ impl Capture {
             .get("effect_id")
             .and_then(Value::as_str)
             .map(|s| copy_text(&self.budget, s));
+        let (audio_curve_attribute, audio_curve_parameter) =
+            if kind == KIND_SOUND && effect.as_deref() == Some("BLEND_AUDIO_DISSOLVE") {
+                let mut attrs = borrowed_attrs(ctx, node)
+                    .iter()
+                    .filter(|(key, _)| key == "_ATN_AUDIO_DISSOLVE_CURVETYPE");
+                let attribute = attrs.next().and_then(|(_, value)| value.as_int());
+                let attribute = attribute.filter(|_| attrs.next().is_none());
+                let parameter = ctx.deref(node.get("param_list")).and_then(|list| {
+                    let Value::RefList(items) = list.get("items")? else {
+                        return None;
+                    };
+                    let mut matches = items
+                        .iter()
+                        .filter_map(|item| ctx.deref(Some(item)))
+                        .filter(|item| {
+                            item.class == *b"PRIT"
+                                && matches!(item.get("uuid"), Some(Value::Uuid(uuid))
+                                    if uuid.to_string() == "8134fc48-3bd6-4904-9520-7a6360cc7127")
+                        });
+                    let value = int(matches.next()?, "value");
+                    value.filter(|_| matches.next().is_none())
+                });
+                (attribute, parameter)
+            } else {
+                (None, None)
+            };
         if !reserve(&self.budget, &mut self.transitions, 1) {
             return usize::MAX;
         }
@@ -1010,6 +1244,8 @@ impl Capture {
             cutpoint: observed("cutpoint"),
             rate,
             effect,
+            audio_curve_attribute,
+            audio_curve_parameter,
             outgoing,
             incoming: None,
         });
@@ -1022,6 +1258,19 @@ impl Capture {
     }
     pub(super) fn query(&mut self, op: usize, node: &Node, motion: Option<(i64, i64)>, motion_adapter_phase: Option<i64>) {
         self.query_with_timewarp(op, node, motion, motion_adapter_phase, None, false);
+    }
+    pub(super) fn query_constant_speed(
+        &mut self, ctx: &Ctx<'_>, op: usize, effect: &Node, input: &Node, ratio: (i64, i64),
+    ) {
+        let index = self.queries.len();
+        self.query(op, input, Some(ratio), None);
+        if self.rate == Rate::new(24, 1)
+            && self.stack.iter().rev().skip(1).all(|&i| self.scopes[i].class == *b"SEQU")
+        {
+            if let Some(query) = self.queries.get_mut(index) {
+                query.constant_speed = timewarp::constant_speed(ctx, effect, input, ratio);
+            }
+        }
     }
     pub(super) fn query_rendered_freeze(&mut self, op: usize, render: &Node) -> bool {
         if self.rate != Rate::new(24, 1)
@@ -1076,10 +1325,121 @@ impl Capture {
             motion,
             motion_adapter_phase,
             saved_timewarp,
+            constant_speed: None,
         });
     }
     pub(super) fn unresolved_motion_adapter(&mut self, record: i64, kind: i64, track: i64) {
         self.unresolved_motion(record, kind, track, "Avid Motion Adapter timing is not supported");
+    }
+    pub(super) fn unsupported_picture_effect<'a>(
+        &mut self, ctx: &Ctx<'a>, node: &'a Node, record: i64, kind: i64, track: i64, effect: &str,
+        ambiguous: &HashSet<MobId>,
+    ) {
+        let Some(scope) = self.stack.last().map(|i| &self.scopes[*i]) else {
+            return;
+        };
+        let direct = self.stack.iter().rev().skip(1).all(|&i| self.scopes[i].class == *b"SEQU");
+        let position_known = direct && scope.position_known && !scope.retimed;
+        let length = scope.record_length.filter(|len| position_known && *len > 0);
+        let (issue, reason) = match effect {
+            "EFF2_2DMATTE" => (
+                SourceIssueKind::MatteKey { length },
+                "Avid Matte Key (EFF2_2DMATTE) omitted; fill and alpha compositing are not converted",
+            ),
+            "EFF2_LUTSFX" => (
+                SourceIssueKind::ColorAdapter { length },
+                "Avid Color Adapter (EFF2_LUTSFX) omitted. Check source color on this edit in Premiere.",
+            ),
+            _ => return,
+        };
+        let index = self.adapter_issues.len();
+        add_classified_issue(
+            &IssueContext {
+                owner: &scope.id,
+                record,
+                position_known,
+                rate: self.rate,
+                kind,
+                track,
+            },
+            issue,
+            reason,
+            Vec::new(),
+            &self.budget,
+            &mut self.adapter_issues,
+        );
+        if effect == "EFF2_2DMATTE" {
+            if let Some(issue) = self.adapter_issues.get_mut(index) {
+                let inputs = matte_inputs(ctx, node);
+                issue.matte_import = matte_import(ctx, &inputs, ambiguous, &self.budget);
+                issue.matte_inputs = Some(inputs);
+                if let (Some(1), Some(import)) = (length, &issue.matte_import) {
+                    if self.rate == Rate::new(24, 1)
+                        && matte::imported_png(ctx, node, &inputs, import)
+                    {
+                        issue.picture_profile = Some(SourcePictureProfile::ImportedPngMatte);
+                    }
+                }
+                if let (Some(span), Some(matte)) = (length, inputs.matte) {
+                    if self.rate == Some(matte.rate) && matte.length == span {
+                        self.capture_matte_input_markers(ctx, node, record, track, span);
+                    }
+                }
+            }
+        } else if let (Some(_), Some(issue)) = (length, self.adapter_issues.get_mut(index)) {
+            if matte::empty_color_adapter(ctx, node).is_some() {
+                issue.picture_profile = Some(SourcePictureProfile::EmptyColorAdapter);
+            }
+        }
+    }
+    // A marked matte leaf can share the composite's record clock even
+    // when the composite cannot emit a portable placement.
+    fn capture_matte_input_markers(
+        &mut self, ctx: &Ctx<'_>, effect: &Node, record: i64, track: i64, span: i64,
+    ) {
+        let Some(input) = matte_track(ctx, effect, 3) else { return };
+        if input.get("edit_rate").is_some()
+            && float(input, "edit_rate").and_then(Rate::from_avid) != self.rate
+        {
+            return;
+        }
+        let Some(leaf) = (match &input.class {
+            b"SCLP" => Some(input),
+            b"SEQU" => sole_picture_segment(ctx, input),
+            _ => None,
+        }) else { return };
+        // SEQU has no stored length. The sole nonempty leaf establishes it.
+        if leaf.class != *b"SCLP" || int(leaf, "length") != Some(span) {
+            return;
+        }
+        let scope = &self.scopes[*self.stack.last().unwrap()];
+        let owner = formatted(&self.budget, format_args!("{}/matte-input", scope.id));
+        let op_index = scope.from;
+        let mut ordinal = 0;
+        each_marker(ctx, leaf, |native| {
+            if !reserve(&self.budget, &mut self.markers, 1) {
+                return;
+            }
+            let (marker, local) = read_marker(ctx, native, &self.budget);
+            let record = match local {
+                Observed::Known(offset) if (0..span).contains(&offset) => record.checked_add(offset),
+                _ => None,
+            };
+            let id = formatted(&self.budget, format_args!("{owner}/marker/{ordinal}"));
+            ordinal += 1;
+            self.markers.push(MarkerFact {
+                id, owner: copy_text(&self.budget, &owner), kind: KIND_PICTURE, track,
+                owner_kind: MarkerOwner::Edit, marker, local, rate: self.rate, record,
+            });
+        });
+        // A scope with no ops keeps the occurrence independent of overlapping edits.
+        if ordinal > 0 && reserve(&self.budget, &mut self.scopes, 1) {
+            self.scopes.push(Scope {
+                id: owner, class: *b"SCLP", from: op_index, to: op_index,
+                rate: self.rate, position_known: true, retimed: false,
+                record_length: Some(span), children: 0, group_path: false,
+            });
+        }
     }
     pub(super) fn unresolved_motion(&mut self, record: i64, kind: i64, track: i64, reason: &'static str) {
         let Some(scope) = self.stack.last().map(|i| &self.scopes[*i]) else {
@@ -1148,7 +1508,7 @@ impl Capture {
             Op::Picture { value, .. } => {
                 let key = Arc::as_ptr(value) as usize;
                 if first_shared(&self.budget, key) {
-                    cost = color_cost(&value.params);
+                    cost = picture_cost(value);
                 }
             }
             Op::PictureChain { chain, .. } => {
@@ -1283,7 +1643,151 @@ fn add_classified_issue(
         record_rate: context.rate,
         kind: context.kind,
         track: context.track,
+        matte_inputs: None,
+        matte_import: None,
+        picture_profile: None,
     });
+}
+
+fn matte_inputs<'a>(ctx: &Ctx<'a>, effect: &'a Node) -> MatteInputs {
+    let mut inputs = MatteInputs {
+        background: MatteBackground::Unresolved,
+        fill: None,
+        matte: None,
+    };
+    let Some(Value::List(tracks)) = effect.get("tracks") else { return inputs };
+    if tracks.len() != 3 {
+        return inputs;
+    }
+    let mut saved = [None; 3];
+    for track in tracks {
+        let Value::Node(track) = track else { return inputs };
+        let Some(index @ 1..=3) = int(track, "index") else { return inputs };
+        let slot = &mut saved[index as usize - 1];
+        if slot.replace(track).is_some() {
+            return inputs;
+        }
+    }
+    let picture = |i: usize| ctx.deref(saved[i]?.get("component"))
+        .filter(|node| int(node, "media_kind_id") == Some(KIND_PICTURE));
+    inputs.background = match picture(0) {
+        Some(node) if ctx.is_empty(node) => MatteBackground::LowerTrack,
+        Some(_) => MatteBackground::Explicit,
+        None => MatteBackground::Unresolved,
+    };
+    inputs.fill = picture(1).and_then(|node| matte_source(ctx, node));
+    inputs.matte = picture(2).and_then(|node| matte_source(ctx, node));
+    inputs
+}
+
+fn matte_track<'a>(ctx: &Ctx<'a>, effect: &Node, track: i64) -> Option<&'a Node> {
+    let Value::List(tracks) = effect.get("tracks")? else { return None };
+    let mut matched = tracks.iter().filter_map(|entry| match entry {
+        Value::Node(node) if int(node, "index") == Some(track) => Some(node),
+        _ => None,
+    });
+    let native = matched.next()?;
+    if matched.next().is_some() {
+        return None;
+    }
+    ctx.deref(native.get("component")).filter(|node| int(node, "media_kind_id") == Some(KIND_PICTURE))
+}
+
+fn sole_picture_segment<'a>(ctx: &Ctx<'a>, node: &Node) -> Option<&'a Node> {
+    let Value::RefList(children) = node.get("components")? else { return None };
+    let mut sole = None;
+    for reference in children {
+        let component = ctx.deref(Some(reference))?;
+        if component.class == *b"FILL" && int(component, "length") == Some(0) {
+            continue;
+        }
+        if sole.replace(component).is_some() {
+            return None;
+        }
+    }
+    sole
+}
+
+fn matte_import(
+    ctx: &Ctx<'_>, inputs: &MatteInputs, ambiguous: &HashSet<MobId>, budget: &SharedBudget,
+) -> Option<MatteImport> {
+    let (fill, matte) = (inputs.fill?, inputs.matte?);
+    if fill.mob != matte.mob || fill.track == matte.track || ambiguous.contains(&fill.mob) {
+        return None;
+    }
+    let master = ctx.mobs.get(&fill.mob)?;
+    if int(master, "mob_type_id") != Some(MOB_MASTER) {
+        return None;
+    }
+    Some(picture_import(ctx, import_settings(ctx, master)?, budget))
+}
+
+fn unique_attribute<'a>(attrs: &'a [(String, Value)], key: &str) -> Option<&'a Value> {
+    let mut matches = attrs.iter().filter(|(name, _)| name == key);
+    let (_, value) = matches.next()?;
+    matches.next().is_none().then_some(value)
+}
+
+fn import_settings<'a>(ctx: &Ctx<'a>, master: &Node) -> Option<&'a [(String, Value)]> {
+    let settings = ctx.deref(unique_attribute(borrowed_attrs(ctx, master), "_IMPORTSETTING"))
+        .filter(|node| node.class == *b"ATTR")?;
+    let Value::Attrs(attrs) = settings.get("entries")? else { return None };
+    Some(attrs)
+}
+
+fn picture_import(ctx: &Ctx<'_>, attrs: &[(String, Value)], budget: &SharedBudget) -> MatteImport {
+    let flag = |key| match unique_attribute(attrs, key).and_then(Value::as_int) {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None,
+    };
+    let ignore_alpha = flag("_IGNOREALPHA");
+    let invert_alpha = flag("_INVERTALPHA");
+    let mut locators = Vec::new();
+    if let Some(locator) = ctx.deref(unique_attribute(attrs, "_SRCFILE")).filter(|node| node.class == *b"FILE") {
+        const MAX_LOCATOR_BYTES: usize = 4096;
+        for key in ["path_posix", "path_utf8", "path"] {
+            if let Some(path) = locator.get(key).and_then(Value::as_str)
+                .filter(|path| !path.is_empty() && path.len() <= MAX_LOCATOR_BYTES)
+            {
+                if !locators.iter().any(|seen| seen == path) && reserve(budget, &mut locators, 1) {
+                    locators.push(copy_text(budget, path));
+                }
+            }
+        }
+    }
+    MatteImport { ignore_alpha, invert_alpha, locators }
+}
+
+fn matte_source<'a>(ctx: &Ctx<'a>, mut node: &'a Node) -> Option<MatteInput> {
+    for _ in 0..8 {
+        if int(node, "media_kind_id") != Some(KIND_PICTURE) {
+            return None;
+        }
+        match &node.class {
+            b"SCLP" => {
+                let mob = mob_id(node)?;
+                if mob.material.data1 == 0 && mob.label == [0; 12] {
+                    return None;
+                }
+                let track = int(node, "track_id").filter(|n| *n > 0)?;
+                let start = int(node, "start_time")?;
+                let length = int(node, "length").filter(|n| *n > 0)?;
+                let rate = Rate::from_avid(float(node, "edit_rate")?)?;
+                return Some(MatteInput { mob, track, start, length, rate });
+            }
+            b"SEQU" => {
+                node = sole_picture_segment(ctx, node)?;
+            }
+            b"TKFX" if node.get("effect_id").and_then(Value::as_str) == Some("EFF2_LUTSFX") => {
+                let Some(Value::List(tracks)) = node.get("tracks") else { return None };
+                let [Value::Node(track)] = tracks.as_slice() else { return None };
+                node = ctx.deref(track.get("component"))?;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 fn qualified_query(
     routes: &HashMap<MobId, MobRoute>,
@@ -1839,10 +2343,13 @@ fn finish_source(
                         range: Some(range),
                         reason: None,
                         volume_automation: None,
+                        pan_automation: None,
                         picture_extension: None,
                         picture_chain: Vec::new(),
                         motion_adapter_phase: fact.motion_adapter_phase,
                         saved_timewarp: fact.saved_timewarp.take(),
+                        constant_speed: fact.constant_speed,
+                        plain_submaster: false,
                     });
                 }
             }
@@ -1864,9 +2371,10 @@ fn finish_source(
                     ));
                 }
             }
-            Op::PanVolume { before, gain, pans, mut automation } => {
+            Op::PanVolume { before, gain, pans, mut automation, mut pan_automation } => {
                 let produced = &mut events[starts[before]..];
                 let single = produced.len() == 1;
+                let has_pan = pan_automation.is_some();
                 for e in produced {
                     e.event.edit_gain_db = gain;
                     e.event.edit_pan = if matches!(e.event.combined, Some((_, 1))) {
@@ -1879,7 +2387,20 @@ fn finish_source(
                             "nested PVOL automation",
                         ));
                     } else if let Some(captured) = automation.take() {
-                        e.volume_automation = Some(captured.resolve(single, e));
+                        e.volume_automation = Some(captured.resolve(
+                            single, e, "volume owner is not one exact same-rate mono edit",
+                        ));
+                    }
+                    if e.pan_automation.is_some() {
+                        e.pan_automation = Some(PanAutomation::Unsupported("nested PVOL pan automation"));
+                    } else if has_pan && !single {
+                        e.pan_automation = Some(PanAutomation::Unsupported(
+                            "pan owner is not one exact same-rate mono edit",
+                        ));
+                    } else if let Some(captured) = pan_automation.take() {
+                        e.pan_automation = Some(captured.resolve(
+                            single, e, "pan owner is not one exact same-rate mono edit",
+                        ));
                     }
                 }
             }
@@ -1898,7 +2419,7 @@ fn finish_source(
                     if e.event.picture.is_some() {
                         e.event.picture_nested = true;
                     } else {
-                        if !charge(&capture.budget, color_cost(&value.params)) {
+                        if !charge(&capture.budget, picture_cost(&value)) {
                             break;
                         }
                         e.event.picture = Some((*value).clone());
@@ -1925,6 +2446,13 @@ fn finish_source(
                 {
                     event.picture_chain = chain.stages;
                 }
+            }
+            Op::PlainSubmaster { before, length, position } => {
+                let [event] = &mut events[starts[before]..] else { continue };
+                event.plain_submaster = event.range.as_ref().is_some_and(|r| {
+                    r.record_start == position && r.length == length && r.source_length == length
+                        && r.record_rate == r.source_rate && r.route.len() == 1
+                });
             }
             Op::Matte {
                 before,
@@ -1978,6 +2506,8 @@ fn finish_source(
             cutpoint: t.cutpoint,
             rate: t.rate,
             effect: t.effect,
+            audio_curve_attribute: t.audio_curve_attribute,
+            audio_curve_parameter: t.audio_curve_parameter,
             outgoing: binding(
                 t.outgoing.as_deref(),
                 &capture.scopes,
@@ -2132,6 +2662,8 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
         ));
     }
     let mut masters = Vec::new();
+    let mut imported_stills = Vec::new();
+    let mut subclips = Vec::new();
     let mut groups = Vec::new();
     let mut group_dependencies = Vec::new();
     let mut sequences = Vec::new();
@@ -2191,9 +2723,15 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
                             duplicates.push((copy_text(&budget, &name), bin));
                         }
                     }
+                    let mut meta = source.expect("source master witness");
+                    if let Some(still) = meta.imported_still.take() {
+                        if !reserve(&budget, &mut imported_stills, 1) {
+                            break;
+                        }
+                        imported_stills.push(still);
+                    }
                     match result {
                         Ok(master) => {
-                            let meta = source.expect("source master witness");
                             let rate = Rate::from_avid(master.edit_rate);
                             if !reserve(&budget, &mut masters, 1) {
                                 break;
@@ -2205,6 +2743,8 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
                                 offsets: meta.offsets,
                                 marker_witnesses: meta.marker_witnesses,
                                 originals: meta.originals,
+                                file_clocks: meta.file_clocks,
+                                input_transforms: meta.input_transforms,
                                 rendered_freeze: meta.rendered_freeze,
                                 rendered_gain: meta.rendered_gain,
                             });
@@ -2224,6 +2764,12 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
                         break;
                     }
                     sequences.push(seq);
+                }
+                Item::Subclip(subclip) => {
+                    if !reserve(&budget, &mut subclips, 1) {
+                        break;
+                    }
+                    subclips.push(subclip);
                 }
                 Item::Group(group) => {
                     if !reserve(&budget, &mut groups, 1) { break; }
@@ -2290,6 +2836,8 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
     let accounted_bytes = budget.as_ref().borrow().used;
     Ok(SourceProject {
         masters,
+        imported_stills,
+        subclips,
         groups,
         sequences: output,
         skipped,

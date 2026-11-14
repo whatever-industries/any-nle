@@ -1,8 +1,10 @@
 //! Same-rate Premiere straight cuts into the shared Resolve turnover path.
 mod components;
 mod controls;
+mod fades;
 mod markers;
 mod metadata;
+mod mixer;
 pub(crate) use metadata::{LABEL_LOSS as CLIP_LABEL_LOSS, LOSS as CLIP_METADATA_LOSS,
     SYNC_LOCK_LOSS, TIMELINE_MARK_LOSS};
 
@@ -21,7 +23,7 @@ use graph::{
 };
 use prproj::{
     build::time::TICKS_PER_SECOND,
-    model::{ItemId, ItemType, Project, TrackId, TrackItemId},
+    model::{ItemId, ItemType, Project, TrackData, TrackId, TrackItemId},
     xml::{NodeId, PremiereDocument},
 };
 use serde::Serialize;
@@ -117,7 +119,8 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         .sequence_id(sequence)
         .ok_or("Premiere sequence lacks ObjectUID")?;
     let data = project.sequence(sequence);
-    check_audio_bus(project, data.element)?;
+    let capture_components = components::is_current_project(project)?;
+    let bus_fader = mixer::read_mix_bus(project, data.element, capture_components)?;
     let frame_ticks = data
         .timebase
         .filter(|&n| n > 0)
@@ -199,9 +202,10 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         texts: vec![],
     };
     let mut seen_items = HashMap::new();
-    let capture_components = components::is_current_project(project)?;
     let mut component_budget = components::Budget::default();
     let mut track_state = metadata::TrackStateCapture::default();
+    let mut muted_tracks = Vec::new();
+    let mut track_pans = [0; 2];
     let mut spec = ProjectSpec {
         root_bin_id: Some("premiere:root".into()),
         timelines: vec![TimelineSpec {
@@ -220,7 +224,7 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         let mut track_indexes = HashSet::new();
         for &track_id in tracks {
             let track = project.track(track_id);
-            if !track.transitions.is_empty() && (kind != StreamKind::Video || !capture_components) {
+            if !track.transitions.is_empty() && (!capture_components || track.clips.is_empty()) {
                 return Err(
                     "Premiere transitions require a qualified Resolve timing mapping".into(),
                 );
@@ -235,20 +239,28 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
             if !(1..=expected).contains(&index) || !track_indexes.insert(index) {
                 return Err("expected active V1 and independent A1/A2 Premiere tracks".into());
             }
-            if (kind == StreamKind::Audio || !capture_components) && project.is_muted(track_id)? {
+            if !capture_components && project.is_muted(track_id)? {
                 return Err("muted Premiere track requires a verified Resolve mix mapping".into());
             }
             if capture_components {
                 metadata::capture_track_state(&project.doc.tree, track.element, kind, index,
                     &id, &mut track_state)?;
             }
-            if kind == StreamKind::Audio {
-                check_neutral_mixer(project, track.element)?;
-            }
+            let level_db = if kind == StreamKind::Audio {
+                let fader = mixer::read_track(project, track.element, capture_components)
+                    .map_err(|error| format!("{id}: Premiere A{index} mixer: {error}"))?;
+                if fader.muted {
+                    muted_tracks.push(Value::Int(index));
+                }
+                track_pans[index as usize - 1] = fader.pan;
+                (fader.tenths_db != 0).then(|| f64::from(fader.tenths_db) / 10.0)
+            } else {
+                None
+            };
             out.tracks.push(Track {
                 kind,
                 index,
-                level_db: None,
+                level_db,
             });
             for &clip in &track.clips {
                 if out.placements.len() == MAX_EDITS {
@@ -414,6 +426,8 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                                 controls::ClipControl::MonoVolume(db) => volume_db = Some(db),
                                 controls::ClipControl::LinearMotion(keys) => picture_effects
                                     .push(graph::picture_motion::linear_effect(keys)),
+                                controls::ClipControl::LinearRoll(roll) => picture_effects
+                                    .push(roll.readback()),
                             }
                             mapped = true;
                         }
@@ -449,8 +463,10 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                     effects: picture_effects,
                 });
             }
-            if !track.transitions.is_empty() {
-                read_dissolve(project, &track.transitions, &mut out, frame_ticks)?;
+            let edge_fades = kind == StreamKind::Audio && capture_components
+                && fades::capture(project, track, frame_ticks, &mut graph.sidecars)?;
+            if !edge_fades && !track.transitions.is_empty() {
+                read_dissolve(project, track, kind, &mut out, frame_ticks)?;
             }
         }
         if track_indexes.len() != expected as usize
@@ -544,59 +560,110 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
             });
         }
     }
+    let mut source_fields = vec![
+        ("bin_id".into(), Value::Str(graph.bins[sequence_bin].id.clone())),
+        ("frame_ticks".into(), Value::Int(frame_ticks)),
+        ("zero_point_ticks".into(), Value::Int(zero)),
+    ];
+    if bus_fader != 0 {
+        source_fields.push((
+            crate::source::mixer::MAIN_BUS_LEVEL.into(),
+            Value::Float(f64::from(bus_fader) / 10.0),
+        ));
+    }
+    if !muted_tracks.is_empty() {
+        source_fields.push((crate::source::mixer::MUTED_AUDIO_TRACKS.into(), Value::Arr(muted_tracks)));
+    }
+    if track_pans != [0; 2] {
+        source_fields.push((
+            crate::linked::mixer::PREMIERE_TRACK_PANS.into(),
+            Value::Arr(track_pans.into_iter().map(|pan| Value::Int(i64::from(pan))).collect()),
+        ));
+    }
     graph.sidecars.push(Sidecar {
         adapter: "premiere.source".into(),
         object: id,
-        data: Value::Obj(vec![
-            (
-                "bin_id".into(),
-                Value::Str(graph.bins[sequence_bin].id.clone()),
-            ),
-            ("frame_ticks".into(), Value::Int(frame_ticks)),
-            ("zero_point_ticks".into(), Value::Int(zero)),
-        ]),
+        data: Value::Obj(source_fields),
     });
+    let mut notices: Vec<_> = out
+        .transitions
+        .iter()
+        .filter(|transition| transition.kind == StreamKind::Video)
+        .map(|transition| {
+            format!(
+                "{} (transition_approximation): Resolve Cross Dissolve preserves the cut and interval. Blend sampling can differ from Premiere Cross Dissolve (Legacy).",
+                transition.id
+            )
+        })
+        .collect();
+    for (lane, pan) in (1..=2).zip(track_pans) {
+        if pan != 0 && pan.abs() != 1000 {
+            notices.push(format!(
+                "{} (track_pan_law): A{lane} retains {}% track pan and uses Resolve's pan law",
+                out.id, f64::from(pan) / 10.0
+            ));
+        }
+    }
     graph.sequences.push(out);
-    Turnover::prepare(graph, spec, ffprobe, vec![(path, digest)], vec![], caption_omissions)
+    Turnover::prepare(graph, spec, ffprobe, vec![(path, digest)], notices, caption_omissions)
 }
 
 fn read_dissolve(
     project: &Project,
-    transitions: &[NodeId],
+    track: &TrackData,
+    kind: StreamKind,
     sequence: &mut SourceSequence,
     frame_ticks: i64,
 ) -> Result<()> {
     use prproj::model::transition::*;
-    let [transition] = transitions else {
+    let [transition] = track.transitions.as_slice() else {
         return Err("Resolve preparation requires exactly one Premiere dissolve".into());
     };
     let tree = &project.doc.tree;
     let id = tree.get(*transition, "ObjectID").ok_or("Premiere transition lacks ObjectID")?;
     let refuse = |reason| format!("Premiere transition {id}: {reason}");
+    if track.index != 0 || sequence.transitions.iter().any(|t| t.kind == kind) {
+        return Err(refuse("expected one transition per supported lane on V1 or A1").into());
+    }
     let start = transition_start(tree, *transition)?.ticks;
     let end = transition_end(tree, *transition)?.ticks;
     let offset = transition_cut_point_offset(tree, *transition)?.ticks;
     let duration = end.checked_sub(start).ok_or_else(|| refuse("duration overflow"))?;
-    if !crate::dissolve::supported_rate(sequence.rate)
-        || start < 0
+    let match_name = transition_match_name(tree, *transition)?;
+    let style = match kind {
+        StreamKind::Video if tree.tag(*transition) == "VideoTransitionTrackItem"
+            && crate::dissolve::supported_rate(sequence.rate)
+            && (offset == duration || offset.checked_mul(2) == Some(duration))
+            && match_name == "ADBE Cross Dissolve" => "premiere.ADBE Cross Dissolve",
+        StreamKind::Audio if tree.tag(*transition) == "AudioTransitionTrackItem"
+            && sequence.rate == Rational::integer(24)
+            && offset.checked_mul(2) == Some(duration)
+            && match_name == "Constant Gain"
+            && constant_gain_fields(tree, *transition)? => crate::dissolve::PREMIERE_AUDIO_STYLE,
+        StreamKind::Video => return Err(refuse("expected the eight-frame left-aligned or centered Cross Dissolve profile").into()),
+        StreamKind::Audio => return Err(refuse("expected the eight-frame centered 24 fps A1 Constant Gain profile").into()),
+    };
+    if start < 0
         || start % frame_ticks != 0
         || duration != frame_ticks.checked_mul(8).ok_or("transition duration overflow")?
-        || (offset != duration && offset.checked_mul(2) != Some(duration))
-        || transition_match_name(tree, *transition)? != "ADBE Cross Dissolve"
         || transition_is_reversed(tree, *transition)?
         || transition_border_width(tree, *transition)? != 0
         || !transition_has_incoming_clip(tree, *transition)?
         || !transition_has_outgoing_clip(tree, *transition)?
     {
-        return Err(refuse("expected the eight-frame left-aligned or centered Cross Dissolve profile").into());
+        return Err(refuse("expected an eight-frame transition with two clip endpoints").into());
     }
     let cut = ticks(start.checked_add(offset).ok_or_else(|| refuse("cut overflow"))?)?;
     let duration = ticks(duration)?;
     let before = ticks(offset)?;
     let after = duration.checked_sub(before).ok_or_else(|| refuse("invalid alignment"))?;
     let begin = ticks(start)?;
+    let on_lane = |p: &Placement| match kind {
+        StreamKind::Video => p.video_track == Some(1),
+        StreamKind::Audio => p.audio_tracks.as_slice() == [1],
+    };
     let mut outgoing = sequence.placements.iter_mut().filter(|p| {
-        p.video_track == Some(1) && p.record_start <= begin
+        on_lane(p) && p.record_start <= begin
             && p.record_start.checked_add(p.duration) == Some(cut)
     });
     let out = outgoing.next().ok_or_else(|| refuse("missing outgoing edit"))?;
@@ -606,10 +673,34 @@ fn read_dissolve(
     let outgoing_id = out.id.clone();
     out.duration = out.duration.checked_add(after).ok_or_else(|| refuse("outgoing extent overflow"))?;
     let mut incoming = sequence.placements.iter_mut()
-        .filter(|p| p.video_track == Some(1) && p.record_start == cut);
+        .filter(|p| on_lane(p) && p.record_start == cut);
     let input = incoming.next().ok_or_else(|| refuse("missing incoming edit"))?;
     if incoming.next().is_some() {
         return Err(refuse("ambiguous incoming edit").into());
+    }
+    let incoming_id = input.id.clone();
+    for &clip in &track.clips {
+        let element = project.track_item(clip).element;
+        let object = tree
+            .get(element, "ObjectID")
+            .ok_or("Premiere edit lacks ObjectID")?;
+        for (field, endpoint) in [
+            ("ClipTrackItem/TailTransition", outgoing_id.as_str()),
+            ("ClipTrackItem/HeadTransition", incoming_id.as_str()),
+        ] {
+            let refs = tree.findall(element, field)?;
+            let expected = endpoint.strip_prefix("premiere:edit:") == Some(object);
+            match refs.as_slice() {
+                [] if !expected => {}
+                [link] if expected && project.doc.resolve(*link).is_ok_and(|id| id == *transition) => {}
+                _ => {
+                    return Err(refuse(
+                        "saved clip transition references disagree with the cut endpoints",
+                    )
+                    .into());
+                }
+            }
+        }
     }
     input.source_in = input.source_in.checked_sub(before).filter(|time| !time.is_negative())
         .ok_or_else(|| refuse("insufficient incoming preroll"))?;
@@ -617,16 +708,32 @@ fn read_dissolve(
     input.duration = input.duration.checked_add(before).ok_or_else(|| refuse("edit range overflow"))?;
     sequence.transitions.push(SourceTransition {
         id: format!("premiere:transition:{id}"),
-        kind: StreamKind::Video,
+        kind,
         track: 1,
         cut,
         duration,
         cut_offset: before,
-        style: "premiere.ADBE Cross Dissolve".into(),
+        style: style.into(),
         outgoing: SourceBinding { placements: vec![outgoing_id], reason: None },
-        incoming: SourceBinding { placements: vec![input.id.clone()], reason: None },
+        incoming: SourceBinding { placements: vec![incoming_id], reason: None },
     });
     Ok(())
+}
+
+fn constant_gain_fields(tree: &prproj::xml::Tree, transition: NodeId) -> Result<bool> {
+    // The saved transition has a stereo render layout even on a mono lane.
+    for (field, expected) in [
+        ("FadeShapeType", "0"),
+        ("FadeShapeValue", "0"),
+        ("AudioChannelLayout", r#"[{"channellabel":100},{"channellabel":101}]"#),
+    ] {
+        let refs = tree.findall(transition, field)?;
+        let [value] = refs.as_slice() else { return Ok(false) };
+        if !tree.is_childless(*value) || tree.text(*value) != Some(expected) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn premiere_path(path: &Path) -> Result<PathBuf> {
@@ -666,99 +773,6 @@ fn read_project(path: &Path) -> Result<(Project, [u8; 32])> {
         PremiereDocument::from_xml_bytes(&input, None)?
     };
     Ok((Project::from_document(document, path)?, digest))
-}
-
-fn check_audio_bus(project: &Project, sequence: NodeId) -> Result<()> {
-    let tree = &project.doc.tree;
-    let mut buses = 0;
-    for reference in tree.findall(sequence, "TrackGroups/TrackGroup/Second")? {
-        let group = project.doc.resolve(reference)?;
-        if tree.tag(group) != "AudioTrackGroup" {
-            continue;
-        }
-        buses += 1;
-        if tree.findtext(group, "NumAdaptiveChannels")?.as_deref() != Some("2") {
-            return Err("expected a stereo Premiere mix bus".into());
-        }
-        let master = tree
-            .find1(group, "MasterTrack")
-            .ok_or("missing Premiere mix bus")?;
-        check_neutral_mixer(project, project.doc.resolve(master)?)?;
-    }
-    if buses != 1 {
-        return Err("expected one Premiere audio track group".into());
-    }
-    Ok(())
-}
-
-fn check_neutral_mixer(project: &Project, track: NodeId) -> Result<()> {
-    let tree = &project.doc.tree;
-    let check_param = |reference| -> Result<()> {
-        let p = project.doc.resolve(reference)?;
-        if prproj::model::component::param_is_time_varying(tree, p)
-            || tree
-                .findtext(p, "Keyframes")?
-                .is_some_and(|v| !v.is_empty())
-        {
-            return Err("Premiere mixer automation requires an explicit mapping".into());
-        }
-        let name = tree.findtext(p, "Name")?.unwrap_or_default();
-        let neutral = |value: &str| match name.as_str() {
-            "Volume" => value.parse::<f64>() == Ok(1.0),
-            "Mute" => value == "false",
-            "Pan" => value.parse::<f64>() == Ok(0.0),
-            "Balance" => value.parse::<f64>() == Ok(0.5),
-            _ => false,
-        };
-        let current = tree.findtext(p, "CurrentValue")?;
-        let start = tree.findtext(p, "StartKeyframe")?;
-        if !matches!(name.as_str(), "Volume" | "Mute" | "Pan" | "Balance")
-            || current
-                .as_deref()
-                .is_some_and(|v| !v.is_empty() && !neutral(v))
-            || start
-                .as_deref()
-                .is_some_and(|v| !v.is_empty() && !v.split(',').nth(1).is_some_and(neutral))
-        {
-            return Err("non-neutral Premiere mixer control requires an explicit mapping".into());
-        }
-        Ok(())
-    };
-    let chain = tree
-        .find1(track, "AudioTrack/ComponentOwner/Components")
-        .ok_or("missing Premiere mixer chain")?;
-    let chain = project.doc.resolve(chain)?;
-    for reference in tree.findall(chain, "ComponentChain/Components/Component")? {
-        let component = project.doc.resolve(reference)?;
-        if !matches!(tree.tag(component), "AudioFader" | "AudioMeter") {
-            return Err("unsupported Premiere mixer component".into());
-        }
-        for param in tree.findall(component, "AudioComponent/Component/Params/Param")? {
-            check_param(param)?;
-        }
-    }
-    let panner = tree
-        .find1(track, "AudioTrack/Panner")
-        .ok_or("missing Premiere panner")?;
-    let panner = project.doc.resolve(panner)?;
-    if !matches!(
-        tree.tag(panner),
-        "StereoToStereoPanProcessor" | "MonoToStereoPanProcessor" | "DefaultPanProcessor"
-    ) {
-        return Err("unsupported Premiere mixer channel routing".into());
-    }
-    for param in tree.findall(panner, "PanProcessor/AudioComponent/Component/Params/Param")? {
-        check_param(param)?;
-    }
-    for field in ["IsSolo", "IsMuted"] {
-        if tree
-            .findtext(track, &format!("ClipTrack/Track/{field}"))?
-            .is_some_and(|v| v == "true")
-        {
-            return Err("Premiere mute or solo state requires an explicit mapping".into());
-        }
-    }
-    Ok(())
 }
 
 fn ticks(value: i64) -> Result<Rational> {

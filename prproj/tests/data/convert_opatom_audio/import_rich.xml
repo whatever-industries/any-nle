@@ -1,0 +1,1052 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<PremiereData Version="3">
+	<Project ObjectRef="1"/>
+	<Project ObjectID="1" ClassID="62ad66dd-0dcd-42da-a660-6d8fbde94876" Version="45">
+		<Node Version="1">
+			<Properties Version="1">
+				<MZ.Project.WorkspaceName>Learning</MZ.Project.WorkspaceName>
+				<MZ.BuildVersion.Created>26.3.0x93 - 20/07/2026 10:07:43</MZ.BuildVersion.Created>
+				<MZ.BuildVersion.Modified>26.3.0x93 - 20/07/2026 10:07:43</MZ.BuildVersion.Modified>
+				<MZ.Project.ApplicationID>Pro</MZ.Project.ApplicationID>
+				<MZ.Project.GUID>98277d49-ef30-4e02-bcb5-9b040bde4805</MZ.Project.GUID>
+				<TL.PJSnappingState>1</TL.PJSnappingState>
+			</Properties>
+		</Node>
+		<RootProjectItem ObjectURef="0e23e09b-dba4-44fb-bba8-e91936eee53d"/>
+		<ProjectSettings ObjectRef="3"/>
+		<ScratchDiskSettings ObjectRef="9"/>
+		<IngestSettings ObjectRef="10"/>
+		<ProjectWorkspace ObjectRef="11"/>
+		<NextID>1000001</NextID>
+	</Project>
+	<RootProjectItem ObjectUID="0e23e09b-dba4-44fb-bba8-e91936eee53d" ClassID="1c307a89-9318-47d7-a583-bf2553736543" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<ProjectViewState.ID>d8ee29fd-3788-42d9-a2fd-bbe08f9bda41</ProjectViewState.ID>
+				</Properties>
+				<ID>1000000</ID>
+			</Node>
+			<Name>Root Bin</Name>
+		</ProjectItem>
+		<ProjectItemContainer Version="1">
+			<Items Version="1">
+				<Item Index="0" ObjectURef="e888b698-8e7a-4946-94e4-f135812a2e68"/>
+				<Item Index="1" ObjectURef="80c2bc10-4180-4a50-9f52-c5a5b66e2918"/>
+				<Item Index="2" ObjectURef="af7974ac-b274-4bdd-a247-43283484c38f"/>
+				<Item Index="3" ObjectURef="7135f844-4e65-41a9-a1c4-a83c9bf74cc0"/>
+				<Item Index="4" ObjectURef="66471c76-8ba5-49af-8a4a-4edc489c500b"/>
+				<Item Index="5" ObjectURef="d3986b55-f444-4763-8997-bef0dcf1822e"/>
+				<Item Index="6" ObjectURef="20c6ff89-2f8b-439e-ab17-f5dca20bf000"/>
+			</Items>
+		</ProjectItemContainer>
+	</RootProjectItem>
+	<ProjectSettings ObjectID="3" ClassID="50c16708-a1a1-4d2f-98d5-4e283ae28353" Version="21">
+		<VideoSettings ObjectRef="12"/>
+		<AudioSettings ObjectRef="13"/>
+		<VideoCompileSettings ObjectRef="14"/>
+		<AudioCompileSettings ObjectRef="15"/>
+		<CaptureSettings ObjectRef="16"/>
+		<DefaultSequenceSettings ObjectRef="17"/>
+		<ColorManagementSettings>{"enableLogColorManagement":2,"graphicsWhiteLuminance":203,"lutInterpolationMethod":1}</ColorManagementSettings>
+		<VideoTimeDisplay>102</VideoTimeDisplay>
+		<AudioTimeDisplay>200</AudioTimeDisplay>
+		<ColorAwareEffectsEnabled>0</ColorAwareEffectsEnabled>
+		<VideoTimeDisplayInitial>102</VideoTimeDisplayInitial>
+		<ActionSafeWidth>10</ActionSafeWidth>
+		<ActionSafeHeight>10</ActionSafeHeight>
+		<TitleSafeWidth>20</TitleSafeWidth>
+		<TitleSafeHeight>20</TitleSafeHeight>
+		<ShouldScaleMedia>false</ShouldScaleMedia>
+		<EditingModeID>00000000-0000-0000-0000-000000000000</EditingModeID>
+		<PreviewFileFormatID>00000000-0000-0000-0000-000000000000</PreviewFileFormatID>
+		<UsePreviewCache>false</UsePreviewCache>
+	</ProjectSettings>
+	<ScratchDiskSettings ObjectID="9" ClassID="4c6ed82b-a81c-4df1-8bd0-750504c4b560" Version="4">
+		<AudioPreviewLocation0>SameAsProject</AudioPreviewLocation0>
+		<VideoPreviewLocation0>SameAsProject</VideoPreviewLocation0>
+		<AutoSaveLocation0>SameAsProject</AutoSaveLocation0>
+		<DVDEncodingLocation0>SameAsProject</DVDEncodingLocation0>
+		<TransferMediaLocation0>SameAsProject</TransferMediaLocation0>
+		<CCLibrariesLocation0>SameAsProject</CCLibrariesLocation0>
+		<CapturedVideoLocation0>SameAsProject</CapturedVideoLocation0>
+		<CapsuleMediaLocation0>SameAsProject</CapsuleMediaLocation0>
+	</ScratchDiskSettings>
+	<IngestSettings ObjectID="10" ClassID="2db8f76b-2c37-48ee-925d-9a4f7278152d" Version="2">
+		<Action>copy</Action>
+		<Enabled>false</Enabled>
+	</IngestSettings>
+	<WorkspaceSettings ObjectID="11" ClassID="c4372273-e1aa-4683-98aa-a2ceadf3066c" Version="1">
+	</WorkspaceSettings>
+	<DummyCaptureSettings ObjectID="16" ClassID="328c2aa2-47f9-4211-805b-b6a6dbd4ca29" Version="1">
+	</DummyCaptureSettings>
+	<DefaultSequenceSettings ObjectID="17" ClassID="567bdf53-d6d9-4d61-b2f1-f4834bebea9b" Version="2">
+		<TotalVideoTracks>1</TotalVideoTracks>
+		<DefaultAudioStandardMonoTracks>0</DefaultAudioStandardMonoTracks>
+		<DefaultAudioStandardStereoTracks>1</DefaultAudioStandardStereoTracks>
+		<DefaultAudioStandard51Tracks>0</DefaultAudioStandard51Tracks>
+		<DefaultAudioSubmixMonoTracks>0</DefaultAudioSubmixMonoTracks>
+		<DefaultAudioSubmixStereoTracks>0</DefaultAudioSubmixStereoTracks>
+		<DefaultAudioSubmix51Tracks>0</DefaultAudioSubmix51Tracks>
+	</DefaultSequenceSettings>
+	<VideoStream ObjectID="18" ClassID="a36e4719-3ec6-4a0c-ab11-8b4aab377aa5" Version="22">
+		<FrameRate>10584000000</FrameRate>
+		<Duration>5080320000000</Duration>
+		<FrameRect>0,0,1920,1080</FrameRect>
+		<CodecType>1096180846</CodecType>
+		<OriginalColorSpace>{"baseColorProfile":{"colorProfileData":"AQAAAP////8=","colorProfileName":"BT.709,8-bit,Display-Referred"},"baseProfileType":1,"colorSpaceMetadata":{"dataRangeInfoValid":1}}</OriginalColorSpace>
+	</VideoStream>
+	<Media ObjectUID="10c56c20-2210-4ecf-8b32-9153bc0edf82" ClassID="7a5c103e-f3ac-4391-b6b4-7cc3d2f9a7ff" Version="30">
+		<VideoStream ObjectRef="18"/>
+		<ModificationState Encoding="base64" BinaryHash="8ca120b6-8714-435e-a1ab-a37ea817d0af">YwBhADEAOAAyAGIANgA1AC0AOABhAGMAZQAtADQAYwBlADkALQA5AGUAZABkAC0ANgAzAGIANABlADkAMAA1AGYAMwBjADUA
+		</ModificationState>
+		<RelativePath>../../../Volumes/Media/Avid MediaFiles/MXF/1/V01.RICHA.mxf</RelativePath>
+		<Start>914457600000000</Start>
+		<ImplementationID>1fa18bfa-255c-44b1-ad73-56bcd99fceaf</ImplementationID>
+		<FileKey>62b52b4f-63c4-4a6c-bdd1-a2f47575092d</FileKey>
+		<AlternateTapeName>A very long tape name that is clearly mo</AlternateTapeName>
+		<ContentAndMetadataState>ca182b65-8ace-4ce9-9edd-63b4e905f3c5</ContentAndMetadataState>
+		<TapeName>A very long tape name that is clearly mo</TapeName>
+		<ActualMediaFilePath>/Volumes/Media/Avid MediaFiles/MXF/1/V01.RICHA.mxf</ActualMediaFilePath>
+		<FilePath>/Volumes/Media/Avid MediaFiles/MXF/1/V01.RICHA.mxf</FilePath>
+		<AlternateStart>0</AlternateStart>
+		<Title>Rich A &lt;1&gt; &amp; "q"</Title>
+	</Media>
+	<VideoMediaSource ObjectID="19" ClassID="e64ddf74-8fac-4682-8aa8-0e0ca2248949" Version="2">
+		<MediaSource Version="4">
+			<Content Version="10">
+			</Content>
+			<Media ObjectURef="10c56c20-2210-4ecf-8b32-9153bc0edf82"/>
+		</MediaSource>
+		<OriginalDuration>5080320000000</OriginalDuration>
+	</VideoMediaSource>
+	<Markers ObjectID="20" ClassID="bee50706-b524-416c-9f03-b596ce5f6866" Version="4">
+		<ByGUID>byGUID</ByGUID>
+		<LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState>
+		<LastContentState>ca182b65-8ace-4ce9-9edd-63b4e905f3c5</LastContentState>
+	</Markers>
+	<ClipLoggingInfo ObjectID="21" ClassID="77ab7fdd-dcdf-465d-9906-7a330ca1e738" Version="10">
+		<ClipID>060A2B340101010501010F101300000000000000000000000000000000000002</ClipID>
+		<CaptureMode>2</CaptureMode>
+		<ClipName>Rich A &lt;1&gt; &amp; "q"</ClipName>
+		<TimecodeFormat>100</TimecodeFormat>
+		<MediaInPoint>914457600000000</MediaInPoint>
+		<MediaOutPoint>919537920000000</MediaOutPoint>
+		<MediaFrameRate>10584000000</MediaFrameRate>
+		<TapeName>A very long tape name that is clearly mo</TapeName>
+		<ShotTake>3</ShotTake>
+		<FilmCameraRoll>A001</FilmCameraRoll>
+		<Description>RICH_A.mov</Description>
+		<Scene>12B</Scene>
+		<LogNote>Sound Roll: S4 | Tracks: V1 A1 A2 | Source Path: /cards/A001 | Avid Start: 01:00:00:00 | Aux TC1: 02:00:00:00 | Aux TC2: 03:00:00:00</LogNote>
+	</ClipLoggingInfo>
+	<VideoClip ObjectID="22" ClassID="9308dbef-2440-4acb-9ab2-953b9a4e82ec" Version="11">
+		<Clip Version="18">
+			<Node Version="1">
+				<Properties Version="1">
+					<asl.clip.label.color>11405886</asl.clip.label.color>
+					<asl.clip.label.name>BE.Prefs.LabelColors.0</asl.clip.label.name>
+				</Properties>
+			</Node>
+			<MarkerOwner Version="1">
+				<Markers ObjectRef="20"/>
+			</MarkerOwner>
+			<Source ObjectRef="19"/>
+			<ClipID>32b45602-cf12-437e-b275-f23a4b61a444</ClipID>
+			<InUse>false</InUse>
+		</Clip>
+	</VideoClip>
+	<ClipChannelGroupVectorSerializer ObjectID="23" ClassID="a3127a8c-95d4-456e-a7f5-171b3f922426" Version="1">
+	</ClipChannelGroupVectorSerializer>
+	<MasterClip ObjectUID="0ec39c0c-c7d4-4c3d-8044-ec58020044b8" ClassID="fb11c33a-b0a9-4465-aa94-b6d5db2628cf" Version="12">
+		<LoggingInfo ObjectRef="21"/>
+		<Clips Version="1">
+			<Clip Index="0" ObjectRef="22"/>
+		</Clips>
+		<AudioClipChannelGroups ObjectRef="23"/>
+		<Name>Rich A &lt;1&gt; &amp; "q"_V</Name>
+		<MasterClipChangeVersion>0</MasterClipChangeVersion>
+	</MasterClip>
+	<ClipProjectItem ObjectUID="e888b698-8e7a-4946-94e4-f135812a2e68" ClassID="cb4e0ed7-aca1-4171-8525-e3658dec06dd" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<Column.PropertyText.Label>BE.Prefs.LabelColors.0</Column.PropertyText.Label>
+					<Column.PropertyText.Comment>good one</Column.PropertyText.Comment>
+				</Properties>
+			</Node>
+			<Name>Rich A &lt;1&gt; &amp; "q"_V</Name>
+		</ProjectItem>
+		<MasterClip ObjectURef="0ec39c0c-c7d4-4c3d-8044-ec58020044b8"/>
+	</ClipProjectItem>
+	<AudioStream ObjectID="24" ClassID="0b5cf52f-2b85-4863-890b-8844b64ecfe9" Version="8">
+		<FrameRate>5292000</FrameRate>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+		<Duration>5080320000000</Duration>
+	</AudioStream>
+	<Media ObjectUID="89bd32d5-e228-4efe-8277-e40341e1137c" ClassID="7a5c103e-f3ac-4391-b6b4-7cc3d2f9a7ff" Version="30">
+		<AudioStream ObjectRef="24"/>
+		<ModificationState Encoding="base64" BinaryHash="bd7dfe64-80af-470f-ad86-1204e66d6240">ZQAzAGUAMQBmAGIAZAA3AC0AOQAyAGMANgAtADQANABiAGMALQBhADAAYQBiAC0AMgA0ADMAMgBhADMAZQBiADEAMABkADYA
+		</ModificationState>
+		<RelativePath>../../../Volumes/Media/Avid MediaFiles/MXF/1/RICH A01.RICHA.mxf</RelativePath>
+		<Start>914457600000000</Start>
+		<ImplementationID>1fa18bfa-255c-44b1-ad73-56bcd99fceaf</ImplementationID>
+		<FileKey>378d6d2f-8a87-425e-8c52-7f231b3143da</FileKey>
+		<AlternateTapeName>A very long tape name that is clearly mo</AlternateTapeName>
+		<ConformedAudioRate>5292000</ConformedAudioRate>
+		<ContentAndMetadataState>e3e1fbd7-92c6-44bc-a0ab-2432a3eb10d6</ContentAndMetadataState>
+		<TapeName>A very long tape name that is clearly mo</TapeName>
+		<ActualMediaFilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH A01.RICHA.mxf</ActualMediaFilePath>
+		<FilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH A01.RICHA.mxf</FilePath>
+		<AlternateStart>0</AlternateStart>
+		<Title>Rich A &lt;1&gt; &amp; "q"</Title>
+	</Media>
+	<AudioMediaSource ObjectID="25" ClassID="f588da05-fc2a-4fbc-9383-74d653b379e3" Version="2">
+		<MediaSource Version="4">
+			<Content Version="10">
+			</Content>
+			<Media ObjectURef="89bd32d5-e228-4efe-8277-e40341e1137c"/>
+		</MediaSource>
+		<OriginalDuration>5080320000000</OriginalDuration>
+	</AudioMediaSource>
+	<Markers ObjectID="26" ClassID="bee50706-b524-416c-9f03-b596ce5f6866" Version="4">
+		<ByGUID>byGUID</ByGUID>
+		<LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState>
+		<LastContentState>e3e1fbd7-92c6-44bc-a0ab-2432a3eb10d6</LastContentState>
+	</Markers>
+	<ClipLoggingInfo ObjectID="27" ClassID="77ab7fdd-dcdf-465d-9906-7a330ca1e738" Version="10">
+		<ClipID>060A2B340101010501010F101300000000000000000000000000000000000002</ClipID>
+		<CaptureMode>1</CaptureMode>
+		<ClipName>Rich A &lt;1&gt; &amp; "q"</ClipName>
+		<TimecodeFormat>200</TimecodeFormat>
+		<MediaInPoint>914457600000000</MediaInPoint>
+		<MediaOutPoint>919537920000000</MediaOutPoint>
+		<MediaFrameRate>5292000</MediaFrameRate>
+		<TapeName>A very long tape name that is clearly mo</TapeName>
+		<ShotTake>3</ShotTake>
+		<FilmCameraRoll>A001</FilmCameraRoll>
+		<Description>RICH_A.mov</Description>
+		<Scene>12B</Scene>
+		<LogNote>Sound Roll: S4 | Tracks: V1 A1 A2 | Source Path: /cards/A001 | Avid Start: 01:00:00:00 | Aux TC1: 02:00:00:00 | Aux TC2: 03:00:00:00</LogNote>
+	</ClipLoggingInfo>
+	<SecondaryContent ObjectID="28" ClassID="f9d004b5-cb04-4e2f-af6f-64fadc2c4be9" Version="1">
+		<Content ObjectRef="25"/>
+		<ChannelIndex>0</ChannelIndex>
+	</SecondaryContent>
+	<AudioClip ObjectID="29" ClassID="b8830d03-de02-41ee-84ec-fe566dc70cd9" Version="8">
+		<Clip Version="18">
+			<Node Version="1">
+				<Properties Version="1">
+					<asl.clip.label.color>480554</asl.clip.label.color>
+					<asl.clip.label.name>BE.Prefs.LabelColors.2</asl.clip.label.name>
+				</Properties>
+			</Node>
+			<MarkerOwner Version="1">
+				<Markers ObjectRef="26"/>
+			</MarkerOwner>
+			<Source ObjectRef="25"/>
+			<ClipID>988776f1-3858-4d67-8dd1-fe37642bb997</ClipID>
+			<InUse>false</InUse>
+		</Clip>
+		<SecondaryContents Version="1">
+			<SecondaryContentItem Index="0" ObjectRef="28"/>
+		</SecondaryContents>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+		<Gain>0.5011872336272722</Gain>
+	</AudioClip>
+	<ClipChannelSerializer ObjectID="30" ClassID="5c89aa7a-89a6-4483-becd-f2b1def42316" Version="1">
+		<SourceClipIndex>0</SourceClipIndex>
+		<mSourceChannelIndex>0</mSourceChannelIndex>
+	</ClipChannelSerializer>
+	<ClipChannelVectorSerializer ObjectID="31" ClassID="333d203b-3a53-4195-8894-fc7523ff3dc7" Version="1">
+		<ClipChannels Version="1">
+			<ClipChannelItem Index="0" ObjectRef="30"/>
+		</ClipChannels>
+		<ChannelType>0</ChannelType>
+	</ClipChannelVectorSerializer>
+	<ClipChannelGroupVectorSerializer ObjectID="32" ClassID="a3127a8c-95d4-456e-a7f5-171b3f922426" Version="1">
+		<ClipChannelVectors Version="1">
+			<ClipChannelVectorItem Index="0" ObjectRef="31"/>
+		</ClipChannelVectors>
+	</ClipChannelGroupVectorSerializer>
+	<AudioComponentChain ObjectID="33" ClassID="3cb131d1-d3c0-47ae-a19a-bdf75ea11674" Version="4">
+		<DefaultVol>true</DefaultVol>
+		<DefaultVolumeComponentID>1</DefaultVolumeComponentID>
+		<ComponentChain Version="3">
+		</ComponentChain>
+	</AudioComponentChain>
+	<MasterClip ObjectUID="913225a0-4382-4ac0-888a-d73a9e23bace" ClassID="fb11c33a-b0a9-4465-aa94-b6d5db2628cf" Version="12">
+		<LoggingInfo ObjectRef="27"/>
+		<AudioComponentChains Version="1">
+			<AudioComponentChain Index="0" ObjectRef="33"/>
+		</AudioComponentChains>
+		<Clips Version="1">
+			<Clip Index="0" ObjectRef="29"/>
+		</Clips>
+		<AudioClipChannelGroups ObjectRef="32"/>
+		<Name>Rich A &lt;1&gt; &amp; "q"_A01</Name>
+		<DefMappingID>df627593-fc39-48e9-95e3-811b65d7a414</DefMappingID>
+		<MasterClipChangeVersion>1</MasterClipChangeVersion>
+	</MasterClip>
+	<ClipProjectItem ObjectUID="80c2bc10-4180-4a50-9f52-c5a5b66e2918" ClassID="cb4e0ed7-aca1-4171-8525-e3658dec06dd" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<Column.PropertyText.Label>BE.Prefs.LabelColors.2</Column.PropertyText.Label>
+					<Column.PropertyText.Comment>good one</Column.PropertyText.Comment>
+				</Properties>
+			</Node>
+			<Name>Rich A &lt;1&gt; &amp; "q"_A01</Name>
+		</ProjectItem>
+		<MasterClip ObjectURef="913225a0-4382-4ac0-888a-d73a9e23bace"/>
+	</ClipProjectItem>
+	<AudioStream ObjectID="34" ClassID="0b5cf52f-2b85-4863-890b-8844b64ecfe9" Version="8">
+		<FrameRate>5292000</FrameRate>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+		<Duration>5080320000000</Duration>
+		<SampleType>3</SampleType>
+	</AudioStream>
+	<Media ObjectUID="3278c494-bfd1-40b0-a11e-dd2b7bc32d87" ClassID="7a5c103e-f3ac-4391-b6b4-7cc3d2f9a7ff" Version="30">
+		<AudioStream ObjectRef="34"/>
+		<ModificationState Encoding="base64" BinaryHash="bdd1924d-d40f-47cb-afe7-0e354f671cd0">NAA2AGQAOABjADAAYQAyAC0AMQBlAGEAYwAtADQAZQA4ADQALQA5AGYAZAA5AC0ANwAxADAAOQBlADUAMgBkADAAZAA3ADMA
+		</ModificationState>
+		<RelativePath>../../../Volumes/Media/Avid MediaFiles/MXF/1/RICH A02.RICHA.mxf</RelativePath>
+		<Start>914457600000000</Start>
+		<ImplementationID>1fa18bfa-255c-44b1-ad73-56bcd99fceaf</ImplementationID>
+		<FileKey>d9417856-9115-47f1-a321-9f06d32b50f0</FileKey>
+		<AlternateTapeName>A very long tape name that is clearly mo</AlternateTapeName>
+		<ConformedAudioRate>5292000</ConformedAudioRate>
+		<ContentAndMetadataState>46d8c0a2-1eac-4e84-9fd9-7109e52d0d73</ContentAndMetadataState>
+		<TapeName>A very long tape name that is clearly mo</TapeName>
+		<ActualMediaFilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH A02.RICHA.mxf</ActualMediaFilePath>
+		<FilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH A02.RICHA.mxf</FilePath>
+		<AlternateStart>0</AlternateStart>
+		<Title>Rich A &lt;1&gt; &amp; "q"</Title>
+	</Media>
+	<AudioMediaSource ObjectID="35" ClassID="f588da05-fc2a-4fbc-9383-74d653b379e3" Version="2">
+		<MediaSource Version="4">
+			<Content Version="10">
+			</Content>
+			<Media ObjectURef="3278c494-bfd1-40b0-a11e-dd2b7bc32d87"/>
+		</MediaSource>
+		<OriginalDuration>5080320000000</OriginalDuration>
+	</AudioMediaSource>
+	<Markers ObjectID="36" ClassID="bee50706-b524-416c-9f03-b596ce5f6866" Version="4">
+		<ByGUID>byGUID</ByGUID>
+		<LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState>
+		<LastContentState>46d8c0a2-1eac-4e84-9fd9-7109e52d0d73</LastContentState>
+	</Markers>
+	<ClipLoggingInfo ObjectID="37" ClassID="77ab7fdd-dcdf-465d-9906-7a330ca1e738" Version="10">
+		<ClipID>060A2B340101010501010F101300000000000000000000000000000000000002</ClipID>
+		<CaptureMode>1</CaptureMode>
+		<ClipName>Rich A &lt;1&gt; &amp; "q"</ClipName>
+		<TimecodeFormat>200</TimecodeFormat>
+		<MediaInPoint>914457600000000</MediaInPoint>
+		<MediaOutPoint>919537920000000</MediaOutPoint>
+		<MediaFrameRate>5292000</MediaFrameRate>
+		<TapeName>A very long tape name that is clearly mo</TapeName>
+		<ShotTake>3</ShotTake>
+		<FilmCameraRoll>A001</FilmCameraRoll>
+		<Description>RICH_A.mov</Description>
+		<Scene>12B</Scene>
+		<LogNote>Sound Roll: S4 | Tracks: V1 A1 A2 | Source Path: /cards/A001 | Avid Start: 01:00:00:00 | Aux TC1: 02:00:00:00 | Aux TC2: 03:00:00:00</LogNote>
+	</ClipLoggingInfo>
+	<SecondaryContent ObjectID="38" ClassID="f9d004b5-cb04-4e2f-af6f-64fadc2c4be9" Version="1">
+		<Content ObjectRef="35"/>
+		<ChannelIndex>0</ChannelIndex>
+	</SecondaryContent>
+	<AudioClip ObjectID="39" ClassID="b8830d03-de02-41ee-84ec-fe566dc70cd9" Version="8">
+		<Clip Version="18">
+			<Node Version="1">
+				<Properties Version="1">
+					<asl.clip.label.color>480554</asl.clip.label.color>
+					<asl.clip.label.name>BE.Prefs.LabelColors.2</asl.clip.label.name>
+				</Properties>
+			</Node>
+			<MarkerOwner Version="1">
+				<Markers ObjectRef="36"/>
+			</MarkerOwner>
+			<Source ObjectRef="35"/>
+			<ClipID>9b03e408-50a7-472a-87e1-0c22f7bc579f</ClipID>
+			<InUse>false</InUse>
+		</Clip>
+		<SecondaryContents Version="1">
+			<SecondaryContentItem Index="0" ObjectRef="38"/>
+		</SecondaryContents>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+	</AudioClip>
+	<ClipChannelSerializer ObjectID="40" ClassID="5c89aa7a-89a6-4483-becd-f2b1def42316" Version="1">
+		<SourceClipIndex>0</SourceClipIndex>
+		<mSourceChannelIndex>0</mSourceChannelIndex>
+	</ClipChannelSerializer>
+	<ClipChannelVectorSerializer ObjectID="41" ClassID="333d203b-3a53-4195-8894-fc7523ff3dc7" Version="1">
+		<ClipChannels Version="1">
+			<ClipChannelItem Index="0" ObjectRef="40"/>
+		</ClipChannels>
+		<ChannelType>0</ChannelType>
+	</ClipChannelVectorSerializer>
+	<ClipChannelGroupVectorSerializer ObjectID="42" ClassID="a3127a8c-95d4-456e-a7f5-171b3f922426" Version="1">
+		<ClipChannelVectors Version="1">
+			<ClipChannelVectorItem Index="0" ObjectRef="41"/>
+		</ClipChannelVectors>
+	</ClipChannelGroupVectorSerializer>
+	<AudioComponentChain ObjectID="43" ClassID="3cb131d1-d3c0-47ae-a19a-bdf75ea11674" Version="4">
+		<DefaultVol>true</DefaultVol>
+		<DefaultVolumeComponentID>1</DefaultVolumeComponentID>
+		<ComponentChain Version="3">
+		</ComponentChain>
+	</AudioComponentChain>
+	<MasterClip ObjectUID="4a80c644-b088-4419-9fd6-aadc0bae7dbd" ClassID="fb11c33a-b0a9-4465-aa94-b6d5db2628cf" Version="12">
+		<LoggingInfo ObjectRef="37"/>
+		<AudioComponentChains Version="1">
+			<AudioComponentChain Index="0" ObjectRef="43"/>
+		</AudioComponentChains>
+		<Clips Version="1">
+			<Clip Index="0" ObjectRef="39"/>
+		</Clips>
+		<AudioClipChannelGroups ObjectRef="42"/>
+		<Name>Rich A &lt;1&gt; &amp; "q"_A02</Name>
+		<DefMappingID>c1297db3-eab2-492b-a384-04e14db3aa41</DefMappingID>
+		<MasterClipChangeVersion>1</MasterClipChangeVersion>
+	</MasterClip>
+	<ClipProjectItem ObjectUID="af7974ac-b274-4bdd-a247-43283484c38f" ClassID="cb4e0ed7-aca1-4171-8525-e3658dec06dd" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<Column.PropertyText.Label>BE.Prefs.LabelColors.2</Column.PropertyText.Label>
+					<Column.PropertyText.Comment>good one</Column.PropertyText.Comment>
+				</Properties>
+			</Node>
+			<Name>Rich A &lt;1&gt; &amp; "q"_A02</Name>
+		</ProjectItem>
+		<MasterClip ObjectURef="4a80c644-b088-4419-9fd6-aadc0bae7dbd"/>
+	</ClipProjectItem>
+	<AudioStream ObjectID="44" ClassID="0b5cf52f-2b85-4863-890b-8844b64ecfe9" Version="8">
+		<FrameRate>5292000</FrameRate>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+		<Duration>5080320000000</Duration>
+	</AudioStream>
+	<Media ObjectUID="3718d6e7-e4b3-4180-b0c9-91113d5ac7c7" ClassID="7a5c103e-f3ac-4391-b6b4-7cc3d2f9a7ff" Version="30">
+		<AudioStream ObjectRef="44"/>
+		<ModificationState Encoding="base64" BinaryHash="a4894fec-37ba-478a-92f8-d657d8ba1925">OAAwADcAMQAxAGMANgAzAC0AMwBkADYANwAtADQANwA1ADEALQBiAGMANQA0AC0ANAAzAGUAYQBmADIAZQBhADAAOAA1AGUA
+		</ModificationState>
+		<RelativePath>../../../Volumes/Media/Avid MediaFiles/MXF/1/RICH B01.RICHB.mxf</RelativePath>
+		<Start>0</Start>
+		<ImplementationID>1fa18bfa-255c-44b1-ad73-56bcd99fceaf</ImplementationID>
+		<FileKey>1ef262cd-6318-45c7-ad60-85b5517dc3ed</FileKey>
+		<AlternateTapeName>Rich B</AlternateTapeName>
+		<ConformedAudioRate>5292000</ConformedAudioRate>
+		<ContentAndMetadataState>80711c63-3d67-4751-bc54-43eaf2ea085e</ContentAndMetadataState>
+		<TapeName>Rich B</TapeName>
+		<ActualMediaFilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH B01.RICHB.mxf</ActualMediaFilePath>
+		<FilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH B01.RICHB.mxf</FilePath>
+		<AlternateStart>0</AlternateStart>
+		<Title>Rich B</Title>
+	</Media>
+	<AudioMediaSource ObjectID="45" ClassID="f588da05-fc2a-4fbc-9383-74d653b379e3" Version="2">
+		<MediaSource Version="4">
+			<Content Version="10">
+			</Content>
+			<Media ObjectURef="3718d6e7-e4b3-4180-b0c9-91113d5ac7c7"/>
+		</MediaSource>
+		<OriginalDuration>5080320000000</OriginalDuration>
+	</AudioMediaSource>
+	<Markers ObjectID="46" ClassID="bee50706-b524-416c-9f03-b596ce5f6866" Version="4">
+		<ByGUID>byGUID</ByGUID>
+		<LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState>
+		<LastContentState>80711c63-3d67-4751-bc54-43eaf2ea085e</LastContentState>
+	</Markers>
+	<ClipLoggingInfo ObjectID="47" ClassID="77ab7fdd-dcdf-465d-9906-7a330ca1e738" Version="10">
+		<CaptureMode>1</CaptureMode>
+		<ClipName>Rich B</ClipName>
+		<TimecodeFormat>200</TimecodeFormat>
+		<MediaInPoint>0</MediaInPoint>
+		<MediaOutPoint>5080320000000</MediaOutPoint>
+		<MediaFrameRate>5292000</MediaFrameRate>
+		<TapeName>Rich B</TapeName>
+	</ClipLoggingInfo>
+	<SecondaryContent ObjectID="48" ClassID="f9d004b5-cb04-4e2f-af6f-64fadc2c4be9" Version="1">
+		<Content ObjectRef="45"/>
+		<ChannelIndex>0</ChannelIndex>
+	</SecondaryContent>
+	<AudioClip ObjectID="49" ClassID="b8830d03-de02-41ee-84ec-fe566dc70cd9" Version="8">
+		<Clip Version="18">
+			<Node Version="1">
+				<Properties Version="1">
+					<asl.clip.label.color>480554</asl.clip.label.color>
+					<asl.clip.label.name>BE.Prefs.LabelColors.2</asl.clip.label.name>
+				</Properties>
+			</Node>
+			<MarkerOwner Version="1">
+				<Markers ObjectRef="46"/>
+			</MarkerOwner>
+			<Source ObjectRef="45"/>
+			<ClipID>741e4514-b324-43b2-bef1-454c92dca037</ClipID>
+			<InUse>false</InUse>
+		</Clip>
+		<SecondaryContents Version="1">
+			<SecondaryContentItem Index="0" ObjectRef="48"/>
+		</SecondaryContents>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+		<Gain>1.4537843856076618</Gain>
+	</AudioClip>
+	<ClipChannelSerializer ObjectID="50" ClassID="5c89aa7a-89a6-4483-becd-f2b1def42316" Version="1">
+		<SourceClipIndex>0</SourceClipIndex>
+		<mSourceChannelIndex>0</mSourceChannelIndex>
+	</ClipChannelSerializer>
+	<ClipChannelVectorSerializer ObjectID="51" ClassID="333d203b-3a53-4195-8894-fc7523ff3dc7" Version="1">
+		<ClipChannels Version="1">
+			<ClipChannelItem Index="0" ObjectRef="50"/>
+		</ClipChannels>
+		<ChannelType>0</ChannelType>
+	</ClipChannelVectorSerializer>
+	<ClipChannelGroupVectorSerializer ObjectID="52" ClassID="a3127a8c-95d4-456e-a7f5-171b3f922426" Version="1">
+		<ClipChannelVectors Version="1">
+			<ClipChannelVectorItem Index="0" ObjectRef="51"/>
+		</ClipChannelVectors>
+	</ClipChannelGroupVectorSerializer>
+	<AudioComponentChain ObjectID="53" ClassID="3cb131d1-d3c0-47ae-a19a-bdf75ea11674" Version="4">
+		<DefaultVol>true</DefaultVol>
+		<DefaultVolumeComponentID>1</DefaultVolumeComponentID>
+		<ComponentChain Version="3">
+		</ComponentChain>
+	</AudioComponentChain>
+	<MasterClip ObjectUID="8ed3c42d-9899-4dd5-a321-061f540c13d7" ClassID="fb11c33a-b0a9-4465-aa94-b6d5db2628cf" Version="12">
+		<LoggingInfo ObjectRef="47"/>
+		<AudioComponentChains Version="1">
+			<AudioComponentChain Index="0" ObjectRef="53"/>
+		</AudioComponentChains>
+		<Clips Version="1">
+			<Clip Index="0" ObjectRef="49"/>
+		</Clips>
+		<AudioClipChannelGroups ObjectRef="52"/>
+		<Name>Rich B_A01</Name>
+		<DefMappingID>3639bb79-eaa1-4e27-b92b-c7b7fa63af0f</DefMappingID>
+		<TimeDisplay>100</TimeDisplay>
+		<MasterClipChangeVersion>1</MasterClipChangeVersion>
+	</MasterClip>
+	<ClipProjectItem ObjectUID="7135f844-4e65-41a9-a1c4-a83c9bf74cc0" ClassID="cb4e0ed7-aca1-4171-8525-e3658dec06dd" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<Column.PropertyText.Label>BE.Prefs.LabelColors.2</Column.PropertyText.Label>
+					<Column.PropertyText.Comment>only a comment</Column.PropertyText.Comment>
+				</Properties>
+			</Node>
+			<Name>Rich B_A01</Name>
+		</ProjectItem>
+		<MasterClip ObjectURef="8ed3c42d-9899-4dd5-a321-061f540c13d7"/>
+	</ClipProjectItem>
+	<AudioStream ObjectID="54" ClassID="0b5cf52f-2b85-4863-890b-8844b64ecfe9" Version="8">
+		<FrameRate>2646000</FrameRate>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+		<Duration>5080320000000</Duration>
+		<SampleType>3</SampleType>
+	</AudioStream>
+	<Media ObjectUID="d41f6f14-47a5-43fa-b2ff-46a02766eaa6" ClassID="7a5c103e-f3ac-4391-b6b4-7cc3d2f9a7ff" Version="30">
+		<AudioStream ObjectRef="54"/>
+		<ModificationState Encoding="base64" BinaryHash="56e9572c-02f2-4d8e-a0dd-3237e79962cc">NgA0AGEAZgBmAGIAOAA0AC0ANQA4ADIAYwAtADQAMAA4ADkALQBhADcAYQAzAC0AYgBjADYANAA2AGYAMwA0ADkAYwAzAGMA
+		</ModificationState>
+		<RelativePath>../../../Volumes/Media/Avid MediaFiles/MXF/1/RICH B02.RICHB.mxf</RelativePath>
+		<Start>0</Start>
+		<ImplementationID>1fa18bfa-255c-44b1-ad73-56bcd99fceaf</ImplementationID>
+		<FileKey>2d25b65c-85bd-43a4-8d6c-c7a2e7893794</FileKey>
+		<AlternateTapeName>Rich B</AlternateTapeName>
+		<ConformedAudioRate>2646000</ConformedAudioRate>
+		<ContentAndMetadataState>64affb84-582c-4089-a7a3-bc646f349c3c</ContentAndMetadataState>
+		<TapeName>Rich B</TapeName>
+		<ActualMediaFilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH B02.RICHB.mxf</ActualMediaFilePath>
+		<FilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH B02.RICHB.mxf</FilePath>
+		<AlternateStart>0</AlternateStart>
+		<Title>Rich B</Title>
+	</Media>
+	<AudioMediaSource ObjectID="55" ClassID="f588da05-fc2a-4fbc-9383-74d653b379e3" Version="2">
+		<MediaSource Version="4">
+			<Content Version="10">
+			</Content>
+			<Media ObjectURef="d41f6f14-47a5-43fa-b2ff-46a02766eaa6"/>
+		</MediaSource>
+		<OriginalDuration>5080320000000</OriginalDuration>
+	</AudioMediaSource>
+	<Markers ObjectID="56" ClassID="bee50706-b524-416c-9f03-b596ce5f6866" Version="4">
+		<ByGUID>byGUID</ByGUID>
+		<LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState>
+		<LastContentState>64affb84-582c-4089-a7a3-bc646f349c3c</LastContentState>
+	</Markers>
+	<ClipLoggingInfo ObjectID="57" ClassID="77ab7fdd-dcdf-465d-9906-7a330ca1e738" Version="10">
+		<CaptureMode>1</CaptureMode>
+		<ClipName>Rich B</ClipName>
+		<TimecodeFormat>200</TimecodeFormat>
+		<MediaInPoint>0</MediaInPoint>
+		<MediaOutPoint>5080320000000</MediaOutPoint>
+		<MediaFrameRate>2646000</MediaFrameRate>
+		<TapeName>Rich B</TapeName>
+	</ClipLoggingInfo>
+	<SecondaryContent ObjectID="58" ClassID="f9d004b5-cb04-4e2f-af6f-64fadc2c4be9" Version="1">
+		<Content ObjectRef="55"/>
+		<ChannelIndex>0</ChannelIndex>
+	</SecondaryContent>
+	<AudioClip ObjectID="59" ClassID="b8830d03-de02-41ee-84ec-fe566dc70cd9" Version="8">
+		<Clip Version="18">
+			<Node Version="1">
+				<Properties Version="1">
+					<asl.clip.label.color>480554</asl.clip.label.color>
+					<asl.clip.label.name>BE.Prefs.LabelColors.2</asl.clip.label.name>
+				</Properties>
+			</Node>
+			<MarkerOwner Version="1">
+				<Markers ObjectRef="56"/>
+			</MarkerOwner>
+			<Source ObjectRef="55"/>
+			<ClipID>78cbc1d2-1c53-4043-b22c-b68568c52dc9</ClipID>
+			<InUse>false</InUse>
+		</Clip>
+		<SecondaryContents Version="1">
+			<SecondaryContentItem Index="0" ObjectRef="58"/>
+		</SecondaryContents>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+	</AudioClip>
+	<ClipChannelSerializer ObjectID="60" ClassID="5c89aa7a-89a6-4483-becd-f2b1def42316" Version="1">
+		<SourceClipIndex>0</SourceClipIndex>
+		<mSourceChannelIndex>0</mSourceChannelIndex>
+	</ClipChannelSerializer>
+	<ClipChannelVectorSerializer ObjectID="61" ClassID="333d203b-3a53-4195-8894-fc7523ff3dc7" Version="1">
+		<ClipChannels Version="1">
+			<ClipChannelItem Index="0" ObjectRef="60"/>
+		</ClipChannels>
+		<ChannelType>0</ChannelType>
+	</ClipChannelVectorSerializer>
+	<ClipChannelGroupVectorSerializer ObjectID="62" ClassID="a3127a8c-95d4-456e-a7f5-171b3f922426" Version="1">
+		<ClipChannelVectors Version="1">
+			<ClipChannelVectorItem Index="0" ObjectRef="61"/>
+		</ClipChannelVectors>
+	</ClipChannelGroupVectorSerializer>
+	<AudioComponentChain ObjectID="63" ClassID="3cb131d1-d3c0-47ae-a19a-bdf75ea11674" Version="4">
+		<DefaultVol>true</DefaultVol>
+		<DefaultVolumeComponentID>1</DefaultVolumeComponentID>
+		<ComponentChain Version="3">
+		</ComponentChain>
+	</AudioComponentChain>
+	<MasterClip ObjectUID="58dfd925-4a9c-4535-aa32-d66685153f9e" ClassID="fb11c33a-b0a9-4465-aa94-b6d5db2628cf" Version="12">
+		<LoggingInfo ObjectRef="57"/>
+		<AudioComponentChains Version="1">
+			<AudioComponentChain Index="0" ObjectRef="63"/>
+		</AudioComponentChains>
+		<Clips Version="1">
+			<Clip Index="0" ObjectRef="59"/>
+		</Clips>
+		<AudioClipChannelGroups ObjectRef="62"/>
+		<Name>Rich B_A02</Name>
+		<DefMappingID>d2f7e323-61ed-4459-b9c9-4a11732d4ec7</DefMappingID>
+		<TimeDisplay>100</TimeDisplay>
+		<MasterClipChangeVersion>1</MasterClipChangeVersion>
+	</MasterClip>
+	<ClipProjectItem ObjectUID="66471c76-8ba5-49af-8a4a-4edc489c500b" ClassID="cb4e0ed7-aca1-4171-8525-e3658dec06dd" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<Column.PropertyText.Label>BE.Prefs.LabelColors.2</Column.PropertyText.Label>
+					<Column.PropertyText.Comment>only a comment</Column.PropertyText.Comment>
+				</Properties>
+			</Node>
+			<Name>Rich B_A02</Name>
+		</ProjectItem>
+		<MasterClip ObjectURef="58dfd925-4a9c-4535-aa32-d66685153f9e"/>
+	</ClipProjectItem>
+	<AudioStream ObjectID="64" ClassID="0b5cf52f-2b85-4863-890b-8844b64ecfe9" Version="8">
+		<FrameRate>5760000</FrameRate>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+		<Duration>5080320000000</Duration>
+		<SampleType>3</SampleType>
+	</AudioStream>
+	<Media ObjectUID="736b3bc3-f711-4445-9844-1b0a2cbc2ed9" ClassID="7a5c103e-f3ac-4391-b6b4-7cc3d2f9a7ff" Version="30">
+		<AudioStream ObjectRef="64"/>
+		<ModificationState Encoding="base64" BinaryHash="a80d2e1d-cb6e-4685-b979-7e3d0fa99f1d">NwAwAGQANgBkAGEAZgAxAC0ANgA1AGMAMgAtADQAOAA2AGIALQBhADkAMgA0AC0ANAAxADEAMwBkADMANQBhAGIAOAA5AGQA
+		</ModificationState>
+		<RelativePath>../../../Volumes/Media/Avid MediaFiles/MXF/1/RICH C01.RICHC.mxf</RelativePath>
+		<Start>0</Start>
+		<ImplementationID>1fa18bfa-255c-44b1-ad73-56bcd99fceaf</ImplementationID>
+		<FileKey>3c30f506-9de4-4a9b-9cc6-a2237eecfb1d</FileKey>
+		<AlternateTapeName>Rich C</AlternateTapeName>
+		<ConformedAudioRate>5760000</ConformedAudioRate>
+		<ContentAndMetadataState>70d6daf1-65c2-486b-a924-4113d35ab89d</ContentAndMetadataState>
+		<TapeName>Rich C</TapeName>
+		<ActualMediaFilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH C01.RICHC.mxf</ActualMediaFilePath>
+		<FilePath>/Volumes/Media/Avid MediaFiles/MXF/1/RICH C01.RICHC.mxf</FilePath>
+		<AlternateStart>0</AlternateStart>
+		<Title>Rich C</Title>
+	</Media>
+	<AudioMediaSource ObjectID="65" ClassID="f588da05-fc2a-4fbc-9383-74d653b379e3" Version="2">
+		<MediaSource Version="4">
+			<Content Version="10">
+			</Content>
+			<Media ObjectURef="736b3bc3-f711-4445-9844-1b0a2cbc2ed9"/>
+		</MediaSource>
+		<OriginalDuration>5080320000000</OriginalDuration>
+	</AudioMediaSource>
+	<Markers ObjectID="66" ClassID="bee50706-b524-416c-9f03-b596ce5f6866" Version="4">
+		<ByGUID>byGUID</ByGUID>
+		<LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState>
+		<LastContentState>70d6daf1-65c2-486b-a924-4113d35ab89d</LastContentState>
+	</Markers>
+	<ClipLoggingInfo ObjectID="67" ClassID="77ab7fdd-dcdf-465d-9906-7a330ca1e738" Version="10">
+		<CaptureMode>1</CaptureMode>
+		<ClipName>Rich C</ClipName>
+		<TimecodeFormat>200</TimecodeFormat>
+		<MediaInPoint>0</MediaInPoint>
+		<MediaOutPoint>5080320000000</MediaOutPoint>
+		<MediaFrameRate>5760000</MediaFrameRate>
+		<TapeName>Rich C</TapeName>
+		<Description>c.wav</Description>
+	</ClipLoggingInfo>
+	<SecondaryContent ObjectID="68" ClassID="f9d004b5-cb04-4e2f-af6f-64fadc2c4be9" Version="1">
+		<Content ObjectRef="65"/>
+		<ChannelIndex>0</ChannelIndex>
+	</SecondaryContent>
+	<AudioClip ObjectID="69" ClassID="b8830d03-de02-41ee-84ec-fe566dc70cd9" Version="8">
+		<Clip Version="18">
+			<Node Version="1">
+				<Properties Version="1">
+					<asl.clip.label.color>480554</asl.clip.label.color>
+					<asl.clip.label.name>BE.Prefs.LabelColors.2</asl.clip.label.name>
+				</Properties>
+			</Node>
+			<MarkerOwner Version="1">
+				<Markers ObjectRef="66"/>
+			</MarkerOwner>
+			<Source ObjectRef="65"/>
+			<ClipID>52712caa-df8d-4d58-a4e9-f893535850d9</ClipID>
+			<InUse>false</InUse>
+		</Clip>
+		<SecondaryContents Version="1">
+			<SecondaryContentItem Index="0" ObjectRef="68"/>
+		</SecondaryContents>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+	</AudioClip>
+	<ClipChannelSerializer ObjectID="70" ClassID="5c89aa7a-89a6-4483-becd-f2b1def42316" Version="1">
+		<SourceClipIndex>0</SourceClipIndex>
+		<mSourceChannelIndex>0</mSourceChannelIndex>
+	</ClipChannelSerializer>
+	<ClipChannelVectorSerializer ObjectID="71" ClassID="333d203b-3a53-4195-8894-fc7523ff3dc7" Version="1">
+		<ClipChannels Version="1">
+			<ClipChannelItem Index="0" ObjectRef="70"/>
+		</ClipChannels>
+		<ChannelType>0</ChannelType>
+	</ClipChannelVectorSerializer>
+	<ClipChannelGroupVectorSerializer ObjectID="72" ClassID="a3127a8c-95d4-456e-a7f5-171b3f922426" Version="1">
+		<ClipChannelVectors Version="1">
+			<ClipChannelVectorItem Index="0" ObjectRef="71"/>
+		</ClipChannelVectors>
+	</ClipChannelGroupVectorSerializer>
+	<AudioComponentChain ObjectID="73" ClassID="3cb131d1-d3c0-47ae-a19a-bdf75ea11674" Version="4">
+		<DefaultVol>true</DefaultVol>
+		<DefaultVolumeComponentID>1</DefaultVolumeComponentID>
+		<ComponentChain Version="3">
+		</ComponentChain>
+	</AudioComponentChain>
+	<MasterClip ObjectUID="7165a4a2-bbe0-43a1-bf2c-8e074ad0c6e1" ClassID="fb11c33a-b0a9-4465-aa94-b6d5db2628cf" Version="12">
+		<LoggingInfo ObjectRef="67"/>
+		<AudioComponentChains Version="1">
+			<AudioComponentChain Index="0" ObjectRef="73"/>
+		</AudioComponentChains>
+		<Clips Version="1">
+			<Clip Index="0" ObjectRef="69"/>
+		</Clips>
+		<AudioClipChannelGroups ObjectRef="72"/>
+		<Name>Rich C_A01</Name>
+		<DefMappingID>4c9a43d8-3196-40c2-9c67-59d137a79d00</DefMappingID>
+		<MasterClipChangeVersion>1</MasterClipChangeVersion>
+	</MasterClip>
+	<ClipProjectItem ObjectUID="d3986b55-f444-4763-8997-bef0dcf1822e" ClassID="cb4e0ed7-aca1-4171-8525-e3658dec06dd" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<Column.PropertyText.Label>BE.Prefs.LabelColors.2</Column.PropertyText.Label>
+				</Properties>
+			</Node>
+			<Name>Rich C_A01</Name>
+		</ProjectItem>
+		<MasterClip ObjectURef="7165a4a2-bbe0-43a1-bf2c-8e074ad0c6e1"/>
+	</ClipProjectItem>
+	<BinProjectItem ObjectUID="20c6ff89-2f8b-439e-ab17-f5dca20bf000" ClassID="dbfd6653-24da-480e-a35e-ba45e9504e4b" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+				</Properties>
+			</Node>
+			<Name>Again</Name>
+		</ProjectItem>
+		<ProjectItemContainer Version="1">
+			<Items Version="1">
+				<Item Index="0" ObjectURef="faed9262-0a34-47bb-b5e8-32b5769769be"/>
+				<Item Index="1" ObjectURef="e31a3231-b296-453d-be69-481bd99a13f7"/>
+				<Item Index="2" ObjectURef="fbe188c6-5d74-4b6f-87aa-5db7ba7527ac"/>
+			</Items>
+		</ProjectItemContainer>
+	</BinProjectItem>
+	<VideoMediaSource ObjectID="74" ClassID="e64ddf74-8fac-4682-8aa8-0e0ca2248949" Version="2">
+		<MediaSource Version="4">
+			<Content Version="10">
+			</Content>
+			<Media ObjectURef="10c56c20-2210-4ecf-8b32-9153bc0edf82"/>
+		</MediaSource>
+		<OriginalDuration>5080320000000</OriginalDuration>
+	</VideoMediaSource>
+	<Markers ObjectID="75" ClassID="bee50706-b524-416c-9f03-b596ce5f6866" Version="4">
+		<ByGUID>byGUID</ByGUID>
+		<LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState>
+		<LastContentState>ca182b65-8ace-4ce9-9edd-63b4e905f3c5</LastContentState>
+	</Markers>
+	<ClipLoggingInfo ObjectID="76" ClassID="77ab7fdd-dcdf-465d-9906-7a330ca1e738" Version="10">
+		<ClipID>060A2B340101010501010F101300000000000000000000000000000000000002</ClipID>
+		<CaptureMode>2</CaptureMode>
+		<ClipName>Rich A &lt;1&gt; &amp; "q"</ClipName>
+		<TimecodeFormat>100</TimecodeFormat>
+		<MediaInPoint>914457600000000</MediaInPoint>
+		<MediaOutPoint>919537920000000</MediaOutPoint>
+		<MediaFrameRate>10584000000</MediaFrameRate>
+		<TapeName>A very long tape name that is clearly mo</TapeName>
+		<ShotTake>3</ShotTake>
+		<FilmCameraRoll>A001</FilmCameraRoll>
+		<Description>RICH_A.mov</Description>
+		<Scene>12B</Scene>
+		<LogNote>Sound Roll: S4 | Tracks: V1 A1 A2 | Source Path: /cards/A001 | Avid Start: 01:00:00:00 | Aux TC1: 02:00:00:00 | Aux TC2: 03:00:00:00</LogNote>
+	</ClipLoggingInfo>
+	<VideoClip ObjectID="77" ClassID="9308dbef-2440-4acb-9ab2-953b9a4e82ec" Version="11">
+		<Clip Version="18">
+			<Node Version="1">
+				<Properties Version="1">
+					<asl.clip.label.color>11405886</asl.clip.label.color>
+					<asl.clip.label.name>BE.Prefs.LabelColors.0</asl.clip.label.name>
+				</Properties>
+			</Node>
+			<MarkerOwner Version="1">
+				<Markers ObjectRef="75"/>
+			</MarkerOwner>
+			<Source ObjectRef="74"/>
+			<ClipID>81cf970f-f0c1-42d5-a909-2ad439e67ff9</ClipID>
+			<InUse>false</InUse>
+		</Clip>
+	</VideoClip>
+	<ClipChannelGroupVectorSerializer ObjectID="78" ClassID="a3127a8c-95d4-456e-a7f5-171b3f922426" Version="1">
+	</ClipChannelGroupVectorSerializer>
+	<MasterClip ObjectUID="f2317db1-6a79-4b8c-971b-c2b9db37c7a5" ClassID="fb11c33a-b0a9-4465-aa94-b6d5db2628cf" Version="12">
+		<LoggingInfo ObjectRef="76"/>
+		<Clips Version="1">
+			<Clip Index="0" ObjectRef="77"/>
+		</Clips>
+		<AudioClipChannelGroups ObjectRef="78"/>
+		<Name>Rich A &lt;1&gt; &amp; "q"_V</Name>
+		<MasterClipChangeVersion>0</MasterClipChangeVersion>
+	</MasterClip>
+	<ClipProjectItem ObjectUID="faed9262-0a34-47bb-b5e8-32b5769769be" ClassID="cb4e0ed7-aca1-4171-8525-e3658dec06dd" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<Column.PropertyText.Label>BE.Prefs.LabelColors.0</Column.PropertyText.Label>
+					<Column.PropertyText.Comment>good one</Column.PropertyText.Comment>
+				</Properties>
+			</Node>
+			<Name>Rich A &lt;1&gt; &amp; "q"_V</Name>
+		</ProjectItem>
+		<MasterClip ObjectURef="f2317db1-6a79-4b8c-971b-c2b9db37c7a5"/>
+	</ClipProjectItem>
+	<AudioMediaSource ObjectID="79" ClassID="f588da05-fc2a-4fbc-9383-74d653b379e3" Version="2">
+		<MediaSource Version="4">
+			<Content Version="10">
+			</Content>
+			<Media ObjectURef="89bd32d5-e228-4efe-8277-e40341e1137c"/>
+		</MediaSource>
+		<OriginalDuration>5080320000000</OriginalDuration>
+	</AudioMediaSource>
+	<Markers ObjectID="80" ClassID="bee50706-b524-416c-9f03-b596ce5f6866" Version="4">
+		<ByGUID>byGUID</ByGUID>
+		<LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState>
+		<LastContentState>e3e1fbd7-92c6-44bc-a0ab-2432a3eb10d6</LastContentState>
+	</Markers>
+	<ClipLoggingInfo ObjectID="81" ClassID="77ab7fdd-dcdf-465d-9906-7a330ca1e738" Version="10">
+		<ClipID>060A2B340101010501010F101300000000000000000000000000000000000002</ClipID>
+		<CaptureMode>1</CaptureMode>
+		<ClipName>Rich A &lt;1&gt; &amp; "q"</ClipName>
+		<TimecodeFormat>200</TimecodeFormat>
+		<MediaInPoint>914457600000000</MediaInPoint>
+		<MediaOutPoint>919537920000000</MediaOutPoint>
+		<MediaFrameRate>5292000</MediaFrameRate>
+		<TapeName>A very long tape name that is clearly mo</TapeName>
+		<ShotTake>3</ShotTake>
+		<FilmCameraRoll>A001</FilmCameraRoll>
+		<Description>c.wav</Description>
+		<Scene>12B</Scene>
+		<LogNote>Sound Roll: S4 | Tracks: V1 A1 A2 | Source Path: /cards/A001 | Avid Start: 01:00:00:00 | Aux TC1: 02:00:00:00 | Aux TC2: 03:00:00:00</LogNote>
+	</ClipLoggingInfo>
+	<SecondaryContent ObjectID="82" ClassID="f9d004b5-cb04-4e2f-af6f-64fadc2c4be9" Version="1">
+		<Content ObjectRef="79"/>
+		<ChannelIndex>0</ChannelIndex>
+	</SecondaryContent>
+	<AudioClip ObjectID="83" ClassID="b8830d03-de02-41ee-84ec-fe566dc70cd9" Version="8">
+		<Clip Version="18">
+			<Node Version="1">
+				<Properties Version="1">
+					<asl.clip.label.color>480554</asl.clip.label.color>
+					<asl.clip.label.name>BE.Prefs.LabelColors.2</asl.clip.label.name>
+				</Properties>
+			</Node>
+			<MarkerOwner Version="1">
+				<Markers ObjectRef="80"/>
+			</MarkerOwner>
+			<Source ObjectRef="79"/>
+			<ClipID>d92c650f-14a2-41da-8f04-34fd08327d45</ClipID>
+			<InUse>false</InUse>
+		</Clip>
+		<SecondaryContents Version="1">
+			<SecondaryContentItem Index="0" ObjectRef="82"/>
+		</SecondaryContents>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+		<Gain>0.5011872336272722</Gain>
+	</AudioClip>
+	<ClipChannelSerializer ObjectID="84" ClassID="5c89aa7a-89a6-4483-becd-f2b1def42316" Version="1">
+		<SourceClipIndex>0</SourceClipIndex>
+		<mSourceChannelIndex>0</mSourceChannelIndex>
+	</ClipChannelSerializer>
+	<ClipChannelVectorSerializer ObjectID="85" ClassID="333d203b-3a53-4195-8894-fc7523ff3dc7" Version="1">
+		<ClipChannels Version="1">
+			<ClipChannelItem Index="0" ObjectRef="84"/>
+		</ClipChannels>
+		<ChannelType>0</ChannelType>
+	</ClipChannelVectorSerializer>
+	<ClipChannelGroupVectorSerializer ObjectID="86" ClassID="a3127a8c-95d4-456e-a7f5-171b3f922426" Version="1">
+		<ClipChannelVectors Version="1">
+			<ClipChannelVectorItem Index="0" ObjectRef="85"/>
+		</ClipChannelVectors>
+	</ClipChannelGroupVectorSerializer>
+	<AudioComponentChain ObjectID="87" ClassID="3cb131d1-d3c0-47ae-a19a-bdf75ea11674" Version="4">
+		<DefaultVol>true</DefaultVol>
+		<DefaultVolumeComponentID>1</DefaultVolumeComponentID>
+		<ComponentChain Version="3">
+		</ComponentChain>
+	</AudioComponentChain>
+	<MasterClip ObjectUID="b6dcae42-abff-4415-bab1-d5bf16bf5fd3" ClassID="fb11c33a-b0a9-4465-aa94-b6d5db2628cf" Version="12">
+		<LoggingInfo ObjectRef="81"/>
+		<AudioComponentChains Version="1">
+			<AudioComponentChain Index="0" ObjectRef="87"/>
+		</AudioComponentChains>
+		<Clips Version="1">
+			<Clip Index="0" ObjectRef="83"/>
+		</Clips>
+		<AudioClipChannelGroups ObjectRef="86"/>
+		<Name>Rich A &lt;1&gt; &amp; "q"_A01</Name>
+		<DefMappingID>e70fbef4-a245-4756-9597-4482185d72f4</DefMappingID>
+		<MasterClipChangeVersion>1</MasterClipChangeVersion>
+	</MasterClip>
+	<ClipProjectItem ObjectUID="e31a3231-b296-453d-be69-481bd99a13f7" ClassID="cb4e0ed7-aca1-4171-8525-e3658dec06dd" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<Column.PropertyText.Label>BE.Prefs.LabelColors.2</Column.PropertyText.Label>
+					<Column.PropertyText.Comment>good one</Column.PropertyText.Comment>
+				</Properties>
+			</Node>
+			<Name>Rich A &lt;1&gt; &amp; "q"_A01</Name>
+		</ProjectItem>
+		<MasterClip ObjectURef="b6dcae42-abff-4415-bab1-d5bf16bf5fd3"/>
+	</ClipProjectItem>
+	<AudioMediaSource ObjectID="88" ClassID="f588da05-fc2a-4fbc-9383-74d653b379e3" Version="2">
+		<MediaSource Version="4">
+			<Content Version="10">
+			</Content>
+			<Media ObjectURef="3278c494-bfd1-40b0-a11e-dd2b7bc32d87"/>
+		</MediaSource>
+		<OriginalDuration>5080320000000</OriginalDuration>
+	</AudioMediaSource>
+	<Markers ObjectID="89" ClassID="bee50706-b524-416c-9f03-b596ce5f6866" Version="4">
+		<ByGUID>byGUID</ByGUID>
+		<LastMetadataState>00000000-0000-0000-0000-000000000000</LastMetadataState>
+		<LastContentState>46d8c0a2-1eac-4e84-9fd9-7109e52d0d73</LastContentState>
+	</Markers>
+	<ClipLoggingInfo ObjectID="90" ClassID="77ab7fdd-dcdf-465d-9906-7a330ca1e738" Version="10">
+		<ClipID>060A2B340101010501010F101300000000000000000000000000000000000002</ClipID>
+		<CaptureMode>1</CaptureMode>
+		<ClipName>Rich A &lt;1&gt; &amp; "q"</ClipName>
+		<TimecodeFormat>200</TimecodeFormat>
+		<MediaInPoint>914457600000000</MediaInPoint>
+		<MediaOutPoint>919537920000000</MediaOutPoint>
+		<MediaFrameRate>5292000</MediaFrameRate>
+		<TapeName>A very long tape name that is clearly mo</TapeName>
+		<ShotTake>3</ShotTake>
+		<FilmCameraRoll>A001</FilmCameraRoll>
+		<Description>RICH_A.mov</Description>
+		<Scene>12B</Scene>
+		<LogNote>Sound Roll: S4 | Tracks: V1 A1 A2 | Source Path: /cards/A001 | Avid Start: 01:00:00:00 | Aux TC1: 02:00:00:00 | Aux TC2: 03:00:00:00</LogNote>
+	</ClipLoggingInfo>
+	<SecondaryContent ObjectID="91" ClassID="f9d004b5-cb04-4e2f-af6f-64fadc2c4be9" Version="1">
+		<Content ObjectRef="88"/>
+		<ChannelIndex>0</ChannelIndex>
+	</SecondaryContent>
+	<AudioClip ObjectID="92" ClassID="b8830d03-de02-41ee-84ec-fe566dc70cd9" Version="8">
+		<Clip Version="18">
+			<Node Version="1">
+				<Properties Version="1">
+					<asl.clip.label.color>480554</asl.clip.label.color>
+					<asl.clip.label.name>BE.Prefs.LabelColors.2</asl.clip.label.name>
+				</Properties>
+			</Node>
+			<MarkerOwner Version="1">
+				<Markers ObjectRef="89"/>
+			</MarkerOwner>
+			<Source ObjectRef="88"/>
+			<ClipID>2f55cb56-6f4d-43f3-9f15-a742857fa73f</ClipID>
+			<InUse>false</InUse>
+		</Clip>
+		<SecondaryContents Version="1">
+			<SecondaryContentItem Index="0" ObjectRef="91"/>
+		</SecondaryContents>
+		<AudioChannelLayout>[{"channellabel":0}]</AudioChannelLayout>
+	</AudioClip>
+	<ClipChannelSerializer ObjectID="93" ClassID="5c89aa7a-89a6-4483-becd-f2b1def42316" Version="1">
+		<SourceClipIndex>0</SourceClipIndex>
+		<mSourceChannelIndex>0</mSourceChannelIndex>
+	</ClipChannelSerializer>
+	<ClipChannelVectorSerializer ObjectID="94" ClassID="333d203b-3a53-4195-8894-fc7523ff3dc7" Version="1">
+		<ClipChannels Version="1">
+			<ClipChannelItem Index="0" ObjectRef="93"/>
+		</ClipChannels>
+		<ChannelType>0</ChannelType>
+	</ClipChannelVectorSerializer>
+	<ClipChannelGroupVectorSerializer ObjectID="95" ClassID="a3127a8c-95d4-456e-a7f5-171b3f922426" Version="1">
+		<ClipChannelVectors Version="1">
+			<ClipChannelVectorItem Index="0" ObjectRef="94"/>
+		</ClipChannelVectors>
+	</ClipChannelGroupVectorSerializer>
+	<AudioComponentChain ObjectID="96" ClassID="3cb131d1-d3c0-47ae-a19a-bdf75ea11674" Version="4">
+		<DefaultVol>true</DefaultVol>
+		<DefaultVolumeComponentID>1</DefaultVolumeComponentID>
+		<ComponentChain Version="3">
+		</ComponentChain>
+	</AudioComponentChain>
+	<MasterClip ObjectUID="0c79d2db-19df-494e-a40a-504e33033396" ClassID="fb11c33a-b0a9-4465-aa94-b6d5db2628cf" Version="12">
+		<LoggingInfo ObjectRef="90"/>
+		<AudioComponentChains Version="1">
+			<AudioComponentChain Index="0" ObjectRef="96"/>
+		</AudioComponentChains>
+		<Clips Version="1">
+			<Clip Index="0" ObjectRef="92"/>
+		</Clips>
+		<AudioClipChannelGroups ObjectRef="95"/>
+		<Name>Rich A &lt;1&gt; &amp; "q"_A02</Name>
+		<DefMappingID>e9e015c7-d049-402c-9a91-fc32667dc1f5</DefMappingID>
+		<MasterClipChangeVersion>1</MasterClipChangeVersion>
+	</MasterClip>
+	<ClipProjectItem ObjectUID="fbe188c6-5d74-4b6f-87aa-5db7ba7527ac" ClassID="cb4e0ed7-aca1-4171-8525-e3658dec06dd" Version="1">
+		<ProjectItem Version="1">
+			<Node Version="1">
+				<Properties Version="1">
+					<Column.PropertyText.Label>BE.Prefs.LabelColors.2</Column.PropertyText.Label>
+					<Column.PropertyText.Comment>good one</Column.PropertyText.Comment>
+				</Properties>
+			</Node>
+			<Name>Rich A &lt;1&gt; &amp; "q"_A02</Name>
+		</ProjectItem>
+		<MasterClip ObjectURef="0c79d2db-19df-494e-a40a-504e33033396"/>
+	</ClipProjectItem>
+</PremiereData>
+

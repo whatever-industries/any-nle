@@ -1,5 +1,6 @@
 //! Resolve Edit Inspector controls on a matched 1920x1080 canvas.
 pub(crate) mod motion;
+pub(crate) mod roll;
 
 use crate::{
     binary::{pack, pb_bytes, pb_int},
@@ -19,6 +20,7 @@ pub(crate) enum PictureControl {
     ReflectedTransform(Transform, Reflection),
     Reflection(Reflection),
     LinearMotion(motion::LinearMotion),
+    LinearRoll(roll::LinearRoll),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,7 +81,7 @@ pub(crate) fn prepare(
 ) -> Result<Option<PreparedVideo>> {
     match (&placement.transform, placement.effects.as_slice()) {
         (None, []) => Ok(None),
-        (Some(transform), []) => prepare_static(transform.clone()),
+        (Some(transform), []) => prepare_static(transform.clone(), rate),
         (Some(transform), [effect]) if motion::is_avid_linear(&effect.kind) => {
             let motion = motion::LinearMotion::from_avid(&effect.kind, &effect.params, transform, source_in, length, available)?;
             Ok(Some(PreparedVideo {
@@ -94,8 +96,18 @@ pub(crate) fn prepare(
                 readback: PictureControl::LinearMotion(motion),
             }))
         }
+        (None, [effect]) if roll::is_linear(&effect.kind) => {
+            if rate != Rational::integer(24) {
+                return Err("Resolve Linear Warp rotation requires a 24 fps timeline".into());
+            }
+            let roll = roll::LinearRoll::from_graph(effect, source_in, length, available)?;
+            Ok(Some(PreparedVideo {
+                encoded: roll.encode()?,
+                readback: PictureControl::LinearRoll(roll),
+            }))
+        }
         (None, [effect]) if effect.kind == graph::picture_chain::KIND => {
-            prepare_chain(effect, source_in, length, available)
+            prepare_chain(effect, rate, source_in, length, available)
         }
         (None, [effect]) => {
             let reflection = Reflection::from_effect(effect)?;
@@ -108,7 +120,8 @@ pub(crate) fn prepare(
     }
 }
 
-fn prepare_static(mut transform: Transform) -> Result<Option<PreparedVideo>> {
+fn prepare_static(mut transform: Transform, rate: Rational) -> Result<Option<PreparedVideo>> {
+    check_static_rate(&transform, rate)?;
     Ok(encode(&transform)?.map(|encoded| {
         transform.scale = (
             (transform.scale.0 / 100.0) * 100.0,
@@ -121,7 +134,7 @@ fn prepare_static(mut transform: Transform) -> Result<Option<PreparedVideo>> {
     }))
 }
 
-fn prepare_chain(effect: &Effect, source_in: i64, length: i64, available: i64) -> Result<Option<PreparedVideo>> {
+fn prepare_chain(effect: &Effect, rate: Rational, source_in: i64, length: i64, available: i64) -> Result<Option<PreparedVideo>> {
     let chain = Chain::read(effect)?;
     let reflection = Reflection::from(chain.before.then(chain.after));
     let Some(motion) = chain.motion else {
@@ -131,8 +144,15 @@ fn prepare_chain(effect: &Effect, source_in: i64, length: i64, available: i64) -
     };
     if motion.is_static() {
         let mut t = motion.transform;
+        if t.rotation != 0.0 && (chain.before.active() || chain.after.active()) {
+            return Err("Resolve static rotation with reflection requires effect-order qualification".into());
+        }
         t.position = chain.after.point(t.position.into()).into();
         t.crop = chain.before.crop(t.crop);
+        if centered_crop_profile(&t) {
+            return Err("Resolve centered crop in an ordered effect chain requires qualification".into());
+        }
+        check_static_rate(&t, rate)?;
         return Ok(encode_with_reflection(&t, reflection)?.map(|encoded| {
             t.scale = ((t.scale.0 / 100.0) * 100.0, (t.scale.1 / 100.0) * 100.0);
             let readback = if reflection.active() {
@@ -154,6 +174,15 @@ fn prepare_chain(effect: &Effect, source_in: i64, length: i64, available: i64) -
     Ok(Some(PreparedVideo { encoded: motion.encode()?, readback: PictureControl::LinearMotion(motion) }))
 }
 
+fn check_static_rate(transform: &Transform, rate: Rational) -> Result<()> {
+    if rate != Rational::integer(24)
+        && (transform.rotation != 0.0 || transform.anchor != (0.0, 0.0) || centered_crop_profile(transform))
+    {
+        return Err("Resolve static rotation, pivot and centered crop profiles require a 24 fps timeline".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn matches_readback(placement: &Placement, video: Option<&PreparedVideo>) -> bool {
     match video.map(|video| &video.readback) {
         Some(PictureControl::Transform(transform)) => {
@@ -168,6 +197,9 @@ pub(crate) fn matches_readback(placement: &Placement, video: Option<&PreparedVid
         Some(PictureControl::LinearMotion(motion)) => {
             placement.transform.is_none() && placement.effects.as_slice() == [motion.readback()]
         }
+        Some(PictureControl::LinearRoll(roll)) => {
+            placement.transform.is_none() && placement.effects.as_slice() == [roll.readback()]
+        }
         None => placement.transform.is_none() && placement.effects.is_empty(),
     }
 }
@@ -176,6 +208,8 @@ pub(crate) const X: (usize, u64) = (3, 40);
 pub(crate) const Y: (usize, u64) = (4, 41);
 pub(crate) const SCALE_X: (usize, u64) = (0, 42);
 pub(crate) const SCALE_Y: (usize, u64) = (1, 43);
+pub(crate) const ROTATION: (usize, u64) = (5, 47);
+pub(crate) const ANCHOR: (usize, u64) = (6, 48);
 pub(crate) const FLIP_X: (usize, u64) = (10, 50);
 pub(crate) const FLIP_Y: (usize, u64) = (11, 51);
 pub(crate) const CROP: [(usize, u64); 4] = [(0, 54), (2, 56), (1, 55), (3, 57)];
@@ -212,8 +246,7 @@ pub(crate) fn encode(t: &Transform) -> Result<Option<String>> {
 pub(crate) fn validate_static_geometry(t: &Transform) -> Result<()> {
     let (x, y) = t.position;
     let (sx, sy) = t.scale;
-    if t.rotation != 0.0
-        || t.anchor != (0.0, 0.0)
+    if t.anchor != (0.0, 0.0)
         || !(-0.05..=0.05).contains(&x)
         || !(-0.05..=0.05).contains(&y)
         || !(87.5..=112.5).contains(&sx)
@@ -222,16 +255,35 @@ pub(crate) fn validate_static_geometry(t: &Transform) -> Result<()> {
     {
         return Err("unsupported Resolve static picture geometry".into());
     }
+    if t.rotation != 0.0
+        && (!(-30.0..=30.0).contains(&t.rotation)
+            || t.position != (0.0, 0.0)
+            || t.scale != (100.0, 100.0)
+            || t.crop != [0.0; 4])
+    {
+        return Err("Resolve rotation outside the centered static picture profiles".into());
+    }
     Ok(())
 }
 
 pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> Result<Option<String>> {
-    validate_static_geometry(t)?;
-    let (x, y) = t.position;
+    let centered_crop = centered_crop_profile(t);
+    let axis = rotation_axis_profile(t);
+    if !centered_crop && !axis {
+        validate_static_geometry(t)?;
+    } else if reflection.active() {
+        return Err("Resolve crop or pivot with reflection requires effect-order qualification".into());
+    }
+    if t.rotation != 0.0 && reflection.active() {
+        return Err("Resolve static rotation with reflection requires effect-order qualification".into());
+    }
+    // In the off-center profile graph position equals anchor, so native
+    // Pan and Tilt stay at zero. Resolve rotates about Anchor Point itself.
+    let (x, y) = if axis { (0.0, 0.0) } else { t.position };
     let (sx, sy) = t.scale;
     let has_crop = t.crop != [0.0; 4];
-    let has_transform = t.position != (0.0, 0.0) || t.scale != (100.0, 100.0);
-    if has_crop && has_transform {
+    let has_transform = t.position != (0.0, 0.0) || t.scale != (100.0, 100.0) || t.rotation != 0.0;
+    if has_crop && has_transform && !centered_crop {
         return Err("combined Resolve transform and crop order is unqualified".into());
     }
     if !has_crop && !has_transform && !reflection.active() {
@@ -244,6 +296,7 @@ pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> R
         (Y, -y, 0.0),
         (SCALE_X, sx / 100.0, 1.0),
         (SCALE_Y, sy / 100.0, 1.0),
+        (ROTATION, -t.rotation, 0.0),
     ] {
         if value != neutral {
             motion[slot] = scalar(id, value);
@@ -251,6 +304,16 @@ pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> R
     }
     if t.scale != (100.0, 100.0) {
         motion[2] = parameter(44, &[0x28, 0]);
+    }
+    if axis {
+        // Resolve saves both anchor coordinates as one big-endian point.
+        let mut xy = Vec::with_capacity(16);
+        xy.extend_from_slice(&t.anchor.0.to_be_bytes());
+        let y = if t.anchor.1 == 0.0 { 0.0 } else { -t.anchor.1 };
+        xy.extend_from_slice(&y.to_be_bytes());
+        let mut point = Vec::new();
+        pb_bytes(7, &xy, &mut point);
+        motion[ANCHOR.0] = parameter(ANCHOR.1, &point);
     }
     reflection.write_slots(&mut motion);
     section(4, 0, &motion, &mut body);
@@ -264,4 +327,37 @@ pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> R
         section(6, 6, &crop, &mut body);
     }
     Ok(Some(pack(&body)?))
+}
+
+/// A single off-center axis, with no translation, scale, or crop.
+pub(crate) fn rotation_axis_profile(t: &Transform) -> bool {
+    let (x, y) = t.anchor;
+    t.anchor != (0.0, 0.0)
+        && t.position == t.anchor
+        && (x == 0.0 || y == 0.0)
+        && (0.0..=(100.0_f64 / 999.0).next_up()).contains(&x)
+        && (-(100.0_f64 / 999.0).next_up()..=0.0).contains(&y)
+        && t.scale == (100.0, 100.0)
+        && (0.0..=30.0).contains(&t.rotation)
+        && t.crop == [0.0; 4]
+}
+
+/// Crop before a centered zoom and clockwise roll, measured on matching 1080p rasters.
+pub(crate) fn centered_crop_profile(t: &Transform) -> bool {
+    (t.crop.iter().any(|&v| v > 0.05)
+        || (t.crop != [0.0; 4] && (t.scale != (100.0, 100.0) || t.rotation != 0.0)))
+        && t.position == (0.0, 0.0)
+        && t.anchor == (0.0, 0.0)
+        && (60.0..=100.0).contains(&t.scale.0)
+        && (90.0..=100.0).contains(&t.scale.1)
+        && (0.0..=30.0).contains(&t.rotation)
+        && t.crop.into_iter().zip([100.0, 80.0, 150.0, 120.0])
+            .all(|(edge, max)| {
+                // Resolve can round one ULP on save. Premiere stores crop
+                // percentages at binary32 precision with 12 decimal places.
+                let fraction = max / 999.0_f64;
+                let premiere = (f64::from((fraction * 100.0) as f32) + 0.5e-12) / 100.0;
+                let upper = fraction.next_up().max(premiere);
+                (0.0..=upper).contains(&edge)
+            })
 }

@@ -159,6 +159,36 @@ fn fixture() -> SourceGraph {
         sidecars,
     }
 }
+
+#[test]
+fn avid_source_color_transform_survives_graph_reload_and_reports_one_affected_clip() {
+    let mut graph = fixture();
+    let options = parse_model_str(include_str!("../../../examples/opatom_clip.model.json"))
+        .unwrap().options;
+    let baseline = prepare(&graph, &options, ClockProfile::LegacyImport).unwrap();
+    let item_id = graph.items[0].id.clone();
+    let native = graph.sidecars.iter_mut()
+        .find(|s| s.adapter == "avid.source" && s.object == item_id).unwrap();
+    let Value::Obj(fields) = &mut native.data else { panic!("native facts must be an object") };
+    let text = "<ColorTransformationList><ColorTransformation/></ColorTransformationList>";
+    let transforms = Value::Arr(vec![v(vec![
+        ("track", Value::Int(1)),
+        ("owner_mob", Value::Str("source-mob".into())),
+        ("text", Value::Str(text.into())),
+    ])]);
+    fields.push(("input_color_transforms".into(), transforms.clone()));
+    let reloaded = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    assert_eq!(
+        reloaded.sidecar("avid.source", &item_id).unwrap().get("input_color_transforms"),
+        Some(&transforms),
+    );
+    let prepared = prepare(&reloaded, &options, ClockProfile::LegacyImport).unwrap();
+    assert_eq!(baseline.model, prepared.model);
+    let losses: Vec<_> = prepared.losses.iter()
+        .filter(|l| l.aspect == "source_color_transform").collect();
+    let [loss] = losses.as_slice() else { panic!("expected one loss for the affected clip") };
+    assert_eq!(loss.object, item_id);
+}
 fn q(n: i64) -> Q {
     Q::integer(n)
 }
@@ -282,6 +312,72 @@ fn direct_dnxhr_needs_the_native_codec_clock_and_discrete_siblings() {
         assert!(doc.tree.iter_tag(doc.root, "MediaInPoint")
             .any(|n| doc.tree.text(n).and_then(|v| v.parse::<i64>().ok()) == Some(exact_ticks)));
     }
+    let mut fades = fixture();
+    let mut sequence = fades.sequences.remove(0);
+    sequence.rate = rate;
+    sequence.markers.clear();
+    let mut outgoing = sequence.placements.into_iter().find(|p| p.audio_tracks == [1]).unwrap();
+    let frame = Q::new(1001, 24000).unwrap();
+    outgoing.duration = Q::new(14 * 1001, 24000).unwrap();
+    outgoing.source_in = frame;
+    let mut incoming = outgoing.clone();
+    incoming.id = "incoming-audio".into();
+    incoming.record_start = Q::new(8 * 1001, 24000).unwrap();
+    incoming.source_in = frame;
+    sequence.transitions.push(SourceTransition {
+        id: "transition:linear".into(),
+        kind: StreamKind::Audio,
+        track: 1,
+        cut: Q::new(10 * 1001, 24000).unwrap(),
+        duration: Q::new(6 * 1001, 24000).unwrap(),
+        cut_offset: Q::new(2 * 1001, 24000).unwrap(),
+        style: "avid.BLEND_AUDIO_DISSOLVE".into(),
+        outgoing: SourceBinding { placements: vec![outgoing.id.clone()], reason: None },
+        incoming: SourceBinding { placements: vec![incoming.id.clone()], reason: None },
+    });
+    sequence.placements = vec![outgoing, incoming];
+    let sequence_id = sequence.id.clone();
+    g.sequences.push(sequence);
+    for (attribute, parameter, mode, expected) in [
+        (Value::Int(0), Value::Int(0), "separate", "constant_gain"),
+        (Value::Int(0), Value::Int(1), "separate", "constant_power"),
+        (Value::Null, Value::Int(0), "separate", "constant_power"),
+        (Value::Int(0), Value::Int(0), "merged", "constant_power"),
+    ] {
+        g.sidecars.retain(|s| s.object != sequence_id);
+        g.sidecars.push(Sidecar {
+            adapter: "avid.source".into(),
+            object: sequence_id.clone(),
+            data: v(vec![("compatibility_start", Value::Str("3600".into())), ("native_transitions", Value::Arr(vec![v(vec![
+                ("id", Value::Str("transition:linear".into())),
+                ("effect", Value::Str("BLEND_AUDIO_DISSOLVE".into())),
+                ("audio_curve_attribute", attribute),
+                ("audio_curve_parameter", parameter),
+            ])]))]),
+        });
+        let options = Options { bin_mode: mode.into(), ..options() };
+        let saved = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+        let prepared = prepare(&saved, &options, ClockProfile::LegacyImport).unwrap();
+        assert_eq!(prepared.model.sequences[0].audio_crossfades[0].style, expected);
+        if expected == "constant_gain" {
+            let out = dir.join("linear.prproj");
+            let mut ids = prproj::SeededUuids::new("synthetic-direct-dnxhr");
+            let mut input = premiere_adapter::prepare_originals(&saved, &options, ClockProfile::LegacyImport).unwrap().input;
+            let ready = prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap();
+            ready.publish().unwrap();
+            let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(out).unwrap()).unwrap();
+            let fade = doc.tree.iter_tag(doc.root, "AudioTransitionTrackItem").next().unwrap();
+            assert_eq!(doc.tree.findtext(fade, "TransitionTrackItem/MatchName").unwrap().as_deref(), Some("Constant Gain"));
+            assert_eq!(doc.tree.findtext(fade, "FadeShapeValue").unwrap().as_deref(), Some("0"));
+            let rejected = dir.join("linear-missing-handle.prproj");
+            input.sequences[0].events[1].source_in = unit;
+            let err = prepare_typed_project(&input, &rejected, &mut ids, &[], false).err().unwrap();
+            assert!(err.to_string().contains("source handles"));
+            assert!(!rejected.exists());
+        }
+    }
+    g.sequences.clear();
+    g.sidecars.retain(|s| s.object != sequence_id);
     let picture = g.media.iter().find(|m| m.kind == StreamKind::Video).unwrap();
     let facts = g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == picture.id).unwrap();
     if let Value::Obj(fields) = &mut facts.data {
@@ -297,6 +393,362 @@ fn direct_dnxhr_needs_the_native_codec_clock_and_discrete_siblings() {
         assert!(error.to_string().contains("no Premiere-observed media timecode format"));
         assert!(!refused.exists());
     }
+}
+
+#[test]
+fn direct_23976_dnxhd_pcm16_preserves_two_file_clocks_and_sample_types() {
+    use prproj::convert::{model::TICKS_PER_SECOND, writer::prepare_typed_project};
+
+    let mut g = fixture();
+    let rate = Q::new(24_000, 1001).unwrap();
+    let frame = |n: i128| Q::new(n * 1001, 24_000).unwrap();
+    let ticks = |n| frame(n).to_units(TICKS_PER_SECOND).unwrap();
+    g.items[0].rate = Some(rate);
+    let make_clock = |count, source_rate| SourceClock {
+        effective_count: count,
+        rate,
+        display_base: 24,
+        drop: false,
+        provenance: SourceClockProvenance {
+            origin_count: count,
+            source_offset: 0,
+            source_rate,
+            source_package: "synthetic physical package".into(),
+            timecode_track: "TC1/synthetic".into(),
+            route: "file_source_clip_to_physical_timecode_track".into(),
+        },
+    };
+    for (i, m) in g.media.iter_mut().enumerate() {
+        let picture = m.kind == StreamKind::Video;
+        m.online = Some(true);
+        m.start = Some(frame(172_800));
+        m.duration = frame(96);
+        if picture { m.rate = Some(rate); } else { m.bits = Some(16); }
+        m.clock = Some(make_clock(172_800, if picture { rate } else { q(48_000) }));
+        let facts = g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == m.id).unwrap();
+        facts.data = v(vec![
+            ("legacy_clock", clock(172_800, 24, false)),
+            ("file_package", Value::Str(format!("file {i}"))),
+            ("descriptor_length", Value::Int(if picture { 96 } else { 192_192 })),
+            ("descriptor", if picture {
+                v(vec![("compression", Value::Str("AVHD".into())), ("resolution_id", Value::Int(1253)),
+                    ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)]))])
+            } else { v(vec![("channels", Value::Int(1)), ("bits", Value::Int(16))]) }),
+            ("picture_coding", if picture { Value::Str("060E2B340401010A0401020271130000".into()) } else { Value::Null }),
+        ]);
+    }
+    let s = &mut g.sequences[0];
+    s.rate = rate;
+    s.start = Some(frame(86_400));
+    s.clock = Some(make_clock(86_400, rate));
+    s.markers.clear();
+    for p in &mut s.placements {
+        p.record_start = Q::ZERO;
+        p.source_in = frame(5);
+        p.duration = frame(24);
+    }
+    let opts = Options { bin_mode: "separate".into(), ..options() };
+    let g = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let input = premiere_adapter::prepare_originals(&g, &opts, ClockProfile::LegacyImport).unwrap().input;
+    assert_eq!(input.sequences[0].start, ticks(86_400));
+    assert!(input.sequences[0].events.iter().all(|e| e.source_in == ticks(5)));
+    let out = std::env::temp_dir().join(format!("anynle-direct-pcm16-{}-{}.prproj", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let mut ids = prproj::SeededUuids::new("synthetic-direct-pcm16");
+    prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    assert!(doc.tree.iter_tag(doc.root, "CodecType").any(|n| doc.tree.text(n) == Some("1096180846")));
+    assert!(doc.tree.iter_tag(doc.root, "TimecodeFormat").any(|n| doc.tree.text(n) == Some("110")));
+    assert_eq!(doc.tree.iter_tag(doc.root, "SampleType").filter(|&n| doc.tree.text(n) == Some("3")).count(), 2);
+    assert_eq!(doc.tree.iter_tag(doc.root, "Media").filter_map(|n| doc.tree.child_by_tag(n, "Start"))
+        .filter_map(|n| doc.tree.text(n).and_then(|s| s.parse::<i64>().ok())).collect::<Vec<_>>(), [ticks(172_800); 3]);
+
+    let mut mixed = g.clone();
+    mixed.media.iter_mut().find(|m| m.kind == StreamKind::Audio).unwrap().bits = Some(24);
+    for (graph, mode) in [(&g, "grouped"), (&g, "merged"), (&mixed, "separate")] {
+        let options = Options { bin_mode: mode.into(), ..opts.clone() };
+        let input = premiere_adapter::prepare_originals(graph, &options, ClockProfile::LegacyImport).unwrap().input;
+        assert!(input.direct_dnxhr_origins.is_empty());
+        assert!(prepare_typed_project(&input, &out, &mut ids, &[], false).is_err());
+        assert!(!out.exists());
+    }
+
+    let mut ranged = g.clone();
+    let parent = ranged.items[0].umid.as_ref().unwrap().clone();
+    let native_id = "060A2B340101010501010F101300000000000000000000000000000000000002";
+    let to_urn = |id: &str| format!("urn:smpte:umid:{}", id.as_bytes().chunks(8)
+        .map(|s| std::str::from_utf8(s).unwrap().to_ascii_lowercase()).collect::<Vec<_>>().join("."));
+    let track = |kind, label| v(vec![
+        ("label", Value::Int(label)), ("kind", Value::Int(kind)),
+        ("component_class", Value::Str("SCLP".into())),
+        ("rate", Value::Str("24000/1001".into())), ("length", Value::Int(96)),
+        ("target_mob", Value::Str(parent.clone())),
+        ("target_track", Value::Int(label)), ("target_offset", Value::Int(0)),
+    ]);
+    let observed = |n| v(vec![("value", Value::Int(n))]);
+    ranged.sidecars.push(Sidecar {
+        adapter: "avid.subclips".into(), object: ranged.bins[0].id.clone(),
+        data: Value::Arr(vec![v(vec![
+            ("id", Value::Str("synthetic-subclip".into())), ("mob", Value::Str(native_id.into())),
+            ("name", Value::Str("Reusable Subclip".into())), ("rate", Value::Str("24000/1001".into())),
+            ("backing_length", Value::Int(96)), ("start", observed(0)), ("end", observed(96)),
+            ("tracks", Value::Arr(vec![track(1, 1), track(2, 1), track(2, 2)])),
+        ])]),
+    });
+    for placement in &ranged.sequences[0].placements {
+        let kind = if placement.video_track.is_some() { 1 } else { 2 };
+        let label = placement.audio_streams.first().copied().unwrap_or(1);
+        let hop = |id, offset, length| v(vec![
+            ("mob", Value::Str(to_urn(id))), ("track", Value::Int(label)),
+            ("rate", Value::Str("24000/1001".into())),
+            ("source_offset", observed(offset)), ("length", observed(length)),
+        ]);
+        ranged.sidecars.push(Sidecar {
+            adapter: "avid.source".into(), object: placement.id.clone(),
+            data: v(vec![("native_kind", Value::Int(kind)),
+                ("route", Value::Arr(vec![hop(native_id, 5, 24), hop(&parent, 0, 96)]))]),
+        });
+    }
+    let prepare = |graph| premiere_adapter::prepare_originals(graph, &opts, ClockProfile::LegacyImport).unwrap();
+    let ranged = SourceGraph::from_json_text(&ranged.to_json_text().unwrap()).unwrap();
+    let ready = prepare(&ranged);
+    assert_eq!(ready.input.av_subclips.len(), 1);
+    assert_eq!(ready.input.av_subclip_uses.len(), 3);
+    prepare_typed_project(&ready.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    let tree = &doc.tree;
+    let master = tree.iter_tag(doc.root, "MasterClip").find(|&m| {
+        tree.findtext(m, "Name").unwrap().as_deref() == Some("Reusable Subclip")
+    }).unwrap();
+    assert_eq!(tree.findall(master, "Clips/Clip").unwrap().len(), 3);
+    assert_eq!(tree.iter_tag(doc.root, "SubClip").filter(|&c| {
+        tree.child_by_tag(c, "MasterClip").is_some_and(|r| doc.resolve(r) == Ok(master))
+    }).count(), 3);
+
+    let shorten = |graph: &mut SourceGraph, start, end| {
+        let receipt = graph.sidecars.iter_mut().find(|s| s.adapter == "avid.subclips").unwrap();
+        let Value::Arr(rows) = &mut receipt.data else { panic!("missing receipt rows") };
+        let Value::Obj(fields) = &mut rows[0] else { panic!("missing receipt fields") };
+        for (field, value) in fields {
+            match field.as_str() {
+                "start" => *value = observed(start),
+                "end" => *value = observed(end),
+                _ => {},
+            }
+        }
+    };
+    let mut shortened = ranged.clone();
+    shorten(&mut shortened, 5, 29);
+    let short = prepare(&shortened);
+    assert_eq!((short.input.av_subclips[0].start, short.input.av_subclips[0].end), (ticks(5), ticks(29)));
+    assert_eq!(short.input.av_subclip_uses.len(), 3);
+    prepare_typed_project(&short.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    for (tag, value) in [("StartBoundary", ticks(5)), ("EndBoundary", ticks(29))] {
+        let expected = value.to_string();
+        assert_eq!(doc.tree.iter_tag(doc.root, tag)
+            .filter(|&n| doc.tree.text(n) == Some(expected.as_str())).count(), 3);
+    }
+
+    let mut pcm24 = shortened.clone();
+    for m in &mut pcm24.media {
+        let facts = pcm24.sidecars.iter_mut()
+            .find(|s| s.adapter == "avid.source" && s.object == m.id).unwrap();
+        let Value::Obj(fields) = &mut facts.data else { panic!("missing media facts") };
+        let mut set = |name, value| {
+            fields.iter_mut().find(|(k, _)| k == name).unwrap().1 = value;
+        };
+        if m.kind == StreamKind::Video {
+            set("descriptor", v(vec![
+                ("compression", Value::Str("RI00".into())),
+                ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)])),
+            ]));
+            set("picture_coding", Value::Str("060E2B340401010D0401020271280000".into()));
+        } else {
+            m.bits = Some(24);
+            set("descriptor", v(vec![("channels", Value::Int(1)), ("bits", Value::Int(24))]));
+        }
+    }
+    let pcm24_graph = SourceGraph::from_json_text(&pcm24.to_json_text().unwrap()).unwrap();
+    let pcm24 = prepare(&pcm24_graph);
+    assert_eq!((pcm24.input.av_subclips[0].start, pcm24.input.av_subclips[0].end), (ticks(5), ticks(29)));
+    assert_eq!(pcm24.input.av_subclip_uses.len(), 3);
+    prepare_typed_project(&pcm24.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    std::fs::remove_file(&out).unwrap();
+
+    let mut nested = pcm24_graph.clone();
+    nested.sidecars.retain(|s| s.adapter != "avid.subclips");
+    let picture = nested.sequences[0].placements.iter_mut().find(|p| p.video_track.is_some()).unwrap();
+    picture.record_start = frame(8);
+    let picture_id = picture.id.clone();
+    let receipt = nested.sidecars.iter_mut().find(|s| s.object == picture_id && s.adapter == "avid.source").unwrap();
+    receipt.data = v(vec![
+        ("plain_submaster", Value::Bool(true)),
+        ("via", Value::Arr(vec![Value::Str("effect EFF_SUBMASTER not converted".into())])),
+    ]);
+    let nested = SourceGraph::from_json_text(&nested.to_json_text().unwrap()).unwrap();
+    let make_nest = prepare(&nested);
+    let [nest] = make_nest.input.picture_nests.as_slice() else { panic!("missing editable nest") };
+    assert_eq!(make_nest.input.sequences[nest.sequence].events[nest.event].record_start, ticks(8));
+    prepare_typed_project(&make_nest.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    let tree = &doc.tree;
+    let child = tree.iter_tag(doc.root, "Sequence")
+        .find(|&n| tree.findtext(n, "Name").unwrap().unwrap_or_default().contains("Submaster")).unwrap();
+    assert_eq!(tree.findtext(child, "Node/Properties/MZ.ZeroPoint").unwrap(), Some(ticks(86_408).to_string()));
+    let child_sources = tree.iter_tag(doc.root, "VideoSequenceSource").filter(|&n| {
+        tree.find1(n, "SequenceSource/Sequence").is_some_and(|r| doc.resolve(r) == Ok(child))
+    }).collect::<Vec<_>>();
+    let [source] = child_sources.as_slice() else { panic!("missing child picture source") };
+    assert_eq!(tree.findtext(*source, "OriginalDuration").unwrap(), Some(ticks(24).to_string()));
+    assert!(tree.iter_tag(doc.root, "VideoClip").any(|n| {
+        tree.find1(n, "Clip/Source").is_some_and(|r| doc.resolve(r) == Ok(*source))
+            && tree.findtext(n, "Clip/InPoint").unwrap().as_deref() == Some("0")
+            && tree.findtext(n, "Clip/OutPoint").unwrap() == Some(ticks(24).to_string())
+    }));
+
+    let mut malformed_nest = make_nest.input;
+    let mut outside = malformed_nest.picture_nests[0];
+    outside.event = usize::MAX;
+    malformed_nest.picture_nests[0] = outside;
+    assert!(prepare_typed_project(&malformed_nest, &out, &mut ids, &[], false).is_err());
+    assert!(!out.exists());
+    let mut unproven = nested.clone();
+    let receipt = unproven.sidecars.iter_mut().find(|s| s.object == picture_id && s.adapter == "avid.source").unwrap();
+    let Value::Obj(fields) = &mut receipt.data else { panic!("missing Submaster fields") };
+    fields.retain(|(name, _)| name != "plain_submaster");
+    let fallback = prepare(&unproven);
+    assert!(fallback.input.picture_nests.is_empty());
+    assert!(fallback.losses.iter().any(|l| l.object == picture_id && l.aspect == "picture_nest"));
+
+    let mut mixed_writer_input = pcm24.input;
+    let prproj::convert::prepared::PreparedClip::Legacy(parent) = &mut mixed_writer_input.clips[0]
+        else { panic!("missing legacy backing master") };
+    parent.audio[1].bits = 16;
+    assert!(prepare_typed_project(&mixed_writer_input, &out, &mut ids, &[], false).is_err());
+    assert!(!out.exists());
+
+    let mut outside = shortened.clone();
+    shorten(&mut outside, 6, 29);
+    let outside = prepare(&outside);
+    assert_eq!(outside.input.av_subclips.len(), 1);
+    assert!(outside.input.av_subclip_uses.is_empty());
+    assert_eq!(outside.losses.iter().filter(|l| l.aspect == "subclip_timeline_source").count(), 3);
+
+    let mut ambiguous = ranged.clone();
+    let receipt = ambiguous.sidecars.iter_mut().find(|s| s.adapter == "avid.subclips").unwrap();
+    let Value::Arr(rows) = &mut receipt.data else { panic!("missing receipt rows") };
+    let mut duplicate = rows[0].clone();
+    let Value::Obj(fields) = &mut duplicate else { panic!("missing receipt fields") };
+    *fields.iter_mut().find(|(k, _)| k == "id").map(|(_, value)| value).unwrap() = Value::Str("duplicate-mob".into());
+    rows.push(duplicate);
+    let result = prepare(&ambiguous);
+    assert_eq!(result.input.av_subclips.len(), 2);
+    assert!(result.input.av_subclip_uses.is_empty());
+    assert_eq!(result.losses.iter().filter(|l| l.aspect == "subclip_timeline_source").count(), 3);
+
+    let mut malformed = ready.input;
+    malformed.av_subclip_uses[0].subclip = usize::MAX;
+    assert!(prepare_typed_project(&malformed, &out, &mut ids, &[], false).err().unwrap()
+        .to_string().contains("unknown prepared A/V subclip"));
+    assert!(!out.exists());
+}
+
+#[test]
+fn direct_dnxhd_drop_frame_requires_the_saved_profile_and_sequence_clock() {
+    use prproj::convert::{model::TICKS_PER_SECOND, writer::prepare_typed_project};
+    let mut g = fixture();
+    let rate = Q::new(30_000, 1001).unwrap();
+    let frame = |n: i128| Q::new(n * 1001, 30_000).unwrap();
+    g.items[0].rate = Some(rate);
+    let make_clock = |count, source_rate, route: &str, track: &str| SourceClock {
+        effective_count: count,
+        rate,
+        display_base: 30,
+        drop: true,
+        provenance: SourceClockProvenance {
+            origin_count: count,
+            source_offset: 0,
+            source_rate,
+            source_package: "synthetic package".into(),
+            timecode_track: track.into(),
+            route: route.into(),
+        },
+    };
+    for (i, m) in g.media.iter_mut().enumerate() {
+        let picture = m.kind == StreamKind::Video;
+        m.online = Some(true);
+        m.start = Some(frame(215_784));
+        m.duration = frame(150);
+        if picture { m.rate = Some(rate); } else { m.bits = Some(24); }
+        m.clock = Some(make_clock(215_784, if picture { rate } else { q(48_000) },
+            "file_source_clip_to_physical_timecode_track", "physical TC"));
+        let facts = g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == m.id).unwrap();
+        facts.data = v(vec![
+            ("legacy_clock", clock(215_784, 30, true)),
+            ("file_package", Value::Str(format!("file {i}"))),
+            ("descriptor_length", Value::Int(if picture { 150 } else { 240_240 })),
+            ("descriptor", if picture {
+                v(vec![("compression", Value::Str("AVHD".into())),
+                    ("resolution_id", Value::Int(1253)),
+                    ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)]))])
+            } else { v(vec![("channels", Value::Int(1))]) }),
+            ("picture_coding", if picture { Value::Str("060E2B340401010A0401020271130000".into()) } else { Value::Null }),
+        ]);
+    }
+    let s = &mut g.sequences[0];
+    s.rate = rate;
+    s.start = Some(frame(1795));
+    s.clock = Some(make_clock(1795, rate, "direct sequence TC1", "TC1/synthetic"));
+    s.markers.clear();
+    for p in &mut s.placements {
+        p.record_start = Q::ZERO;
+        p.source_in = frame(10);
+        p.duration = frame(5);
+    }
+    let separate = Options { bin_mode: "separate".into(), ..options() };
+    let saved = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let input = premiere_adapter::prepare_originals(&saved, &separate, ClockProfile::LegacyImport).unwrap().input;
+    let ticks = |n| frame(n).to_units(TICKS_PER_SECOND).unwrap();
+    assert_eq!(input.sequences[0].start, ticks(1795));
+    assert!(input.sequences[0].events.iter().all(|e| e.source_in == ticks(10)));
+    let out = std::env::temp_dir().join(format!("anynle-direct-dnxhd-{}-{}.prproj",
+        std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let mut ids = prproj::SeededUuids::new("synthetic-direct-dnxhd");
+    prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    assert!(doc.tree.iter_tag(doc.root, "CodecType").any(|n| doc.tree.text(n) == Some("1096180846")));
+    assert!(!doc.tree.iter_tag(doc.root, "CodecType").any(|n| doc.tree.text(n) == Some("1096180840")));
+    assert!(doc.tree.iter_tag(doc.root, "TimecodeFormat").any(|n| doc.tree.text(n) == Some("102")));
+    assert_eq!(doc.tree.iter_tag(doc.root, "Media").filter_map(|n| doc.tree.child_by_tag(n, "Start"))
+        .filter_map(|n| doc.tree.text(n).and_then(|s| s.parse::<i64>().ok())).collect::<Vec<_>>(), [ticks(215_784); 3]);
+
+    for mode in ["grouped", "merged"] {
+        let options = Options { bin_mode: mode.into(), ..options() };
+        let input = premiere_adapter::prepare_originals(&saved, &options, ClockProfile::LegacyImport).unwrap().input;
+        assert!(input.direct_dnxhr_origins.is_empty());
+        assert!(prepare_typed_project(&input, &out, &mut ids, &[], false).is_err());
+        assert!(!out.exists());
+    }
+    let mut unknown = saved.clone();
+    unknown.sequences[0].clock = None;
+    assert!(premiere_adapter::prepare_originals(&unknown, &separate, ClockProfile::LegacyImport)
+        .err().unwrap().to_string().contains("direct_dnxhd_sequence_clock"));
+    let mut wrong_coding = saved;
+    let picture = wrong_coding.media.iter().find(|m| m.kind == StreamKind::Video).unwrap();
+    let facts = wrong_coding.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == picture.id).unwrap();
+    let Value::Obj(fields) = &mut facts.data else { unreachable!() };
+    fields.iter_mut().find(|(name, _)| name == "picture_coding").unwrap().1 =
+        Value::Str("060E2B340401010D0401020271280000".into());
+    let input = premiere_adapter::prepare_originals(&wrong_coding, &separate, ClockProfile::LegacyImport).unwrap().input;
+    assert!(input.direct_dnxhr_origins.is_empty());
+    assert!(prepare_typed_project(&input, &out, &mut ids, &[], false).is_err());
+    assert!(!out.exists());
 }
 
 fn two_edits() -> SourceGraph {
@@ -380,6 +832,55 @@ fn exact_tc1_changes_only_the_absolute_sequence_origin() {
 }
 
 #[test]
+fn avid_drop_frame_tc1_uses_the_saved_frame_count() {
+    let mut g = fixture();
+    let rate = Q::new(30_000, 1001).unwrap();
+    let seq = &mut g.sequences[0];
+    seq.rate = rate;
+    // Use frame-aligned record ranges at 29.97 without changing source trims.
+    let record = |time: Q| Q::new(time.num() as i128 * 1001, time.den() as i128 * 1000).unwrap();
+    for edit in &mut seq.placements {
+        edit.record_start = record(edit.record_start);
+        edit.duration = record(edit.duration);
+    }
+    let sequence_id = seq.id.clone();
+    g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == sequence_id)
+        .unwrap().data = v(vec![("compatibility_start", Value::Str("0".into()))]);
+    let baseline = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let mut expected = baseline.model.sequences[0].clone();
+    assert_eq!(expected.start, 0);
+
+    let seq = &mut g.sequences[0];
+    let count = 1795; // 00:00:59;25, five actual frames before 00:01:00;02.
+    let clock = SourceClock {
+        effective_count: count,
+        rate,
+        display_base: 30,
+        drop: true,
+        provenance: SourceClockProvenance {
+            origin_count: count,
+            source_offset: 0,
+            source_rate: rate,
+            source_package: "sequence".into(),
+            timecode_track: "TC1/0".into(),
+            route: "direct sequence TC1".into(),
+        },
+    };
+    seq.start = clock.exact_start();
+    seq.clock = Some(clock);
+    let saved = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let corrected = prepare(&saved, &options(), ClockProfile::LegacyImport).unwrap();
+    expected.start = 15_213_822_624_000;
+    assert_eq!(corrected.model.sequences[0], expected);
+    assert_eq!(corrected.ownership, baseline.ownership);
+    assert!(corrected.diagnostics.iter().any(|s| s.contains("qualified 29.97 DF clock")));
+
+    g.sequences[0].clock.as_mut().unwrap().drop = false;
+    let fallback = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(fallback.model.sequences, baseline.model.sequences);
+}
+
+#[test]
 fn ordinary_avid_dissolve_preserves_an_asymmetric_cut() {
     let mut g = two_edits();
     let t = &mut g.sequences[0].transitions[0];
@@ -416,6 +917,73 @@ fn avid_subframe_volume_uses_the_media_clock_and_reports_tick_rounding() {
     assert_eq!(key.ticks, 640714429688);
     assert!(p.losses.iter().any(|l| l.aspect == "volume_key_clock"));
     assert_eq!(g.sequences[0].placements.iter().find_map(|p| p.volume_keys.first()).unwrap().at, at);
+}
+
+#[test]
+fn corner_pin_round_trips_points_and_rejects_crossed_corners() {
+    use prproj::convert::prepared::{CornerPin, PictureEffect};
+    let mut g = fixture();
+    let corners = [[-0.001, 0.1], [0.8, 0.05], [0.95, 0.8], [0.15, 0.95]];
+    let effect = |corners: [[f64; 2]; 4]| graph::Effect {
+        kind: "picture.corner_pin".into(),
+        params: v(vec![("target_corners_tl_tr_br_bl", Value::Arr(
+            corners.map(|point| Value::Arr(point.map(Value::Float).into())).into(),
+        ))]),
+    };
+    let edit = &mut g.sequences[0].placements[0];
+    assert!(edit.video_track.is_some());
+    edit.effects = vec![effect(corners)];
+    let id = edit.id.clone();
+    let reloaded = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let prepared = prepare(&reloaded, &options(), ClockProfile::LegacyImport).unwrap();
+    let [pin] = prepared.picture_effects.as_slice() else { panic!("expected one Corner Pin") };
+    assert_eq!((pin.sequence, pin.event), prepared.ownership[&id]);
+    assert_eq!(pin.effect, PictureEffect::CornerPin(CornerPin { corners, source_crop: [0.0; 4] }));
+
+    let source_crop = [0.1, 0.08, 0.15, 0.12];
+    let mut cropped = effect(corners);
+    let Value::Obj(params) = &mut cropped.params else { unreachable!() };
+    params.push(("source_crop_ltrb".into(), Value::Arr(source_crop.map(Value::Float).into())));
+    g.sequences[0].placements[0].effects = vec![cropped];
+    let reloaded = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let prepared = prepare(&reloaded, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(prepared.picture_effects[0].effect, PictureEffect::CornerPin(CornerPin { corners, source_crop }));
+    // A reversed component list still parses in Premiere but crops the warped result.
+    use prproj::convert::writer::{prepare_project_with_effects, Editorial};
+    let dir = std::env::temp_dir().join(format!("anynle-crop-pin-{}-{}",
+        std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("corner-pin.prproj");
+    let editorial = Editorial {
+        texts: &prepared.texts,
+        video_dissolves: &prepared.video_dissolves,
+        picture_effects: &prepared.picture_effects,
+        direct_dnxhr_origins: &prepared.direct_dnxhr_origins,
+        constant_speeds: &prepared.constant_speeds,
+    };
+    let mut ids = prproj::SeededUuids::new("static-crop-pin");
+    prepare_project_with_effects(&prepared.model, editorial, &path, &mut ids, &[], false)
+        .unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(path).unwrap()).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    let item = doc.tree.iter_tag(doc.root, "VideoClipTrackItem").next().unwrap();
+    let chain = doc.resolve(doc.tree.find1(item, "ClipTrackItem/ComponentOwner/Components").unwrap()).unwrap();
+    let names: Vec<_> = doc.tree.findall(chain, "ComponentChain/Components/Component").unwrap().into_iter()
+        .map(|reference| doc.tree.findtext(doc.resolve(reference).unwrap(), "MatchName").unwrap().unwrap())
+        .collect();
+    assert_eq!(names, ["AE.ADBE Corner Pin", "AE.Impact_Crop_FX"]);
+
+    let mut crossed = corners;
+    crossed.swap(2, 3);
+    g.sequences[0].placements[0].effects = vec![effect(crossed)];
+    assert!(prepare(&g, &options(), ClockProfile::LegacyImport).err().unwrap().to_string()
+        .contains("invalid Corner Pin points"));
+    let mut invalid_crop = effect(corners);
+    let Value::Obj(params) = &mut invalid_crop.params else { unreachable!() };
+    params.push(("source_crop_ltrb".into(), Value::Arr([0.6, 0.0, 0.5, 0.0].map(Value::Float).into())));
+    g.sequences[0].placements[0].effects = vec![invalid_crop];
+    assert!(prepare(&g, &options(), ClockProfile::LegacyImport).err().unwrap().to_string()
+        .contains("invalid Corner Pin points or source crop"));
 }
 
 #[test]
@@ -567,6 +1135,45 @@ fn animated_crop_keeps_four_edges_on_the_source_frame_clock() {
     let refused = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
     assert!(refused.picture_effects.is_empty());
     assert!(refused.model.sequences[0].events[0].transform.is_none());
+}
+
+#[test]
+fn warp_interpolation_uses_the_exact_source_key_times() {
+    use prproj::convert::prepared::{PictureEffect, WarpRollInterpolation};
+    let mut g = fixture();
+    let sequence = &mut g.sequences[0];
+    sequence.placements.retain(|p| p.video_track.is_some());
+    let p = &mut sequence.placements[0];
+    p.source_in = Q::new(2, 24).unwrap();
+    p.duration = Q::new(13, 24).unwrap();
+    p.transform = None;
+    let key = |frame, x, width, rotation| v(vec![
+        ("frame", Value::Int(frame)), ("x", Value::Float(x)),
+        ("width", Value::Float(width)), ("rotation", Value::Float(rotation)),
+    ]);
+    p.effects = vec![graph::Effect {
+        kind: "avid.warp_roll_shelf".into(),
+        params: v(vec![("keys", Value::Arr(vec![
+            key(0, -60.0 / 999.0, 70.0, -15.0),
+            key(5, 90.0 / 999.0, 100.0, 25.0),
+            key(12, -30.0 / 999.0, 80.0, -10.0),
+        ]))]),
+    }];
+    let reopened = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let prepared = prepare(&reopened, &options(), ClockProfile::LegacyImport).unwrap();
+    let [picture] = prepared.picture_effects.as_slice() else { panic!("expected one Warp") };
+    let PictureEffect::WarpRoll { keys, interpolation: WarpRollInterpolation::Hold } = picture.effect else { panic!("expected Hold keys") };
+    let frame = prproj::convert::model::TICKS_PER_SECOND / 24;
+    assert_eq!(keys.map(|k| k.ticks), [2 * frame, 7 * frame, 14 * frame]);
+    for (kind, interpolation) in [
+        ("avid.warp_roll_linear", WarpRollInterpolation::Linear),
+        ("avid.warp_roll_bezier", WarpRollInterpolation::FlatBezier),
+        ("avid.warp_roll_spline", WarpRollInterpolation::FlatBezier),
+    ] {
+        g.sequences[0].placements[0].effects[0].kind = kind.into();
+        let prepared = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+        assert_eq!(prepared.picture_effects[0].effect, PictureEffect::WarpRoll { keys, interpolation });
+    }
 }
 
 #[test]
@@ -1054,6 +1661,7 @@ fn marker_inheritance_uses_exact_source_time_and_creation_content() {
     source.owner_local = Some(q(3));
     source.owner_rate = Some(q(24));
     source.owner_occurrence = "native:master".into();
+    source.track = Some(graph::TrackRef { kind: StreamKind::Video, index: 1 });
     g.items[0].markers.push(source);
     let m = &mut g.sequences[0].markers[0];
     m.owner = MarkerOwner::Edit;
@@ -1075,6 +1683,8 @@ fn marker_inheritance_uses_exact_source_time_and_creation_content() {
                 Value::Arr(vec![v(vec![
                     ("graph_index", Value::Int(0)),
                     ("created", Value::Int(100)),
+                    ("kind", Value::Int(1)),
+                    ("track", Value::Int(1)),
                 ])]),
             ));
         }
@@ -1083,6 +1693,26 @@ fn marker_inheritance_uses_exact_source_time_and_creation_content() {
     let m = &r.model.sequences[0].markers[0];
     assert_eq!(m.source, Some(3 * 254016000000));
     assert!(m.inherited);
+    g.items[0].markers[0].track = None;
+    let saved = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let r = prepare(&saved, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(r.model.clips["clip-1"].markers[0].track.as_deref(), Some("V1"));
+    assert!(r.model.sequences[0].markers[0].inherited);
+    g.items[0].markers[0].track = Some(graph::TrackRef { kind: StreamKind::Video, index: 1 });
+
+    // An edit-local range change must not be discarded as an inherited copy.
+    g.sequences[0].markers[0].duration = Q::new(1, 24).unwrap();
+    let r = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(!r.model.sequences[0].markers[0].inherited);
+    g.sequences[0].markers[0].duration = g.items[0].markers[0].duration;
+
+    // Matching content and time on a different source lane are independent.
+    let saved_track = g.items[0].markers[0].track;
+    g.items[0].markers[0].track = Some(graph::TrackRef { kind: StreamKind::Audio, index: 1 });
+    let r = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(!r.model.sequences[0].markers[0].inherited);
+    g.items[0].markers[0].track = saved_track;
+
     g.items[0].markers[0].start = Some(Q::new(73, 24).unwrap());
     let r = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
     assert!(!r.model.sequences[0].markers[0].inherited);
@@ -1375,6 +2005,119 @@ fn linked_originals_use_typed_codec_channels_and_keep_legacy_projection_strict()
 }
 
 #[test]
+fn linked_mono_wav_keeps_source_gain_without_changing_the_older_edit() {
+    use prproj::convert::prepared::PreparedClip;
+
+    let mut g = original_fixture();
+    g.media.retain(|m| m.kind == StreamKind::Audio && m.stream == Some(1));
+    let m = &mut g.media[0];
+    m.codec = Some("pcm_s24le".into());
+    m.bits = Some(24);
+    m.online = Some(true);
+    m.locations = vec!["/Synthetic/source.wav".into()];
+    let original = m.original.as_mut().unwrap();
+    original.saved_locators = m.locations.clone();
+    original.container = "wav".into();
+    original.stream_index = 0;
+    original.channels = Some(1);
+    original.sample_representation = Some("pcm24".into());
+
+    g.items[0].media.retain(|a| a.media == m.id);
+    g.items[0].media[0].gain_db = 3.0;
+    g.items[0].rate = Some(q(24));
+    let item = g.items[0].id.clone();
+    let mob = "urn:smpte:umid:060a2b34.01010101.01010f00.13000000.00000001.00000002.00000003.00000004";
+    g.sidecars.retain(|sc| !(sc.object == item && sc.adapter == "avid"));
+    g.sidecars.push(Sidecar {
+        adapter: "avid".into(), object: item, data: v(vec![
+            ("mob_id", Value::Str(mob.into())),
+            ("columns", v(vec![])),
+            ("start_timecode", Value::Null),
+            ("aux_timecodes", Value::Arr(vec![])),
+            ("source_file", Value::Null),
+            ("source_path", Value::Null),
+        ]),
+    });
+
+    let seq = &mut g.sequences[0];
+    seq.rate = q(24);
+    seq.frame_size = Some((1920, 1080));
+    seq.markers.clear();
+    let mut dry = seq.placements.iter().find(|p| p.audio_tracks == [1]).unwrap().clone();
+    dry.record_start = q(0);
+    dry.source_in = q(2);
+    dry.duration = q(2);
+    dry.gain_db = 0.0;
+    dry.volume_db = None;
+    dry.volume_keys.clear();
+    dry.track_gains_db.clear();
+    dry.track_pans.clear();
+    dry.speed = None;
+    dry.frame_map = None;
+    let receipt = |p: &graph::Placement, gain: Value, native_mob: &str| v(vec![
+        ("id", Value::Str(p.id.clone())),
+        ("placement_id", Value::Str(p.id.clone())),
+        ("master", Value::Str(native_mob.into())),
+        ("kind", Value::Int(2)),
+        ("track", Value::Int(1)),
+        ("master_track", Value::Int(1)),
+        ("combined", Value::Null),
+        ("edit_gain_db", gain),
+        ("edit_pan", Value::Null),
+        ("reason", Value::Null),
+        ("via", Value::Arr(vec![])),
+        ("controls", v(vec![("speed", Value::Null)])),
+        ("range", v(vec![
+            ("record_rate", Value::Str("24".into())),
+            ("source_rate", Value::Str("24".into())),
+            ("record_start", Value::Int(p.record_start.to_units(24).unwrap())),
+            ("source_in", Value::Int(48)),
+            ("record_length", Value::Int(48)),
+            ("source_length", Value::Int(48)),
+            ("route", Value::Arr(vec![v(vec![
+                ("mob", Value::Str(native_mob.into())),
+                ("track", Value::Int(1)),
+                ("rate", Value::Str("24".into())),
+                ("source_offset", v(vec![("value", Value::Int(48))])),
+                ("length", v(vec![("value", Value::Int(48))])),
+            ])])),
+        ])),
+    ]);
+    let mut copied = dry.clone();
+    copied.id = "copied-gain".into();
+    copied.record_start = q(2);
+    copied.track_gains_db = vec![Some(3.0)];
+    let mut mismatched = dry.clone();
+    mismatched.id = "other-master".into();
+    mismatched.record_start = q(4);
+    let events = vec![
+        receipt(&dry, Value::Null, mob),
+        receipt(&copied, Value::Float(3.0), mob),
+        receipt(&mismatched, Value::Null, "another-master"),
+    ];
+    seq.placements = vec![dry, copied, mismatched];
+    let sc = g.sidecars.iter_mut().find(|sc| sc.object == seq.id && sc.adapter == "avid.source").unwrap();
+    let Value::Obj(fields) = &mut sc.data else { unreachable!() };
+    fields.push(("native_events".into(), Value::Arr(events)));
+    let seq = &g.sequences[0];
+    g.sidecars.retain(|sc| sc.object == seq.id || sc.object == g.items[0].id
+        || sc.object == g.media[0].id || seq.placements.iter().any(|p| p.id == sc.object));
+    g.losses.clear();
+
+    let json = g.to_json_text().unwrap();
+    let saved = SourceGraph::from_json_text(&json).unwrap();
+    for g in [&g, &saved] {
+        let prepared = premiere_adapter::prepare_originals(g, &options(), ClockProfile::LegacyImport).unwrap();
+        let PreparedClip::Original(master) = &prepared.input.clips[0] else { panic!("expected a file-backed master") };
+        assert_eq!(master.channels[0].gain_db, 3.0);
+        let events = &prepared.input.sequences[0].events;
+        assert_eq!(events[0].audio_gains, vec![Some(0.0)]);
+        assert_eq!(events[1].audio_gains, vec![Some(3.0)]);
+        assert!(events[2].audio_gains.is_empty(), "contradictory receipt does not override gain");
+    }
+}
+
+#[test]
 fn source_stereo_is_kept_for_fresh_edits_without_merging_existing_mono_edits() {
     use prproj::convert::prepared::PreparedClip;
     let mut g = original_fixture();
@@ -1537,7 +2280,8 @@ fn editable_multicam_resolves_independent_audio_order_and_refuses_unsupported_us
     assert_eq!(p.input.multicams[0].cameras[1].clip, "camera-b");
     assert_eq!(p.input.multicam_uses.len(), 2);
     assert!(p.input.multicam_uses.iter().any(|u| u.video == Some(1) && u.audio.is_empty()));
-    assert!(p.input.multicam_uses.iter().any(|u| u.video.is_none() && u.audio == [0,1]));
+    use prproj::convert::multicam::PreparedGroupAudio::Group;
+    assert!(p.input.multicam_uses.iter().any(|u| u.video.is_none() && u.audio == [Group(0), Group(1)]));
     assert!(p.input.multicam_uses.iter().all(|u| u.source_in == 8 * FRAME));
     let media = p.input.build_native_media_model().unwrap();
     assert_eq!(media.clips.len(), 2);
@@ -1556,7 +2300,172 @@ fn editable_multicam_resolves_independent_audio_order_and_refuses_unsupported_us
     let mut mixed_depth = g.clone();
     mixed_depth.media.iter_mut().find(|m| m.kind == StreamKind::Audio).unwrap().bits = Some(16);
     assert!(make(&mixed_depth).err().unwrap().0.contains("PCM24/48k"));
-    assert!(premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).err().unwrap().0.contains("multicam_native_route_required"));
+    assert!(premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).err().unwrap().0.contains("two original mono PCM24 siblings"));
+}
+
+#[test]
+fn linked_editable_multicam_uses_the_six_original_streams() {
+    use prproj::convert::{multicam::FRAME, writer::prepare_typed_project};
+
+    let mut g = fixed_audio_group();
+    let rate = Q::new(24000, 1001).unwrap();
+    for (i, m) in g.media.iter_mut().enumerate() {
+        let picture = m.kind == StreamKind::Video;
+        m.online = Some(true);
+        m.start = Some(Q::ZERO);
+        m.clock = Some(SourceClock {
+            effective_count: 0,
+            rate,
+            display_base: 24,
+            drop: false,
+            provenance: SourceClockProvenance {
+                origin_count: 0,
+                source_offset: 0,
+                source_rate: if picture { rate } else { q(48000) },
+                source_package: format!("physical package {i}"),
+                timecode_track: format!("TC1/{i}"),
+                route: "file_source_clip_to_physical_timecode_track".into(),
+            },
+        });
+        let descriptor = if picture {
+            v(vec![
+                ("compression", Value::Str("RI00".into())),
+                ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)])),
+            ])
+        } else {
+            v(vec![("channels", Value::Int(1))])
+        };
+        let facts = g.sidecars.iter_mut()
+            .find(|s| s.adapter == "avid.source" && s.object == m.id).unwrap();
+        facts.data = v(vec![
+            ("legacy_clock", clock(0, 24, false)),
+            ("file_package", Value::Str(format!("file package {i}"))),
+            ("descriptor_length", Value::Int(if picture { 60 } else { 120120 })),
+            ("descriptor", descriptor),
+            ("picture_coding", if picture { Value::Str("060E2B340401010D0401020271280000".into()) } else { Value::Null }),
+        ]);
+    }
+    let g = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let prepare_linked = |g: &SourceGraph, options: &Options| {
+        premiere_adapter::prepare_originals(g, options, ClockProfile::LegacyImport)
+    };
+    let input = prepare_linked(&g, &options()).unwrap().input;
+    assert_eq!(input.direct_dnxhr_origins.len(), 2);
+    let merged = Options { bin_mode: "merged".into(), ..options() };
+    assert!(prepare_linked(&g, &merged).err().unwrap().0.contains("Separate files"));
+    let mut missing = g.clone();
+    missing.media[5].bits = Some(16);
+    assert!(prepare_linked(&missing, &options()).err().unwrap().0.contains("two original mono PCM24 siblings"));
+
+    let dir = std::env::temp_dir().join(format!("anynle-linked-group-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir(&dir).unwrap();
+    let out = dir.join("Linked Group.prproj");
+    let mut ids = prproj::SeededUuids::new("synthetic-linked-group");
+    let ready = prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap();
+    assert!(!out.exists());
+    ready.publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    let project = prproj::model::Project::from_document(doc, &out).unwrap();
+    let tree = &project.doc.tree;
+    let paths: std::collections::HashSet<_> = tree.iter_tag(project.doc.root, "ActualMediaFilePath")
+        .map(|n| tree.text(n).unwrap()).collect();
+    assert_eq!(paths, g.media.iter().map(|m| m.locations[0].as_str()).collect());
+    let source = project.sequences().iter().copied()
+        .find(|&s| project.sequence_name(s) == "Synthetic Group").unwrap();
+    assert_eq!(project.sequence_end(source).unwrap().ticks, 63 * FRAME);
+    let audio = project.audio_tracks(source);
+    assert_eq!(audio.iter().map(|&t| project.is_muted(t).unwrap()).collect::<Vec<_>>(), [false,false,true,true]);
+    assert_eq!(tree.iter_tag(project.doc.root, "MonoToStereoPanProcessor").count(), 2);
+    assert_eq!(tree.iter_tag(project.doc.root, "SelectedTrackIndex")
+        .map(|n| tree.text(n).unwrap()).collect::<Vec<_>>(), ["1"]);
+
+    let mut ranged = g.clone();
+    let parent = ranged.items.iter().find(|i| i.id == "clip:camera-b").unwrap()
+        .umid.as_ref().unwrap().clone();
+    let range = |n: i64, start, end| v(vec![
+        ("id", Value::Str(format!("range:{n}"))),
+        ("mob", Value::Str(format!("{n:064X}"))),
+        ("name", Value::Str("Same range name".into())),
+        ("rate", Value::Str("24000/1001".into())),
+        ("backing_length", Value::Int(60)),
+        ("start", v(vec![("value", Value::Int(start))])),
+        ("end", v(vec![("value", Value::Int(end))])),
+        ("tracks", Value::Arr(vec![v(vec![
+            ("label", Value::Int(1)),
+            ("kind", Value::Int(1)),
+            ("component_class", Value::Str("SCLP".into())),
+            ("rate", Value::Str("24000/1001".into())),
+            ("length", Value::Int(60)),
+            ("target_mob", Value::Str(parent.clone())),
+            ("target_track", Value::Int(1)),
+            ("target_offset", Value::Int(0)),
+        ])])),
+    ]);
+    ranged.sidecars.push(Sidecar {
+        adapter: "avid.subclips".into(), object: ranged.bins[0].id.clone(),
+        data: Value::Arr(vec![range(1, 5, 13), range(2, 17, 29), range(3, 17, 61)]),
+    });
+    let ranged = SourceGraph::from_json_text(&ranged.to_json_text().unwrap()).unwrap();
+    let prepared = prepare_linked(&ranged, &options()).unwrap();
+    assert_eq!(prepared.input.picture_subclips.len(), 2);
+    assert!(prepared.losses.iter().any(|loss| loss.object == "range:3"
+        && loss.aspect == "subclip_bin_item" && loss.reason.contains("outside the usable backing range")));
+    let out = dir.join("Picture Subclips.prproj");
+    prepare_typed_project(&prepared.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    let project = prproj::model::Project::from_document(doc, &out).unwrap();
+    let ranges: Vec<_> = project.walk(project.root_item().unwrap()).into_iter()
+        .filter(|&item| project.item_name(item) == "Same range name")
+        .map(|item| (
+            project.media_element(item).unwrap().unwrap(),
+            project.subclip_in_point(item).unwrap().unwrap().ticks,
+            project.subclip_out_point(item).unwrap().unwrap().ticks,
+        )).collect();
+    assert_eq!(ranges.len(), 2);
+    let mut bounds: Vec<_> = ranges.iter().map(|&(_, a, b)| (a, b)).collect();
+    bounds.sort_unstable();
+    assert_eq!(bounds, [(5 * FRAME, 13 * FRAME), (17 * FRAME, 29 * FRAME)]);
+    assert_eq!(ranges[0].0, ranges[1].0);
+
+    use prproj::convert::multicam::PreparedGroupAudio::{Group, LinkedAlternate};
+    let mut switched = g.clone();
+    let alternate = switched.multicam_uses.iter_mut()
+        .find(|u| u.kind == StreamKind::Audio && u.track == 1).unwrap();
+    alternate.selected = Some(0); // Audio's alternate ordering differs from picture.
+    let occurrence = alternate.id.clone();
+    let binding = alternate.binding.placements[0].clone();
+    assert!(prepare_linked(&switched, &options()).err().unwrap().0.contains("contradicts the bound leaf"));
+    let placement = switched.sequences[0].placements.iter_mut()
+        .find(|p| p.id == binding).unwrap();
+    placement.item = "clip:camera-b".into();
+    placement.source_in = Q::new(8 * 1001, 24000).unwrap();
+    let prepared = prepare_linked(&switched, &options()).unwrap();
+    assert!(prepared.losses.iter().any(|l| l.object == occurrence && l.aspect == "group_audio_editability"));
+    assert!(prepared.input.multicam_uses.iter().any(|u| u.audio.contains(&LinkedAlternate(0))));
+    assert!(prepared.input.multicam_uses.iter().any(|u| u.audio.contains(&Group(1))));
+    let out = dir.join("Alternate Audio.prproj");
+    prepare_typed_project(&prepared.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    let project = prproj::model::Project::from_document(doc, &out).unwrap();
+    let sequence = project.sequences().into_iter()
+        .find(|&s| project.sequence_name(s) == switched.sequences[0].name).unwrap();
+    let audio = project.audio_tracks(sequence);
+    let a1 = project.track(audio[0]).clips[0];
+    let a2 = project.track(audio[1]).clips[0];
+    let a1_source = project.track_item_source(a1).unwrap();
+    let a2_source = project.track_item_source(a2).unwrap();
+    let camera_b = switched.items.iter().find(|item| item.id == "clip:camera-b").unwrap();
+    let alternate_path = switched.media.iter().find(|media| {
+        media.kind == StreamKind::Audio && media.stream == Some(1)
+            && camera_b.media.iter().any(|binding| binding.media == media.id)
+    }).unwrap().locations[0].as_str();
+    assert_eq!(project.item_media_path(a1_source), Some(alternate_path));
+    assert_eq!(project.item_name(a2_source), "Synthetic Group");
+    for item in [a1, a2] {
+        assert_eq!(project.in_point(item).unwrap().ticks, 8 * FRAME);
+        assert_eq!(project.out_point(item).unwrap().ticks, 18 * FRAME);
+    }
 }
 
 #[test]

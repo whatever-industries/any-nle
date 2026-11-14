@@ -54,11 +54,16 @@ pub(super) fn compare(
 }
 
 pub(super) fn compared_loss(t: &Timeline<'_>, loss: &Loss) -> bool {
-    loss.object == t.seq.id
-        && matches!(
-            (loss.aspect.as_str(), loss.reason.as_str()),
-            MAIN_BUS_LOSS | TRACK_MUTE_LOSS
-        )
+    if loss.object != t.seq.id {
+        return false;
+    }
+    match (loss.aspect.as_str(), loss.reason.as_str()) {
+        MAIN_BUS_LOSS | TRACK_MUTE_LOSS => true,
+        crate::source::mixer::FAIRLIGHT_LOSS =>
+            crate::linked::mixer::StaticFaders::prepare(t.graph, t.seq)
+                .is_ok_and(|faders| faders.pans != [0; 2]),
+        _ => false,
+    }
 }
 
 fn in_scope(t: &Timeline<'_>) -> bool {

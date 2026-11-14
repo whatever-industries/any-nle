@@ -12,6 +12,7 @@ mod volume;
 mod picture_extension;
 mod freeze;
 mod gain;
+mod submaster;
 pub(crate) use source_capture::{extract_source_paths, extract_source_files, extract_source_paths_observed};
 
 #[derive(Debug)]
@@ -212,6 +213,7 @@ enum Item {
         source: Option<source_capture::MasterMeta>,
     },
     Sequence(PendingSequence),
+    Subclip(crate::source::SourceSubclip),
     Group(crate::source::SourceGroup),
     GroupDependency { id: Option<MobId>, name: String },
     Skipped(Skipped),
@@ -277,7 +279,7 @@ fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture:
                     bin,
                     name,
                     source: source.map(|source| {
-                        let mut meta = source.master_meta(&ctx, mob, item_index, result.as_ref().ok());
+                        let mut meta = source.master_meta(&ctx, mob, item_index, result.as_ref().ok(), &cache.ambiguous);
                         meta.rendered_freeze = freeze.is_some();
                         meta
                     }),
@@ -288,6 +290,8 @@ fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture:
             (Some(MOB_COMPOSITION), Some(0)) => retain_item(&mut summary.items,source,Item::Sequence(
                 compile_sequence_inner(&ctx, bin, mob, &mut cache,
                     source.map(|source| source.sequence_capture(mob, item_index))))),
+            (Some(MOB_COMPOSITION), Some(2)) if source.is_some() =>
+                retain_item(&mut summary.items, source, Item::Subclip(source.unwrap().subclip(&ctx, mob, item_index))),
             (Some(MOB_COMPOSITION), Some(4)) if source.is_some() =>
                 retain_item(&mut summary.items, source, Item::Group(source.unwrap().group(&ctx, mob, item_index))),
             (Some(MOB_COMPOSITION), Some(5)) if source.is_some() =>
@@ -338,6 +342,7 @@ impl Project {
                     }
                 }
                 Item::Sequence(seq) => self.sequences.push(seq),
+                Item::Subclip(_) => unreachable!("subclip facts are enabled only for source extraction"),
                 Item::Group(_) => unreachable!("group facts are enabled only for source extraction"),
                 Item::GroupDependency { .. } => unreachable!("group facts are enabled only for source extraction"),
                 Item::Skipped(item) => self.out.skipped.push(item),
@@ -372,12 +377,14 @@ enum Op {
     Problem { position: i64, kind: i64, track: i64, message: String },
     PanVolume {
         before: usize, gain: Option<f64>, pans: [Option<f64>; 2],
-        automation: Option<volume::Capture>,
+        automation: Option<volume::Capture<crate::source::VolumePoint>>,
+        pan_automation: Option<volume::Capture<crate::source::PanPoint>>,
     },
     Color { before: usize, value: Arc<ColorCorrection> },
     Picture { before: usize, value: Arc<PictureEffect> },
     PictureExtension { before: usize, capture: picture_extension::Capture },
     PictureChain { before: usize, chain: picture_extension::OrderedChain },
+    PlainSubmaster { before: usize, length: i64, position: i64 },
     Matte { before: usize, length: i64, value: Arc<AniMatteData> },
     Combined { before: usize, group: usize, channel: usize },
 }
@@ -455,7 +462,7 @@ impl PendingSequence {
                         }
                     }
                 }
-                Op::PictureExtension { .. } | Op::PictureChain { .. } => {}
+                Op::PictureExtension { .. } | Op::PictureChain { .. } | Op::PlainSubmaster { .. } => {}
                 Op::Matte { before, length, value } => {
                     let produced = info.events.len() - starts[before];
                     for e in &mut info.events[starts[before]..] {
@@ -556,7 +563,7 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                                         if let Some(source) = &mut self.source { source.invalidate_position("transition length is absent"); }
                                     }
                                     if let Some(source) = &mut self.source {
-                                        let transition = source.transition(n, pos, self.kind, self.track, prior_owner.clone());
+                                        let transition = source.transition(ctx, n, pos, self.kind, self.track, prior_owner.clone());
                                         pending_transitions.push(transition);
                                     }
                                     if self.source.is_none(){ self.info.transitions.push(SeqTransition {
@@ -727,7 +734,7 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     via.push("timewarp parameters present (ramps not decoded; constant speed assumed)".into());
                 }
                 if let Some(source) = &mut self.source {
-                    source.query(self.ops.len(), input, Some(ratio), None);
+                    source.query_constant_speed(ctx, self.ops.len(), c, input, ratio);
                     if source.failed() { return; }
                 }
                 self.push_op(Op::Motion {
@@ -766,6 +773,17 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                 let effect = c.get("effect_id").and_then(Value::as_str).unwrap_or(c.type_name).to_string();
                 let tracks = ctx.tracks(c);
                 let mut inputs: Vec<&Node> = tracks.iter().filter_map(|t| ctx.deref(t.get("component"))).collect();
+                if self.kind == KIND_PICTURE && matches!(effect.as_str(), "EFF2_2DMATTE" | "EFF2_LUTSFX") {
+                    if let Some(source) = &mut self.source {
+                        source.unsupported_picture_effect(
+                            ctx, c, position, self.kind, self.track, &effect, &self.cache.ambiguous,
+                        );
+                        if effect == "EFF2_2DMATTE" {
+                            // A single surviving input cannot stand in for a composite.
+                            return self.problem(position, "Matte Key (EFF2_2DMATTE) not converted".into());
+                        }
+                    }
+                }
                 if self.source.is_some() && self.kind == KIND_PICTURE && text::kind(c).is_some() {
                     // The source capture retains the text occurrence independently of
                     // the media edit beneath it (including a filler-only title).
@@ -780,10 +798,10 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     return;
                 }
                 if &c.class == b"PVOL" && self.kind == KIND_SOUND {
-                    let automation = self.source.as_mut().and_then(|source| {
-                        source.capture_volume(ctx, c, &tracks, position)
+                    let (automation, pan_automation) = self.source.as_mut().map_or((None, None), |source| {
+                        source.capture_pvol(ctx, c, &tracks, position)
                     });
-                    if automation.is_some() {
+                    if automation.is_some() || pan_automation.is_some() {
                         inputs = tracks.iter().filter_map(|track| {
                             let input = ctx.deref(track.get("component"))?;
                             let control = input.class == *b"CTRL"
@@ -813,6 +831,7 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                             gain,
                             pans: [pan1, pan2],
                             automation,
+                            pan_automation,
                         });
                         return;
                     }
@@ -875,6 +894,11 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                                 Arc::new(PictureEffect {
                                     kind,
                                     params: color_params(ctx, c),
+                                    corner_pin: (self.source.is_some() && kind == PictureKind::Warp)
+                                        .then(|| picture_extension::static_projective_warp(ctx, c))
+                                        .flatten(),
+                                    compact_affine_warp: self.source.is_some() && kind == PictureKind::Warp
+                                        && picture_extension::compact_affine_warp(ctx, c),
                                 })
                             })
                             .clone();
@@ -940,6 +964,11 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                 }
                 match inputs.as_slice() {
                     [input] => {
+                        let plain_submaster = effect == submaster::EFFECT
+                            && self.kind == KIND_PICTURE && self.track == 1
+                            && self.source.as_ref().is_some_and(|source| source.direct_submaster())
+                            && submaster::plain_input(ctx, c, length);
+                        let before = self.ops.len();
                         let mut via = via.to_vec();
                         via.push(if &c.class == b"PVOL" {
                             format!(
@@ -950,7 +979,10 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                         } else {
                             format!("effect {} not converted", effect)
                         });
-                        self.component(input, position, &via, depth + 1)
+                        self.component(input, position, &via, depth + 1);
+                        if plain_submaster {
+                            self.push_op(Op::PlainSubmaster { before, length, position });
+                        }
                     }
                     [] => self.problem(position, format!("effect {} with no input clip ({} frames) not converted", effect, length)),
                     many => self.problem(position, format!("effect {} with {} inputs not converted", effect, many.len())),
@@ -1328,6 +1360,7 @@ mod tests {
             gain: Some(-6.0),
             pans: [Some(-100.0), Some(25.0)],
             automation: None,
+            pan_automation: None,
         });
         let mut routes = HashMap::new();
         routes.insert(
@@ -1406,6 +1439,7 @@ mod tests {
             gain: Some(-6.0),
             pans: [None, None],
             automation: None,
+            pan_automation: None,
         });
         // Both pieces of one source query receive the enclosing edit's settings.
         let info = sequence.finish(&project.routes);
@@ -1506,6 +1540,8 @@ mod tests {
                 value: Arc::new(PictureEffect {
                     kind,
                     params: ColorCorrection::default(),
+                    corner_pin: None,
+                    compact_affine_warp: false,
                 }),
             });
         }
@@ -1632,6 +1668,94 @@ mod tests {
     }
 
     #[test]
+    fn source_corner_pin_uses_full_image_edges_and_refuses_duplicate_controls() {
+        use crate::io::Uuid;
+        let mut file = file();
+        let mut controls = Vec::new();
+        for (code, value) in [
+            (0x812b, 0.0), (0x81a1, 0.5900000000000001), (0x81a2, 0.0),
+            (0x81a4, 0.0), (0x81d0, 0.0), (0x81ed, 1.0), (0x81fc, 255.0),
+            (0x821c, 0.0), (0x828e, 0.0), (0x820a, 1.0),
+            (0x820b, -400.0), (0x820c, 400.0), (0x820d, 300.0), (0x820e, 450.0),
+            (0x820f, 450.0), (0x8210, -300.0), (0x8211, -350.0), (0x8212, -450.0),
+            (0x81cb, 1.0), (0x81cc, -799.0), (0x81cd, 699.0),
+            (0x81ce, 839.0), (0x81cf, -759.0),
+        ] {
+            let mut control = node(*b"PRIT", "ParameterItem");
+            control.put("uuid", Value::Uuid(Uuid {
+                data1: 0x8d560000 | code,
+                data2: 0x847e,
+                data3: 0x11d5,
+                data4: [0x93, 0x5a, 0x50, 0xf8, 0x57, 0xc1, 0, 0],
+            }));
+            control.put("enable", Value::Bool(true));
+            control.put("value", Value::Float(value));
+            controls.push(Value::Ref(add(&mut file, control)));
+        }
+        let picture = source(&mut file, id(1), KIND_PICTURE, 1, 0, 10);
+        let Some(Object::Decoded(picture_node)) = &mut file.objects[picture as usize] else { unreachable!() };
+        picture_node.put("edit_rate", Value::Float(24.0));
+        let mut background = node(*b"FILL", "Filler");
+        background.put("media_kind_id", Value::Int(KIND_PICTURE));
+        background.put("length", Value::Int(10));
+        let background = add(&mut file, background);
+        let mut attrs = node(*b"ATTR", "Attributes");
+        attrs.put("entries", Value::Attrs(vec![
+            ("_EFFECT_PLUGIN_NAME".into(), Value::Str("3DWarp".into())),
+            ("_EFFECT_PLUGIN_PRODUCT_ID".into(), Value::Str("1cf8c0c4-8536-45ab-aace-02abfeed5fdd".into())),
+        ]));
+        let attrs = add(&mut file, attrs);
+        let mut parameters = node(*b"PRLS", "ParameterList");
+        parameters.put("items", Value::RefList(controls.clone()));
+        let parameters = add(&mut file, parameters);
+        let mut effect = node(*b"TKFX", "TrackEffect");
+        effect.put("effect_id", Value::Str("EFF2_SBLEND".into()));
+        effect.put("edit_rate", Value::Float(24.0));
+        effect.put("length", Value::Int(10));
+        effect.put("info_is_reversed", Value::Int(0));
+        effect.put("info_smooth", Value::Int(0));
+        effect.put("attributes", Value::Ref(attrs));
+        effect.put("param_list", Value::Ref(parameters));
+        effect.put("tracks", Value::List([(1, background), (2, picture)].map(|(label, child)| {
+            let mut track = node([0; 4], "Track");
+            track.put("index", Value::Int(label));
+            track.put("component", Value::Ref(child));
+            Value::Node(Box::new(track))
+        }).into()));
+        let ctx = Ctx { file: &file, mobs: HashMap::new() };
+        let pin = picture_extension::static_projective_warp(&ctx, &effect).unwrap();
+        assert_eq!(pin.corners[0], [0.5 - 400.0 / 999.0; 2]);
+        assert_eq!(pin.corners[2], [0.5 + 450.0 / 999.0, 0.5 + 300.0 / 999.0]);
+        assert_eq!(pin.crop, [200.0 / 1998.0, 160.0 / 1998.0, 300.0 / 1998.0, 240.0 / 1998.0]);
+        let mut flip = node(*b"TKFX", "TrackEffect");
+        flip.put("effect_id", Value::Str("EFF2_BLEND_FLIP_HORZ".into()));
+        flip.put("length", Value::Int(10));
+        flip.put("edit_rate", Value::Float(24.0));
+        flip.put("media_kind_id", Value::Int(KIND_PICTURE));
+        let mut track = node([0; 4], "Track");
+        track.put("component", Value::Ref(picture));
+        flip.put("tracks", Value::List(vec![Value::Node(Box::new(track))]));
+        let inner = add(&mut file, flip);
+        let mut stacked = effect.clone();
+        let Some(Value::List(tracks)) = effect.get("tracks") else { unreachable!() };
+        let mut tracks = tracks.clone();
+        let Value::Node(track) = &mut tracks[1] else { unreachable!() };
+        track.fields.iter_mut().find(|(key, _)| *key == "component").unwrap().1 = Value::Ref(inner);
+        stacked.fields.iter_mut().find(|(key, _)| *key == "tracks").unwrap().1 = Value::List(tracks);
+        let ctx = Ctx { file: &file, mobs: HashMap::new() };
+        assert_eq!(picture_extension::static_projective_warp(&ctx, &stacked), Some(pin));
+        let Some(Object::Decoded(flip)) = &mut file.objects[inner as usize] else { unreachable!() };
+        flip.fields.iter_mut().find(|(key, _)| *key == "edit_rate").unwrap().1 = Value::Float(25.0);
+        let ctx = Ctx { file: &file, mobs: HashMap::new() };
+        assert!(picture_extension::static_projective_warp(&ctx, &stacked).is_none());
+        controls[11] = controls[10].clone();
+        let Some(Object::Decoded(list)) = &mut file.objects[parameters as usize] else { unreachable!() };
+        list.fields[0].1 = Value::RefList(controls);
+        let ctx = Ctx { file: &file, mobs: HashMap::new() };
+        assert!(picture_extension::static_projective_warp(&ctx, &effect).is_none());
+    }
+
+    #[test]
     fn source_picture_chain_keeps_input_order_and_rejects_an_unresolved_second_input() {
         use crate::source::{PictureExtension, PictureStage};
 
@@ -1735,19 +1859,29 @@ mod tests {
 
     #[test]
     fn sequence_clock_requires_a_unique_direct_tc1_with_the_exact_record_rate() {
-        for (record_rate, label, rate, length, flags, duplicate, known) in [
-            (23.976, 1, 23.976, 100, 0, false, true),
-            (23.976, 2, 23.976, 100, 0, false, false),
-            (23.976, 1, 24.0, 100, 0, false, false),
-            (24.0, 1, 24.0, 100, 0, false, true),
-            (24.0, 1, 23.976, 100, 0, false, false),
-            (23.976, 1, 23.976, 99, 0, false, false),
-            (23.976, 1, 23.976, 100, 1, false, false),
-            (23.976, 1, 23.976, 100, 0, true, false),
+        for (record_rate, label, rate, length, fps, flags, count, duplicate, known) in [
+            (23.976, 1, 23.976, 100, 24, 0, 86400, false, true),
+            (23.976, 2, 23.976, 100, 24, 0, 86400, false, false),
+            (23.976, 1, 24.0, 100, 24, 0, 86400, false, false),
+            (24.0, 1, 24.0, 100, 24, 0, 86400, false, true),
+            (24.0, 1, 23.976, 100, 24, 0, 86400, false, false),
+            (23.976, 1, 23.976, 99, 24, 0, 86400, false, false),
+            (23.976, 1, 23.976, 100, 24, 1, 86400, false, false),
+            (23.976, 1, 23.976, 100, 24, 0, 86400, true, false),
+            (29.97, 1, 29.97, 100, 30, 1, 1795, false, true),
+            (29.97, 1, 29.97, 100, 30, 1, 2_589_407, false, true),
+            (29.97, 1, 29.97, 100, 30, 1, 2_589_408, false, false),
+            (29.97, 1, 30.0, 100, 30, 1, 1795, false, false),
+            (29.97, 1, 29.97, 100, 30, 3, 1795, false, false),
+            (29.97, 1, 29.97, 100, 24, 1, 1795, false, false),
+            (29.97, 1, 29.97, 100, 30, 1, 1795, true, false),
         ] {
             let mut f = file();
             let tc = marked_timecode(&mut f, *b"TCCP", Some(rate), length, None);
             let Object::Decoded(t) = f.objects[tc as usize].as_mut().unwrap() else { unreachable!() };
+            t.fields.retain(|(k, _)| !matches!(*k, "fps" | "start"));
+            t.put("fps", Value::Int(fps));
+            t.put("start", Value::Int(count));
             t.put("flags", Value::Int(flags));
             let alternate = marked_timecode(&mut f, *b"TCCP", Some(23.976), 100, None);
             let Object::Decoded(t) = f.objects[alternate as usize].as_mut().unwrap() else { unreachable!() };
@@ -1768,9 +1902,10 @@ mod tests {
             assert_eq!(
                 out.sequences[0].clock,
                 known.then(|| crate::source::SequenceClock {
-                    count: 86400,
+                    count: count as u64,
                     rate: crate::source::Rate::from_avid(record_rate).unwrap(),
-                    display_base: 24,
+                    display_base: fps as u16,
+                    drop: flags == 1,
                     track_ordinal: 1,
                 })
             );
@@ -2001,6 +2136,37 @@ mod tests {
         assert_eq!(seq.markers[0].binding.reason,None);
     }
     #[test]
+    fn source_subclips_preserve_saved_ranges_and_distinct_backing_references() {
+        use crate::source::Observed;
+        let mut f = file();
+        mob(&mut f, id(1), "Master", MOB_MASTER, 0, &[]);
+        for (number, start, end) in [(2, 11, Value::Int(21)), (3, 41, Value::Str("54".into()))] {
+            let component = source(&mut f, id(1), KIND_PICTURE, 1, 3, 100);
+            let subclip = mob(&mut f, id(number), "Same name", MOB_COMPOSITION, 2, &[(1, component)]);
+            let mut attrs = node(*b"ATTR", "Attributes");
+            attrs.put("entries", Value::Attrs(vec![("_START".into(), Value::Int(start)), ("_END".into(), end)]));
+            let attrs = add(&mut f, attrs);
+            let Some(Object::Decoded(subclip)) = &mut f.objects[subclip as usize] else { unreachable!() };
+            subclip.put("attributes", Value::Ref(attrs));
+        }
+        let reference = source(&mut f, id(2), KIND_PICTURE, 1, 11, 4);
+        mob(&mut f, id(4), "Timeline", MOB_COMPOSITION, 0, &[(1, reference)]);
+        let facts = source_project(&[f]);
+        let [first, second] = facts.subclips.as_slice() else { panic!("expected two subclips") };
+        assert_eq!(first.name, second.name);
+        assert_ne!(first.id, second.id);
+        assert_eq!((first.mob, second.mob), (Some(id(2)), Some(id(3))));
+        assert_eq!((first.backing_length, first.start.clone(), first.end.clone()),
+            (Some(100), Observed::Known(11), Observed::Known(21)));
+        assert_eq!(second.start, Observed::Known(41));
+        assert!(matches!(second.end, Observed::Unresolved(_)));
+        let [track] = first.tracks.as_slice() else { panic!("expected one track") };
+        assert_eq!((track.component_class, track.target_mob, track.target_track, track.target_offset),
+            (Some(*b"SCLP"), Some(id(1)), Some(1), Some(3)));
+        assert_eq!(facts.sequences[0].events[0].event.source_in, 14);
+        assert!(facts.skipped.is_empty());
+    }
+    #[test]
     fn source_paths_release_decoder_before_next_bin_and_limit_before_open(){
         use std::cell::Cell;use std::rc::Rc;
         struct Tracked{file:AvbFile,active:Rc<Cell<usize>>}
@@ -2039,6 +2205,38 @@ mod tests {
     }
 
     #[test]
+    fn imported_still_keeps_original_when_managed_master_is_unresolved() {
+        let mut f = file();
+        let mut locator = node(*b"FILE", "MacFileLocator");
+        locator.put("path_posix", Value::Str("/Synthetic/chart.png".into()));
+        let locator = add(&mut f, locator);
+        let mut settings = node(*b"ATTR", "Attributes");
+        settings.put("entries", Value::Attrs(vec![
+            ("_SRCFILE".into(), Value::Ref(locator)),
+            ("_IMPORTPICTSEQ".into(), Value::Int(0)),
+            ("_IGNOREALPHA".into(), Value::Int(1)),
+            ("_INVERTALPHA".into(), Value::Int(0)),
+        ]));
+        let settings = add(&mut f, settings);
+        let mut attrs = node(*b"ATTR", "Attributes");
+        attrs.put("entries", Value::Attrs(vec![("_IMPORTSETTING".into(), Value::Ref(settings))]));
+        let attrs = add(&mut f, attrs);
+        let file_mob = mob(&mut f, id(8), "Managed picture", MOB_SOURCE, 0, &[]);
+        let clip = source(&mut f, id(8), KIND_PICTURE, 1, 3, 20);
+        let master = mob(&mut f, id(2), "Imported still", MOB_MASTER, 0, &[(1, clip)]);
+        let Some(Object::Decoded(master)) = &mut f.objects[master as usize] else { unreachable!() };
+        master.put("attributes", Value::Ref(attrs));
+        let facts = source_project(std::slice::from_ref(&f));
+        let [still] = facts.imported_stills.as_slice() else { panic!("expected one imported still") };
+        assert_eq!((still.master, still.file_mob, still.track), (id(2), id(8), 1));
+        assert_eq!((still.file_in, still.source_length), (Some(3), Some(20)));
+        assert_eq!(still.import.locators, ["/Synthetic/chart.png"]);
+        assert_eq!(still.import.ignore_alpha, Some(true));
+        item(&mut f, file_mob);
+        assert!(source_project(&[f]).imported_stills.is_empty());
+    }
+
+    #[test]
     fn source_master_absence_and_known_zero_offsets_are_distinct(){
         let mut f=file();let master=mob(&mut f,id(1),"Master",MOB_MASTER,0,&[]);
         let known=source_project(std::slice::from_ref(&f));assert_eq!(known.masters[0].offsets,vec![crate::source::Observed::Known(0)]);
@@ -2065,6 +2263,106 @@ mod tests {
         mob(&mut f,id(3),"Unqualified span",MOB_COMPOSITION,0,&[(1,effect)]);mob(&mut f,id(1),"Master",MOB_MASTER,0,&[]);
         let out=source_project(&[f]);assert!(out.sequences[0].events.is_empty());
         assert!(out.sequences[0].unresolved.iter().any(|i|i.reason.contains("enclosing component span")));
+    }
+
+    #[test]
+    fn source_matte_key_keeps_distinct_occurrences_without_using_a_partial_input() {
+        use crate::source::{MatteBackground, Observed, SourceIssueKind};
+
+        let mut f = file();
+        let leaf = source(&mut f, id(1), KIND_PICTURE, 1, 0, 10);
+        let effect = |f: &mut AvbFile, effect_id: &str, refs: &[u32]| {
+            let mut node = node(*b"TKFX", "TrackEffect");
+            node.put("media_kind_id", Value::Int(KIND_PICTURE));
+            node.put("length", Value::Int(10));
+            node.put("effect_id", Value::Str(effect_id.into()));
+            node.put("tracks", Value::List(refs.iter().enumerate().map(|(i, &reference)| {
+                let mut track = self::node([0; 4], "Track");
+                track.put("index", Value::Int(i as i64 + 1));
+                track.put("component", Value::Ref(reference));
+                Value::Node(Box::new(track))
+            }).collect()));
+            add(f, node)
+        };
+        let alpha = source(&mut f, id(1), KIND_PICTURE, 2, 2, 10);
+        marker_on(&mut f, alpha, Some(2));
+        for input in [leaf, alpha] {
+            let Some(Object::Decoded(input)) = &mut f.objects[input as usize] else { unreachable!() };
+            input.put("edit_rate", Value::Float(25.0));
+        }
+        let mut matte_sequence = node(*b"SEQU", "Sequence");
+        matte_sequence.put("media_kind_id", Value::Int(KIND_PICTURE));
+        matte_sequence.put("components", Value::RefList(vec![Value::Ref(alpha)]));
+        let matte_sequence = add(&mut f, matte_sequence);
+        let full = effect(&mut f, "EFF2_2DMATTE", &[leaf, leaf, matte_sequence]);
+        let partial = effect(&mut f, "EFF2_2DMATTE", &[leaf, 50_000, 50_001]);
+        let nested = effect(&mut f, "unknown enclosing effect", &[full]);
+        let adapter = effect(&mut f, "EFF2_LUTSFX", &[leaf]);
+        let seq = segments(&mut f, KIND_PICTURE, &[full, partial, nested, adapter, leaf]);
+        mob(&mut f, id(2), "Matte", MOB_COMPOSITION, 0, &[(1, seq)]);
+        let master = mob(&mut f, id(1), "Master", MOB_MASTER, 0, &[]);
+        let mut original = node(*b"FILE", "MacFileLocator");
+        for field in ["path_posix", "path_utf8"] {
+            original.put(field, Value::Str("/Synthetic/alpha.png".into()));
+        }
+        let original = add(&mut f, original);
+        let mut settings = node(*b"ATTR", "Attributes");
+        settings.put("entries", Value::Attrs(vec![
+            ("_IGNOREALPHA".into(), Value::Int(0)),
+            ("_INVERTALPHA".into(), Value::Int(1)),
+            ("_SRCFILE".into(), Value::Ref(original)),
+        ]));
+        let settings = add(&mut f, settings);
+        let mut attrs = node(*b"ATTR", "Attributes");
+        attrs.put("entries", Value::Attrs(vec![("_IMPORTSETTING".into(), Value::Ref(settings))]));
+        let attrs = add(&mut f, attrs);
+        let Some(Object::Decoded(master)) = &mut f.objects[master as usize] else { unreachable!() };
+        master.put("attributes", Value::Ref(attrs));
+
+        let out = source_project(std::slice::from_ref(&f));
+        let s = &out.sequences[0];
+        let [first, partial, nested, adapter] = s.unresolved.as_slice() else {
+            panic!("expected three Matte Key issues and one Color Adapter issue: {:?}", s.unresolved);
+        };
+        assert_eq!(first.issue_kind, SourceIssueKind::MatteKey { length: Some(10) });
+        assert_eq!(first.picture_profile, None);
+        assert_eq!(first.record_start, Observed::Known(0));
+        let inputs = first.matte_inputs.unwrap();
+        assert_eq!(inputs.background, MatteBackground::Explicit);
+        let fill = inputs.fill.unwrap();
+        let matte = inputs.matte.unwrap();
+        assert_eq!((fill.mob, fill.track, fill.start), (id(1), 1, 0));
+        assert_eq!((matte.mob, matte.track, matte.start), (id(1), 2, 2));
+        let import = first.matte_import.as_ref().unwrap();
+        assert_eq!((import.ignore_alpha, import.invert_alpha), (Some(false), Some(true)));
+        assert_eq!(import.locators, ["/Synthetic/alpha.png"]);
+        assert_eq!(partial.issue_kind, first.issue_kind);
+        assert_eq!(partial.record_start, Observed::Known(10));
+        let inputs = partial.matte_inputs.unwrap();
+        assert!(inputs.fill.is_none() && inputs.matte.is_none());
+        assert!(partial.matte_import.is_none());
+        assert_ne!(first.owner, partial.owner);
+        assert_eq!(nested.issue_kind, SourceIssueKind::MatteKey { length: None });
+        assert!(matches!(nested.record_start, Observed::Unresolved(_)));
+        assert_eq!(adapter.issue_kind, SourceIssueKind::ColorAdapter { length: Some(10) });
+        assert_eq!(adapter.picture_profile, None);
+        assert_eq!(adapter.record_start, Observed::Known(30));
+        let [adapted, plain] = s.events.as_slice() else { panic!("expected the adapted input and the plain edit") };
+        assert_eq!(adapted.range.as_ref().unwrap().record_start, 30);
+        assert_eq!(plain.range.as_ref().unwrap().record_start, 40);
+        let [marker] = s.markers.as_slice() else { panic!("expected only the direct matte marker") };
+        assert_eq!(marker.record_frame, Some(2));
+        assert_eq!(marker.owner, format!("{}/matte-input", first.owner));
+        assert!(marker.binding.placements.is_empty());
+        assert!(marker.binding.reason.is_some());
+
+        let Some(Object::Decoded(settings)) = &mut f.objects[settings as usize] else { unreachable!() };
+        let Some((_, Value::Attrs(entries))) = settings.fields.first_mut() else { unreachable!() };
+        entries.push(("_INVERTALPHA".into(), Value::Int(0)));
+        let out = source_project(&[f]);
+        let import = out.sequences[0].unresolved[0].matte_import.as_ref().unwrap();
+        assert_eq!((import.ignore_alpha, import.invert_alpha), (Some(false), None));
+        assert_eq!(import.locators, ["/Synthetic/alpha.png"]);
     }
 
     #[test]

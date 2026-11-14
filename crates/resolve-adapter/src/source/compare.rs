@@ -379,12 +379,12 @@ fn compare_timelines(left: &Timeline<'_>, right: &Timeline<'_>, diff: &mut Diff)
             compared_audio_right.insert(b.id.as_str());
         }
     }
-    let a_dissolve = dissolve::prepare(left.graph, a);
-    let b_dissolve = dissolve::prepare(right.graph, b);
+    let a_dissolve = dissolve::prepare_all_native(left.graph, a);
+    let b_dissolve = dissolve::prepare_all_native(right.graph, b);
     report_losses(
         left,
         "left",
-        a_dissolve.as_ref().ok().and_then(Option::as_ref),
+        a_dissolve.as_deref().unwrap_or_default(),
         compared_mixer,
         &left_nests,
         &multicam.left_gaps,
@@ -394,14 +394,14 @@ fn compare_timelines(left: &Timeline<'_>, right: &Timeline<'_>, diff: &mut Diff)
     report_losses(
         right,
         "right",
-        b_dissolve.as_ref().ok().and_then(Option::as_ref),
+        b_dissolve.as_deref().unwrap_or_default(),
         compared_mixer,
         &right_nests,
         &multicam.right_gaps,
         &compared_audio_right,
         diff,
     );
-    compare_transition(left, a_dissolve, right, b_dissolve, &pairs, &scope, diff);
+    compare_transitions(a_dissolve, b_dissolve, &pairs, &scope, diff);
     known(
         diff,
         "timeline_markers",
@@ -414,7 +414,7 @@ fn compare_timelines(left: &Timeline<'_>, right: &Timeline<'_>, diff: &mut Diff)
 fn report_losses(
     t: &Timeline<'_>,
     side: &str,
-    transition: Option<&dissolve::Dissolve>,
+    transitions: &[dissolve::SourceDissolve<'_>],
     compared_mixer: bool,
     compared_nests: &HashSet<&str>,
     proven_angle_gaps: &HashSet<&str>,
@@ -424,7 +424,9 @@ fn report_losses(
     for loss in &t.losses {
         let signature = (loss.aspect.as_str(), loss.reason.as_str());
         if matches!(signature, audio::KEY_LOSS | audio::FADE_LOSS | audio::CUSTOM_FADE_LOSS | audio::KEYED_FADE_LOSS)
-            || transition.is_some_and(|value| value.recover(loss, &t.seq.id))
+            || signature == audio::FRACTIONAL_FADE_LOSS
+                && compared_audio.contains(loss.object.as_str())
+            || transitions.iter().any(|value| value.prepared.recover(loss, &t.seq.id))
             // The dedicated comparisons report these saved values or give a
             // specific gap. These generic losses only concern destination writing.
             || TrackState::recover(loss, &t.seq.id)
@@ -910,11 +912,9 @@ fn markers(t: &Timeline<'_>) -> Option<Json> {
     )
 }
 
-fn compare_transition(
-    left: &Timeline<'_>,
-    a: Result<Option<dissolve::Dissolve>>,
-    right: &Timeline<'_>,
-    b: Result<Option<dissolve::Dissolve>>,
+fn compare_transitions(
+    a: Result<Vec<dissolve::SourceDissolve<'_>>>,
+    b: Result<Vec<dissolve::SourceDissolve<'_>>>,
     pairs: &[(&Placement, &Placement)],
     scope: &Json,
     diff: &mut Diff,
@@ -925,52 +925,53 @@ fn compare_transition(
             diff.gap(
                 "transition",
                 scope,
-                "a saved transition is outside the qualified Cross Dissolve profile",
+                "a saved transition is outside the qualified Resolve profiles",
             );
             return;
         }
     };
-    let summary = |value: Option<dissolve::Dissolve>| {
-        value.map_or(Json::Null, |d| {
-            json!({"kind":d.type_label(), "track":1, "cut_frames":d.cut,
-            "duration_frames":dissolve::DURATION, "alignment":d.alignment()})
-        })
-    };
-    let both = a.is_some() && b.is_some();
-    diff.change("transition", scope, summary(a), summary(b));
-    if !both {
+    if a.len() <= 1 && b.len() <= 1 {
+        compare_transition(a.first(), b.first(), pairs, scope, diff);
         return;
     }
-    for key in ["outgoing", "incoming"] {
-        if let (Some(a), Some(b)) = (endpoint(left, key), endpoint(right, key)) {
-            if pairs.iter().any(|(l, r)| l.id == a && r.id == b) {
-                continue;
-            }
-            if let Some((_, expected)) = pairs.iter().find(|(l, _)| l.id == a) {
-                diff.change(
-                    &format!("transition.{key}"),
-                    scope,
-                    json!(expected.id),
-                    json!(b),
-                );
-                continue;
-            }
-        }
-        diff.gap(
-            &format!("transition.{key}"),
-            scope,
-            "transition endpoint has no corresponding edit",
-        );
+    for audio in [false, true] {
+        let left = a.iter().find(|row| row.prepared.audio == audio);
+        let right = b.iter().find(|row| row.prepared.audio == audio);
+        let mut context = scope.clone();
+        context["track_kind"] = json!(if audio { "audio" } else { "video" });
+        compare_transition(left, right, pairs, &context, diff);
     }
 }
 
-fn endpoint<'a>(t: &Timeline<'a>, key: &str) -> Option<&'a str> {
-    let Value::Arr(rows) = t.graph.sidecar(dissolve::ADAPTER, &t.seq.id)? else {
-        return None;
+fn compare_transition(
+    left: Option<&dissolve::SourceDissolve<'_>>,
+    right: Option<&dissolve::SourceDissolve<'_>>,
+    pairs: &[(&Placement, &Placement)],
+    scope: &Json,
+    diff: &mut Diff,
+) {
+    let summary = |value: Option<&dissolve::SourceDissolve<'_>>| {
+        value.map_or(Json::Null, |row| {
+            let d = &row.prepared;
+            json!({"kind":d.type_label(), "track":1, "cut_frames":d.cut,
+                "duration_frames":dissolve::DURATION, "alignment":d.alignment()})
+        })
     };
-    match rows.first()?.get(key)? {
-        Value::Str(id) => Some(id),
-        _ => None,
+    diff.change("transition", scope, summary(left), summary(right));
+    let (Some(left), Some(right)) = (left, right) else { return };
+    for (key, a, b) in [
+        ("outgoing", left.outgoing, right.outgoing),
+        ("incoming", left.incoming, right.incoming),
+    ] {
+        if let Some((_, expected)) = pairs.iter().find(|(l, _)| l.id == a) {
+            diff.change(&format!("transition.{key}"), scope, json!(expected.id), json!(b));
+        } else {
+            diff.gap(
+                &format!("transition.{key}"),
+                scope,
+                "transition endpoint has no corresponding edit",
+            );
+        }
     }
 }
 

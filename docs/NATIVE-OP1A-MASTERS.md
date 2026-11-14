@@ -22,13 +22,12 @@ any-nle convert --from avid BIN.avb --media SOURCE_FOLDER --to premiere OUTPUT.p
 ```
 
 The macOS picker can be replaced with `--rewrap-op1a NEW_MEDIA_DIRECTORY` for scripts.
-The exact notice is **Creates new media.** `--rewrap-native-master` is explicit, experimental
-and off by default in the CLI. It replaces Grouped/Merged/Separate construction for that run;
-omit `--bin-mode`. Other policy choices still apply. The complete wizard remains planned.
-Its Avid → Premiere clip menu will put **OP1a rewrap first and select it by default**
-for new/reset settings (User, 2026-11-05), followed by Grouped, Merged and Separate.
-That choice uses this native AV-master route and the output-folder/space review;
-explicitly remembered choices and presets remain respected. See the
+The exact notice is **Creates new media.** `--rewrap-native-master` is explicit
+and off by default in the CLI. It replaces Grouped, Merged, or Separate
+construction for that run, so omit `--bin-mode`. Other policy choices still apply.
+In the wizard, **Rewrap to native clips** is the default for new or reset
+settings. It uses this AV-master route with an output-folder and space review.
+Saved choices and presets still apply. See the
 [menu and review contract](MEDIA-REWRAP.md#import-option-and-review).
 
 ## Logical configuration and placement

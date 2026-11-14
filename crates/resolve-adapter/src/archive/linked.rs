@@ -629,6 +629,10 @@ fn write_timeline(
         Mixer::decode(&fields)?
             .ok_or("missing qualified Fairlight mixer in timeline template")?
             .write_direct(donors.fairlight, mixer)?
+    } else if timeline.faders != Default::default() {
+        Mixer::decode(&fields)?
+            .ok_or("missing static Fairlight fader template")?
+            .write_linked_faders(timeline.faders)?
     } else {
         fields
     };
@@ -694,9 +698,9 @@ fn write_timeline(
         let mut list = String::from("<Items>");
         for edit in &timeline.lanes[lane] {
             if let Some(dissolve) = timeline
-                .dissolve
-                .as_ref()
-                .filter(|dissolve| lane == usize::from(dissolve.audio) && edit.start == dissolve.cut)
+                .dissolves
+                .iter()
+                .find(|dissolve| lane == usize::from(dissolve.audio) && edit.start == dissolve.cut)
             {
                 write_dissolve(&mut list, timeline.origin, dissolve);
             }
@@ -798,19 +802,23 @@ fn write_timeline(
         list.push_str("</Items>");
         container.replace_range(span, &list);
     }
-    if let Some(state) = &timeline.track_state {
+    if timeline.track_state.is_some() || timeline.faders.muted != [false; 2] {
+        let neutral = crate::track_state::TrackState(Default::default());
+        let state = timeline.track_state.as_ref().unwrap_or(&neutral);
         let pattern = blocks("Sm2TiTrack")?;
         let spans: Vec<_> = pattern.find_iter(&container).map(|row| row.range()).collect();
         if spans.len() != state.0.len() {
             return Err("unexpected Resolve track-state template layout".into());
         }
-        for (span, track) in spans.into_iter().zip(&state.0).rev() {
+        for ((span, track), muted) in spans.into_iter().zip(&state.0)
+            .zip([false, timeline.faders.muted[0], timeline.faders.muted[1]]).rev()
+        {
             let mut xml_track = container[span.clone()].to_owned();
             let at = xml_track.find("<Items").ok_or("missing Resolve track items")?;
-            if track.locked || track.disabled {
+            if track.locked || track.disabled || muted {
                 let mut head = xml_track[..at].to_owned();
                 let flags: u32 = tag(&head, "Flags")?.parse()?;
-                let flags = flags | u32::from(track.locked) | (u32::from(track.disabled) << 1);
+                let flags = flags | u32::from(track.locked) | (u32::from(track.disabled || muted) << 1);
                 set(&mut head, "Flags", &flags.to_string())?;
                 xml_track.replace_range(..at, &head);
             }
@@ -1259,9 +1267,11 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             }
             _ => return Err("generated Resolve nested use count differs from preparation".into()),
         }
-        let saved = dissolve::prepare(&graph, read)?;
-        let window = |dissolve: &Dissolve| (dissolve.audio, dissolve.window());
-        if saved.as_ref().map(window) != timeline.dissolve.as_ref().map(window) {
+        let saved = dissolve::prepare_all_native(&graph, read)?;
+        if saved.len() != timeline.dissolves.len() || !timeline.dissolves.iter().all(|expected| {
+            saved.iter().any(|actual| actual.prepared.audio == expected.audio
+                && actual.prepared.cut == expected.cut && actual.prepared.before == expected.before)
+        }) {
             return Err("generated Resolve dissolve differs from preparation".into());
         }
         dissolves.push(saved);
@@ -1444,6 +1454,9 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                 format!("generated Fairlight mixer disagrees with {}", timeline.name).into(),
             );
         }
+        if crate::linked::mixer::StaticFaders::prepare(&graph, read)? != timeline.faders {
+            return Err(format!("generated Fairlight faders disagree with {}", timeline.name).into());
+        }
         if let Some(group) = &timeline.group {
             let id = ids
                 .group
@@ -1583,9 +1596,10 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             .zip(&dissolves)
             .any(|((timeline, read), dissolve)| {
                 timeline.mixer.is_some() && DirectMixer::recover(loss, &read.id)
+                    || timeline.faders.recover(loss, &read.id)
                     || timeline.track_state.is_some() && crate::track_state::TrackState::recover(loss, &read.id)
                     || timeline.marks.is_some() && crate::timeline_marks::TimelineMarks::recover(loss, &read.id)
-                    || dissolve.as_ref().is_some_and(|d| d.recover(loss, &read.id))
+                    || dissolve.iter().any(|d| d.prepared.recover(loss, &read.id))
                     || crate::nests::recover_empty_stereo(&graph, loss, &read.id)
             })
     })

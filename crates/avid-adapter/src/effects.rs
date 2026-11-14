@@ -6,6 +6,31 @@ use sha2::{Digest, Sha256};
 
 const INLINE_EFFECT_BYTES: usize = 4096;
 
+fn corner_pin_points(corners: [[f64; 2]; 4]) -> Value {
+    Value::Arr(corners.map(|point| Value::Arr(point.map(Value::Float).into())).into())
+}
+
+fn corner_pin_effect(pin: avid_reader::transform::CornerPin) -> Effect {
+    let mut params = vec![("target_corners_tl_tr_br_bl", corner_pin_points(pin.corners))];
+    if pin.crop != [0.0; 4] {
+        params.push(("source_crop_ltrb", Value::Arr(pin.crop.map(Value::Float).into())));
+    }
+    Effect {
+        kind: "picture.corner_pin".into(),
+        params: obj(params),
+    }
+}
+
+pub(super) fn apply_corner_pin(
+    pin: avid_reader::transform::CornerPin, p: &mut Placement, budget: &mut Budget,
+) -> Result<(), String> {
+    let effect = corner_pin_effect(pin);
+    budget.value(&effect.params)?;
+    budget.charge(size_of::<Effect>() + effect.kind.len())?;
+    p.effects.push(effect);
+    Ok(())
+}
+
 pub(super) fn apply_picture_extension(
     effect: PictureExtension, raster: Option<(i64, i64)>, p: &mut Placement,
     out: &mut ReadResult, budget: &mut Budget,
@@ -35,6 +60,23 @@ fn picture_extension(
                 return Err("Flip with another translated effect requires effect ordering qualification");
             }
             return Ok(graph::picture_chain::Reflection { horizontal, vertical }.effect());
+        }
+        PictureExtension::WarpRoll { keys, interpolation } => {
+            if raster != Some((1920, 1080)) || transform.is_some() || has_effects {
+                return Err("Animated Warp Rotation requires isolated 1080p picture");
+            }
+            let keys = keys.map(|k| obj(vec![
+                ("frame", Value::Int(k.frame)), ("x", Value::Float(k.x)),
+                ("width", Value::Float(k.width)), ("rotation", Value::Float(k.rotation)),
+            ]));
+            use avid_reader::source::WarpRollInterpolation;
+            let kind = match interpolation {
+                WarpRollInterpolation::Linear => "avid.warp_roll_linear",
+                WarpRollInterpolation::Shelf => "avid.warp_roll_shelf",
+                WarpRollInterpolation::Bezier => "avid.warp_roll_bezier",
+                WarpRollInterpolation::Spline => "avid.warp_roll_spline",
+            };
+            (kind, obj(vec![("keys", Value::Arr(keys.into()))]))
         }
         PictureExtension::WarpTrim(trim) | PictureExtension::ResizeTrim(trim) => {
             let resize = matches!(effect, PictureExtension::ResizeTrim(_));
@@ -129,6 +171,14 @@ pub(super) fn apply_picture_chain(
     let mut losses = Vec::new();
     for stage in chain {
         let (effect, transform) = match stage {
+            PictureStage::Static(picture) if picture.corner_pin.is_some() => {
+                let pin = picture.corner_pin.unwrap();
+                if !square_pixels || raster != Some((1920, 1080)) {
+                    return loss(out, budget, &p.id, "picture_effect",
+                        "Ordered projective 3D Warp requires verified square-pixel 1080p picture");
+                }
+                (corner_pin_effect(pin), None)
+            }
             PictureStage::Static(picture) => {
                 let t = picture.interpret();
                 losses.extend(t.not_converted);
@@ -183,43 +233,86 @@ pub(super) fn apply_picture_chain(
     Ok(())
 }
 
+/// Static projective stages may not be the event's innermost saved picture
+/// effect. Keep their original controls at their actual chain indices.
+pub(super) fn projective_stage_receipt(
+    chain: &[PictureStage],
+) -> Vec<Value> {
+    projective_stages(chain).map(|(i, picture)| {
+        obj(vec![
+            ("stage", Value::Int(i as i64)),
+            ("controls", picture_receipt(picture, true)),
+        ])
+    }).collect()
+}
+
+fn projective_stages(
+    chain: &[PictureStage],
+) -> impl Iterator<Item = (usize, &avid_reader::transform::PictureEffect)> {
+    chain.iter().enumerate().filter_map(|(i, stage)| match stage {
+        PictureStage::Static(picture) if picture.corner_pin.is_some() => Some((i, picture.as_ref())),
+        _ => None,
+    })
+}
+
 /// Original owned parser facts. These are opaque witnesses, not additional interpretations.
-pub(super) fn receipt(event: &SeqEvent) -> Value {
-    fn params(cc: &avid_reader::color::ColorCorrection) -> Value {
-        Value::Arr(
-            cc.params
-                .iter()
-                .map(|(id, value)| {
-                    obj(vec![
-                        ("id", s(id)),
-                        (
-                            "value",
-                            match value {
-                                ParamValue::Int(n) => obj(vec![("int", Value::Int(*n))]),
-                                ParamValue::Float(n) => obj(vec![
-                                    ("float", raw_float(*n)),
-                                    ("float_bits", s(format!("{:016x}", n.to_bits()))),
-                                ]),
-                                ParamValue::Bytes(b) => {
-                                    let mut fields = vec![
-                                        ("byte_count", Value::Int(b.len() as i64)),
-                                        ("sha256", s(hex::encode(Sha256::digest(b)))),
-                                    ];
-                                    if b.len() <= INLINE_EFFECT_BYTES {
-                                        fields.push(("bytes_hex", s(hex::encode_upper(b))));
-                                    }
-                                    obj(fields)
+fn params(cc: &avid_reader::color::ColorCorrection) -> Value {
+    Value::Arr(
+        cc.params
+            .iter()
+            .map(|(id, value)| {
+                obj(vec![
+                    ("id", s(id)),
+                    (
+                        "value",
+                        match value {
+                            ParamValue::Int(n) => obj(vec![("int", Value::Int(*n))]),
+                            ParamValue::Float(n) => obj(vec![
+                                ("float", raw_float(*n)),
+                                ("float_bits", s(format!("{:016x}", n.to_bits()))),
+                            ]),
+                            ParamValue::Bytes(b) => {
+                                let mut fields = vec![
+                                    ("byte_count", Value::Int(b.len() as i64)),
+                                    ("sha256", s(hex::encode(Sha256::digest(b)))),
+                                ];
+                                if b.len() <= INLINE_EFFECT_BYTES {
+                                    fields.push(("bytes_hex", s(hex::encode_upper(b))));
                                 }
-                                ParamValue::Other => {
-                                    obj(vec![("uninterpreted", Value::Bool(true))])
-                                }
-                            },
-                        ),
-                    ])
-                })
-                .collect(),
-        )
+                                obj(fields)
+                            }
+                            ParamValue::Other => {
+                                obj(vec![("uninterpreted", Value::Bool(true))])
+                            }
+                        },
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn picture_receipt(p: &avid_reader::transform::PictureEffect, nested: bool) -> Value {
+    let mut fields = vec![
+        ("kind", s(match p.kind {
+            avid_reader::transform::Kind::Resize => "resize",
+            avid_reader::transform::Kind::Warp => "warp",
+        })),
+        ("params", params(&p.params)),
+        ("nested", Value::Bool(nested)),
+    ];
+    if let Some(pin) = p.corner_pin {
+        let name = if pin.from_transform { "projected_corners" } else { "corner_pin" };
+        fields.push((name, obj(vec![
+            ("reference_canvas", Value::Arr(vec![Value::Int(1920), Value::Int(1080)])),
+            ("target_corners_tl_tr_br_bl", corner_pin_points(pin.corners)),
+            ("source_crop_ltrb", Value::Arr(pin.crop.into_iter().map(Value::Float).collect())),
+        ])));
     }
+    obj(fields)
+}
+
+pub(super) fn receipt(event: &SeqEvent) -> Value {
     let point = |p: &avid_reader::animatte::AniMattePoint| {
         obj(vec![
             ("xy", Value::Arr(p.xy.into_iter().map(raw_float).collect())),
@@ -244,19 +337,7 @@ pub(super) fn receipt(event: &SeqEvent) -> Value {
             event
                 .picture
                 .as_ref()
-                .map(|p| {
-                    obj(vec![
-                        (
-                            "kind",
-                            s(match p.kind {
-                                avid_reader::transform::Kind::Resize => "resize",
-                                avid_reader::transform::Kind::Warp => "warp",
-                            }),
-                        ),
-                        ("params", params(&p.params)),
-                        ("nested", Value::Bool(event.picture_nested)),
-                    ])
-                })
+                .map(|p| picture_receipt(p, event.picture_nested))
                 .unwrap_or(Value::Null),
         ),
         (
@@ -349,21 +430,34 @@ pub(super) fn receipt(event: &SeqEvent) -> Value {
         ),
     ])
 }
-pub(super) fn reserve_receipt(event: &SeqEvent, budget: &mut Budget) -> Result<(), String> {
+fn reserve_parameter_receipt(
+    cc: &avid_reader::color::ColorCorrection, budget: &mut Budget,
+) -> Result<(), String> {
+    for (id, v) in &cc.params {
+        budget.charge(1024 + id.len())?;
+        if let ParamValue::Bytes(b) = v {
+            budget.charge(if b.len() <= INLINE_EFFECT_BYTES { b.len() * 2 } else { 0 })?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn reserve_receipt(event: &avid_reader::source::SourceEvent, budget: &mut Budget) -> Result<(), String> {
+    for (_, picture) in projective_stages(&event.picture_chain) {
+        budget.charge(2048 + size_of::<Value>())?;
+        reserve_parameter_receipt(&picture.params, budget)?;
+    }
+    let event = &event.event;
     budget.charge(2048)?;
+    if event.picture.as_ref().is_some_and(|p| p.corner_pin.is_some()) {
+        budget.charge(1024)?;
+    }
     for cc in event
         .color
         .iter()
         .chain(event.picture.iter().map(|p| &p.params))
     {
-        for (id, v) in &cc.params {
-            budget.charge(1024 + id.len())?;
-            if let ParamValue::Bytes(b) = v {
-                budget.charge(
-                    if b.len() <= INLINE_EFFECT_BYTES { b.len() * 2 } else { 0 },
-                )?;
-            }
-        }
+        reserve_parameter_receipt(cc, budget)?;
     }
     if let Some(a) = &event.animatte {
         for st in &a.states {
@@ -463,6 +557,10 @@ pub(super) fn apply(
         }
         for reason in t.not_converted {
             loss(out, budget, &p.id, "transform", reason)?;
+        }
+        if fx.corner_pin.is_some() {
+            loss(out, budget, &p.id, "picture_effect",
+                "3D Warp projective geometry is retained in the Avid source receipt for this edit")?;
         }
         if event.picture_nested {
             loss(

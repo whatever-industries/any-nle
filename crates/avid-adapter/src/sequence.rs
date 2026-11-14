@@ -165,6 +165,62 @@ fn automatic_adapter_picture_and_sound_use_separate_native_clocks() {
     assert_eq!(start, 100_002);
     assert_eq!(1104 * 2000 - (2_306_304 - start), 1698);
 }
+fn extend_effect_issue(issue: &av::SourceIssue, fields: &mut Vec<(&str, Value)>) {
+    let (id, length) = match issue.issue_kind {
+        av::SourceIssueKind::MatteKey { length } => ("EFF2_2DMATTE", length),
+        av::SourceIssueKind::ColorAdapter { length } => ("EFF2_LUTSFX", length),
+        _ => return,
+    };
+    fields.push(("effect_id", s(id)));
+    fields.push(("record_length", length.map(Value::Int).unwrap_or(Value::Null)));
+    if let Some(profile) = issue.picture_profile {
+        fields.push(("picture_profile", s(match profile {
+            av::SourcePictureProfile::ImportedPngMatte => "imported_png_matte_controls",
+            av::SourcePictureProfile::EmptyColorAdapter => "empty_color_adapter_controls",
+        })));
+    }
+    if let Some(inputs) = issue.matte_inputs {
+        let reference = |input: Option<av::MatteInput>| input.map(|input| obj(vec![
+            ("mob", s(input.mob.urn())),
+            ("track", Value::Int(input.track)),
+            ("start", Value::Int(input.start)),
+            ("length", Value::Int(input.length)),
+            ("rate", s(rational(input.rate))),
+        ])).unwrap_or(Value::Null);
+        fields.push(("matte_inputs", obj(vec![
+            ("background", s(match inputs.background {
+                av::MatteBackground::LowerTrack => "lower_track",
+                av::MatteBackground::Explicit => "explicit",
+                av::MatteBackground::Unresolved => "unresolved",
+            })),
+            ("fill", reference(inputs.fill)),
+            ("matte", reference(inputs.matte)),
+        ])));
+    }
+    if let Some(import) = &issue.matte_import {
+        let flag = |value: Option<bool>| value.map(Value::Bool).unwrap_or(Value::Null);
+        fields.push(("matte_import", obj(vec![
+            ("ignore_alpha", flag(import.ignore_alpha)),
+            ("invert_alpha", flag(import.invert_alpha)),
+            ("saved_locators", Value::Arr(import.locators.iter().map(s).collect())),
+        ])));
+    }
+}
+
+fn source_issue_receipt(issue: &av::SourceIssue) -> Value {
+    let mut fields = vec![
+        ("owner", s(&issue.owner)),
+        ("reason", s(&issue.reason)),
+        ("kind", Value::Int(issue.kind)),
+        ("track", Value::Int(issue.track)),
+        ("record_start", observed(&issue.record_start)),
+        ("record_rate", issue.record_rate.map(|r| s(rational(r))).unwrap_or(Value::Null)),
+        ("route", routes(&issue.route)),
+    ];
+    extend_effect_issue(issue, &mut fields);
+    obj(fields)
+}
+
 pub(super) fn append(
     source: &av::SourceSequence,
     copies: &HashMap<avid_reader::io::MobId, Vec<(usize, usize)>>,
@@ -208,7 +264,12 @@ pub(super) fn append(
         }
     }
     for issue in &source.unresolved {
-        budget.charge(issue.reason.len() + issue.owner.len() + issue.route.len() * 1024)?;
+        budget.charge(issue.reason.len() + issue.owner.len() + issue.route.len() * 1024
+            + if issue.matte_inputs.is_some() { 1024 } else { 0 }
+            + if issue.picture_profile.is_some() { 128 } else { 0 })?;
+        if let Some(import) = &issue.matte_import {
+            budget.charge(512 + import.locators.iter().map(|p| p.len() + 64).sum::<usize>())?;
+        }
     }
     for text in &source.info.problems {
         budget.charge(text.len())?;
@@ -255,7 +316,7 @@ pub(super) fn append(
             effective_count: c.count,
             rate: rational(c.rate),
             display_base: c.display_base,
-            drop: false,
+            drop: c.drop,
             provenance: SourceClockProvenance {
                 origin_count: c.count,
                 source_offset: 0,
@@ -505,7 +566,24 @@ pub(super) fn append(
                 }
             }
         }
-        if event.picture_chain.is_empty() {
+        let corner_pin = e.picture.as_ref().and_then(|fx| fx.corner_pin).filter(|_|
+            e.kind == KIND_PICTURE && !e.picture_nested
+                && e.color.is_none() && e.animatte.is_none() && event.picture_extension.is_none()
+                && event.picture_chain.is_empty() && p.speed.is_none() && p.frame_map.is_none());
+        if let Some(pin) = corner_pin {
+            if Some(range.record_rate) != av::Rate::new(24, 1) || range.source_rate != range.record_rate
+                || raster != Some((1920, 1080)) || !item_routes[index].square_pixels
+            {
+                loss(out, budget, &p.id, "picture_effect",
+                    "3D Warp Corner Pin requires verified square-pixel 1080p24 picture")?;
+            } else {
+                effects::apply_corner_pin(pin, &mut p, budget)?;
+                if pin.from_transform {
+                    loss(out, budget, &p.id, "picture_editability",
+                        "3D Warp geometry is represented by four target points. Original controls are retained in the source receipt")?;
+                }
+            }
+        } else if event.picture_chain.is_empty() {
             // Active curves in the qualified transforms supersede stale inline scalars.
             let replace_static = event.picture_extension.is_some_and(av::PictureExtension::replaces_static_transform);
             effects::apply(e, !replace_static, raster, &mut p, out, budget)?;
@@ -540,6 +618,13 @@ pub(super) fn append(
         }
         if event.saved_timewarp.is_some() {
             receipt.push(("saved_timewarp", Value::Bool(true)));
+        }
+        if let Some((num, den)) = event.constant_speed {
+            budget.charge(192)?;
+            receipt.push(("constant_speed", Value::Arr(vec![Value::Int(num), Value::Int(den)])));
+        }
+        if event.plain_submaster {
+            receipt.push(("plain_submaster", Value::Bool(true)));
         }
         let reflection = |stage, native_id| {
             obj(vec![("stage", Value::Int(stage as i64)), ("effect_id", s(native_id))])
@@ -678,6 +763,18 @@ pub(super) fn append(
     out.graph
         .losses
         .retain(|l| !removed_ids.contains(&l.object));
+    let mut reported_pan = HashSet::new();
+    for event in &source.events {
+        if let (Some(automation), Some(placement)) = (&event.pan_automation, map.get(&event.id)) {
+            let reason = match automation {
+                av::PanAutomation::Keys(_) => "Avid clip pan keys are retained in source facts and omitted from the converted edit",
+                av::PanAutomation::Unsupported(reason) => reason,
+            };
+            if reported_pan.insert((placement, reason)) {
+                loss(out, budget, placement, crate::PAN_AUTOMATION_LOSS, reason)?;
+            }
+        }
+    }
     for t in &source.transitions {
         let (
             Some(k),
@@ -824,32 +921,32 @@ pub(super) fn append(
     seq.tracks
         .sort_by_key(|t| (if t.kind == StreamKind::Video { 0 } else { 1 }, t.index));
     for issue in &source.unresolved {
-        unresolved.push(obj(vec![
-            ("owner", s(&issue.owner)),
-            ("reason", s(&issue.reason)),
-            ("kind", Value::Int(issue.kind)),
-            ("track", Value::Int(issue.track)),
-            ("record_start", observed(&issue.record_start)),
-            (
-                "record_rate",
-                issue
-                    .record_rate
-                    .map(|r| s(rational(r)))
-                    .unwrap_or(Value::Null),
-            ),
-            ("route", routes(&issue.route)),
-        ]));
-        if issue.issue_kind == av::SourceIssueKind::RouteTiming {
-            let lane = if issue.kind == KIND_PICTURE { "V" } else { "A" };
-            loss(
-                out,
-                budget,
-                id,
-                crate::UNQUALIFIED_ROUTE_TIMING,
-                format!("{lane}{}: {}", issue.track, issue.reason),
-            )?;
-        } else {
-            loss(out, budget, id, "source_route", issue.reason.clone())?;
+        unresolved.push(source_issue_receipt(issue));
+        match issue.issue_kind {
+            av::SourceIssueKind::RouteTiming => {
+                let lane = if issue.kind == KIND_PICTURE { "V" } else { "A" };
+                loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING,
+                    format!("{lane}{}: {}", issue.track, issue.reason))?;
+            }
+            av::SourceIssueKind::MatteKey { length } | av::SourceIssueKind::ColorAdapter { length } => {
+                let position = match (&issue.record_start, length, issue.record_rate) {
+                    (Observed::Known(frame), Some(len), Some(rate)) =>
+                        format!("at record frame {frame} for {len} {} ({} fps)",
+                            if len == 1 { "frame" } else { "frames" }, rational(rate)),
+                    (Observed::Known(frame), _, _) => format!("at record frame {frame}"),
+                    _ => "at unresolved record position".into(),
+                };
+                let aspect = if matches!(issue.issue_kind, av::SourceIssueKind::ColorAdapter { .. }) {
+                    "source_color_adapter"
+                } else {
+                    "picture_effect"
+                };
+                loss(out, budget, id, aspect,
+                    format!("V{} {position}: {}", issue.track, issue.reason))?;
+            }
+            av::SourceIssueKind::Route => {
+                loss(out, budget, id, "source_route", issue.reason.clone())?;
+            }
         }
     }
     let legacy = source
@@ -924,7 +1021,7 @@ pub(super) fn append(
                 ),
                 ("reason", opt_s(e.reason.as_deref())),
                 ("via", Value::Arr(e.event.via.iter().map(s).collect())),
-                ("controls", effects::receipt(&e.event)),
+                ("controls", native_controls(e)),
             ])
         })
         .collect();
@@ -944,6 +1041,8 @@ pub(super) fn append(
                     t.rate.map(|r| s(rational(r))).unwrap_or(Value::Null),
                 ),
                 ("effect", opt_s(t.effect.as_deref())),
+                ("audio_curve_attribute", t.audio_curve_attribute.map_or(Value::Null, Value::Int)),
+                ("audio_curve_parameter", t.audio_curve_parameter.map_or(Value::Null, Value::Int)),
                 ("outgoing", binding_receipt(&t.outgoing)),
                 ("incoming", binding_receipt(&t.incoming)),
             ])
@@ -1039,7 +1138,13 @@ fn reserve_controls(source: &av::SourceSequence, budget: &Budget) -> Result<(), 
     // charged once by sidecar(), after construction. No shared payload is charged twice.
     let mut reservation = Budget { used: budget.used };
     for e in &source.events {
-        effects::reserve_receipt(&e.event, &mut reservation)?;
+        effects::reserve_receipt(e, &mut reservation)?;
+        if let Some(automation) = &e.pan_automation {
+            reservation.charge(512)?;
+            if let av::PanAutomation::Keys(keys) = automation {
+                reservation.charge(keys.len().checked_mul(384).ok_or("pan key receipt overflow")?)?;
+            }
+        }
     }
     for t in &source.texts {
         reservation.charge(2048 + t.id.len() + t.content.as_ref().map_or(0, String::len) + t.reason.as_ref().map_or(0, String::len))?;
@@ -1060,6 +1165,36 @@ fn group_use_native(u:&av::SourceGroupUse)->Value{obj(vec![
     ("alternatives",Value::Arr(u.alternatives.iter().copied().map(super::multicam::endpoint).collect())),
     ("binding",binding_receipt(&u.binding)),("reason",opt_s(u.reason.as_deref())),
 ])}
+fn native_controls(event: &av::SourceEvent) -> Value {
+    let mut controls = effects::receipt(&event.event);
+    if event.plain_submaster {
+        let Value::Obj(fields) = &mut controls else { unreachable!() };
+        fields.push(("plain_submaster".into(), Value::Bool(true)));
+    }
+    let projective = effects::projective_stage_receipt(&event.picture_chain);
+    if !projective.is_empty() {
+        let Value::Obj(fields) = &mut controls else { unreachable!() };
+        fields.push(("projective_picture_stages".into(), Value::Arr(projective)));
+    }
+    if let Some(automation) = &event.pan_automation {
+        let mut pan = vec![("control_code", Value::Int(2000))];
+        match automation {
+            av::PanAutomation::Keys(keys) => {
+                pan.push(("saved_interp_kind", Value::Int(3)));
+                pan.push(("keys", Value::Arr(keys.iter().map(|key| obj(vec![
+                    ("frame_numerator", Value::Int(key.frame_numerator)),
+                    ("frame_denominator", Value::Int(key.frame_denominator)),
+                    ("raw_pan", Value::Int(key.raw_pan)),
+                ])).collect())));
+            }
+            av::PanAutomation::Unsupported(reason) => pan.push(("unqualified", s(reason))),
+        }
+        let Value::Obj(fields) = &mut controls else { unreachable!() };
+        fields.push(("pvol_pan".into(), obj(pan)));
+    }
+    controls
+}
+
 fn raw_sequence(seq: &av::SourceSequence) -> Value {
     let mut value = obj(vec![
         ("id", s(&seq.id)),
@@ -1151,7 +1286,7 @@ fn raw_sequence(seq: &av::SourceSequence) -> Value {
                                 e.event.edit_pan.map(Value::Float).unwrap_or(Value::Null),
                             ),
                             ("via", Value::Arr(e.event.via.iter().map(s).collect())),
-                            ("controls", effects::receipt(&e.event)),
+                            ("controls", native_controls(e)),
                             ("reason", opt_s(e.reason.as_deref())),
                         ])
                     })
@@ -1223,19 +1358,18 @@ fn raw_sequence(seq: &av::SourceSequence) -> Value {
             Value::Arr(
                 seq.unresolved
                     .iter()
-                    .map(|i| {
-                        obj(vec![
-                            ("owner", s(&i.owner)),
-                            ("reason", s(&i.reason)),
-                            ("route", routes(&i.route)),
-                            ("record_start", observed(&i.record_start)),
-                            (
-                                "record_rate",
-                                i.record_rate.map(|r| s(rational(r))).unwrap_or(Value::Null),
-                            ),
-                            ("kind", Value::Int(i.kind)),
-                            ("track", Value::Int(i.track)),
-                        ])
+                    .map(|issue| {
+                        let mut fields = vec![
+                            ("owner", s(&issue.owner)),
+                            ("reason", s(&issue.reason)),
+                            ("route", routes(&issue.route)),
+                            ("record_start", observed(&issue.record_start)),
+                            ("record_rate", issue.record_rate.map(|r| s(rational(r))).unwrap_or(Value::Null)),
+                            ("kind", Value::Int(issue.kind)),
+                            ("track", Value::Int(issue.track)),
+                        ];
+                        extend_effect_issue(issue, &mut fields);
+                        obj(fields)
                     })
                     .collect(),
             ),

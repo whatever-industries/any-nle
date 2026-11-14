@@ -20,8 +20,17 @@ New media uses a new folder; the visible notice is **Creates new media.**
 
 Marker conflict rules, the 16 named Avid marker colors, all 32 clip palette swatches and
 custom RGB mappings use the existing policy. Current effect handling is shown by type;
-unsupported alternatives are not presented as working controls. Proxy attachment and
-additional audio-to-source relinking remain unavailable and have no active controls.
+unsupported alternatives are not presented as working controls.
+
+In source builds with the offline and proxy controls, **Separate files**,
+**Grouped**, and **Merged** offer the options below. Check the
+[release notes](../RELEASE_NOTES.md) for packaged support.
+**Allow offline media** lets qualified missing sources become relinkable items.
+**Prefer camera originals** tries Avid's saved source path and falls back to
+managed media if verification fails. **Attach Avid media as proxies** uses
+verified matches, with an optional new folder for a compatible stereo proxy
+rewrap. **Rewrap to native clips** requires the source media online.
+[Verification and relink scope](VERIFIED-RELINK.md)
 
 On Review, **Run preflight** checks the job without creating outputs. The summary
 shows project and media folder names; hover or use **Copy full path** from the

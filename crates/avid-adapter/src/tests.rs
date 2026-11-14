@@ -17,6 +17,54 @@ fn mob(n: u32) -> MobId {
         },
     }
 }
+
+#[test]
+fn graph_keeps_same_named_subclip_receipts_on_their_bin() {
+    let (mut facts, index) = fixture(1);
+    for (number, start) in [(2, 11), (3, 41)] {
+        facts.subclips.push(av::SourceSubclip {
+            id: format!("revision/bin/0/item/{number}"),
+            bin: 0,
+            mob: Some(mob(number)),
+            name: "Same name".into(),
+            rate: Rate::new(24, 1),
+            backing_length: Some(100),
+            start: Observed::Known(start),
+            end: Observed::Known(start + 10),
+            tracks: vec![av::SourceSubclipTrack {
+                label: Some(1),
+                component_class: Some(*b"SCLP"),
+                kind: Some(KIND_SOUND),
+                rate: Rate::new(24, 1),
+                length: Some(100),
+                target_mob: Some(mob(1)),
+                target_track: Some(1),
+                target_offset: Some(3),
+            }],
+        });
+    }
+    let result = build(&facts, &index, "Synthetic", &["Bin".into()]).unwrap();
+    let parsed = SourceGraph::from_json_text(&result.graph.to_json_text().unwrap()).unwrap();
+    assert_eq!(parsed.items.len(), 1);
+    let data = parsed.sidecar("avid.subclips", "bin:0").unwrap();
+    assert_eq!(Some(data), result.graph.sidecar("avid.subclips", "bin:0"));
+    let Value::Arr(entries) = data else { panic!("expected subclip list") };
+    assert_eq!(entries.len(), 2);
+    let get = |i: usize, key: &str| {
+        let Value::Obj(fields) = &entries[i] else { panic!("expected subclip object") };
+        &fields.iter().find(|(name, _)| name == key).unwrap().1
+    };
+    assert_eq!(get(0, "name"), get(1, "name"));
+    assert_ne!(get(0, "id"), get(1, "id"));
+    assert_ne!(get(0, "mob"), get(1, "mob"));
+    assert_eq!(get(0, "start"), &observed(&Observed::Known(11)));
+    assert_eq!(get(1, "start"), &observed(&Observed::Known(41)));
+    assert_eq!(get(1, "backing_length"), &Value::Int(100));
+    facts.subclips[1].bin = 1;
+    assert!(build(&facts, &index, "Synthetic", &["Bin".into()]).err().unwrap()
+        .contains("unknown bin"));
+}
+
 fn fixture(channels: i64) -> (av::SourceProject, index::MediaIndex) {
     let rate = Rate::new(24, 1).unwrap();
     let mut index = index::MediaIndex::default();
@@ -76,6 +124,8 @@ fn fixture(channels: i64) -> (av::SourceProject, index::MediaIndex) {
         offsets: (0..channels).map(|_| Observed::Known(0)).collect(),
         marker_witnesses: vec![],
         originals: vec![],
+        file_clocks: vec![],
+        input_transforms: vec![],
         rendered_freeze: false,
         rendered_gain: None,
     };
@@ -83,6 +133,8 @@ fn fixture(channels: i64) -> (av::SourceProject, index::MediaIndex) {
         av::SourceProject {
             groups: vec![],
             masters: vec![source],
+            imported_stills: vec![],
+            subclips: vec![],
             sequences: vec![],
             skipped: vec![],
             duplicates: vec![],
@@ -103,10 +155,13 @@ fn event(
     av::SourceEvent {
         id: id.into(),
         volume_automation: None,
+        pan_automation: None,
         picture_extension: None,
         picture_chain: Vec::new(),
         motion_adapter_phase: None,
         saved_timewarp: None,
+        constant_speed: None,
+        plain_submaster: false,
         owner: format!("owner-{id}"),
         event: SeqEvent {
             kind: KIND_SOUND,
@@ -158,6 +213,91 @@ fn sequence(events: Vec<av::SourceEvent>) -> av::SourceSequence {
     s.events = events;
     s
 }
+
+#[test]
+fn matte_key_loss_is_locatable_after_graph_reload() {
+    let (mut facts, index) = fixture(1);
+    let mut source = sequence(vec![event("unchanged-audio", 1, 1, 0, 24, None)]);
+    let start = Observed::Known(17);
+    source.unresolved.push(av::SourceIssue {
+        owner: "revision/seq/component/0".into(),
+        reason: "Avid Matte Key (EFF2_2DMATTE) omitted".into(),
+        issue_kind: av::SourceIssueKind::MatteKey { length: Some(3) },
+        route: vec![],
+        record_start: start.clone(),
+        record_rate: Rate::new(24, 1),
+        kind: KIND_PICTURE,
+        track: 2,
+        matte_inputs: Some(av::MatteInputs {
+            background: av::MatteBackground::LowerTrack,
+            fill: Some(av::MatteInput {
+                mob: mob(10), track: 1, start: 8, length: 3, rate: Rate::new(24, 1).unwrap(),
+            }),
+            matte: None,
+        }),
+        matte_import: Some(av::MatteImport {
+            ignore_alpha: Some(false),
+            invert_alpha: None,
+            locators: vec!["/Synthetic/alpha.png".into()],
+        }),
+        picture_profile: None,
+    });
+    facts.sequences.push(source);
+    let built = run(&facts, &index).graph;
+    let graph = SourceGraph::from_json_text(&built.to_json_text().unwrap()).unwrap();
+    assert_eq!(graph.sequences[0].placements[0].id, "unchanged-audio");
+    let loss = graph.losses.iter().find(|l| l.aspect == "picture_effect").unwrap();
+    assert_eq!(loss.object, "revision/seq");
+    assert!(loss.reason.contains("V2 at record frame 17 for 3 frames (24 fps)"));
+    let receipt = graph.sidecar("avid.source", "revision/seq").unwrap();
+    let Some(Value::Arr(issues)) = receipt.get("unresolved") else { panic!("expected issues") };
+    assert_eq!(issues[0].get("effect_id"), Some(&s("EFF2_2DMATTE")));
+    assert_eq!(issues[0].get("owner"), Some(&s("revision/seq/component/0")));
+    assert_eq!(issues[0].get("record_start"), Some(&observed(&start)));
+    assert_eq!(issues[0].get("record_length"), Some(&Value::Int(3)));
+    let inputs = issues[0].get("matte_inputs").unwrap();
+    assert_eq!(inputs.get("background"), Some(&s("lower_track")));
+    assert_eq!(inputs.get("matte"), Some(&Value::Null));
+    let fill = inputs.get("fill").unwrap();
+    assert_eq!(fill.get("mob"), Some(&s(mob(10).urn())));
+    assert_eq!(fill.get("start"), Some(&Value::Int(8)));
+    let import = issues[0].get("matte_import").unwrap();
+    assert_eq!(import.get("ignore_alpha"), Some(&Value::Bool(false)));
+    assert_eq!(import.get("invert_alpha"), Some(&Value::Null));
+    assert_eq!(import.get("saved_locators"), Some(&Value::Arr(vec![s("/Synthetic/alpha.png")])));
+}
+
+#[test]
+fn avid_pan_keys_survive_graph_reload_with_an_occurrence_loss() {
+    let (mut facts, index) = fixture(1);
+    let mut edit = event("pan-edit", 1, 1, 0, 24, None);
+    edit.pan_automation = Some(av::PanAutomation::Keys(vec![
+        av::PanPoint { frame_numerator: 0, frame_denominator: 1, raw_pan: 0 },
+        av::PanPoint { frame_numerator: 25, frame_denominator: 2, raw_pan: 32768 },
+    ]));
+    facts.sequences.push(sequence(vec![edit]));
+    let graph = run(&facts, &index).graph;
+    let graph = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    let sequence = &graph.sequences[0];
+    let placement = &sequence.placements[0];
+    let receipt = graph.sidecar("avid.source", &sequence.id).unwrap();
+    let Some(Value::Arr(events)) = receipt.get("native_events") else {
+        panic!("expected native events");
+    };
+    assert_eq!(events[0].get("placement_id"), Some(&s(&placement.id)));
+    let pan = events[0].get("controls").and_then(|c| c.get("pvol_pan")).unwrap();
+    let Some(Value::Arr(keys)) = pan.get("keys") else {
+        panic!("expected native pan keys");
+    };
+    assert_eq!(keys[0].get("raw_pan"), Some(&Value::Int(0)));
+    assert_eq!(keys[1].get("frame_numerator"), Some(&Value::Int(25)));
+    assert_eq!(keys[1].get("frame_denominator"), Some(&Value::Int(2)));
+    assert_eq!(keys[1].get("raw_pan"), Some(&Value::Int(32768)));
+    assert!(placement.volume_keys.is_empty());
+    assert_eq!(graph.losses.iter().filter(|l| {
+        l.object == placement.id && l.aspect == "pan_automation"
+    }).count(), 1);
+}
 fn run(f: &av::SourceProject, i: &index::MediaIndex) -> ReadResult {
     build(f, i, "project", &["bin".into()]).unwrap()
 }
@@ -165,11 +305,21 @@ fn run(f: &av::SourceProject, i: &index::MediaIndex) -> ReadResult {
 #[test]
 fn native_color_receipt_survives_an_unavailable_picture_route() {
     use avid_reader::color::{ColorCorrection, ParamValue};
+    use avid_reader::transform::{CornerPin, Kind, PictureEffect};
     let (mut facts, index) = fixture(1);
     let audio = event("audio", 1, 1, 0, 24, None);
     let mut picture = event("picture", 1, 1, 0, 24, None);
     picture.event.kind = KIND_PICTURE;
     picture.event.master = mob(2);
+    let pin = CornerPin {
+        corners: [[0.1, 0.2], [0.8, 0.1], [0.9, 0.8], [0.2, 0.9]],
+        crop: [0.05, 0.1, 0.15, 0.2],
+        from_transform: false,
+    };
+    picture.event.picture = Some(PictureEffect {
+        kind: Kind::Warp, params: ColorCorrection::default(), corner_pin: Some(pin),
+        compact_affine_warp: false,
+    });
     let opaque = vec![17; 4097];
     picture.event.color = Some(ColorCorrection {
         params: vec![
@@ -189,6 +339,9 @@ fn native_color_receipt_survives_an_unavailable_picture_route() {
     };
     assert_eq!(events[0].get("placement_id"), Some(&s("audio")));
     assert_eq!(events[1].get("placement_id"), Some(&Value::Null));
+    let corner = events[1].get("controls").and_then(|v| v.get("picture"))
+        .and_then(|v| v.get("corner_pin")).unwrap();
+    assert_eq!(corner.get("source_crop_ltrb"), Some(&Value::Arr(pin.crop.map(Value::Float).into())));
     let Some(Value::Arr(parameters)) = events[1].get("controls").and_then(|v| v.get("color")) else {
         panic!("missing native color parameters");
     };
@@ -200,6 +353,51 @@ fn native_color_receipt_survives_an_unavailable_picture_route() {
     assert_eq!(payload.get("byte_count"), Some(&Value::Int(4097)));
     assert!(matches!(payload.get("sha256"), Some(Value::Str(hash)) if hash.len() == 64));
     assert!(payload.get("bytes_hex").is_none());
+}
+
+#[test]
+fn ordered_projective_warp_receipt_survives_without_linked_picture() {
+    use avid_reader::color::{ColorCorrection, ParamValue};
+    use avid_reader::transform::{CornerPin, Kind, PictureEffect};
+    let (mut facts, index) = fixture(1);
+    let mut picture = event("picture", 1, 1, 0, 24, None);
+    picture.event.kind = KIND_PICTURE;
+    picture.event.master = mob(2);
+    let pin = CornerPin {
+        corners: [[0.1, 0.2], [0.8, 0.1], [0.9, 0.8], [0.2, 0.9]],
+        crop: [0.05, 0.1, 0.15, 0.2],
+        from_transform: true,
+    };
+    let yaw_id = "b981568d7e84d511935a50f857c10000";
+    picture.picture_chain = vec![
+        av::PictureStage::Extension(av::PictureExtension::Flip {
+            native_id: "EFF2_BLEND_FLIP_HORZ", horizontal: true, vertical: false,
+        }),
+        av::PictureStage::Static(std::sync::Arc::new(PictureEffect {
+            kind: Kind::Warp,
+            params: ColorCorrection { params: vec![(yaw_id.into(), ParamValue::Float(30.0))] },
+            corner_pin: Some(pin),
+            compact_affine_warp: false,
+        })),
+    ];
+    facts.sequences.push(sequence(vec![event("audio", 1, 1, 0, 24, None), picture]));
+    let graph = run(&facts, &index).graph;
+    let reopened = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    assert_eq!(graph, reopened);
+    let sequence = &reopened.sequences[0];
+    assert_eq!(sequence.placements.len(), 1);
+    let source = reopened.sidecar("avid.source", &sequence.id).unwrap();
+    let Some(Value::Arr(events)) = source.get("native_events") else { panic!() };
+    assert_eq!(events[1].get("placement_id"), Some(&Value::Null));
+    let Some(Value::Arr(stages)) = events[1].get("controls").unwrap()
+        .get("projective_picture_stages") else { panic!() };
+    let [stage] = stages.as_slice() else { panic!() };
+    assert_eq!(stage.get("stage"), Some(&Value::Int(1)));
+    let controls = stage.get("controls").unwrap();
+    let Some(Value::Arr(params)) = controls.get("params") else { panic!() };
+    assert_eq!(params[0].get("id"), Some(&s(yaw_id)));
+    assert_eq!(controls.get("projected_corners").unwrap().get("source_crop_ltrb"),
+        Some(&Value::Arr(pin.crop.map(Value::Float).into())));
 }
 
 #[test]
@@ -220,6 +418,8 @@ fn source_resize_curves_override_the_cached_static_values() {
     e.event.kind = KIND_PICTURE;
     e.event.picture = Some(PictureEffect {
         kind: Kind::Resize,
+        corner_pin: None,
+        compact_affine_warp: false,
         params: ColorCorrection { params: vec![
             ("2581568d7e84d511935a50f857c10000".into(), ParamValue::Float(3000.0)),
         ] },
@@ -390,6 +590,8 @@ fn transition_endpoints_keep_native_identity() {
         cutpoint: Observed::Known(3),
         rate: Rate::new(24, 1),
         effect: Some("DISSOLVE".into()),
+        audio_curve_attribute: None,
+        audio_curve_parameter: None,
         outgoing: av::Binding {
             placements: vec!["out".into()],
             reason: None,
@@ -429,6 +631,8 @@ fn native_only_controls_and_missing_marker_witness_survive() {
     let mut e = event("e", 1, 1, 0, 24, None);
     e.event.picture = Some(PictureEffect {
         kind: Kind::Resize,
+        corner_pin: None,
+        compact_affine_warp: false,
         params: ColorCorrection {
             params: vec![(
                 "unknown-control".into(),
@@ -512,6 +716,10 @@ fn spanned_marker_without_rate_stays_raw_and_indexes_surviving_markers() {
     let out = run(&facts, &index);
     assert_eq!(out.graph.items[0].markers.len(), 1);
     assert_eq!(out.graph.items[0].markers[0].name, "m1");
+    assert_eq!(out.graph.items[0].markers[0].track, Some(TrackRef {
+        kind: StreamKind::Audio,
+        index: 1,
+    }));
     let Value::Arr(native) = out
         .graph
         .sidecar("avid.source", "clip:clip-1")
@@ -659,12 +867,74 @@ fn named_aac_and_smpte_ds_source_groups_preserve_declared_order() {
 }
 
 #[test]
+fn explicit_root_mappings_keep_same_named_originals_distinct() {
+    let root = std::env::temp_dir().join(format!("anynle-original-collision-{}", std::process::id()));
+    let a = root.join("a");
+    let b = root.join("b");
+    for dir in [&a, &b] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("source.wav"), dir.as_os_str().as_encoded_bytes()).unwrap();
+    }
+    let (mut facts, _) = fixture(1);
+    let (mut second, _) = fixture(1);
+    let mut second = second.masters.remove(0);
+    second.id = "revision/second".into();
+    second.master.mob_id = mob(2);
+    facts.masters.push(second);
+    for (master, root) in facts.masters.iter_mut().zip(["/saved/a", "/saved/b"]) {
+        master.originals = vec![Some(av::OriginalTrack {
+            locators: vec![format!("{root}/source.wav")],
+            descriptor_class: "PCMA".into(),
+            descriptor_rate: 48000.0,
+            descriptor_length: 96000,
+            channels: Some(1),
+            sample_rate: Some(48000.0),
+            stored_quantization_bits: Some(24),
+            display_raster: None,
+            file_track: Some(1),
+            motion_audio_track_start: None,
+        })];
+    }
+    let metadata = graph::json::parse(r#"{
+        "format":{"format_name":"wav"},
+        "streams":[{"index":0,"codec_type":"audio","codec_name":"pcm_s24le",
+          "sample_rate":"48000","channels":1,"time_base":"1/48000","duration_ts":96000}]
+    }"#).unwrap();
+    let mut options = original::OriginalOptions {
+        root_mappings: vec![
+            original::RootMapping { saved_root: "/saved/a".into(), current_root: a.clone() },
+            original::RootMapping { saved_root: "/saved/b".into(), current_root: b.clone() },
+        ],
+        ..Default::default()
+    };
+    let scan = |facts: &av::SourceProject, options: &original::OriginalOptions| {
+        original::OriginalIndex::scan_with(facts, options, |_| Ok(metadata.clone()))
+    };
+    let distinct = scan(&facts, &options).unwrap();
+    assert_eq!(distinct.original_inputs.len(), 2);
+    assert_eq!(distinct.tracks[&("revision/master".into(), 0)].path, a.join("source.wav").canonicalize().unwrap());
+    assert_eq!(distinct.tracks[&("revision/second".into(), 0)].path, b.join("source.wav").canonicalize().unwrap());
+
+    options.root_mappings[1].current_root = a.clone();
+    let error = scan(&facts, &options).err().expect("distinct paths must not collapse");
+    assert!(error.contains("/saved/b/source.wav"));
+    assert!(error.contains("root mappings resolve distinct saved originals"));
+
+    // Separate bin items and even different mob IDs can legitimately reuse one locator.
+    facts.masters[1].originals = facts.masters[0].originals.clone();
+    let reused = scan(&facts, &options).unwrap();
+    assert_eq!(reused.original_inputs.len(), 1);
+    assert_eq!(reused.tracks.len(), 2);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn controlled_original_pcm_and_compressed_clocks_use_physical_streams_without_mxf_ids(){
     let dir=std::env::temp_dir().join(format!("anynle-original-stream-{}",std::process::id()));std::fs::create_dir_all(&dir).unwrap();
     for (codec,bits,representation) in [("pcm_s16le",16,"pcm16"),("pcm_s24le",24,"pcm24"),("aac",16,"aac")] {
         let compressed=codec=="aac";let path=dir.join(if compressed{"source.mp4"}else{"source.wav"});std::fs::write(&path,b"synthetic probe witness").unwrap();
         let (mut facts,_)=fixture(2);let m=&mut facts.masters[0];
-        m.originals=(1..=2).map(|channel|Some(av::OriginalTrack{locators:vec![path.to_str().unwrap().into()],descriptor_class:if compressed{"MPGA"}else{"PCMA"}.into(),descriptor_rate:if compressed{46.875}else{48000.0},descriptor_length:96000,channels:Some(2),sample_rate:Some(48000.0),stored_quantization_bits:Some(bits),file_track:Some(channel),motion_audio_track_start:None})).collect();
+        m.originals=(1..=2).map(|channel|Some(av::OriginalTrack{locators:vec![path.to_str().unwrap().into()],descriptor_class:if compressed{"MPGA"}else{"PCMA"}.into(),descriptor_rate:if compressed{46.875}else{48000.0},descriptor_length:96000,channels:Some(2),sample_rate:Some(48000.0),stored_quantization_bits:Some(bits),display_raster:None,file_track:Some(channel),motion_audio_track_start:None})).collect();
         for t in &mut m.master.tracks {t.edit_rate=if compressed{46.875}else{48000.0};t.essence=if compressed{Some(Essence::Other("MPGA".into()))}else{Some(Essence::Sound{sample_rate:48000.,bits,channels:2})};}
         let mut streams=vec![];
         if compressed{streams.push(graph::json::parse(r#"{"index":0,"codec_type":"video","codec_name":"h264","codec_tag_string":"avc1","profile":"High","level":40,"pix_fmt":"yuv420p","width":1920,"height":1080,"avg_frame_rate":"24/1","r_frame_rate":"24/1","field_order":"progressive","sample_aspect_ratio":"1:1"}"#).unwrap());}

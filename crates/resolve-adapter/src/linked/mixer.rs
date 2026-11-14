@@ -1,12 +1,170 @@
 //! Narrow Resolve-to-Resolve Fairlight preparation for the turnover archive.
 use crate::{
-    source::mixer::{valid_ticks, DIRECT_PROFILE, FAIRLIGHT_ADAPTER, FAIRLIGHT_LOSS},
+    source::mixer::{valid_ticks, DIRECT_PROFILE, FAIRLIGHT_ADAPTER, FAIRLIGHT_LOSS, LINKED_TRACK_PANS},
     Result,
 };
 use graph::{
     source::{SourceGraph, SourceSequence},
     Loss, Value,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StaticFaders {
+    pub(crate) tracks: [i32; 2],
+    pub(crate) bus: i32,
+    pub(crate) muted: [bool; 2],
+    pub(crate) pans: [i32; 2],
+}
+
+pub(crate) const PREMIERE_TRACK_PANS: &str = "track_pans_tenths_percent";
+
+impl StaticFaders {
+    pub(crate) fn prepare(graph: &SourceGraph, sequence: &SourceSequence) -> Result<Self> {
+        use crate::source::mixer::{fader_ticks, parse_track_mutes, MAIN_BUS_LEVEL, MUTED_AUDIO_TRACKS};
+        let premiere = graph.sidecar("premiere.source", &sequence.id);
+        let resolve = graph.sidecar(crate::source::ADAPTER, &sequence.id);
+        let mut result = Self::default();
+        for track in &sequence.tracks {
+            if let Some(db) = track.level_db {
+                if track.kind != graph::StreamKind::Audio || !matches!(track.index, 1 | 2) {
+                    return Err("static gain requires a supported mono audio track".into());
+                }
+                result.tracks[track.index as usize - 1] =
+                    fader_ticks(db).ok_or("unsupported static track gain")?;
+            }
+        }
+        let mixer_fields = |receipt: Option<&Value>| {
+            receipt.is_some_and(|r| [MAIN_BUS_LEVEL, MUTED_AUDIO_TRACKS, PREMIERE_TRACK_PANS]
+                .iter().any(|key| r.get(key).is_some()))
+        };
+        let fairlight = graph.sidecar(FAIRLIGHT_ADAPTER, &sequence.id);
+        let saved_pans = if fairlight.is_some_and(|r| r.get(DIRECT_PROFILE).is_some()) {
+            // The direct mixer owns its own pan and routing.
+            None
+        } else {
+            prepare_linked_track_pans(fairlight, &sequence.id)?
+        };
+        let has_mixer_fields = mixer_fields(premiere) || mixer_fields(resolve) || saved_pans.is_some();
+        if (has_mixer_fields || result.tracks != [0; 2])
+            && (premiere.is_some() && resolve.is_some()
+                || !sequence.clock.as_ref().is_some_and(|clock| {
+                    match clock.provenance.route.as_str() {
+                        "Premiere sequence ticks" => premiere.is_some(),
+                        "Resolve archive clock" => resolve.is_some(),
+                        _ => false,
+                    }
+                }))
+        {
+            return Err(format!("{}: static faders require an unambiguous saved mixer owner", sequence.id).into());
+        }
+        if let Some(pans) = saved_pans {
+            if resolve.is_none() {
+                return Err("linked Fairlight pan requires a Resolve mixer owner".into());
+            }
+            result.pans = pans;
+        }
+        if let Some(pans) = premiere.and_then(|r| r.get(PREMIERE_TRACK_PANS)) {
+            let Value::Arr(pans) = pans else { return Err("invalid Premiere track pan receipt".into()) };
+            let [Value::Int(left @ -1000..=1000), Value::Int(right @ -1000..=1000)] = pans.as_slice() else {
+                return Err("invalid Premiere track pan receipt".into());
+            };
+            result.pans = [*left as i32, *right as i32];
+        }
+        if let Some(receipt) = premiere.or(resolve) {
+            if let Some(value) = receipt.get(MAIN_BUS_LEVEL) {
+                let db = match value {
+                    Value::Float(db) => *db,
+                    Value::Int(db) if (-6..=0).contains(db) => *db as f64,
+                    _ => return Err("invalid static bus gain".into()),
+                };
+                result.bus = fader_ticks(db).ok_or("unsupported static bus gain")?;
+            }
+            if let Some(value) = receipt.get(MUTED_AUDIO_TRACKS) {
+                result.muted = parse_track_mutes(value)?;
+            }
+        }
+        if let Some(fairlight) = fairlight.filter(|_| saved_pans.is_some()) {
+            let fader = |row: &Value, db, muted| {
+                row.get("fader_tenths_db") == Some(&Value::Int(i64::from(db)))
+                    && row.get("mute_code") == Some(&Value::Int(i64::from(muted)))
+            };
+            let Some(Value::Arr(tracks)) = fairlight.get("tracks") else {
+                return Err("missing saved Fairlight track faders".into());
+            };
+            if !fairlight.get("main_bus").is_some_and(|bus| fader(bus, result.bus, false))
+                || !tracks.iter().zip(result.tracks).zip(result.muted)
+                    .all(|((track, db), muted)| fader(track, db, muted))
+            {
+                return Err(format!("{}: linked Fairlight pan and fader receipts disagree", sequence.id).into());
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn recover(self, loss: &Loss, owner: &str) -> bool {
+        use crate::source::mixer::{MAIN_BUS_LOSS, TRACK_MUTE_LOSS};
+        loss.object == owner && match (loss.aspect.as_str(), loss.reason.as_str()) {
+            MAIN_BUS_LOSS => self.bus != 0,
+            TRACK_MUTE_LOSS => self.muted != [false; 2],
+            FAIRLIGHT_LOSS => self.pans != [0; 2],
+            _ => false,
+        }
+    }
+}
+
+pub(crate) fn prepare_linked_track_pans(fairlight: Option<&Value>, sequence_id: &str) -> Result<Option<[i32; 2]>> {
+    let Some(data) = fairlight else {
+        return Ok(None);
+    };
+    let Some(saved_pans) = data.get(LINKED_TRACK_PANS) else {
+        return Ok(None);
+    };
+    let unsupported = || format!("{sequence_id}: unsupported Resolve track pan or routing");
+    let (Value::Arr(pans), Some(Value::Arr(tracks)), Some(Value::Arr(buses))) =
+        (saved_pans, data.get("tracks"), data.get("buses"))
+    else {
+        return Err(unsupported().into());
+    };
+    let ([Value::Int(left), Value::Int(right)], [first, second], [bus]) =
+        (pans.as_slice(), tracks.as_slice(), buses.as_slice())
+    else {
+        return Err(unsupported().into());
+    };
+    let row_value = |row: &Value, key, value| row.get(key) == Some(&Value::Int(value));
+    if !row_value(bus, "index", 0)
+        || !row_value(bus, "strip_id", 3)
+        || !row_value(bus, "channels", 2)
+        || !row_value(bus, "mute_code", 0)
+        || !row_value(bus, "output_connected_code", 0)
+        || !row_value(bus, "output_bus_index", -1)
+        || !neutral_when_present(bus, &["raw_pan", "raw_pan_bypass", "raw_solo",
+            "pre_dynamics_gain_tenths_db", "effects_in_code"])
+        || data.get("plugins").is_some()
+        || StripProcessing::from_bus_receipt(bus).ok() != Some(StripProcessing::DEFAULT)
+        || data.get("main_bus") != Some(bus)
+        || data.get(PROCESSING_RECEIPT).is_some()
+        || data.get(DIRECT_PROFILE).is_some_and(|profile| profile != &Value::Int(1))
+        || [(*left, first), (*right, second)].into_iter().enumerate().any(|(index, (pan, row))| {
+            !(-1000..=1000).contains(&pan)
+                || !row_value(row, "track", index as i64 + 1)
+                || !row_value(row, "strip_id", index as i64)
+                || !row_value(row, "channel_index", 0)
+                || !row_value(row, "pan_tenths_percent", pan)
+                || !row_value(row, "pan_bypass_code", 0)
+                || !row_value(row, "output_connected_code", 1)
+                || !row_value(row, "output_bus_index", 0)
+                || !neutral_when_present(row, &["solo_code", "pre_dynamics_gain_tenths_db",
+                    "effects_in_code"])
+                || row.get("unresolved_channel_fields").is_some_and(|fields| {
+                    !neutral_when_present(fields, &["0x011_second"])
+                })
+                || !StripProcessing::saved_rows_are_default(row)
+        })
+    {
+        return Err(unsupported().into());
+    }
+    Ok(Some([*left as i32, *right as i32]))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DirectMixer {
@@ -470,6 +628,11 @@ impl DirectMixer {
             return Err("direct Fairlight controls require a native Resolve clock".into());
         }
         let mixer = Self::from_receipt(data)?;
+        if prepare_linked_track_pans(Some(data), &sequence.id)?
+            .is_some_and(|pans| pans != mixer.pan)
+        {
+            return Err(format!("{}: Resolve track pan receipts disagree", sequence.id).into());
+        }
         if mixer.buses == 1
             && mixer.pan == [0; 2]
             && mixer.pan_bypassed == [false; 2]

@@ -7,6 +7,7 @@ pub mod original;
 mod revision;
 mod sequence;
 mod multicam;
+mod subclips;
 use avid_reader::{
     extract::{self, AvidMarker, Essence, KIND_PICTURE, KIND_SOUND},
     source::{self as av, Observed, Rate},
@@ -20,6 +21,7 @@ use std::{
 
 /// A source timing route that would otherwise omit a saved timeline edit.
 pub const UNQUALIFIED_ROUTE_TIMING: &str = "source_route_timing";
+pub const PAN_AUTOMATION_LOSS: &str = "pan_automation";
 
 pub struct ReadResult {
     pub graph: SourceGraph,
@@ -28,10 +30,13 @@ pub struct ReadResult {
     pub group_bins: HashMap<String, usize>,
     /// Exact original bytes pinned before/after stream probing and checked again at read completion.
     pub original_inputs: Vec<av::SourceInput>,
+    /// A saved original-file route was not resolved as an original or native file.
+    pub has_unresolved_original_links: bool,
     pub diagnostics: Vec<String>,
     pub audio_group_issues: Vec<String>,
     pub scan_issues: Vec<String>,
     pub missing_native_picture: bool,
+    pub missing_managed_audio: Vec<String>,
     pub files_scanned: usize,
 }
 
@@ -40,16 +45,18 @@ pub struct ReadResult {
 pub enum SourceReadIssue {
     Bin(String),
     OriginalLocator(String),
+    MissingOriginal(String),
     OriginalMedia(String),
     MediaScan(String),
     SourceFacts(String),
 }
 
 impl SourceReadIssue {
-    fn into_message(self) -> String {
+    pub fn into_message(self) -> String {
         match self {
             Self::Bin(message)
             | Self::OriginalLocator(message)
+            | Self::MissingOriginal(message)
             | Self::OriginalMedia(message)
             | Self::MediaScan(message)
             | Self::SourceFacts(message) => message,
@@ -157,9 +164,22 @@ pub fn read_with_originals_for_review(
     before: &mut dyn FnMut(usize, &std::path::Path) -> Result<(), String>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<ReadResult, SourceReadIssue> {
+    read_with_media_policy(inputs, media_roots, project, bin_names, options, false, before, check)
+}
+
+pub fn read_with_media_policy(
+    inputs: &[av::SourceInput], media_roots: &[PathBuf], project: &str, bin_names: &[String],
+    options: &original::OriginalOptions, allow_offline: bool,
+    before: &mut dyn FnMut(usize, &Path) -> Result<(), String>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<ReadResult, SourceReadIssue> {
     let facts = av::extract_source_paths_observed(inputs, av::SourceLimits::default(), before)
         .map_err(|e| SourceReadIssue::Bin(e.to_string()))?;
-    let originals = original::OriginalIndex::scan_for_review(&facts, options, check)?;
+    let originals = if allow_offline {
+        original::OriginalIndex::scan_allow_offline(&facts, options, check)?
+    } else {
+        original::OriginalIndex::scan_for_review(&facts, options, check)?
+    };
     resolve_media_and_build(
         &facts,
         media_roots,
@@ -225,9 +245,12 @@ fn verify_motion_mxf<'a>(
 ) -> Result<HashMap<&'a std::path::Path, Option<(Rational, Rational)>>, String> {
     let masters: HashSet<_> = facts.sequences.iter().flat_map(|seq| &seq.events)
         .filter(|e| e.saved_timewarp.is_some()
+            || e.event.picture.as_ref().is_some_and(|p| p.corner_pin.is_some())
             || e.picture_extension.is_some_and(av::PictureExtension::requires_square_pixels)
-            || e.picture_chain.iter().any(|stage| matches!(stage,
-                av::PictureStage::Extension(effect) if effect.requires_square_pixels())))
+            || e.picture_chain.iter().any(|stage| match stage {
+                av::PictureStage::Extension(effect) => effect.requires_square_pixels(),
+                av::PictureStage::Static(effect) => effect.corner_pin.is_some(),
+            }))
         .map(|e| e.event.master).collect();
     let mut probed = HashSet::new();
     let mut verified = HashMap::new();
@@ -282,6 +305,13 @@ fn build_selected(
         sequence_bins: HashMap::new(),
         group_bins: HashMap::new(),
         original_inputs: originals.original_inputs.clone(),
+        has_unresolved_original_links: facts.masters.iter().any(|source| {
+            source.master.tracks.iter().zip(&source.originals).enumerate().any(|(i, (track, original))| {
+                original.is_some()
+                    && !index.files.contains_key(&track.file_mob.umid_hex())
+                    && !originals.tracks.contains_key(&(source.id.clone(), i))
+            })
+        }),
         graph: SourceGraph {
             multicams: Vec::new(),
             multicam_uses: Vec::new(),
@@ -304,6 +334,7 @@ fn build_selected(
         audio_group_issues: vec![],
         scan_issues: vec![],
         missing_native_picture: false,
+        missing_managed_audio: vec![],
         files_scanned: index.files_scanned,
     };
     for (i, name) in bin_names.iter().enumerate() {
@@ -314,6 +345,32 @@ fn build_selected(
             parent: None,
             items: vec![],
         });
+    }
+    subclips::append(&facts.subclips, &mut out.graph, &mut budget)?;
+    for still in &facts.imported_stills {
+        budget.charge(still.id.len() + 2048)?;
+        for path in &still.import.locators {
+            budget.charge(path.len() + 64)?;
+        }
+        let int_or_null = |value: Option<i64>| value.map(Value::Int).unwrap_or(Value::Null);
+        let flag = |value: Option<bool>| value.map(Value::Bool).unwrap_or(Value::Null);
+        let data = obj(vec![
+            ("id", s(&still.id)),
+            ("mob", s(still.master.urn())),
+            ("track", Value::Int(still.track)),
+            ("file_mob", s(still.file_mob.urn())),
+            ("file_track", Value::Int(still.file_track)),
+            ("rate", still.rate.map(|rate| s(rational(rate))).unwrap_or(Value::Null)),
+            ("master_length", int_or_null(still.master_length)),
+            ("file_in", int_or_null(still.file_in)),
+            ("source_length", int_or_null(still.source_length)),
+            ("import_aspect", int_or_null(still.import_aspect)),
+            ("color_level", int_or_null(still.color_level)),
+            ("ignore_alpha", flag(still.import.ignore_alpha)),
+            ("invert_alpha", flag(still.import.invert_alpha)),
+            ("saved_locators", Value::Arr(still.import.locators.iter().map(s).collect())),
+        ]);
+        append_bin_receipt(&mut out, &mut budget, still.bin, "imported_stills", data)?;
     }
     for (name, bin) in &facts.duplicates {
         out.diagnostics.push(format!(
@@ -340,6 +397,7 @@ fn build_selected(
             out.graph.losses.len(),
             budget.used,
         );
+        let missing_audio_before = out.missing_managed_audio.len();
         match master(source, index, &id, &mut out, &mut budget, originals) {
             Ok(item) => {
                 let bin = out
@@ -370,6 +428,9 @@ fn build_selected(
                 out.graph.sidecars.truncate(checkpoint.1);
                 out.graph.losses.truncate(checkpoint.2);
                 budget.used = checkpoint.3;
+                for message in &out.missing_managed_audio[missing_audio_before..] {
+                    budget.charge(message.capacity() + size_of::<String>())?;
+                }
                 retain_unresolved_master(source, &e, &mut out, &mut budget)?;
                 out.diagnostics
                     .push(format!("{:?}: skipped ({e})", source.master.name));
@@ -522,6 +583,11 @@ fn validate_rates(facts: &av::SourceProject) -> Result<(), String> {
             }
         }
     }
+    for subclip in &facts.subclips {
+        for r in subclip.rate.into_iter().chain(subclip.tracks.iter().filter_map(|t| t.rate)) {
+            rate(r)?;
+        }
+    }
     for g in &facts.groups {
         if let Some(r)=g.rate{rate(r)?;}
         for l in &g.lanes {
@@ -626,6 +692,32 @@ fn output_mix(m: &extract::MasterOutputMix, budget: &mut Budget) -> Result<Value
 }
 fn rational(r: Rate) -> Rational {
     Rational::new(r.num as i128, r.den as i128).expect("positive reduced i64 source rate")
+}
+fn source_input_transforms(
+    source: &av::SourceMaster,
+    budget: &Budget,
+) -> Result<Option<Value>, String> {
+    if source.input_transforms.is_empty() {
+        return Ok(None);
+    }
+    let mut reservation = Budget { used: budget.used };
+    for transform in &source.input_transforms {
+        let text = match &transform.value {
+            Observed::Known(text) | Observed::Unresolved(text) => text,
+        };
+        reservation.charge(text.len() + 512)?;
+    }
+    Ok(Some(Value::Arr(source.input_transforms.iter().map(|transform| {
+        let (key, text) = match &transform.value {
+            Observed::Known(text) => ("text", text),
+            Observed::Unresolved(reason) => ("reason", reason),
+        };
+        obj(vec![
+            ("track", Value::Int(transform.track)),
+            ("owner_mob", s(transform.file_mob.urn())),
+            (key, s(text)),
+        ])
+    }).collect())))
 }
 fn time(n: i64, r: Rate) -> Result<Rational, String> {
     Rational::new(n as i128 * r.den as i128, r.num as i128)
@@ -761,7 +853,7 @@ fn retain_unresolved_master(
         })
         .collect();
     let mix = output_mix(&m.output_mix, budget)?;
-    let raw = obj(vec![
+    let mut raw = vec![
         ("occurrence", s(&source.id)),
         ("name", s(&m.name)),
         ("mob_id", s(m.mob_id.urn())),
@@ -860,8 +952,11 @@ fn retain_unresolved_master(
         ),
         ("marker_native", Value::Arr(markers)),
         ("master_output_mix", mix),
-    ]);
-    append_bin_receipt(out, budget, m.bin, "unresolved_masters", raw)?;
+    ];
+    if let Some(transforms) = source_input_transforms(source, budget)? {
+        raw.push(("input_color_transforms", transforms));
+    }
+    append_bin_receipt(out, budget, m.bin, "unresolved_masters", obj(raw))?;
     loss(
         out,
         budget,
@@ -1014,6 +1109,68 @@ impl From<String> for MasterError {
         Self::Unsupported(e)
     }
 }
+fn offline_managed(
+    source: &av::SourceMaster, index: usize, item: &str, audio_index: usize,
+    video: &mut bool, labels: &mut HashSet<i64>, out: &mut ReadResult, budget: &mut Budget,
+) -> Result<SourceMedia, MasterError> {
+    let track = &source.master.tracks[index];
+    let rate = Rate::from_avid(track.edit_rate).ok_or("offline descriptor rate is unresolved".to_string())?;
+    let clock = source.file_clocks.get(index).and_then(Option::as_ref)
+        .filter(|c| (c.rate.num, c.rate.den, c.base, c.drop) == (24_000, 1001, 24, false))
+        .ok_or_else(|| format!("offline managed track {} requires a saved 23.976 non-drop file clock", track.index))?;
+    if source.offsets.get(index) != Some(&Observed::Known(0))
+        || source.rendered_freeze || source.rendered_gain.is_some()
+        || track.length <= 0 || clock.file_track != track.index
+    {
+        return Err("offline managed media has an unqualified offset, render or track selector".to_string().into());
+    }
+    let (id, kind, codec, size, sample_rate, bits, stream) = match &track.essence {
+        Some(Essence::Picture { compression, width: 1920, height: 1080,
+            display_aspect: Some((16, 9)), resolution_id: 0 })
+            if track.kind == KIND_PICTURE && compression == "RI00" && rate == clock.rate && !*video =>
+        {
+            *video = true;
+            (format!("{item}:video"), StreamKind::Video, Some("AVdn".into()), Some((1920,1080)), None, None, None)
+        }
+        Some(Essence::Sound { sample_rate: 48000.0, bits: 24, channels: 1 })
+            if track.kind == KIND_SOUND && rate == Rate::new(48_000,1).unwrap() && matches!(track.index, 1 | 2) =>
+        {
+            labels.insert(track.index);
+            (format!("{item}:audio:{audio_index}"), StreamKind::Audio, None, None, Some(48000), Some(24), Some(track.index))
+        }
+        _ => return Err("offline managed descriptor is outside the 1080p23.976 DNx/PCM24 profile".to_string().into()),
+    };
+    let package = track.file_mob.umid_hex();
+    let suffix = if kind == StreamKind::Video { "V1".to_owned() } else { format!("A{}", track.index) };
+    let path = format!("/AnyNLE-Offline/{package}/{suffix}-{package}.mxf");
+    let effective = clock.count.checked_add(clock.offset).ok_or("offline timecode overflow".to_string())?;
+    let local_offset = time(clock.offset, clock.rate)?.to_units(rate.num)
+        .filter(|n| n % rate.den == 0).map(|n| n / rate.den)
+        .ok_or("offline physical timecode offset is off the source clock".to_string())?;
+    let source_clock = SourceClock {
+        effective_count: effective as u64, rate: rational(clock.rate), display_base: 24, drop: false,
+        provenance: SourceClockProvenance {
+            origin_count: clock.count as u64, source_offset: local_offset, source_rate: rational(rate),
+            source_package: clock.package.umid_hex(), timecode_track: "TC1".into(),
+            route: "avid_saved_file_to_physical_timecode".into(),
+        },
+    };
+    sidecar(out, budget, "avid.source", &id, obj(vec![
+        ("legacy_clock", self::clock(Some((clock.count as u64, 24, false)))),
+        ("file_package", s(package)), ("file_track", Value::Int(clock.file_track)),
+        ("descriptor_length", Value::Int(track.length)), ("descriptor", descriptor(&track.essence)),
+        ("native_track", Value::Int(track.index)),
+    ])).map_err(MasterError::Budget)?;
+    budget.charge(size_of::<SourceMedia>() + size_of::<SourceItemMedia>() + id.len()*2 + path.len() + 512)
+        .map_err(MasterError::Budget)?;
+    Ok(SourceMedia {
+        id, kind, codec, frame_size: size, sample_rate, bits, stream,
+        locations: vec![path], rate: (kind == StreamKind::Video).then(|| rational(rate)),
+        duration: time(track.length, rate)?, start: source_clock.exact_start(), clock: Some(source_clock),
+        online: Some(false), original: None,
+    })
+}
+
 fn master(
     source: &av::SourceMaster,
     index: &index::MediaIndex,
@@ -1140,7 +1297,7 @@ fn master(
                 start: None,
                 clock: None,
                 stream: (selected.kind == StreamKind::Audio).then_some(t.index),
-                online: Some(true),
+                online: Some(selected.online),
                 original: Some(original.clone()),
             });
             item.media.push(SourceItemMedia {
@@ -1166,7 +1323,25 @@ fn master(
         let rate = Rate::from_avid(t.edit_rate)
             .ok_or_else(|| format!("unsupported edit rate {}", t.edit_rate))?;
         let Some(path) = index.files.get(&t.file_mob.umid_hex()) else {
+            if originals.allow_offline {
+                let media = offline_managed(source, tindex, id, audio_index, &mut video, &mut labels,
+                    out, budget)?;
+                item.media.push(SourceItemMedia {
+                    media: media.id.clone(), gain_db: t.gain_db.unwrap_or(0.0),
+                    source_offset: Some(Rational::ZERO),
+                });
+                out.graph.media.push(media);
+                raw_tracks.push(obj(vec![
+                    ("kind", Value::Int(t.kind)), ("label", Value::Int(t.index)),
+                    ("pan_raw", t.pan_raw.map(Value::Int).unwrap_or(Value::Null)),
+                    ("offset", observed(&Observed::Known(0))),
+                ]));
+                continue;
+            }
             if t.kind == KIND_SOUND {
+                budget.charge(m.name.len()*4 + 160).map_err(MasterError::Budget)?;
+                out.missing_managed_audio.push(format!("{:?} A{}: missing file package {}",
+                    m.name, t.index, t.file_mob.umid_hex()));
                 out.diagnostics.push(format!(
                     "{:?} audio A{}: media for file mob {} not found; converted without it",
                     m.name,
@@ -1489,6 +1664,9 @@ fn master(
             (Some(n), Some(r)) => Some(time(n, r)?),
             _ => None,
         };
+        let track = witness.filter(|w| w.track > 0).and_then(|w| {
+            kind(w.kind).map(|kind| TrackRef { kind, index: w.track })
+        });
         item.markers.push(marker(
             mk,
             start,
@@ -1498,7 +1676,7 @@ fn master(
                 .map(|w| w.owner.clone())
                 .unwrap_or_else(|| source.id.clone()),
             MarkerOwner::Sequence,
-            None,
+            track,
             SourceBinding {
                 placements: vec![],
                 reason: None,
@@ -1539,29 +1717,24 @@ fn master(
     ]);
     sidecar(out, budget, "avid", id, avid).map_err(MasterError::Budget)?;
     let mix = output_mix(&m.output_mix, budget).map_err(MasterError::Budget)?;
+    let mut native = vec![
+        ("occurrence", s(&source.id)),
+        ("native_rate", source.rate.map(|r| s(rational(r))).unwrap_or(Value::Null)),
+        ("drop", Value::Bool(m.start.as_ref().is_some_and(|t| t.drop))),
+        ("raw_groups", Value::Arr(m.other_groups.iter().map(s).collect())),
+        ("tracks", Value::Arr(raw_tracks)),
+        ("marker_native", Value::Arr(marker_receipts)),
+        ("master_output_mix", mix),
+    ];
+    if let Some(transforms) = source_input_transforms(source, budget).map_err(MasterError::Budget)? {
+        native.push(("input_color_transforms", transforms));
+    }
     sidecar(
         out,
         budget,
         "avid.source",
         id,
-        obj(vec![
-            ("occurrence", s(&source.id)),
-            (
-                "native_rate",
-                source.rate.map(|r| s(rational(r))).unwrap_or(Value::Null),
-            ),
-            (
-                "drop",
-                Value::Bool(m.start.as_ref().is_some_and(|t| t.drop)),
-            ),
-            (
-                "raw_groups",
-                Value::Arr(m.other_groups.iter().map(s).collect()),
-            ),
-            ("tracks", Value::Arr(raw_tracks)),
-            ("marker_native", Value::Arr(marker_receipts)),
-            ("master_output_mix", mix),
-        ]),
+        obj(native),
     )
     .map_err(MasterError::Budget)?;
     budget

@@ -786,14 +786,24 @@ pub fn set_clip_pan(project: &mut Project, placed: TrackItemId, full: Pan) -> Re
             if !(0.0..=1.0).contains(&v) {
                 return Err(other(format!("pan {}: expected -100..100", crate::build::fmt::py_repr(p))));
             }
-            panner(project, placed, Some(&crate::build::fmt::py_repr(v)))
+            panner(project, placed, Some(&crate::build::fmt::py_repr(v)), &[])
         }
-        Pan::Left => panner(project, placed, Some("0")),
-        Pan::Right => panner(project, placed, None),
+        Pan::Left => panner(project, placed, Some("0"), &[]),
+        Pan::Right => panner(project, placed, None, &[]),
     }
 }
 
-fn panner(project: &mut Project, placed: TrackItemId, value: Option<&str>) -> Result<()> {
+pub(crate) fn set_clip_pan_keys(
+    project: &mut Project, placed: TrackItemId, keys: &[super::prepared::AudioPanKey],
+) -> Result<()> {
+    // Premiere's imported mono clip panner initializes to center and stores
+    // the envelope separately. Time is absolute on the original file's clock.
+    panner(project, placed, Some("0.5"), keys)
+}
+
+fn panner(project: &mut Project, placed: TrackItemId, value: Option<&str>,
+    keys: &[super::prepared::AudioPanKey],
+) -> Result<()> {
     let tree = &mut project.doc.tree;
     let panner = tree.new_element_with("MonoToStereoPanProcessor", &[("ClassID", PANNER_CLASS_ID), ("Version", "1")]);
     let pan = tree.sub_element(panner, "PanProcessor", &[("Version", "3")]);
@@ -807,7 +817,19 @@ fn panner(project: &mut Project, placed: TrackItemId, value: Option<&str>) -> Re
         leaves.push(("StartKeyframe", format!("-91445760000000000,{start},0,0,0,0,0,0")));
         leaves.push(("CurrentValue", value.to_string()));
     }
-    leaves.extend([("IsTimeVarying", "false".into()), ("Name", "Pan".into()), ("IsInverted", "true".into())]);
+    if keys.is_empty() {
+        leaves.extend([("IsTimeVarying", "false".into()), ("Name", "Pan".into()), ("IsInverted", "true".into())]);
+    } else {
+        use std::fmt::Write;
+        let mut records = String::new();
+        for key in keys {
+            write!(records, "{},{},0,0,0,0.16666666666666666,0,0.16666666666666666;",
+                key.ticks, crate::build::fmt::py_repr(key.value)).expect("write to String");
+        }
+        leaves.push(("Keyframes", records));
+        leaves.extend([("Timestamp", "0".into()), ("IsInverted", "true".into()),
+            ("RangeLocked", "false".into()), ("Name", "Pan".into())]);
+    }
     for (tag, text) in leaves {
         let leaf = tree.sub_element(param, tag, &[]);
         tree.set_text(leaf, Some(text));
@@ -828,6 +850,10 @@ fn panner(project: &mut Project, placed: TrackItemId, value: Option<&str>) -> Re
     }
     let layout = tree.sub_element(pan, "OutputAudioChannelLayout", &[]);
     tree.set_text(layout, Some(STEREO_LAYOUT));
+    if !keys.is_empty() {
+        let layout = tree.sub_element(pan, "InputAudioChannelLayout", &[]);
+        tree.set_text(layout, Some(r#"[{"channellabel":0}]"#));
+    }
     let panner_id = project.register(panner)?;
     let element = project.track_item(placed).element;
     let tree = &mut project.doc.tree;

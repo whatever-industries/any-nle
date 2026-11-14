@@ -224,9 +224,10 @@ pub struct Speed {
     pub source_duration: Rational,
 }
 
-/// Picture position, scale, rotation and crop. Fractions of the frame from its centre, x right,
-/// y down; scale in percent; rotation in degrees clockwise; crop left, top, right, bottom of the
-/// source.
+/// Picture geometry. The anchor is the pivot in the source frame and position is where
+/// that pivot lands in the destination frame. Both use fractions from the frame centre
+/// with x right and y down. Scale is in percent, rotation is clockwise in degrees,
+/// and crop is measured inward from the source's left, top, right, and bottom edges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transform {
     pub position: (f64, f64),

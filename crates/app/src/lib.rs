@@ -1,6 +1,8 @@
 //! Shared Any NLE application engine. The CLI and native wizard share preparation and publication.
 mod application;
+mod png_mattes;
 mod media_prompt;
+mod offline;
 mod output;
 mod premiere_route;
 mod rewrap;
@@ -38,6 +40,42 @@ mod rewrap_args_tests {
     #[test]
     fn duplicate_rewrap_directory_is_refused() {
         assert!(args(&["--rewrap-op1a", "one", "--rewrap-op1a", "two"]).is_err());
+    }
+    #[test]
+    fn original_link_mode_requires_premiere_and_explicit_root_mappings() {
+        let root = std::env::current_dir().unwrap();
+        let root = root.to_str().unwrap();
+        let a = args(&[
+            "--to", "premiere", "out.prproj", "--link-originals",
+            "--map-original-root", "/saved", root, "--ffprobe", "probe",
+        ]).unwrap();
+        assert!(a.link_originals && !a.wants_rewrap());
+        assert_eq!(a.original_mappings[0].current_root, std::path::Path::new(root));
+        assert!(args(&["--map-original-root", "/saved", root]).is_err());
+        for options in [
+            vec!["--map-original-root", "/saved", "--ffprobe", "probe"],
+            vec!["--map-original-root", "/saved", "relative"],
+            vec!["--rewrap-op1a", "new"],
+            vec!["--link-originals"],
+        ] {
+            let mut command = vec!["--to", "premiere", "out.prproj", "--link-originals"];
+            command.extend(options);
+            assert!(args(&command).is_err());
+        }
+        assert!(args(&["--to", "fcpxml", "out.fcpxml", "--link-originals"]).is_err());
+    }
+    #[test]
+    fn offline_media_is_opt_in_and_refuses_rewrap() {
+        let direct = ["--to", "premiere", "out.prproj"];
+        assert!(!args(&direct).unwrap().allow_offline_media);
+        for mode in ["separate", "grouped", "merged"] {
+            assert!(args(&[&direct[..], &["--allow-offline-media", "--bin-mode", mode]].concat())
+                .unwrap().allow_offline_media);
+        }
+        assert!(args(&[&direct[..], &["--allow-offline-media", "--rewrap-op1a-prompt"]].concat()).is_err());
+        let old: crate::job::JobSpec = serde_json::from_str(r#"{"mode":"separate"}"#).unwrap();
+        assert!(!old.allow_offline_media);
+        assert!(!serde_json::to_string(&old).unwrap().contains("allow_offline_media"));
     }
     #[test]
     fn prompt_is_an_explicit_exclusive_rewrap_choice() {

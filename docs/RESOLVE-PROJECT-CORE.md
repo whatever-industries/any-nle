@@ -317,6 +317,65 @@ clip's available handle. The internal writer now round-trips that
 [Resolve profile](RESOLVE-DRP-FORMAT-CLOSEOUT.md#qualified-left-aligned-cross-dissolve).
 Avid overlap-to-cut timing remains open.
 
+#### Centered static Z Rotation
+
+The linked writer maps the compact Avid 3D Warp profile to editable
+Resolve Rotation Angle for centered, isolated angles from −30° through
++30°. It reverses the sign once between graph/2 and the Resolve Inspector.
+Resolve Studio 21.2.0.0006 saves the angle as a scalar in zero-based slot
+5, parameter ID 47, in the Inspector motion section of `EffectFiltersBA`.
+The source reader restores the graph angle from that slot.
+
+Three one-frame 1080p24 linked ProRes edits retained their original
+media, trims, and 01:00:00:00 timeline start through Resolve import,
+save, export, close, and reopen from the saved archive. All three
+decoded frames matched the corresponding native Resolve control
+exactly. The 21 measured chart points agreed with the retained Avid
+renders within 0.09 px. The profiles below also cover centered crop with
+scale and a static off-center X or Y pivot. The Linear rotation profile
+below covers a separate compact animation. Stacks with reflection
+require separate checks.
+
+#### Centered static crop with Z Rotation and Scale
+
+On matching 1080p24 picture, the linked writer preserves four source
+crop edges, independent Zoom, and centered Z Rotation as editable
+Inspector controls. The measured range covers up to about 10% left,
+8% top, 15% right, and 12% bottom crop, with width from 60% to 100%,
+height from 90% to 100%, and clockwise rotation through 30°. Retain
+Image Position is off and Softness is zero. The profile uses neutral
+position and pivot.
+
+Four linked edits from the retained Avid control tested crop alone,
+crop with rotation, crop with scale, and all three together. After
+saving and reopening from the exported archive in Resolve Studio
+21.2.0.0006, all four decoded frames matched the native Resolve control
+exactly. All 28 measured chart points agreed with Avid within 0.09 px.
+Crop masks overlapped Avid by at least 99.70% intersection over union.
+The separate Retain Image Position control changed the rendered frame
+and remains outside this mapping.
+
+#### Off-center static Z Rotation
+
+The linked writer maps Avid Axis X or Axis Y to Resolve's editable
+Anchor Point on matching 1080p24 rasters. The qualified range covers
+one positive Avid axis at a time, up to 100 Avid units, and clockwise
+rotation up to 30°, at neutral scale, source crop and translation.
+Graph/2 carries the pivot in source coordinates and the point where it
+lands in destination coordinates. Those points coincide in this profile,
+so Resolve Pan and Tilt stay at zero. Resolve saves Anchor Point in
+zero-based motion slot 6, parameter ID 48, as a pair of big-endian
+doubles. The Y axis points up in Resolve.
+
+Three linked edits tested an X pivot alone, rotation about an X pivot,
+and rotation about a Y pivot. After Resolve Studio 21.2.0.0006 saved,
+exported, closed and reopened the archive, all three decoded frames
+matched the native Resolve control exactly. All 20 visible chart
+points agreed with Avid within 0.08 px. Changing the sign of the native
+Y pivot moved the chart by over 100 px. Combined X/Y pivots, zoom or
+translation around a displaced pivot, and Axis Z remain outside this
+profile.
+
 ### Flip, Flop, and Flip-Flop
 
 The linked project writer translates isolated Avid Flip, Flop, and
@@ -406,6 +465,23 @@ alternative of applying crop after Zoom missed by up to 66 pixels.
 This profile is same-rate square-pixel 1080p with neutral background and
 other controls. Independent crop clocks, Fixed Width with crop, other
 curve modes, and stacks of separate effects remain unqualified.
+
+### Three-key Linear 3D Warp with Z Rotation
+
+The internal linked writer maps the compact Avid Linear profile to
+editable Pan, independent Zoom X, and Rotation Angle on 1080p24 V1.
+All three curves share the same three key positions from the first
+through the last visible frame. Resolve stores the opposite rotation
+sign on its source-frame clock. The writer adds source In once to the
+edit-local Avid keys. Resolve readback retains the resulting curves on
+the edit in graph/2.
+
+After saving and reopening the archive in Resolve Studio 21.2.0.0006,
+all nine Linear keys survived. The 13 decoded frames matched a separately
+prepared Resolve archive with the same keys. All 91 measured chart
+points agreed with the retained Avid renders within 0.22 px. The profile
+uses neutral tilt, height, crop and pivot. Shelf, Spline, Bezier and
+keys outside the visible edit require separate qualification.
 
 ### Avid UME originals
 

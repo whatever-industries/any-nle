@@ -7,11 +7,10 @@ Storage, from the User's Premiere 26.5.2 read-backs (2026-10-14, fixture
 - Class 0 logging columns live on the master clip's ClipLoggingInfo, as elements
   ShotTake ("Shot"), TapeName, Description, Scene, LogNote (the order Premiere wrote).
   Property-bag leaves with those column IDs are kept on save but never displayed.
-Sound Roll, Camera Roll, Aux/Sound Timecode exist as Premiere columns but are not
-editable in the Metadata panel and their storage is unknown, so those Avid values go to
-Log Note for now.
+Premiere 27's linked AAF import stores Camroll as FilmCameraRoll in ClipLoggingInfo.
+Unmapped fields such as Sound Roll go to Log Note.
 
-Mapping (proposal, User to confirm): Camroll -> Tape Name, Scene -> Scene, Take -> Shot,
+Mapping: Camroll -> Camera Roll, Scene -> Scene, Take -> Shot,
 Comments -> Comment, Source File -> Description, everything else -> Log Note lines.
 """
 from __future__ import annotations
@@ -21,14 +20,14 @@ import xml.etree.ElementTree as ET
 from .model import AvidInfo
 
 LOGGING = (  # (Avid column, ClipLoggingInfo element)
-    ("Camroll", "TapeName"),
+    ("Camroll", "FilmCameraRoll"),
     ("Scene", "Scene"),
     ("Take", "ShotTake"),
 )
 BAG = (  # (Avid column, property-bag key)
     ("Comments", "Column.PropertyText.Comment"),
 )
-LOGGING_ORDER = ("ShotTake", "TapeName", "Description", "Scene", "LogNote")
+LOGGING_ORDER = ("ShotTake", "FilmCameraRoll", "Description", "Scene", "LogNote")
 # Avid-internal or already-represented columns that should not be copied as text.
 SKIP = {"UNC Path", "Video"}
 

@@ -1,6 +1,10 @@
 //! Qualified interpretations of saved Premiere intrinsic clip components.
 use super::components::field;
-use crate::{audio::VOLUME_DB, Result};
+use crate::{
+    audio::VOLUME_DB,
+    video::{centered_crop_profile, roll::LinearRoll, validate_static_geometry},
+    Result,
+};
 use graph::{picture_motion::MotionKey, Rational, StreamKind, Transform, Value};
 use prproj::{
     build::time::TICKS_PER_SECOND,
@@ -13,11 +17,12 @@ use prproj::{
 
 const MOTION: &str = "AE.ADBE Motion";
 const MONO_VOLUME: &str = "Internal Volume Mono";
-const DEFAULT_TICKS: i64 = -91_445_760_000_000_000;
+pub(super) const DEFAULT_TICKS: i64 = -91_445_760_000_000_000;
 
 pub(super) enum ClipControl {
     StaticMotion(Transform),
     LinearMotion([MotionKey; 2]),
+    LinearRoll(LinearRoll),
     MonoVolume(f64),
 }
 
@@ -64,15 +69,25 @@ pub(super) fn interpret(
     match (kind, name.as_str()) {
         (StreamKind::Video, MOTION)
             if field(tree, item.element, "FrameRect")? == Some("0,0,1920,1080")
-                && field(tree, item.element, "PixelAspectRatio")? == Some("1,1")
-                && neutral_motion(tree, &component.properties)? =>
+                && field(tree, item.element, "PixelAspectRatio")? == Some("1,1") =>
         {
-            Ok(motion(
-                params,
-                source_in / frame_ticks,
-                source_out / frame_ticks,
-                frame_ticks,
-            ))
+            let source_in = source_in / frame_ticks;
+            let source_out = source_out / frame_ticks;
+            if frame_ticks == TICKS_PER_SECOND / 24 {
+                if let Some(roll) = linear_roll(params, source_in, source_out, frame_ticks) {
+                    return Ok(neutral_motion(tree, &component.properties, &[5])?
+                        .then_some(ClipControl::LinearRoll(roll)));
+                }
+                if let Some(transform) = static_warp(params) {
+                    return Ok(neutral_motion(tree, &component.properties, &[5, 8, 9, 10, 11])?
+                        .then_some(ClipControl::StaticMotion(transform)));
+                }
+            }
+            Ok(if neutral_motion(tree, &component.properties, &[])? {
+                motion(params, source_in, source_out, frame_ticks)
+            } else {
+                None
+            })
         }
         (StreamKind::Audio, MONO_VOLUME) if neutral_mute(project, owner)? => {
             Ok(mono_volume(params).map(ClipControl::MonoVolume))
@@ -81,7 +96,7 @@ pub(super) fn interpret(
     }
 }
 
-fn neutral_motion(tree: &Tree, params: &[NodeId]) -> Result<bool> {
+fn neutral_motion(tree: &Tree, params: &[NodeId], interpreted: &[usize]) -> Result<bool> {
     if params.len() != 11 {
         return Ok(false);
     }
@@ -96,7 +111,7 @@ fn neutral_motion(tree: &Tree, params: &[NodeId]) -> Result<bool> {
         if std::mem::replace(&mut seen[id - 1], true) {
             return Ok(false);
         }
-        if id <= 4 {
+        if id <= 4 || interpreted.contains(&id) {
             continue;
         }
         if field(tree, param, "Keyframes")?.is_some()
@@ -300,6 +315,101 @@ fn centered(value: f64) -> f64 {
     (value - 0.5).clamp(-0.05, 0.05)
 }
 
+fn static_warp(params: &[Value]) -> Option<Transform> {
+    let saved = |name| static_motion_value(parameter(params, name)?);
+    if point(saved("position")?)? != (0.5, 0.5) {
+        return None;
+    }
+    let height = number(saved("scale")?)?;
+    let width = number(saved("scale_width")?)?;
+    let Value::Bool(uniform) = saved("uniform_scale")? else {
+        return None;
+    };
+    let transform = Transform {
+        position: (0.0, 0.0),
+        scale: (if *uniform { height } else { width }, height),
+        rotation: number(saved("rotation")?)?,
+        anchor: (0.0, 0.0),
+        crop: [
+            number(saved("crop_left")?)? / 100.0,
+            number(saved("crop_top")?)? / 100.0,
+            number(saved("crop_right")?)? / 100.0,
+            number(saved("crop_bottom")?)? / 100.0,
+        ],
+    };
+    (centered_crop_profile(&transform)
+        || (transform.rotation != 0.0 && validate_static_geometry(&transform).is_ok()))
+        .then_some(transform)
+}
+
+fn linear_roll(
+    params: &[Value],
+    source_in: i64,
+    source_out: i64,
+    frame_ticks: i64,
+) -> Option<LinearRoll> {
+    if number(static_motion_value(parameter(params, "scale")?)?)? != 100.0
+        || static_motion_value(parameter(params, "uniform_scale")?)? != &Value::Bool(false)
+    {
+        return None;
+    }
+    let [position, width, rotation] = ["position", "scale_width", "rotation"]
+        .map(|name| parameter(params, name).and_then(three_linear_keys));
+    let (position, width, rotation) = (position?, width?, rotation?);
+    let mut curves = std::array::from_fn(|_| Vec::with_capacity(3));
+    let range = (-60.0 / 999.0)..=(90.0 / 999.0);
+    for ((pos, width), angle) in position.into_iter().zip(width).zip(rotation) {
+        let (frame, point) = source_key(pos, frame_ticks)?;
+        let (width_frame, width) = source_key(width, frame_ticks)?;
+        let (angle_frame, angle) = source_key(angle, frame_ticks)?;
+        let Value::Arr(point) = point else {
+            return None;
+        };
+        let [x, y] = point.as_slice() else {
+            return None;
+        };
+        let x = number(x)? - 0.5;
+        // Recenter the saved normalized point and admit only endpoint roundoff.
+        let bounded_x = x.clamp(*range.start(), *range.end());
+        if frame != width_frame || frame != angle_frame || number(y)? != 0.5
+            || (x - bounded_x).abs() > f64::EPSILON
+        {
+            return None;
+        }
+        curves[0].push((frame, bounded_x));
+        curves[1].push((frame, number(width)? / 100.0));
+        curves[2].push((frame, -number(angle)?));
+    }
+    LinearRoll::from_saved(curves, source_in, source_out.checked_sub(source_in)?, source_out)
+}
+
+fn three_linear_keys(param: &Value) -> Option<[&Value; 3]> {
+    let [first, middle, last] = keys(param)? else { return None };
+    (param.get("is_time_varying")? == &Value::Bool(true)
+        && param.get("current_value")? == &Value::Null
+        && start_value(param)? == first.get("value")?)
+        .then_some([first, middle, last])
+}
+
+fn source_key(key: &Value, frame_ticks: i64) -> Option<(u32, &Value)> {
+    let Value::Int(ticks) = key.get("ticks")? else {
+        return None;
+    };
+    if !is_linear_motion_key(key)? || ticks % frame_ticks != 0 {
+        return None;
+    }
+    Some((u32::try_from(ticks / frame_ticks).ok()?, key.get("value")?))
+}
+
+fn is_linear_motion_key(key: &Value) -> Option<bool> {
+    let Value::Arr(aux) = key.get("auxiliary_fields")? else {
+        return None;
+    };
+    Some(is_linear(key)
+        && (aux.len() == 4 || (aux.len() == 10
+            && matches!(&aux[4..6], [Value::Str(a), Value::Str(b)] if a == "5" && b == "4"))))
+}
+
 fn linear_keys(
     param: &Value,
     source_in: i64,
@@ -313,14 +423,8 @@ fn linear_keys(
         return None;
     };
     for (key, frame) in [(first, source_in), (last, source_out.checked_sub(1)?)] {
-        if !is_linear(key) || key.get("ticks")? != &Value::Int(frame.checked_mul(frame_ticks)?) {
-            return None;
-        }
-        let Value::Arr(aux) = key.get("auxiliary_fields")? else {
-            return None;
-        };
-        if aux.len() == 10
-            && !matches!(&aux[4..6], [Value::Str(a), Value::Str(b)] if a == "5" && b == "4")
+        if !is_linear_motion_key(key)?
+            || key.get("ticks")? != &Value::Int(frame.checked_mul(frame_ticks)?)
         {
             return None;
         }

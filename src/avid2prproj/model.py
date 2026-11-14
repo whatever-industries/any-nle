@@ -227,7 +227,7 @@ class AudioCrossfade:
     cut: int  # sequence ticks of the cut between two adjacent events on `track`
     duration: int
     cut_offset: int  # ticks from the crossfade start to the cut (Premiere `Alignment`)
-    style: str = "constant_power"  # or "custom_fade" (Premiere 26.5.2 save form); see audio.add_crossfade
+    style: str = "constant_power"  # Also accepts "constant_gain" and "custom_fade".
 
 
 @dataclass(frozen=True)
@@ -653,7 +653,7 @@ def _sequence(obj: object, where: str) -> Sequence:
     fades = []
     for i, f in enumerate(o.get("audio_crossfades", [])):
         fo = _keys(f, f"{where}.audio_crossfades[{i}]", {"audio_track", "cut_ticks", "duration_ticks", "cut_offset_ticks"}, {"style"})
-        _require(fo.get("style", "constant_power") in ("constant_power", "custom_fade"), f"{where}.audio_crossfades[{i}].style: constant_power or custom_fade")
+        _require(fo.get("style", "constant_power") in ("constant_power", "constant_gain", "custom_fade"), f"{where}.audio_crossfades[{i}].style: constant_power or custom_fade")
         _require(isinstance(fo["audio_track"], int) and 1 <= fo["audio_track"] <= 99, f"{where}.audio_crossfades[{i}].audio_track: expected 1..99")
         duration = _ticks(fo["duration_ticks"], f"{where}.audio_crossfades[{i}].duration_ticks", positive=True)
         offset = _ticks(fo["cut_offset_ticks"], f"{where}.audio_crossfades[{i}].cut_offset_ticks")

@@ -1,9 +1,10 @@
 //! Preparation for the bounded, linked-media project qualification harness.
+mod clip_envelope;
 pub(crate) mod mixer;
 
 use crate::{
     atom::{verify_atom_binding, AtomBindingSpec},
-    audio::{self, Envelope},
+    audio::Envelope,
     clip_label::ClipLabel,
     dissolve,
     group::prepare_bound_group,
@@ -223,7 +224,8 @@ pub(crate) struct Timeline {
     pub(crate) track_state: Option<crate::track_state::TrackState>,
     pub(crate) group: Option<GroupTimeline>,
     pub(crate) mixer: Option<mixer::DirectMixer>,
-    pub(crate) dissolve: Option<dissolve::Dissolve>,
+    pub(crate) faders: mixer::StaticFaders,
+    pub(crate) dissolves: Vec<dissolve::Dissolve>,
     pub(crate) captions: Vec<crate::captions::Caption>,
     pub(crate) solid: Option<crate::generator::Solid>,
     pub(crate) compound: bool,
@@ -803,6 +805,7 @@ pub(crate) fn prepare_project(
                 return Err("unqualified canvas, mixed project rates, duplicate selection or timeline topology".into());
             }
             let compound = crate::nests::compound(graph, &sequence.id);
+            let faders = mixer::StaticFaders::prepare(graph, sequence)?;
             let uses = &nests[row_index];
             let nest_member = !uses.is_empty() || nested_children.contains(&row_index);
             let shape = |kind, index| sequence.tracks.iter().any(|t|
@@ -838,7 +841,7 @@ pub(crate) fn prepare_project(
                     !sequence
                         .tracks
                         .iter()
-                        .any(|t| t.kind == kind && t.index == index && t.level_db.is_none())
+                        .any(|t| t.kind == kind && t.index == index)
                 })
                 || (third_mono && !sequence.tracks.iter().any(|track|
                     track.kind == StreamKind::Audio && track.index == 3 && track.level_db.is_none()))
@@ -858,6 +861,9 @@ pub(crate) fn prepare_project(
             }
             let origin = check_origin(sequence)?;
             if let Some(group) = &row.group {
+                if faders != mixer::StaticFaders::default() {
+                    return Err("Group timelines require neutral track and bus faders".into());
+                }
                 if second_picture || !sequence.texts.is_empty() || !sequence.transitions.is_empty()
                     || graph.sidecar(crate::generator::ADAPTER, &sequence.id).is_some()
                 {
@@ -902,7 +908,8 @@ pub(crate) fn prepare_project(
                         marks: None,
                         track_state: None,
                         mixer: None,
-                        dissolve: None,
+                        faders: Default::default(),
+                        dissolves: vec![],
                         captions: vec![],
                         solid: None,
                         compound: false,
@@ -926,18 +933,37 @@ pub(crate) fn prepare_project(
                 );
             }
             let mixer = mixer::DirectMixer::prepare(graph, sequence)?;
+            if faders != mixer::StaticFaders::default()
+                && (picture_only || second_picture || third_mono || mixer.is_some() || nest_member)
+            {
+                return Err("static faders require a linked V1/A1/A2 timeline with a neutral mixer".into());
+            }
             let track_state = crate::track_state::TrackState::prepare_for_resolve(graph, sequence)?;
+            if faders.pans != [0; 2] && track_state.is_some() {
+                return Err("linked track pan with track names, locks or output state is unqualified".into());
+            }
             if track_state.is_some() && (picture_only || compound || second_picture || third_mono) {
                 return Err("Resolve track names and locks require a registered V1/A1/A2 timeline".into());
             }
-            let dissolve = dissolve::prepare(graph, sequence)?;
-            let source_dissolve = dissolve::from_source(sequence)?;
+            let native_dissolves = dissolve::prepare_all_native(graph, sequence)?;
+            let source_dissolves = dissolve::from_source(sequence)?;
             let solid = crate::generator::prepare(graph, sequence)?;
             if solid.is_some() && !picture_only {
                 return Err("Solid Color requires a picture-only linked project timeline".into());
             }
-            if dissolve.is_some() && source_dissolve.is_some() {
+            if !native_dissolves.is_empty() && !source_dissolves.is_empty() {
                 return Err("conflicting Resolve and cross-editor transition facts".into());
+            }
+            if let Some(fade) = source_dissolves.iter().find(|fade| fade.prepared.audio) {
+                if graph.losses.iter().any(|loss| {
+                    (loss.object == fade.outgoing || loss.object == fade.incoming)
+                        && loss.aspect == "premiere.appearance"
+                }) {
+                    return Err(format!(
+                        "{}: A1 crossfade endpoints have unsupported clip processing",
+                        fade.prepared.id
+                    ).into());
+                }
             }
             if mixer.is_some() && (picture_only || third_mono) {
                 return Err(
@@ -952,8 +978,11 @@ pub(crate) fn prepare_project(
                 .filter(|p| matches!(p.effects.as_slice(), [effect] if effect.kind == "avid.resize_linear"))
                 .map(|p| p.id.as_str())
                 .collect();
-            let mut recovered_audio = HashMap::new();
             let mut recovered_labels = HashSet::new();
+            let has_a1_crossfade = source_dissolves.iter().chain(&native_dissolves)
+                .any(|fade| fade.prepared.audio);
+            let mut clip_envelopes =
+                clip_envelope::ClipEnvelopePreparation::new(graph, sequence, has_a1_crossfade);
             let mut lanes: [Vec<Edit>; 5] = Default::default();
             for edit in &sequence.placements {
                 check_linked_placement(edit).map_err(|e| format!("{}: {e}", edit.id))?;
@@ -1008,16 +1037,19 @@ pub(crate) fn prepare_project(
                     )
                     .into());
                 }
+                let premiere_fades = clip_envelopes.check_premiere_fades(
+                    edit, lane, &media[*media_index].profile,
+                )?;
                 let mut start = frames_on(edit.record_start, sequence.rate)?;
                 let mut source_in = frames_on(edit.source_in, sequence.rate)?;
                 let mut length = frames_on(edit.duration, sequence.rate)?;
-                if let Some(dissolve) = source_dissolve.as_ref().filter(|dissolve| dissolve.incoming == edit.id) {
+                if let Some(dissolve) = source_dissolves.iter().find(|dissolve| dissolve.incoming == edit.id) {
                     let preroll = dissolve.prepared.before;
                     start = start.checked_add(preroll).ok_or("dissolve start overflow")?;
                     source_in = source_in.checked_add(preroll).ok_or("dissolve source in overflow")?;
                     length -= preroll;
                 }
-                if let Some(dissolve) = source_dissolve.as_ref().filter(|dissolve| dissolve.outgoing == edit.id) {
+                if let Some(dissolve) = source_dissolves.iter().find(|dissolve| dissolve.outgoing == edit.id) {
                     length -= crate::dissolve::DURATION - dissolve.prepared.before;
                 }
                 let speed = crate::retime::PictureSpeed::prepare(edit, sequence.rate, length)
@@ -1036,29 +1068,9 @@ pub(crate) fn prepare_project(
                         format!("{}: edit exceeds the physical playable range", edit.id).into(),
                     );
                 }
-                let envelope = if matches!(lane, 1 | 2 | 4) {
-                    if graph.sidecar(audio::UNQUALIFIED_FADE_ADAPTER, &edit.id).is_some() {
-                        return Err(format!("{}: unqualified Resolve clip fade points", edit.id).into());
-                    }
-                    let receipt = graph.sidecar(crate::source::ADAPTER, &edit.id);
-                    if (receipt.is_some() || edit.volume_db.is_some() || !edit.volume_keys.is_empty())
-                        && !matches!(&media[*media_index].profile, Profile::Wav { .. })
-                    {
-                        return Err(format!("{}: clip envelopes require a verified WAV source", edit.id).into());
-                    }
-                    if (receipt.is_some() || !edit.volume_keys.is_empty())
-                        && (sequence.rate.num(), sequence.rate.den()) != (24, 1)
-                    {
-                        return Err(format!("{}: linked fades and volume keys require 24 fps", edit.id).into());
-                    }
-                    let envelope = audio::prepare(edit, source_in, length, sequence.rate, receipt)?;
-                    if let Some(loss) = envelope.and_then(Envelope::recovered_loss) {
-                        recovered_audio.insert(edit.id.as_str(), loss);
-                    }
-                    envelope.filter(|control| *control != Envelope::static_volume(0.0))
-                } else {
-                    None
-                };
+                let envelope = clip_envelopes.prepare(
+                    edit, lane, &media[*media_index].profile, source_in, length, premiere_fades,
+                )?;
                 let video = crate::video::prepare(edit, sequence.rate, source_in, length, available)
                     .map_err(|e| format!("{}: {e}", edit.id))?;
                 let grade = crate::grade::prepare(graph, &edit.id)?;
@@ -1121,7 +1133,9 @@ pub(crate) fn prepare_project(
                 }
                 duration = Some(end);
             }
-            if let Some(fade) = dissolve.as_ref().filter(|fade| fade.audio) {
+            if let Some(fade) = native_dissolves.iter().chain(&source_dissolves)
+                .map(|value| &value.prepared).find(|fade| fade.audio)
+            {
                 let adjacent = lanes[1].windows(2).find(|pair| pair[1].start == fade.cut);
                 let Some([left, right]) = adjacent else {
                     return Err("missing prepared A1 crossfade endpoints".into());
@@ -1131,6 +1145,9 @@ pub(crate) fn prepare_project(
                 else {
                     return Err("A1 crossfade requires two verified WAV channels".into());
                 };
+                if left.envelope.is_some() || right.envelope.is_some() {
+                    return Err("A1 crossfade with a clip envelope requires a combined mapping".into());
+                }
                 if left.source_in.checked_add(left.length)
                     .and_then(|end| end.checked_add(dissolve::DURATION - fade.before))
                     .is_none_or(|end| end > samples / samples_per_frame(sequence.rate))
@@ -1180,10 +1197,7 @@ pub(crate) fn prepare_project(
                 if marks.is_some() && crate::timeline_marks::TimelineMarks::recover(l, &sequence.id) {
                     return false;
                 }
-                if recovered_audio
-                    .get(l.object.as_str())
-                    .is_some_and(|(aspect, reason)| l.aspect == *aspect && l.reason == *reason)
-                {
+                if clip_envelopes.recovers(l) {
                     return false;
                 }
                 if recovered_labels.contains(l.object.as_str()) && ClipLabel::recover(l) {
@@ -1192,7 +1206,10 @@ pub(crate) fn prepare_project(
                 if mixer.is_some() && mixer::DirectMixer::recover(l, &sequence.id) {
                     return false;
                 }
-                if dissolve.as_ref().is_some_and(|d| d.recover(l, &sequence.id)) {
+                if faders.recover(l, &sequence.id) {
+                    return false;
+                }
+                if native_dissolves.iter().any(|d| d.prepared.recover(l, &sequence.id)) {
                     return false;
                 }
                 if crate::nests::recover(l, &sequence.id, uses)
@@ -1256,7 +1273,9 @@ pub(crate) fn prepare_project(
                     track_state,
                     group: None,
                     mixer,
-                    dissolve: dissolve.or_else(|| source_dissolve.map(|value| value.prepared)),
+                    faders,
+                    dissolves: native_dissolves.into_iter().chain(source_dissolves)
+                        .map(|transition| transition.prepared).collect(),
                     captions,
                     solid,
                     compound,

@@ -71,6 +71,11 @@ const UNIFORM_SCALE: Parameter = Parameter {
     tag: "VideoComponentParam",
     units: "boolean",
 };
+const ROTATION: Parameter = Parameter {
+    name: "rotation",
+    units: "degrees_clockwise",
+    ..SCALE
+};
 const VOLUME: Parameter = Parameter {
     name: "level",
     class: AUDIO_SCALAR_CLASS,
@@ -129,6 +134,11 @@ pub(super) fn capture(
                     Some("2") => SCALE,
                     Some("3") => SCALE_WIDTH,
                     Some("4") => UNIFORM_SCALE,
+                    Some("5") => ROTATION,
+                    Some("8") => Parameter { name: "crop_left", ..SCALE },
+                    Some("9") => Parameter { name: "crop_top", ..SCALE },
+                    Some("10") => Parameter { name: "crop_right", ..SCALE },
+                    Some("11") => Parameter { name: "crop_bottom", ..SCALE },
                     _ => continue,
                 };
                 capture_parameter(tree, param, profile, budget, &mut parameters)?;

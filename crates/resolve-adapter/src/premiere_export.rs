@@ -4,7 +4,7 @@ use crate::{
     dissolve,
     linked::{
         self,
-        mixer::{neutral_when_present, DirectMixer, StripProcessing, PROCESSING_RECEIPT},
+        mixer::{prepare_linked_track_pans, DirectMixer, StripProcessing},
         MediaSpec, Profile,
     },
     media::{check_wav_extent, media_digest},
@@ -12,9 +12,14 @@ use crate::{
     source::{
         mixer::{
             fader_ticks, parse_track_mutes, DIRECT_PROFILE, FAIRLIGHT_ADAPTER, FAIRLIGHT_LOSS,
-            LINKED_TRACK_PANS, MAIN_BUS_LEVEL, MAIN_BUS_LOSS, MUTED_AUDIO_TRACKS, TRACK_MUTE_LOSS,
+            MAIN_BUS_LEVEL, MAIN_BUS_LOSS, MUTED_AUDIO_TRACKS, TRACK_MUTE_LOSS,
         },
         ADAPTER,
+    },
+    video::{
+        centered_crop_profile, rotation_axis_profile, validate_static_geometry,
+        motion::{LinearMotion, NATIVE_LINEAR_KIND},
+        roll::{LinearRoll, RESOLVE_KIND as LINEAR_ROLL_KIND},
     },
     Result, StreamSelector,
 };
@@ -68,20 +73,23 @@ pub fn write_with_options(
     let handled_labels: HashSet<_> = labels.iter().map(|label| label.owner.as_str())
         .chain(metadata_losses.iter().filter(|loss| loss.aspect == "clip_label")
             .map(|loss| loss.object.as_str())).collect();
-    let transition = dissolve::prepare_native(&graph, sequence)?
-        .map(|fade| {
-            let d = fade.prepared;
-            if d.audio && mixer.mono_track_pans.is_some() {
-                return Err(format!("Resolve transition {}: audio crossfade with track pan is unqualified", d.id));
-            }
-            if !d.audio && (sequence.rate.num(), sequence.rate.den()) != (24000, 1001) {
-                return Err(format!("Resolve transition {}: Premiere video dissolve requires the qualified 23.976 profile", d.id));
-            }
-            let frame = Rational::new(sequence.rate.den().into(), sequence.rate.num().into())
-                .and_then(|period| period.to_units(TICKS_PER_SECOND))
-                .ok_or_else(|| format!("Resolve transition {}: no exact Premiere frame clock", d.id))?;
-            Ok::<_, String>((d, fade.outgoing.to_owned(), fade.incoming.to_owned(), frame))
-        }).transpose()?;
+    let mut transitions = Vec::new();
+    for transition in dissolve::prepare_all_native(&graph, sequence)? {
+        let d = transition.prepared;
+        if d.audio && mixer.mono_track_pans.is_some() {
+            return Err(format!("Resolve transition {}: audio crossfade with track pan is unqualified", d.id).into());
+        }
+        if !d.audio && sequence.rate == Rational::integer(24) && d.before != dissolve::DURATION / 2 {
+            return Err(format!(
+                "Resolve transition {}: 24 fps Premiere video dissolve requires centered alignment",
+                d.id
+            ).into());
+        }
+        let frame = Rational::new(sequence.rate.den().into(), sequence.rate.num().into())
+            .and_then(|period| period.to_units(TICKS_PER_SECOND))
+            .ok_or_else(|| format!("Resolve transition {}: no exact Premiere frame clock", d.id))?;
+        transitions.push((d, transition.outgoing.to_owned(), transition.incoming.to_owned(), frame));
+    }
     let used: HashSet<_> = sequence.placements.iter().map(|p| p.item.clone()).collect();
     let mut owned = used.clone();
     owned.insert(sequence_id.into());
@@ -110,7 +118,7 @@ pub fn write_with_options(
             {
                 return false;
             }
-            if transition.as_ref().is_some_and(|(d, ..)| d.recover(loss, sequence_id)) {
+            if transitions.iter().any(|(d, ..)| d.recover(loss, sequence_id)) {
                 return false;
             }
             let control = (loss.aspect.as_str(), loss.reason.as_str());
@@ -206,7 +214,7 @@ pub fn write_with_options(
             reflection_before_motion: [false; 2],
         });
     }
-    if let Some((d, outgoing, incoming, frame)) = transition {
+    for (d, outgoing, incoming, frame) in transitions {
         let refuse = |reason| format!("Resolve transition {}: {reason}", d.id);
         let (Some(&(sequence, out)), Some(&(other_sequence, inc))) =
             (prepared.ownership.get(&outgoing), prepared.ownership.get(&incoming))
@@ -358,7 +366,7 @@ fn validate_sequence(
         .iter()
         .any(|p| !p.audio_tracks.is_empty());
     let has_linear_motion = sequence.placements.iter().any(|p| {
-        p.effects.iter().any(|effect| effect.kind == crate::video::motion::NATIVE_LINEAR_KIND)
+        p.effects.iter().any(|effect| effect.kind == NATIVE_LINEAR_KIND)
     });
     let qualified_clock = sequence.clock.as_ref().is_some_and(|clock| {
         clock.provenance.route == "Resolve archive clock"
@@ -376,7 +384,8 @@ fn validate_sequence(
     });
     let sequence_receipt = graph.sidecar(ADAPTER, sequence_id);
     let fairlight = graph.sidecar(FAIRLIGHT_ADAPTER, sequence_id);
-    let mut mono_track_pans = prepare_mono_track_pans(fairlight, sequence_id)?;
+    let mut mono_track_pans = prepare_linked_track_pans(fairlight, sequence_id)?
+        .map(|pans| pans.map(|pan| f64::from(pan) / 10.0));
     let mut mapped_direct_mixer = false;
     if has_track_state && has_audio && fairlight.is_some_and(|r| r.get(DIRECT_PROFILE).is_some()) {
         // Resolve saves a separate Fairlight mirror when a track is renamed or
@@ -492,17 +501,31 @@ fn validate_sequence(
             _ => return Err(unsupported().into()),
         };
         if let Some(transform) = &edit.transform {
+            let qualified_geometry = match (sequence.rate.num(), sequence.rate.den()) {
+                (24000, 1001) => transform.rotation == 0.0 && validate_static_geometry(transform).is_ok(),
+                (24, 1) => centered_crop_profile(transform)
+                    || rotation_axis_profile(transform)
+                    || (transform.position == (0.0, 0.0)
+                        && transform.scale == (100.0, 100.0)
+                        && transform.crop == [0.0; 4]
+                        && validate_static_geometry(transform).is_ok()),
+                _ => false,
+            };
             if lane != 0
-                || (sequence.rate.num(), sequence.rate.den()) != (24000, 1001)
+                || !qualified_geometry
                 || edit.speed.is_some()
-                || crate::video::validate_static_geometry(transform).is_err()
+                || !edit.effects.is_empty()
             {
-                return Err(format!("{}: unsupported Resolve static position, scale or crop", edit.id).into());
+                return Err(format!("{}: unsupported Resolve static picture geometry or effect stack for Premiere", edit.id).into());
             }
         }
         let qualified_effects = match edit.effects.as_slice() {
             [] => true,
-            [effect] => lane == 0 && effect.kind == crate::video::motion::NATIVE_LINEAR_KIND,
+            [effect] if lane == 0 => match effect.kind.as_str() {
+                NATIVE_LINEAR_KIND => (sequence.rate.num(), sequence.rate.den()) == (24000, 1001),
+                LINEAR_ROLL_KIND => sequence.rate == Rational::integer(24) && edit.speed.is_none(),
+                _ => false,
+            },
             _ => false,
         };
         if !edit.grouped_audio.is_empty()
@@ -596,59 +619,6 @@ fn prepare_track_pan(sequence: &mut SourceSequence, mixer: &mut PreparedAudioMix
     mixer.mono_track_pans = pans.iter().any(Option::is_some).then_some(pans);
 }
 
-fn prepare_mono_track_pans(fairlight: Option<&Value>, sequence_id: &str) -> Result<Option<[f64; 2]>> {
-    let Some(data) = fairlight else {
-        return Ok(None);
-    };
-    let Some(saved_pans) = data.get(LINKED_TRACK_PANS) else {
-        return Ok(None);
-    };
-    let unsupported = || format!("{sequence_id}: unsupported Resolve track pan or routing");
-    let (Value::Arr(pans), Some(Value::Arr(tracks)), Some(Value::Arr(buses))) =
-        (saved_pans, data.get("tracks"), data.get("buses"))
-    else {
-        return Err(unsupported().into());
-    };
-    let ([Value::Int(left), Value::Int(right)], [first, second], [bus]) =
-        (pans.as_slice(), tracks.as_slice(), buses.as_slice())
-    else {
-        return Err(unsupported().into());
-    };
-    let row_value = |row: &Value, key, value| row.get(key) == Some(&Value::Int(value));
-    if !row_value(bus, "index", 0)
-        || !row_value(bus, "strip_id", 3)
-        || !row_value(bus, "channels", 2)
-        || !row_value(bus, "mute_code", 0)
-        || !row_value(bus, "output_connected_code", 0)
-        || !row_value(bus, "output_bus_index", -1)
-        || !neutral_when_present(bus, &["raw_pan", "raw_pan_bypass", "raw_solo",
-            "pre_dynamics_gain_tenths_db", "effects_in_code"])
-        || StripProcessing::from_bus_receipt(bus).ok() != Some(StripProcessing::DEFAULT)
-        || data.get("main_bus") != Some(bus)
-        || data.get(PROCESSING_RECEIPT).is_some()
-        || data.get(DIRECT_PROFILE).is_some_and(|profile| profile != &Value::Int(1))
-        || [(*left, first), (*right, second)].into_iter().enumerate().any(|(index, (pan, row))| {
-            !(-1000..=1000).contains(&pan)
-                || !row_value(row, "track", index as i64 + 1)
-                || !row_value(row, "strip_id", index as i64)
-                || !row_value(row, "channel_index", 0)
-                || !row_value(row, "pan_tenths_percent", pan)
-                || !row_value(row, "pan_bypass_code", 0)
-                || !row_value(row, "output_connected_code", 1)
-                || !row_value(row, "output_bus_index", 0)
-                || !neutral_when_present(row, &["solo_code", "pre_dynamics_gain_tenths_db",
-                    "effects_in_code"])
-                || row.get("unresolved_channel_fields").is_some_and(|fields| {
-                    !neutral_when_present(fields, &["0x011_second"])
-                })
-                || !StripProcessing::saved_rows_are_default(row)
-        })
-    {
-        return Err(unsupported().into());
-    }
-    Ok(Some([*left as f64 / 10.0, *right as f64 / 10.0]))
-}
-
 struct ClipFade {
     owner: String,
     track: i64,
@@ -714,46 +684,31 @@ fn prepare_clip_controls(graph: &mut SourceGraph) -> Result<(Vec<ClipFade>, Vec<
         };
         let rate = sequence.rate;
         let length = frames_on(edit.duration, rate).map_err(|_| unsupported())?;
-        let (head, tail) = if receipt.get("fade_in_fractional_frames").is_some()
-            || receipt.get("fade_out_fractional_frames").is_some()
-        {
-            if !edit.volume_keys.is_empty() {
-                return Err(unsupported().into());
-            }
-            let [head, tail] =
-                fractional_fade_ticks(receipt, length, frame_ticks).ok_or_else(unsupported)?;
-            recovered.insert((edit.id.as_str(), audio::FRACTIONAL_FADE_LOSS));
-            (head, tail)
+        let source_in = if edit.volume_keys.is_empty() {
+            0
         } else {
-            let source_in = if edit.volume_keys.is_empty() {
-                0
-            } else {
-                frames_on(edit.source_in, rate).map_err(|_| unsupported())?
-            };
-            let envelope = audio::prepare(edit, source_in, length, rate, Some(receipt))?
-                .ok_or_else(unsupported)?;
-            if let Some(loss) = envelope.recovered_loss() {
-                recovered.insert((edit.id.as_str(), loss));
-            }
-            if matches!(envelope.volume, Some(Volume::Keys(_))) {
-                losses.push(Loss {
-                    object: edit.id.clone(),
-                    aspect: "volume_interpolation".into(),
-                    reason: "Premiere keeps the editable key times and dB values; its Linear curve can differ from Resolve's linear-dB curve"
-                        .into(),
-                });
-            }
-            let Some(fade) = envelope.fades else {
-                continue;
-            };
-            if fade.head_point.is_some() || fade.tail_point.is_some() {
-                return Err(unsupported().into());
-            }
-            (
-                fade.head.checked_mul(frame_ticks).ok_or_else(unsupported)?,
-                fade.tail.checked_mul(frame_ticks).ok_or_else(unsupported)?,
-            )
+            frames_on(edit.source_in, rate).map_err(|_| unsupported())?
         };
+        let envelope = audio::prepare(edit, source_in, length, rate, Some(receipt))?
+            .ok_or_else(unsupported)?;
+        if let Some(loss) = envelope.recovered_loss() {
+            recovered.insert((edit.id.as_str(), loss));
+        }
+        if matches!(envelope.volume, Some(Volume::Keys(_))) {
+            losses.push(Loss {
+                object: edit.id.clone(),
+                aspect: "volume_interpolation".into(),
+                reason: "Premiere keeps the editable key times and dB values; its Linear curve can differ from Resolve's linear-dB curve"
+                    .into(),
+            });
+        }
+        let Some(fade) = envelope.fades else {
+            continue;
+        };
+        if fade.head_point.is_some() || fade.tail_point.is_some() {
+            return Err(unsupported().into());
+        }
+        let [head, tail] = fade.ticks(length, frame_ticks).ok_or_else(unsupported)?;
         fades.push(ClipFade {
             owner: edit.id.clone(),
             track: *track,
@@ -768,45 +723,6 @@ fn prepare_clip_controls(graph: &mut SourceGraph) -> Result<(Vec<ClipFade>, Vec<
         ))
     });
     Ok((fades, losses))
-}
-
-fn fractional_fade_ticks(data: &Value, length: i64, frame_ticks: i64) -> Option<[i64; 2]> {
-    let Value::Obj(fields) = data else {
-        return None;
-    };
-    let (
-        Some(Value::Str(clock)),
-        Some(Value::Str(shape)),
-        Some(Value::Float(head)),
-        Some(Value::Float(tail)),
-    ) = (
-        data.get("fade_clock"),
-        data.get("fade_shape"),
-        data.get("fade_in_fractional_frames"),
-        data.get("fade_out_fractional_frames"),
-    )
-    else {
-        return None;
-    };
-    if fields.len() != 4
-        || clock != "clip_edges"
-        || shape != "linear_amplitude"
-        || !head.is_finite()
-        || !tail.is_finite()
-        || *head < 0.0
-        || *tail < 0.0
-        || head + tail > length as f64
-        || (head.fract() == 0.0 && tail.fract() == 0.0)
-    {
-        return None;
-    }
-    let ticks = |frames: f64| {
-        let ticks = (frames * frame_ticks as f64).round();
-        // Bound the float-to-tick quantization to exact integer f64 values.
-        (ticks <= (1u64 << 53) as f64 && (frames == 0.0 || ticks >= 1.0)).then_some(ticks as i64)
-    };
-    let result = [ticks(*head)?, ticks(*tail)?];
-    (result[0].checked_add(result[1])? <= length.checked_mul(frame_ticks)?).then_some(result)
 }
 
 type VerifiedFiles = HashMap<String, (linked::Media, Rational, i64)>;
@@ -1000,23 +916,28 @@ fn prepare_discrete_tracks(graph: &mut SourceGraph) -> Result<Vec<(String, Pictu
             return Err(invalid().into());
         }
         if let [effect] = edit.effects.as_slice() {
-            let refuse = || format!("{}: unsupported Resolve Linear position or scale", edit.id);
-            if kind != StreamKind::Video
-                || (sequence.rate.num(), sequence.rate.den()) != (24000, 1001)
-                || edit.transform.is_some()
-                || edit.speed.is_some()
-            {
+            let refuse = || format!("{}: unsupported Resolve Linear picture controls", edit.id);
+            if kind != StreamKind::Video || edit.transform.is_some() || edit.speed.is_some() {
                 return Err(refuse().into());
             }
-            let (base, picture) = crate::video::motion::LinearMotion::prepare_premiere(
-                effect,
-                frames_on(edit.source_in, sequence.rate).map_err(|_| refuse())?,
-                frames_on(edit.duration, sequence.rate).map_err(|_| refuse())?,
-                frames_on(source.duration, sequence.rate).map_err(|_| refuse())?,
-                TICKS_PER_SECOND / 24000 * 1001,
-            )
-            .map_err(|error| format!("{}: {error}", refuse()))?;
-            edit.transform = Some(base);
+            let source_in = frames_on(edit.source_in, sequence.rate).map_err(|_| refuse())?;
+            let length = frames_on(edit.duration, sequence.rate).map_err(|_| refuse())?;
+            let available = frames_on(source.duration, sequence.rate).map_err(|_| refuse())?;
+            let picture = match effect.kind.as_str() {
+                NATIVE_LINEAR_KIND if (sequence.rate.num(), sequence.rate.den()) == (24000, 1001) => {
+                    let (base, picture) = LinearMotion::prepare_premiere(
+                        effect, source_in, length, available, TICKS_PER_SECOND / 24000 * 1001,
+                    ).map_err(|error| format!("{}: {error}", refuse()))?;
+                    edit.transform = Some(base);
+                    picture
+                }
+                LINEAR_ROLL_KIND if sequence.rate == Rational::integer(24) => {
+                    LinearRoll::from_graph(effect, source_in, length, available)
+                        .and_then(|roll| roll.prepare_premiere())
+                        .map_err(|error| format!("{}: {error}", refuse()))?
+                }
+                _ => return Err(refuse().into()),
+            };
             edit.effects.clear();
             motions.push((edit.id.clone(), picture));
         }

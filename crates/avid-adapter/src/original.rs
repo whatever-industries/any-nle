@@ -3,11 +3,13 @@ use crate::SourceReadIssue;
 use avid_reader::source as av;
 use graph::{source::OriginalStream, Rational, StreamKind, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
+mod still;
+pub use still::{verify_imported_png, PngRole};
 #[derive(Clone, Debug)]
 pub struct RootMapping {
     pub saved_root: PathBuf,
@@ -29,6 +31,7 @@ impl Default for OriginalOptions {
 #[derive(Clone, Debug)]
 pub struct Selected {
     pub path: PathBuf,
+    pub online: bool,
     pub stream: OriginalStream,
     pub kind: StreamKind,
     pub codec: String,
@@ -43,9 +46,86 @@ pub struct Selected {
 #[derive(Default)]
 pub struct OriginalIndex {
     pub tracks: HashMap<(String, usize), Selected>,
+    pub(crate) allow_offline: bool,
     pub original_inputs: Vec<av::SourceInput>,
     /// Explicit destination defaults, never observations of missing source tags.
     pub notes: Vec<String>,
+}
+
+fn selection_cost(master: &av::SourceMaster, raw: &av::OriginalTrack, path: &Path) -> usize {
+    std::mem::size_of::<Selected>() + path.as_os_str().len()
+        + raw.locators.iter().map(String::len).sum::<usize>() + master.id.len() + 256
+}
+
+fn offline_original(master: &av::SourceMaster, index: usize) -> Result<Selected, String> {
+    let track = &master.master.tracks[index];
+    let raw = master.originals[index].as_ref().unwrap();
+    let mut locators = raw.locators.iter().map(|path| saved_parts(path));
+    let saved = locators.next().transpose()?.ok_or("saved original path is absent")?;
+    for other in locators {
+        if other? != saved {
+            return Err("offline original has conflicting saved locators".into());
+        }
+    }
+    let path = PathBuf::from(&raw.locators[0]);
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let movie = extension == "mp4";
+    let has_picture = master.master.tracks.iter().any(|t| t.kind == avid_reader::extract::KIND_PICTURE);
+    let (kind, codec, representation, bits, rate, raster) = match (&track.essence, raw.descriptor_class.as_str()) {
+        (Some(avid_reader::extract::Essence::Picture { width: 1920, height: 1080 | 1088, .. }), "CDCI")
+            if track.kind == avid_reader::extract::KIND_PICTURE && extension == "mp4"
+                && raw.display_raster == Some((1920, 1080)) && raw.descriptor_rate == 24.0
+                && track.edit_rate == 24.0 && raw.descriptor_length == track.length
+                && raw.file_track == Some(1) =>
+            (StreamKind::Video, "avc1", None, None, Some(Rational::integer(24)), Some((1920, 1080))),
+        (Some(avid_reader::extract::Essence::Sound { bits, .. }), "PCMA")
+            if track.kind == avid_reader::extract::KIND_SOUND && extension == "wav"
+                && matches!(bits, 16 | 24) && raw.descriptor_rate == 48000.0 && !has_picture =>
+            (StreamKind::Audio, if *bits == 16 {"pcm_s16le"} else {"pcm_s24le"},
+                Some(if *bits == 16 {"pcm16"} else {"pcm24"}), Some(*bits), None, None),
+        (_, "MPGA") if track.kind == avid_reader::extract::KIND_SOUND && extension == "mp4"
+            && has_picture && raw.descriptor_rate == 46.875 && raw.channels == Some(2)
+            && raw.motion_audio_track_start != Some(1) =>
+            (StreamKind::Audio, "aac", Some("aac"), None, None, None),
+        _ => return Err("saved descriptor is outside the offline WAV or same-rate MP4 profile".into()),
+    };
+    let (time_base, channels, channel_index, sample_rate) = if kind == StreamKind::Video {
+        (Rational::new(1, 24).unwrap(), None, None, None)
+    } else {
+        let count = raw.channels.filter(|c| matches!(c, 1 | 2)).ok_or("offline channel count unresolved")?;
+        let channel = raw.file_track.filter(|n| (1..=count).contains(n)).ok_or("offline channel selector unresolved")? - 1;
+        if raw.sample_rate != Some(48_000.0) || bits.is_some() && raw.stored_quantization_bits != bits {
+            return Err("offline audio descriptor has an unsupported sample clock or representation".into());
+        }
+        (Rational::new(1, 48_000).unwrap(), Some(count), Some(channel), Some(48_000))
+    };
+    if raw.descriptor_length <= 0 || master.offsets.get(index) != Some(&av::Observed::Known(0)) {
+        return Err("offline original requires a known zero item offset and a positive extent".into());
+    }
+    Ok(Selected {
+        path,
+        online: false,
+        stream: OriginalStream {
+            saved_locators: raw.locators.clone(),
+            container: if movie {"mov"} else {"wav"}.into(),
+            stream_index: if movie && kind == StreamKind::Audio {1} else {0},
+            channel_index,
+            channels,
+            time_base,
+            start_pts: 0,
+            duration_ts: raw.descriptor_length,
+            sample_representation: representation.map(str::to_owned),
+        },
+        kind,
+        codec: codec.into(),
+        raster,
+        rate,
+        sample_rate,
+        bits,
+        duration: Rational::new(raw.descriptor_length.into(), time_base.den().into())
+            .ok_or("offline original extent exceeds the time model")?,
+        motion_audio_origin: None,
+    })
 }
 fn text(v: &Value, k: &str) -> Option<String> {
     match v.get(k)? {
@@ -275,7 +355,24 @@ fn saved_parts(raw: &str) -> Result<(String, Vec<String>), String> {
     }
     Ok((root, parts))
 }
+#[derive(Default)]
+struct LocatorClaim {
+    saved_paths: HashSet<String>,
+    mapped: bool,
+}
+
 pub fn resolve(locators: &[String], mappings: &[RootMapping]) -> Result<PathBuf, String> {
+    resolve_with_claim(locators, mappings)?.ok_or_else(missing_locator).map(|(path, _)| path)
+}
+
+fn missing_locator() -> String {
+    "original locator resolution has 0 exact candidates; an explicit unambiguous root mapping is required".into()
+}
+
+fn resolve_with_claim(
+    locators: &[String],
+    mappings: &[RootMapping],
+) -> Result<Option<(PathBuf, LocatorClaim)>, String> {
     let mappings = mappings
         .iter()
         .map(|m| {
@@ -295,33 +392,54 @@ pub fn resolve(locators: &[String], mappings: &[RootMapping]) -> Result<PathBuf,
             Ok((saved_parts(saved)?, &m.current_root))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let mut paths = HashSet::new();
+    let mut paths = HashMap::<PathBuf, LocatorClaim>::new();
     for raw in locators {
         let (root, parts) = saved_parts(raw)?;
         let path = Path::new(raw);
         let mut candidates = Vec::new();
         if path.is_absolute() {
-            candidates.push(path.to_owned());
+            candidates.push((path.to_owned(), false));
         }
         for ((saved_root, saved), current) in &mappings {
             if root == *saved_root && parts.starts_with(saved) {
                 let mut mapped = (*current).clone();
                 for part in &parts[saved.len()..] {
+                    let mut components = Path::new(part).components();
+                    if !matches!(
+                        (components.next(), components.next()),
+                        (Some(Component::Normal(name)), None) if name == part.as_str()
+                    ) {
+                        return Err("saved locator component cannot be mapped literally on this platform".into());
+                    }
                     mapped.push(part);
                 }
-                candidates.push(mapped);
+                candidates.push((mapped, true));
             }
         }
-        for p in candidates {
-            if p.is_file() {
-                paths.insert(std::fs::canonicalize(&p).map_err(|e| e.to_string())?);
+        let saved_path = format!("{}/{}", root.trim_end_matches('/'), parts.join("/"));
+        for (p, mapped) in candidates {
+            match std::fs::metadata(&p) {
+                Ok(meta) if meta.is_file() => {
+                    let path = std::fs::canonicalize(&p).map_err(|e| e.to_string())?;
+                    let claim = paths.entry(path).or_default();
+                    claim.saved_paths.insert(saved_path.clone());
+                    claim.mapped |= mapped;
+                }
+                Ok(_) => return Err(format!("original locator is not a file: {}", p.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(&p) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                        _ => return Err(format!("original locator could not be followed: {}", p.display())),
+                    }
+                }
+                Err(e) => return Err(format!("{}: {e}", p.display())),
             }
         }
     }
-    if paths.len() != 1 {
+    if paths.len() > 1 {
         return Err(format!("original locator resolution has {} exact candidates; an explicit unambiguous root mapping is required",paths.len()));
     }
-    Ok(paths.into_iter().next().unwrap())
+    Ok(paths.into_iter().next())
 }
 
 fn bounded_probe(mut command: Command, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
@@ -487,6 +605,8 @@ fn probe(path: &Path, tool: &Path) -> Result<OriginalProbe, String> {
         .args([
             "-v",
             "error",
+            "-protocol_whitelist",
+            "file,pipe",
             "-read_intervals",
             "%+#16",
             "-show_packets",
@@ -526,6 +646,69 @@ fn probe(path: &Path, tool: &Path) -> Result<OriginalProbe, String> {
         prores_color_defaulted,
     })
 }
+
+/// Compare a relink candidate with the same bounded source profiles used by
+/// original linking. Times here are file-relative; clip logging TC is separate.
+pub fn verify_offline_original(
+    path: &Path, tool: &Path, container: &str, expected: &[(&OriginalStream, StreamKind, Rational, Option<i64>)],
+) -> Result<(), String> {
+    let inspected = probe(path, tool)?;
+    let value = &inspected.metadata;
+    if qualify_container(path, value)? != container {
+        return Err("candidate container does not match the saved original".into());
+    }
+    let Some(Value::Arr(streams)) = value.get("streams") else {
+        return Err("candidate stream list is absent".into());
+    };
+    let video = |s: &Value| text(s, "codec_type").as_deref() == Some("video");
+    let audio = |s: &Value| text(s, "codec_type").as_deref() == Some("audio");
+    match (container, streams.as_slice()) {
+        ("wav", [a]) if audio(a) => {}
+        ("mov", [v]) if video(v) => { qualify_movie(v, None, false)?; }
+        ("mov", [v, a]) if video(v) && audio(a) => { qualify_movie(v, Some(a), false)?; }
+        _ => return Err("candidate stream topology is outside the saved original profile".into()),
+    }
+    for (saved, kind, duration, bits) in expected {
+        let s = streams.iter().find(|s| number(s, "index") == Some(saved.stream_index))
+            .ok_or("candidate is missing the saved physical stream")?;
+        let tb = ratio(s, "time_base").ok_or("candidate stream has no exact time base")?;
+        let count = number(s, "duration_ts").ok_or("candidate stream has no exact duration")?;
+        let start = number(s, "start_pts").or((container == "wav").then_some(0));
+        if start != Some(0) || Rational::new(i128::from(count) * i128::from(tb.num()), i128::from(tb.den())) != Some(*duration) {
+            return Err("candidate file-relative origin or extent differs from the saved original".into());
+        }
+        match kind {
+            StreamKind::Video if video(s) && number(s, "nb_frames") == Some(saved.duration_ts) => {}
+            StreamKind::Audio if audio(s) => {
+                let codec = match saved.sample_representation.as_deref() {
+                    Some("pcm16") => "pcm_s16le",
+                    Some("pcm24") => "pcm_s24le",
+                    Some("aac") => "aac",
+                    _ => return Err("saved audio representation is unresolved".into()),
+                };
+                if text(s, "codec_name").as_deref() != Some(codec)
+                    || tb != saved.time_base || number(s, "sample_rate") != Some(48_000)
+                    || number(s, "channels") != saved.channels
+                    || bits.is_some_and(|bits| number(s, "bits_per_sample") != Some(bits))
+                    || !matches!((saved.channel_index, saved.channels), (Some(c), Some(n)) if (0..n).contains(&c))
+                {
+                    return Err("candidate audio representation or physical channel assignment differs".into());
+                }
+            }
+            _ => return Err("candidate stream kind or picture frame count differs".into()),
+        }
+    }
+    Ok(())
+}
+
+pub fn probe_offline_atom(path: &Path, tool: &Path) -> Result<Value, String> {
+    let mut command = Command::new(tool);
+    command.args(["-v", "error", "-protocol_whitelist", "file,pipe", "-f", "mxf", "-show_entries",
+        "stream=codec_type,codec_name,profile,width,height,sample_aspect_ratio,field_order,channels,sample_rate,bits_per_sample,start_pts,time_base,duration_ts:format_tags=operational_pattern_ul",
+        "-of", "json"]).arg(path);
+    let bytes = bounded_probe(command, std::time::Duration::from_secs(30))?;
+    graph::json::parse(std::str::from_utf8(&bytes).map_err(|_| "MXF probe output is not UTF-8")?)
+}
 fn has_aac_priming_packet(probe: &Value, stream: i64) -> bool {
     let Some(Value::Arr(packets)) = probe.get("packets") else { return false; };
     let mut audio = packets.iter().filter(|p| number(p, "stream_index") == Some(stream));
@@ -548,7 +731,7 @@ impl OriginalIndex {
         mut inspect: impl FnMut(&Path) -> Result<Value, String>,
     ) -> Result<Self, String> {
         Self::scan_with_control(
-            facts,
+            facts, false,
             options,
             |path| {
                 inspect(path).map(|metadata| OriginalProbe {
@@ -572,18 +755,25 @@ impl OriginalIndex {
         options: &OriginalOptions,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, SourceReadIssue> {
-        Self::scan_with_control(facts, options, |path| probe(path, &options.ffprobe), check)
+        Self::scan_with_control(facts, false, options, |path| probe(path, &options.ffprobe), check)
+    }
+    pub(crate) fn scan_allow_offline(
+        facts: &av::SourceProject, options: &OriginalOptions, check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, SourceReadIssue> {
+        Self::scan_with_control(facts, true, options, |path| probe(path, &options.ffprobe), check)
     }
     fn scan_with_control(
         facts: &av::SourceProject,
+        allow_offline: bool,
         options: &OriginalOptions,
         mut inspect: impl FnMut(&Path) -> Result<OriginalProbe, String>,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, SourceReadIssue> {
-        let mut out = Self::default();
+        let mut out = Self { allow_offline, ..Self::default() };
         let mut last_probe: Option<(PathBuf, OriginalProbe)> = None;
         let mut used = 0usize;
         let mut pinned = HashMap::<PathBuf, String>::new();
+        let mut locator_claims = HashMap::<PathBuf, LocatorClaim>::new();
         let adapter_masters: std::collections::HashSet<_> = facts.sequences.iter()
             .flat_map(|s| &s.events)
             .filter(|e| e.motion_adapter_phase.is_some())
@@ -602,10 +792,58 @@ impl OriginalIndex {
                 check()?;
                 let raw = raw.as_ref().unwrap();
                 let t = &m.master.tracks[i];
-                let path = resolve(&raw.locators, &options.root_mappings).map_err(|why| {
+                let locator_error = |why| {
                     let saved = raw.locators.first().map_or("no saved path", String::as_str);
                     SourceReadIssue::OriginalLocator(format!("{:?} · {saved}: {why}", m.master.name))
-                })?;
+                };
+                let found = resolve_with_claim(&raw.locators, &options.root_mappings).map_err(locator_error)?;
+                let Some((path, claim)) = found else {
+                    if !allow_offline {
+                        let saved = raw.locators.first().map_or("no saved path", String::as_str);
+                        return Err(SourceReadIssue::MissingOriginal(format!(
+                            "{:?} · {saved}: {}", m.master.name, missing_locator()
+                        )));
+                    }
+                    let selected = offline_original(m, i).map_err(|e| locator_error(format!(
+                        "{e} ({} track {}, {} at {} Hz, file track {:?})",
+                        raw.descriptor_class, t.index, raw.descriptor_length, raw.descriptor_rate, raw.file_track
+                    )))?;
+                    used = used.checked_add(selection_cost(m, raw, &selected.path))
+                        .filter(|n| *n <= av::MAX_SOURCE_FACT_BYTES)
+                        .ok_or("original index exceeds 64 MiB")?;
+                    out.tracks.insert((m.id.clone(), i), selected);
+                    continue;
+                };
+                if !options.root_mappings.is_empty() {
+                    match locator_claims.entry(path.clone()) {
+                        Entry::Occupied(mut entry) => {
+                            let previous = entry.get_mut();
+                            // Require a common witness across all selections of this path.
+                            // An intermediate row with several aliases cannot join two sources.
+                            previous.saved_paths.retain(|saved| claim.saved_paths.contains(saved));
+                            previous.mapped |= claim.mapped;
+                            if previous.mapped && previous.saved_paths.is_empty() {
+                                let saved = raw.locators.first().map_or("no saved path", String::as_str);
+                                return Err(SourceReadIssue::OriginalLocator(format!(
+                                    "{:?} · {saved}: root mappings resolve distinct saved originals to {}; check the mappings",
+                                    m.master.name, path.display()
+                                )));
+                            }
+                        }
+                        Entry::Vacant(entry) => {
+                            used = used
+                                .checked_add(
+                                    std::mem::size_of::<(PathBuf, LocatorClaim)>()
+                                        + path.as_os_str().len()
+                                        + claim.saved_paths.capacity() * std::mem::size_of::<String>()
+                                        + claim.saved_paths.iter().map(String::capacity).sum::<usize>(),
+                                )
+                                .filter(|n| *n <= av::MAX_SOURCE_FACT_BYTES)
+                                .ok_or("original locator claims exceed 64 MiB")?;
+                            entry.insert(claim);
+                        }
+                    }
+                }
                 let describe = |why: String| format!("{:?} · {}: {why}", m.master.name, path.display());
                 let fresh_probe = last_probe.as_ref().is_none_or(|(p, _)| p != &path);
                 if fresh_probe {
@@ -744,19 +982,14 @@ impl OriginalIndex {
                         _ => return Err("original container/codec route is not qualified".into()),
                     };
                 used = used
-                    .checked_add(
-                        std::mem::size_of::<Selected>()
-                            + path.as_os_str().len()
-                            + raw.locators.iter().map(String::len).sum::<usize>()
-                            + m.id.len()
-                            + 256,
-                    )
+                    .checked_add(selection_cost(m, raw, &path))
                     .ok_or("original index budget overflow")?;
                 if used > av::MAX_SOURCE_FACT_BYTES {
                     return Err("original index exceeds 64 MiB".into());
                 }
                 let mut selected = Selected {
                     path: path.clone(),
+                    online: true,
                     stream: OriginalStream {
                         saved_locators: raw.locators.clone(),
                         container: container.into(),

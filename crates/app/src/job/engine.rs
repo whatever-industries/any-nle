@@ -132,6 +132,7 @@ pub struct PreparedJob {
     originals: Vec<OriginalStamp>,
     receipt: PathBuf,
     replay: PathBuf,
+    offline_relink: Option<(PathBuf, String)>,
     aux_outputs: Vec<PathBuf>,
 }
 impl PreparedJob {
@@ -279,6 +280,9 @@ pub fn prepare_for_review(
     cb: &mut dyn FnMut(Progress),
 ) -> Result<PreparedJob, ReviewBlocker> {
     use BlockerKind::*;
+    if spec.allow_offline_media && spec.mode == ClipMode::RewrapNative {
+        return Err(ReviewBlocker::new(Rewrap, "Allow offline media requires Separate files, Grouped or Merged"));
+    }
     let check_cancel = || cancel.check().map_err(blocker(Retry));
     check_cancel()?;
     if spec.schema != "anynle.job/1" {
@@ -368,7 +372,7 @@ pub fn prepare_for_review(
         .clone()
         .unwrap_or_else(|| names[0].clone());
     let read_source = |cb: &mut dyn FnMut(Progress)| {
-        avid_adapter::read_with_originals_for_review(
+        avid_adapter::read_with_media_policy(
             &inputs,
             &spec.media_roots,
             &project,
@@ -384,6 +388,7 @@ pub fn prepare_for_review(
                     .collect(),
                 ffprobe: tools.ffprobe.clone(),
             },
+            spec.allow_offline_media,
             &mut |n, path| {
                 cancel.check()?;
                 cb(Progress {
@@ -401,7 +406,8 @@ pub fn prepare_for_review(
             use avid_adapter::SourceReadIssue;
             let (kind, message) = match issue {
                 SourceReadIssue::Bin(m) => (ProjectSource, m),
-                SourceReadIssue::OriginalLocator(m) => (OriginalLocator, m),
+                SourceReadIssue::MissingOriginal(m) if spec.mode == ClipMode::RewrapNative => (RewrapMissingMedia, m),
+                SourceReadIssue::OriginalLocator(m) | SourceReadIssue::MissingOriginal(m) => (OriginalLocator, m),
                 SourceReadIssue::OriginalMedia(m) => (OriginalMedia, m),
                 SourceReadIssue::MediaScan(m) => (AvidMedia, m),
                 SourceReadIssue::SourceFacts(m) => (SourceContent, m),
@@ -416,7 +422,7 @@ pub fn prepare_for_review(
         .graph
         .media
         .iter()
-        .filter(|m| m.original.is_none())
+        .filter(|m| m.original.is_none() && m.online == Some(true))
         .flat_map(|m| m.locations.iter().map(PathBuf::from))
         .collect::<Vec<_>>();
     native_paths.sort();
@@ -442,6 +448,14 @@ pub fn prepare_for_review(
         read = again;
     }
     media_inputs.extend(read.original_inputs.iter().cloned());
+    let mappings = spec.path_mappings.iter().map(|m| avid_adapter::original::RootMapping {
+        saved_root: m.saved_prefix.clone(),
+        current_root: m.actual_root.clone(),
+    }).collect::<Vec<_>>();
+    let mut matte = crate::png_mattes::prepare(&read, &mappings, spec.mode == ClipMode::Separate,
+        &mut || cancel.check()).map_err(blocker(OriginalMedia))?;
+    let png_count = matte.inputs.len();
+    media_inputs.append(&mut matte.inputs);
     check_cancel()?;
     source_input::recheck_checked(&inputs, &mut || cancel.check()).map_err(blocker(Retry))?;
     read.graph.encoded_len().map_err(|e| ReviewBlocker::new(SourceContent, e.to_string()))?;
@@ -451,6 +465,7 @@ pub fn prepare_for_review(
         .iter()
         .chain(&read.scan_issues)
         .chain(&read.audio_group_issues)
+        .filter(|text| matte.keeps_reader_note(text))
     {
         notes.push(note(
             "warning",
@@ -459,12 +474,19 @@ pub fn prepare_for_review(
             "Review the affected object before using the result.",
         ));
     }
+    if spec.mode == ClipMode::RewrapNative
+        && (read.missing_native_picture || !read.missing_managed_audio.is_empty()) {
+        let mut issue = ReviewBlocker::new(RewrapMissingMedia, "Rewrap requires all source media");
+        issue.affected = unresolved_masters(&read.graph);
+        issue.affected.extend(read.missing_managed_audio);
+        return Err(issue);
+    }
     // An unresolved master must not vanish from a successful wizard conversion.
     if read
         .graph
         .losses
         .iter()
-        .any(|l| l.aspect == "source_master")
+        .any(|l| l.aspect == "source_master" && matte.keeps_loss(l))
     {
         let kind = if read.missing_native_picture { AvidMedia } else { SourceContent };
         let mut issue = ReviewBlocker::new(kind, "Selected content contains unresolved masters; exclude those bins or resolve their media before conversion");
@@ -486,10 +508,13 @@ pub fn prepare_for_review(
     if let Some(issue) = sequence_timing_blocker(&read.graph) {
         return Err(issue);
     }
+    crate::offline::check_edit_routes(&read.graph).map_err(blocker(SourceContent))?;
     for l in read
         .graph
         .losses
         .iter()
+        .filter(|loss| loss.aspect != "subclip_bin_item"
+            && loss.aspect != avid_adapter::PAN_AUTOMATION_LOSS && matte.keeps_loss(loss))
         .chain(policy.losses_source(&read.graph).iter())
     {
         notes.push(note("loss", &l.object, &l.reason, &l.aspect));
@@ -518,17 +543,28 @@ pub fn prepare_for_review(
         ));
     }
     for l in prepared.losses {
-        notes.push(note("loss", l.object, l.reason, l.aspect));
+        if matte.keeps_loss(&l) {
+            notes.push(note("loss", l.object, l.reason, l.aspect));
+        }
     }
     drop(prepared.ownership);
     let mut input = prepared.input;
+    matte.apply(&mut input, &read.graph).map_err(blocker(SourceContent))?;
+    let offline = crate::offline::paths(&read.graph);
+    let offline_relink = crate::offline::report(&read.graph, &spec.output).map_err(blocker(ProjectOutput))?;
+    if let Some((path, _)) = &offline_relink {
+        output::preflight(&spec.output, Some(path)).map_err(blocker(ProjectOutput))?;
+    }
+    for clip in crate::offline::review_notes(&read.graph) {
+        notes.push(clip);
+    }
     let mut originals = Vec::new();
     let mut seen = HashSet::new();
     let mut native_count = 0;
     for clip in &input.clips {
         match clip {
             PreparedClip::Original(c) => {
-                if seen.insert(c.path.clone()) {
+                if !offline.contains(c.path.as_str()) && seen.insert(c.path.clone()) {
                     originals.push(original_stamp(Path::new(&c.path)).map_err(blocker(OriginalMedia))?);
                 }
             }
@@ -551,16 +587,17 @@ pub fn prepare_for_review(
             .len()
     };
     inv.native_media = paths(Some(false), false);
-    inv.ume_originals = paths(Some(true), false);
-    inv.total_media = paths(None, false);
-    inv.found_media = paths(None, true);
+    inv.ume_originals = paths(Some(true), true);
+    inv.total_media = paths(None, false) + png_count;
+    inv.found_media = paths(None, true) + png_count;
     notes.push(note("info","source verification","Referenced media content is hashed in place during pre-flight and rechecked before publication.","This can take time for large sources; it prevents using stale pre-flight facts after a file changes."));
     inv.notes
         .retain(|n| n != super::inventory::PRESENCE_PENDING);
-    inv.notes.push(
-        "Pre-flight resolved referenced source media; application acceptance is a separate check."
-            .into(),
-    );
+    inv.notes.push(if offline.is_empty() {
+        "Pre-flight resolved referenced source media; application acceptance is a separate check.".into()
+    } else {
+        "The project will include offline media. Verify the proposed files with the relink report before using Link Media.".into()
+    });
     if !spec.original_roots.is_empty() {
         notes.push(note("info","original roots","Original roots are hints for your saved-prefix mappings; files are selected only by exact saved paths or explicit mappings.","No basename search or automatic original-file substitution is performed."));
     }
@@ -657,8 +694,8 @@ pub fn prepare_for_review(
     } else {
         None
     };
-    let document = match &layout {
-        Some(layout) => prproj::convert::writer::prepare_typed_project_with_layout(
+    let document = match (&layout, offline.is_empty()) {
+        (Some(layout), true) => prproj::convert::writer::prepare_typed_project_with_layout(
             &input,
             &spec.output,
             &mut ids,
@@ -666,12 +703,15 @@ pub fn prepare_for_review(
             native,
             layout,
         ),
-        None => prproj::convert::writer::prepare_typed_project(
+        (None, true) => prproj::convert::writer::prepare_typed_project(
             &input,
             &spec.output,
             &mut ids,
             &bindings,
             native,
+        ),
+        (_, false) => prproj::convert::writer::prepare_offline_project(
+            &input, &spec.output, &mut ids, layout.as_ref(), &offline,
         ),
     }
     .map_err(|e| ReviewBlocker::new(SourceContent, format!("Premiere document preparation failed: {e}")))?;
@@ -681,6 +721,9 @@ pub fn prepare_for_review(
     document
         .check_reserved_output(&replay)
         .map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
+    if let Some((path, _)) = &offline_relink {
+        document.check_reserved_output(path).map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
+    }
     if let Some(p) = &media {
         document
             .check_reserved_output(p.directory())
@@ -717,6 +760,7 @@ pub fn prepare_for_review(
         originals,
         receipt,
         replay,
+        offline_relink,
         aux_outputs: vec![],
     })
 }
@@ -811,6 +855,9 @@ pub fn execute(
     let outcome = (|| -> Result<(), String> {
         cancel.check()?;
         check_paths(&job.spec, &job.receipt, &job.replay)?;
+        if let Some((path, _)) = &job.offline_relink {
+            output::preflight(&job.spec.output, Some(path))?;
+        }
         job.document.recheck_outputs().map_err(|e| e.to_string())?;
         source_input::recheck_checked(&job.inputs, &mut || cancel.check())?;
         source_input::recheck_checked(&job.media_inputs, &mut || cancel.check())?;
@@ -835,14 +882,22 @@ pub fn execute(
         job.document.publish_assets().map_err(|e| e.to_string())?;
         cancel.check()?;
         phase = "project publication";
+        let preparation_notes = job.document.report().notes.len();
         let report = job.document.publish_project().map_err(|e| e.to_string())?;
-        for d in report.notes {
+        // Review already contains the preparation notes. Publication only
+        // appends diagnostics generated by saving the prepared project.
+        for d in report.notes.into_iter().skip(preparation_notes) {
             job.review.notes.push(note(
-                "info",
+                "warning",
                 "publication",
                 d,
                 "Successful project publication may retain a staging file after cleanup failure.",
             ));
+        }
+        if let Some((path, text)) = &job.offline_relink {
+            phase = "offline relink report";
+            output::write_snapshot(path, text)?;
+            job.aux_outputs.push(path.clone());
         }
         if let Some(p) = &job.media {
             phase = "media completion receipt";
@@ -979,8 +1034,26 @@ mod tests {
             inputs: vec![],
             media_inputs: vec![],
             originals: vec![],
+            offline_relink: None,
             aux_outputs: vec![],
         }
+    }
+    #[test]
+    fn successful_job_does_not_repeat_preparation_notes_as_publication_notes() {
+        let t = Scratch::new();
+        let mut job = prepared(&t.0);
+        let notes = job.document.report().notes.clone();
+        assert!(!notes.is_empty());
+        for d in &notes {
+            job.review.notes.push(note("info", "writer", d.clone(), "Writer preparation report."));
+        }
+        let done = execute(job, &CancelToken::default(), &mut |_| {});
+        assert_eq!(done.status, CompletionStatus::Complete);
+        assert!(done.report.iter().all(|n| n.object != "publication"));
+        assert_eq!(
+            done.report.iter().filter(|n| n.object == "writer").map(|n| &n.message).collect::<Vec<_>>(),
+            notes.iter().collect::<Vec<_>>(),
+        );
     }
     #[test]
     fn late_project_is_preserved_and_not_claimed_as_our_output() {

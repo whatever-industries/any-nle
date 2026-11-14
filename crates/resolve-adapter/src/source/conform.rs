@@ -499,9 +499,9 @@ fn track_unknowns(graph: &SourceGraph, timeline: &mut Timeline<'_>) -> Result<()
     let origin = seq.start.and_then(|start| frames_on(start, rate).ok());
     if let Some(data) = graph.sidecar(dissolve::ADAPTER, &seq.id) {
         if let Value::Arr(rows) = data {
-            let qualified = dissolve::prepare(graph, seq).ok().flatten();
-            if let Some(known) = qualified.as_ref().filter(|d| !d.audio) {
-                timeline.dissolve = Some(known.window());
+            let qualified = dissolve::prepare_all_native(graph, seq).unwrap_or_default();
+            if let Some(known) = qualified.iter().find(|d| !d.prepared.audio) {
+                timeline.dissolve = Some(known.prepared.window());
             }
             for row in rows {
                 if let Some(Value::Str(id)) = row.get("id") {
@@ -509,7 +509,7 @@ fn track_unknowns(graph: &SourceGraph, timeline: &mut Timeline<'_>) -> Result<()
                 }
                 if matches!(row.get("kind"), Some(Value::Str(kind)) if kind == "audio")
                     || matches!(row.get("track"), Some(Value::Int(track)) if *track > 1)
-                    || qualified.is_some()
+                    || timeline.dissolve.is_some()
                 {
                     continue;
                 }

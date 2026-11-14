@@ -1,6 +1,6 @@
 use super::*;
 use graph::picture_chain::{Chain, Reflection};
-use prproj::convert::prepared::{MotionKey, PictureEffect, TrimmedMotion, TrimmedMotionKey};
+use prproj::convert::prepared::{CornerPin, MotionKey, PictureEffect, TrimmedMotion, TrimmedMotionKey};
 
 fn number(value: &Value) -> Option<f64> {
     match value {
@@ -24,6 +24,18 @@ fn numbers<const N: usize>(value: &Value) -> Option<[f64; N]> {
     Some(result)
 }
 
+pub(super) fn corner_pin(params: &Value) -> Option<CornerPin> {
+    let Value::Obj(fields) = params else { return None };
+    let Value::Arr(points) = params.get("target_corners_tl_tr_br_bl")? else { return None };
+    let [tl, tr, br, bl] = points.as_slice() else { return None };
+    let source_crop = params.get("source_crop_ltrb");
+    let pin = CornerPin {
+        corners: [numbers(tl)?, numbers(tr)?, numbers(br)?, numbers(bl)?],
+        source_crop: match source_crop { Some(value) => numbers(value)?, None => [0.0; 4] },
+    };
+    (fields.len() == 1 + usize::from(source_crop.is_some()) && pin.is_valid()).then_some(pin)
+}
+
 pub(super) fn prepare_chain(
     placement: &graph::Placement,
     effect: &graph::Effect,
@@ -35,6 +47,26 @@ pub(super) fn prepare_chain(
     losses: &mut Vec<Loss>,
 ) -> R<(Option<graph::Transform>, Option<PictureEffect>, [bool; 2])> {
     let refused = (None, None, [false; 2]);
+    if let Some(Value::Arr(stages)) = effect.params.get("stages") {
+        if stages.iter().any(is_pin_stage) {
+            let Some(native) = prepare_pin_chain(stages, &effect.params)
+                .map_err(|()| error(format!("malformed ordered Corner Pin at {}", placement.id)))?
+            else {
+                loss(losses, &placement.id, "picture_effect",
+                    "Ordered Corner Pin requires one static pin and one horizontal reflection");
+                return Ok(refused);
+            };
+            if !full_span || !same_rate || !matched_hd_raster
+                || frame_ticks != model::ticks_per_unit(Fraction::new(24, 1))
+                || placement.video_track.is_none() || placement.speed.is_some() || placement.frame_map.is_some()
+            {
+                loss(losses, &placement.id, "picture_effect",
+                    "Ordered Corner Pin requires a same-rate 1080p24 picture edit over the saved span");
+                return Ok(refused);
+            }
+            return Ok((None, Some(native), [false; 2]));
+        }
+    }
     let chain = match Chain::read(effect) {
         Ok(chain) => chain,
         Err(graph::picture_chain::Error::Unsupported(reason)) => {
@@ -69,6 +101,78 @@ pub(super) fn prepare_chain(
         reflect_motion(effect, chain.after)
     };
     Ok((Some(transform), Some(native), [flip.horizontal, flip.vertical]))
+}
+
+fn is_pin_stage(stage: &Value) -> bool {
+    matches!(stage.get("kind"), Some(Value::Str(kind)) if kind == "picture.corner_pin")
+}
+
+fn prepare_pin_chain(stages: &[Value], params: &Value) -> Result<Option<PictureEffect>, ()> {
+    if !matches!(params, Value::Obj(fields) if fields.len() == 1)
+        || !(2..=16).contains(&stages.len())
+    {
+        return Err(());
+    }
+    let [first, second] = stages else { return Ok(None); };
+    let (pin, reflection, flop_before_pin) = if is_pin_stage(first) {
+        (first, second, false)
+    } else {
+        (second, first, true)
+    };
+    if !matches!(pin, Value::Obj(fields) if fields.len() == 2) {
+        return Err(());
+    }
+    let pin = corner_pin(pin.get("params").ok_or(())?).ok_or(())?;
+    let Some(Value::Str(kind)) = reflection.get("kind") else { return Err(()); };
+    if !Reflection::is_effect_kind(kind) {
+        return Ok(None);
+    }
+    if !matches!(reflection, Value::Obj(fields) if fields.len() == 2) {
+        return Err(());
+    }
+    let axes = Reflection::from_params(reflection.get("params").ok_or(())?).ok_or(())?;
+    Ok((axes.horizontal && !axes.vertical).then_some(PictureEffect::CornerPinWithFlop {
+        pin, flop_before_pin,
+    }))
+}
+
+#[cfg(test)]
+mod pin_chain_tests {
+    use super::*;
+
+    #[test]
+    fn static_pin_chain_keeps_horizontal_order_and_rejects_other_stacks() {
+        let pin = Value::Obj(vec![
+            ("kind".into(), Value::Str("picture.corner_pin".into())),
+            ("params".into(), Value::Obj(vec![("target_corners_tl_tr_br_bl".into(),
+                Value::Arr([[0.1, 0.2], [0.8, 0.1], [0.9, 0.8], [0.2, 0.9]]
+                    .map(|p| Value::Arr(p.map(Value::Float).into())).into()))])),
+        ]);
+        let reflect = |horizontal, vertical| {
+            let e = Reflection { horizontal, vertical }.effect();
+            Value::Obj(vec![("kind".into(), Value::Str(e.kind)), ("params".into(), e.params)])
+        };
+        let prepare = |stages: Vec<Value>| {
+            let params = Value::Obj(vec![("stages".into(), Value::Arr(stages.clone()))]);
+            prepare_pin_chain(&stages, &params)
+        };
+        for (stages, before) in [
+            (vec![reflect(true, false), pin.clone()], true),
+            (vec![pin.clone(), reflect(true, false)], false),
+        ] {
+            assert!(matches!(prepare(stages), Ok(Some(PictureEffect::CornerPinWithFlop {
+                flop_before_pin, ..
+            })) if flop_before_pin == before));
+        }
+        assert_eq!(prepare(vec![reflect(false, true), pin.clone()]), Ok(None));
+        assert_eq!(prepare(vec![pin.clone(), pin.clone()]), Ok(None));
+        assert_eq!(prepare(vec![reflect(true, false), pin.clone(), reflect(true, false)]), Ok(None));
+        let malformed = Value::Obj(vec![
+            ("kind".into(), Value::Str("picture.corner_pin".into())),
+            ("params".into(), Value::Obj(vec![])),
+        ]);
+        assert!(prepare(vec![malformed, reflect(true, false)]).is_err());
+    }
 }
 
 fn reflect_motion(effect: PictureEffect, reflection: Reflection) -> PictureEffect {
@@ -124,6 +228,40 @@ pub(super) fn prepare(
             "Linear picture animation requires the saved edit span at the source media rate",
         );
         return Ok(None);
+    }
+    use prproj::convert::prepared::WarpRollInterpolation;
+    let roll_interpolation = match kind {
+        "avid.warp_roll_linear" => Some(WarpRollInterpolation::Linear),
+        "avid.warp_roll_shelf" => Some(WarpRollInterpolation::Hold),
+        "avid.warp_roll_bezier" | "avid.warp_roll_spline" => Some(WarpRollInterpolation::FlatBezier),
+        _ => None,
+    };
+    if let Some(interpolation) = roll_interpolation {
+        let Some(Value::Arr(keys)) = key(params, "keys") else { return Err(malformed()); };
+        let [a, b, c] = keys.as_slice() else { return Err(malformed()); };
+        if !matches!(params, Value::Obj(fields) if fields.len() == 1) || placement.transform.is_some() {
+            return Err(malformed());
+        }
+        let source = ticks(placement.source_in, "Warp Rotation media in")?;
+        let read = |key_values: &Value| -> R<prproj::convert::prepared::WarpRollKey> {
+            if !matches!(key_values, Value::Obj(fields) if fields.len() == 4) {
+                return Err(malformed());
+            }
+            let get = |name| key(key_values, name).and_then(number).ok_or_else(malformed);
+            let frame = key(key_values, "frame").and_then(integer).ok_or_else(malformed)?;
+            let ticks = frame.checked_mul(frame_ticks).and_then(|t| source.checked_add(t)).ok_or_else(malformed)?;
+            Ok(prproj::convert::prepared::WarpRollKey {
+                ticks, x: get("x")?, width: get("width")?, rotation: get("rotation")?,
+            })
+        };
+        let keys = [read(a)?, read(b)?, read(c)?];
+        if video_duration.and_then(|t| ticks(t, "Warp Rotation media extent").ok())
+            .is_none_or(|end| keys.iter().any(|k| !(0..end).contains(&k.ticks)))
+        {
+            loss(losses, &placement.id, "picture_effect", "Animated Warp Rotation requires verified source-media coverage");
+            return Ok(None);
+        }
+        return Ok(Some(PictureEffect::WarpRoll { keys, interpolation }));
     }
     let trimmed_crop = matches!(kind, "avid.warp_trim_crop_linear" | "avid.resize_trim_crop_linear");
     if trimmed_crop || matches!(kind, "avid.warp_trim_linear" | "avid.resize_trim_linear") {

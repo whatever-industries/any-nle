@@ -81,10 +81,10 @@ Static clip volume on a direct mono edit is read as a per-placement dB
 value from −6 through +3 for the witnessed single-control shape. The
 bounded two-point volume curve preserves exact item-source times and dB
 values. Its interpolation and hold law stay in Resolve metadata. Default
-linear-amplitude fades retain whole-frame head and tail lengths as
-clip-edge metadata and report the portable representation loss. The
-linked-project writer also rebuilds these two envelope types on qualified
-24 fps mono WAV edits and checks the reconstructed control on each clip
+linear-amplitude fades retain whole or fractional head and tail lengths
+as clip-edge metadata. The linked writer rebuilds default fades on
+qualified 24 and 23.976 fps mono WAV edits and two-point volume curves on
+the 24 fps profile. It checks the reconstructed controls on each clip
 before publication.
 
 The Resolve reader also retains one custom curve point per clip edge
@@ -139,8 +139,9 @@ timeline flags and both mixer rows must agree. The track and its edits
 remain present, with clip volume, track level and bus level independent.
 The qualified internal Resolve and Premiere writers apply the saved
 mute to the owning audio track.
-The linked mixer forms also retain static track pan with the saved
-track ownership, routing, and processing qualification.
+Both internal writers support the qualified static track pan on the linked
+mono mixer. The Resolve writer checks the track and bus fader values and
+mute against the saved mixer rows before recreating the panners.
 Recognized but unqualified mixer settings or conflicting mute fields
 receive scoped losses that block an internal Resolve write.
 
@@ -333,7 +334,8 @@ physical video stream selectors when both are known. The profile covers
 originals linked in place. Unknown mappings are inconclusive, and a
 confirmed mismatch stays visible alongside gaps. Qualified dissolve
 windows use half-open frame intervals, and samples inside them are
-excluded.
+excluded. A qualified A1 crossfade can coexist with the V1 dissolve.
+Only the V1 interval affects picture sampling.
 
 At 24 fps, saved 50% forward and 100% reverse edits also contribute
 source-frame samples. Half speed repeats each source picture twice
@@ -776,6 +778,23 @@ Resolve within one pixel. The effect was confined to the intended
 24-frame edit. The Resolve writer keeps its separate admission rules
 for combined static geometry.
 
+#### Static 3D Warp geometry at 24 fps
+
+The internal Resolve to Premiere writer also accepts three 1080p24 V1
+profiles from the Resolve reader. It writes isolated centered rotation,
+centered source crop with independent scale and clockwise rotation, and
+rotation about one displaced X or Y pivot. These profiles reuse the
+same graph/2 geometry as the linked Resolve writer. The Resolve reader
+has already converted the rotation sign and pivot coordinates to graph
+units. Premiere receives those values directly in Motion.
+
+Offline checks on ten edits preserved the linked ProRes original, exact
+source and record bounds, and the one-hour sequence origin. The four
+centered crop and scale edits matched the retained Premiere 27 control's
+saved Motion values within its rounding precision. The three displaced
+pivot edits matched the previous Avid-derived Premiere output. A fresh
+Premiere Save As, reopen, and render comparison remains pending.
+
 ### Resolve to Premiere Linear position and scale
 
 The internal writer maps the saved `resolve.motion_linear` record to
@@ -801,6 +820,19 @@ percentages. It uses the saved file-relative key frames directly.
 
 Longer curves, nonlinear interpolation, reflection combined with this
 motion, and animated crop require separate qualification.
+
+### Resolve to Premiere Linear Z Rotation
+
+The internal writer maps the three aligned curves in
+`resolve.warp_roll_linear` to editable Premiere Motion on 1080p24 V1.
+The Premiere keys use the saved file-relative frames. Zoom X becomes
+Scale Width in percent, and Rotation Angle changes sign. Vertical
+position, Scale Height, crop, and pivot use their neutral values.
+
+The generated project from the reopened Resolve archive matched the
+edit bounds and all nine Linear Motion keys in the retained Premiere 27
+control for the same Avid chart. Qualification for this route is offline.
+A fresh Premiere Save As, reopen, and render comparison remains pending.
 
 ### Resolve to Premiere video dissolves
 
@@ -839,6 +871,20 @@ source trim and the linear blend. Its blend coefficients differed from
 Resolve by less than 0.00003 after accounting for the editors' center pan
 levels. Across all 96,000 sample frames on A2, the two Premiere renders
 agreed within one PCM24 code value.
+
+### Resolve to Premiere combined transitions at 24 fps
+
+The internal writer can carry one centered eight-frame V1 Cross Dissolve
+and one centered eight-frame A1 Cross Fade 0DB in the same 1080p24 project.
+It writes Premiere Cross Dissolve (Legacy) and Constant Gain at their
+own cuts and reports the picture blend sampling difference.
+
+The saved Premiere XML retained both transitions, the original links,
+and all five visible edits. A disposable copy with its project version
+marker set to 46 converted back to Resolve. After reopening in Resolve,
+all 48 picture frames and both isolated 96,000-frame PCM24 lanes matched
+the original Resolve render. Native Premiere reopen and playback of
+the combined project remain pending.
 
 ## Write picture nests
 

@@ -1,6 +1,6 @@
 use super::*;
 mod trim_defaults;
-use crate::source::{PictureExtension, PictureStage, Rate, ResizeKey, SourceEvent, LinearTrim, LinearTrimKey};
+use crate::source::{PictureExtension, PictureStage, Rate, ResizeKey, SourceEvent, LinearTrim, LinearTrimKey, WarpRollInterpolation, WarpRollKey};
 
 #[derive(Debug)]
 pub(super) struct Capture {
@@ -166,7 +166,7 @@ impl Capture {
                 r.record_start != self.position
                     || Some(r.length) != self.length
                     || Some(r.record_rate) != self.rate
-                    || (matches!(self.effect, PictureExtension::Resize(_) | PictureExtension::ResizeCrop(_) | PictureExtension::Warp(_) | PictureExtension::WarpTrim(_) | PictureExtension::ResizeTrim(_))
+                    || (matches!(self.effect, PictureExtension::Resize(_) | PictureExtension::ResizeCrop(_) | PictureExtension::Warp(_) | PictureExtension::WarpRoll { .. } | PictureExtension::WarpTrim(_) | PictureExtension::ResizeTrim(_))
                         && r.source_rate != r.record_rate)
             })
         {
@@ -609,6 +609,416 @@ fn has_curve(item: &Node) -> bool {
     !matches!(item.get("control_track"), None | Some(Value::Null | Value::Ref(0)))
 }
 
+pub(super) fn static_projective_warp(ctx: &Ctx<'_>, effect: &Node) -> Option<crate::transform::CornerPin> {
+    let mut values = compact_static_warp_controls(ctx, effect, true)?;
+    let count = values.len() + crate::transform::COMPACT_WARP_DEFAULTS.len();
+    let mut take = |prefix: &str| values.remove(&format!("{prefix}568d7e84d511935a50f857c10000"));
+    let (corners, from_transform) = match (take("0a82"), take("c881")) {
+        (Some(1.0), None) if matches!(count, 18 | 23) => {
+            let mut corners = [[0.0; 2]; 4];
+            for (corner, (x, y)) in corners.iter_mut().zip([
+                ("0b82", "0c82"), ("0d82", "0e82"), ("0f82", "1082"), ("1182", "1282"),
+            ]) {
+                *corner = [0.5 + take(x)? / 999.0, 0.5 - take(y)? / 999.0];
+            }
+            (corners, false)
+        }
+        (None, Some(1.0)) if matches!(count, 11..=14) => {
+            (skew_corners(&mut take)?, true)
+        }
+        (None, None) if matches!(count, 13..=15 | 24) => {
+            (rotation_corners(&mut take, count == 24)?, true)
+        }
+        _ => return None,
+    };
+    let crop = match take("cb81") {
+        None => [0.0; 4],
+        Some(1.0) => static_warp_crop(&mut take)?,
+        _ => return None,
+    };
+    if !values.is_empty() || !valid_crop(crop)
+        || corners.iter().flatten().any(|v| !(-1.0..=2.0).contains(v))
+    {
+        return None;
+    }
+    // A convex quad in the observed winding excludes crossed, mirrored and
+    // collapsed corners. Leave their behavior to a native render comparison.
+    for i in 0..4 {
+        let [a, b, c] = [corners[i], corners[(i + 1) % 4], corners[(i + 2) % 4]];
+        let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+        if cross <= 1e-9 {
+            return None;
+        }
+    }
+    Some(crate::transform::CornerPin { corners, crop, from_transform })
+}
+
+pub(super) fn compact_affine_warp(ctx: &Ctx<'_>, effect: &Node) -> bool {
+    compact_static_warp_controls(ctx, effect, false).is_some_and(|values| {
+        if values.len() == 15 {
+            isolated_roll_controls(values)
+        } else {
+            affine_crop_controls(values)
+        }
+    })
+}
+
+fn isolated_roll_controls(mut values: HashMap<String, f64>) -> bool {
+    // The compact static Z Rotation control has four enabled groups.
+    // Require neutral position, scale, X/Y rotation, and Z axis offset.
+    let mut take = |prefix: &str| values.remove(&format!("{prefix}568d7e84d511935a50f857c10000"));
+    for (id, expected) in [
+        ("a981", 1.0), ("b281", 1.0), ("b781", 1.0), ("bc81", 1.0),
+        ("aa81", 0.0), ("ab81", 0.0), ("ac81", 0.0),
+        ("b381", 100.0), ("b481", 100.0),
+        ("b881", 0.0), ("b981", 0.0),
+        ("bf81", 0.0),
+    ] {
+        if take(id) != Some(expected) {
+            return false;
+        }
+    }
+    let (Some(x), Some(y), Some(roll)) = (take("bd81"), take("be81"), take("ba81")) else {
+        return false;
+    };
+    (-30.0..=30.0).contains(&roll)
+        && (0.0..=100.0).contains(&x) && (0.0..=100.0).contains(&y)
+        && (x == 0.0 || y == 0.0)
+        && ((x == 0.0 && y == 0.0) || (0.0..=30.0).contains(&roll))
+        && values.is_empty()
+}
+
+fn affine_crop_controls(mut values: HashMap<String, f64>) -> bool {
+    let mut take = |prefix: &str| values.remove(&format!("{prefix}568d7e84d511935a50f857c10000"));
+    if take("cb81") != Some(1.0) || !static_warp_crop(&mut take).is_some_and(valid_crop) {
+        return false;
+    }
+    match take("b281") {
+        None => {}
+        Some(1.0) if take("b381").is_some_and(|v| (60.0..=100.0).contains(&v))
+            && take("b481").is_some_and(|v| (90.0..=100.0).contains(&v)) => {}
+        _ => return false,
+    }
+    match take("b781") {
+        None => {}
+        Some(1.0) if take("ba81").is_some_and(|v| (0.0..=30.0).contains(&v)) => {}
+        _ => return false,
+    }
+    values.is_empty()
+}
+
+fn static_warp_crop(take: &mut impl FnMut(&str) -> Option<f64>) -> Option<[f64; 4]> {
+    Some([
+        (take("cc81")? + 999.0) / 1998.0,
+        (999.0 - take("ce81")?) / 1998.0,
+        (999.0 - take("cd81")?) / 1998.0,
+        (take("cf81")? + 999.0) / 1998.0,
+    ])
+}
+
+fn compact_static_warp_controls(
+    ctx: &Ctx<'_>, effect: &Node, allow_reflections: bool,
+) -> Option<HashMap<String, f64>> {
+    // Match the compact, curve-free controls in the retained geometry renders.
+    // Unknown controls may affect geometry or the compositing result.
+    let length = int(effect, "length").filter(|&n| n > 0)?;
+    let rate = float(effect, "edit_rate").and_then(Rate::from_avid)?;
+    if effect.get("effect_id").and_then(Value::as_str) != Some("EFF2_SBLEND")
+        || Rate::new(24, 1) != Some(rate)
+        || !effect_envelope(ctx, effect, "3DWarp")
+    {
+        return None;
+    }
+    let mut input = ordered_picture_input(ctx, effect, length, rate)?;
+    for _ in 0..MAX_NESTING {
+        match &input.class {
+            b"SEQU" if int(input, "media_kind_id") == Some(KIND_PICTURE)
+                && (input.get("edit_rate").is_none()
+                    || float(input, "edit_rate").and_then(Rate::from_avid) == Some(rate)) => {
+                input = single_picture_segment(ctx, input, length)?;
+            }
+            b"TKFX" if allow_reflections
+                && int(input, "length") == Some(length)
+                && int(input, "media_kind_id") == Some(KIND_PICTURE)
+                && flip(input.get("effect_id").and_then(Value::as_str)?).is_some() => {
+                input = ordered_picture_input(ctx, input, length, rate)?;
+            }
+            _ => break,
+        }
+    }
+    if input.class != *b"SCLP" || int(input, "length") != Some(length)
+        || int(input, "media_kind_id") != Some(KIND_PICTURE)
+        || float(input, "edit_rate").and_then(Rate::from_avid) != Some(rate)
+    {
+        return None;
+    }
+    let list = ctx.deref(effect.get("param_list")).filter(|node| node.class == *b"PRLS")?;
+    let Value::RefList(items) = list.get("items")? else { return None };
+    if !matches!(items.len(), 11..=19 | 23 | 24) {
+        return None;
+    }
+    let mut values = HashMap::new();
+    for item in items {
+        let item = ctx.deref(Some(item)).filter(|node| node.class == *b"PRIT")?;
+        if has_curve(item) || item.get("enable") != Some(&Value::Bool(true)) {
+            return None;
+        }
+        let Value::Uuid(id) = item.get("uuid")? else { return None };
+        let value = float(item, "value").or_else(|| int(item, "value").map(|value| value as f64))?;
+        if !value.is_finite() || values.insert(file_order_hex(id), value).is_some() {
+            return None;
+        }
+    }
+    let mut take = |prefix: &str| values.remove(&format!("{prefix}568d7e84d511935a50f857c10000"));
+    for (id, expected) in crate::transform::COMPACT_WARP_DEFAULTS {
+        if take(id) != Some(expected) {
+            return None;
+        }
+    }
+    Some(values)
+}
+
+fn skew_corners(take: &mut impl FnMut(&str) -> Option<f64>) -> Option<[[f64; 2]; 4]> {
+    let skew_x = take("c981").unwrap_or(0.0);
+    let skew_y = take("ca81").unwrap_or(0.0);
+    let roll = match take("b781") {
+        None => 0.0,
+        Some(1.0) if skew_y == 0.0 => take("ba81")?,
+        _ => return None,
+    };
+    if skew_x.abs() > 200.0 || !(-150.0..=200.0).contains(&skew_y)
+        || roll.abs() > 30.0 || (skew_x == 0.0 && skew_y == 0.0)
+    {
+        return None;
+    }
+    let (sin, cos) = roll.to_radians().sin_cos();
+    Some([[-960.0, -540.0], [960.0, -540.0], [960.0, 540.0], [-960.0, 540.0]].map(|[x, y]| {
+        // Both shears use the original coordinates. Avid applies Z rotation
+        // after that shear, about the same picture center.
+        let sx = x - 1.5 * skew_x / 999.0 * y;
+        let sy = y - (2.0 / 3.0) * skew_y / 999.0 * x;
+        [0.5 + (cos * sx - sin * sy) / 1920.0, 0.5 + (sin * sx + cos * sy) / 1080.0]
+    }))
+}
+
+fn rotation_corners(
+    take: &mut impl FnMut(&str) -> Option<f64>, model_controls: bool,
+) -> Option<[[f64; 2]; 4]> {
+    if take("b781") != Some(1.0) {
+        return None;
+    }
+    let pitch = take("b881")?;
+    let yaw = take("b981")?;
+    let roll = take("ba81")?;
+    let max_roll = if model_controls { 35.0 } else { 0.0 };
+    if pitch.abs() > 25.0 || yaw.abs() > 30.0 || roll.abs() > max_roll {
+        return None;
+    }
+    // The retained 24-control profile combines model transforms with the
+    // default camera. The compact camera profile uses neutral model controls.
+    let (scale, axis, position) = if model_controls {
+        if [take("a981"), take("b281"), take("bc81")] != [Some(1.0); 3] {
+            return None;
+        }
+        let scale = [take("b381")?, take("b481")?];
+        let axis = [take("bd81")?, take("be81")?, take("bf81")?];
+        let position = [take("aa81")?, take("ab81")?, take("ac81")?];
+        if pitch == 0.0 && yaw == 0.0 {
+            // The isolated depth calibration keeps every other model control
+            // neutral, with the same enabled gates as the combined profile.
+            if roll != 0.0 || scale != [100.0; 2] || axis != [0.0; 3]
+                || position[0] != 0.0 || position[1] != 0.0
+                || position[2] == 0.0 || position[2].abs() > 100.0
+            {
+                return None;
+            }
+        } else if !(60.0..=100.0).contains(&scale[0]) || !(90.0..=100.0).contains(&scale[1])
+            || axis.iter().zip([80.0, 60.0, 25.0]).any(|(v, max)| v.abs() > max)
+            || position.iter().zip([40.0, 30.0, 20.0]).any(|(v, max)| v.abs() > max)
+        {
+            return None;
+        }
+        (scale.map(|v| v / 100.0), axis, position)
+    } else {
+        if pitch == 0.0 && yaw == 0.0 {
+            return None;
+        }
+        ([1.0; 2], [0.0; 3], [0.0; 3])
+    };
+    let (camera_x, camera_y, focal) = match take("c481") {
+        None => (0.0, 0.0, 2400.0),
+        Some(1.0) if !model_controls => {
+            let x = take("c581");
+            let y = take("c681");
+            let z = take("c781");
+            if [x, y, z].iter().flatten().count() > 1
+                || x.is_some_and(|v| v.abs() > 200.0)
+                || y.is_some_and(|v| v.abs() > 200.0)
+                || z.is_some_and(|v| !(250.0..=750.0).contains(&v))
+            {
+                return None;
+            }
+            (x.unwrap_or(0.0), y.unwrap_or(0.0), z.map_or(2400.0, |v| v * 9600.0 / 999.0))
+        }
+        _ => return None,
+    };
+    let [scale_x, scale_y] = scale;
+    let units = [1920.0 / 999.0, -1080.0 / 999.0, 9600.0 / 999.0];
+    let [axis_x, axis_y, axis_z] = [
+        axis[0] * units[0] * scale_x, axis[1] * units[1] * scale_y, axis[2] * units[2],
+    ];
+    let [tx, ty, tz] = [position[0] * units[0], position[1] * units[1], position[2] * units[2]];
+    let (roll_sin, roll_cos) = roll.to_radians().sin_cos();
+    let (pitch_sin, pitch_cos) = pitch.to_radians().sin_cos();
+    let (yaw_sin, yaw_cos) = yaw.to_radians().sin_cos();
+    let mut corners = [[0.0; 2]; 4];
+    for (corner, [x, y]) in corners.iter_mut().zip([
+        [-960.0, -540.0], [960.0, -540.0], [960.0, 540.0], [-960.0, 540.0],
+    ]) {
+        let (x, y) = (x * scale_x - axis_x, y * scale_y - axis_y);
+        // Avid rotates Z, then X, then Y about the scaled Axis point.
+        let (x, y) = (roll_cos * x - roll_sin * y, roll_sin * x + roll_cos * y);
+        let z = -axis_z;
+        let (y, z) = (pitch_cos * y - pitch_sin * z, pitch_sin * y + pitch_cos * z);
+        let (x, z) = (yaw_cos * x + yaw_sin * z, -yaw_sin * x + yaw_cos * z);
+        let (x, y, z) = (x + axis_x + tx, y + axis_y + ty, z + axis_z + tz);
+        let denominator = 2.0 * focal - 2400.0 - z;
+        // Depth is affine across the source plane. Requiring positive depth
+        // at all four corners excludes a projective pole anywhere in the image.
+        if denominator <= 0.0 {
+            return None;
+        }
+        let magnification = focal / denominator;
+        *corner = [
+            0.5 + magnification * (x / 1920.0 - camera_x / 999.0),
+            0.5 + magnification * (y / 1080.0 + camera_y / 999.0),
+        ];
+    }
+    Some(corners)
+}
+
+#[cfg(test)]
+mod projective_tests {
+    use super::{affine_crop_controls, isolated_roll_controls, rotation_corners, skew_corners};
+    use std::collections::HashMap;
+
+    #[test]
+    fn compact_roll_requires_all_neutral_controls_and_a_bounded_angle() {
+        let id = |prefix: &str| format!("{prefix}568d7e84d511935a50f857c10000");
+        let controls: HashMap<_, _> = [
+            ("a981", 1.0), ("b281", 1.0), ("b781", 1.0), ("bc81", 1.0),
+            ("aa81", 0.0), ("ab81", 0.0), ("ac81", 0.0),
+            ("b381", 100.0), ("b481", 100.0),
+            ("b881", 0.0), ("b981", 0.0), ("ba81", -30.0),
+            ("bd81", 0.0), ("be81", 0.0), ("bf81", 0.0),
+        ].into_iter().map(|(key, value)| (id(key), value)).collect();
+        assert!(isolated_roll_controls(controls.clone()));
+        for (key, value) in [("bd81", 1.0), ("ba81", 31.0), ("bc81", 0.0), ("b881", 1.0), ("bf81", 1.0)] {
+            let mut changed = controls.clone();
+            changed.insert(id(key), value);
+            assert!(!isolated_roll_controls(changed), "{key}");
+        }
+        let mut axis = controls;
+        axis.insert(id("ba81"), 30.0);
+        axis.insert(id("bd81"), 100.0);
+        assert!(isolated_roll_controls(axis.clone()));
+        axis.insert(id("be81"), 100.0);
+        assert!(!isolated_roll_controls(axis));
+    }
+
+    #[test]
+    fn compact_affine_crop_refuses_unmeasured_controls() {
+        let measured = [
+            ("cb81", 1.0), ("cc81", -799.0), ("cd81", 699.0),
+            ("ce81", 839.0), ("cf81", -759.0),
+            ("b281", 1.0), ("b381", 60.0), ("b481", 90.0), ("b781", 1.0), ("ba81", 30.0),
+        ];
+        let id = |prefix: &str| format!("{prefix}568d7e84d511935a50f857c10000");
+        let controls: HashMap<_, _> = measured.into_iter().map(|(key, value)| (id(key), value)).collect();
+        assert!(affine_crop_controls(controls.clone()));
+        for (key, value) in [("b881", 0.0), ("c081", 1.0), ("ba81", 31.0), ("cc81", 800.0)] {
+            let mut changed = controls.clone();
+            changed.insert(id(key), value);
+            assert!(!affine_crop_controls(changed), "{key}");
+        }
+    }
+
+    #[test]
+    fn skew_axes_use_the_same_untransformed_coordinates() {
+        let mut values = HashMap::from([("c981", 200.0), ("ca81", -150.0)]);
+        let [tl, tr, br, bl] = skew_corners(&mut |key| values.remove(key)).unwrap();
+        // The horizontal edge keeps the full source width, even with both axes active.
+        assert!((tr[0] - tl[0] - 1.0).abs() < 1e-12);
+        assert!((br[1] - tr[1] - 1.0).abs() < 1e-12);
+        assert!(tr[1] > tl[1] && bl[0] < tl[0]);
+        let mut values = HashMap::from([("c981", 200.0), ("ca81", -150.0), ("b781", 1.0), ("ba81", 30.0)]);
+        assert!(skew_corners(&mut |key| values.remove(key)).is_none());
+    }
+
+    #[test]
+    fn projected_yaw_uses_signed_depth_and_rejects_combined_camera_axes() {
+        let controls = [("b781", 1.0), ("b881", 0.0), ("b981", 30.0), ("ba81", 0.0)];
+        let mut values = HashMap::from(controls);
+        let [tl, tr, br, bl] = rotation_corners(&mut |key| values.remove(key), false).unwrap();
+        // Positive yaw brings the left edge closer. Its projected height is
+        // 1 / (1 - 480/2400), while the right edge uses the opposite depth.
+        assert!((bl[1] - tl[1] - 1.25).abs() < 1e-12);
+        assert!((br[1] - tr[1] - 5.0 / 6.0).abs() < 1e-12);
+        let mut values = HashMap::from(controls);
+        values.extend([("c481", 1.0), ("c581", 100.0), ("c681", 100.0)]);
+        assert!(rotation_corners(&mut |key| values.remove(key), false).is_none());
+        let mut values = HashMap::from(controls);
+        values.extend([("c481", 1.0), ("c781", 0.0)]);
+        assert!(rotation_corners(&mut |key| values.remove(key), false).is_none());
+    }
+
+    #[test]
+    fn rotated_picture_uses_the_scaled_axis_as_its_pivot() {
+        let mut values = HashMap::from([
+            ("b781", 1.0), ("b881", 0.0), ("b981", 30.0), ("ba81", 0.0),
+            ("a981", 1.0), ("b281", 1.0), ("bc81", 1.0),
+            ("b381", 60.0), ("b481", 90.0), ("bd81", 50.0), ("be81", 0.0), ("bf81", 0.0),
+            ("aa81", 0.0), ("ab81", 0.0), ("ac81", 0.0),
+        ]);
+        let [tl, tr, br, bl] = rotation_corners(&mut |key| values.remove(key), true).unwrap();
+        // For pure yaw the projected vertical edge lengths reveal each edge's
+        // depth directly, including the shared shift from the scaled X pivot.
+        let left_depth = 2400.0 * (1.0 - 0.9 / (bl[1] - tl[1]));
+        let right_depth = 2400.0 * (1.0 - 0.9 / (br[1] - tr[1]));
+        assert!((left_depth - right_depth - 576.0).abs() < 1e-9);
+        assert!(((left_depth + right_depth) / 2.0 - 28_800.0 / 999.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn isolated_position_depth_uses_the_default_camera() {
+        let controls = [
+            ("b781", 1.0), ("b881", 0.0), ("b981", 0.0), ("ba81", 0.0),
+            ("a981", 1.0), ("b281", 1.0), ("bc81", 1.0),
+            ("b381", 100.0), ("b481", 100.0), ("bd81", 0.0), ("be81", 0.0), ("bf81", 0.0),
+            ("aa81", 0.0), ("ab81", 0.0),
+        ];
+        for (depth, expected_width) in [(100.0, 999.0 / 599.0), (-100.0, 999.0 / 1399.0)] {
+            let mut values = HashMap::from(controls);
+            values.insert("ac81", depth);
+            let [tl, tr, br, bl] = rotation_corners(&mut |key| values.remove(key), true).unwrap();
+            assert!(values.is_empty());
+            assert!((tr[0] - tl[0] - expected_width).abs() < 1e-12);
+            assert!((bl[1] - tl[1] - expected_width).abs() < 1e-12);
+            assert!((tl[0] + br[0] - 1.0).abs() < 1e-12);
+            assert!((tl[1] + br[1] - 1.0).abs() < 1e-12);
+        }
+        for (control, value) in [
+            ("ac81", 0.0), ("ac81", 101.0), ("aa81", 1.0), ("b381", 99.0),
+            ("ba81", 1.0), ("bd81", 1.0), ("c481", 1.0),
+        ] {
+            let mut values = HashMap::from(controls);
+            values.insert("ac81", 100.0);
+            values.insert(control, value);
+            assert!(rotation_corners(&mut |key| values.remove(key), true).is_none(), "{control}");
+        }
+    }
+}
+
 // A malformed or unresolved control reference cannot be used as a static value.
 fn curve_differs_from_inline(ctx: &Ctx<'_>, item: &Node) -> bool {
     has_curve(item) && ctx.deref(item.get("control_track"))
@@ -621,11 +1031,15 @@ fn curve_differs_from_inline(ctx: &Ctx<'_>, item: &Node) -> bool {
 }
 
 fn qualified_controls(ctx: &Ctx<'_>, effect: &Node, list: &Node, rate: Rate, name: &str) -> bool {
+    list.class == *b"PRLS" && Rate::new(24_000, 1001) == Some(rate)
+        && effect_envelope(ctx, effect, name)
+}
+
+fn effect_envelope(ctx: &Ctx<'_>, effect: &Node, name: &str) -> bool {
     let attrs = ctx.attrs(effect);
     let one = |key, expected| attrs.iter().filter(|(k, _)| k == key)
         .map(|(_, v)| v.as_str()).eq([Some(expected)]);
-    effect.class == *b"TKFX" && list.class == *b"PRLS"
-        && Rate::new(24_000, 1001) == Some(rate)
+    effect.class == *b"TKFX"
         && matches!(effect.get("precomputed"), None | Some(Value::Null | Value::Ref(0)))
         && matches!(effect.get("trackman"), None | Some(Value::Null | Value::Ref(0)))
         && int(effect, "info_is_reversed") == Some(0)
@@ -732,11 +1146,108 @@ fn normalize(length: i64, pairs: [[f64; 2]; 8], warp: bool) -> Option<[ResizeKey
     }).then_some(keys)
 }
 
+fn warp_roll(ctx: &Ctx<'_>, effect: &Node, list: &Node, items: &[Value]) -> Option<PictureExtension> {
+    let rate = Rate::new(24, 1)?;
+    let length = int(effect, "length").filter(|&n| (3..=256).contains(&n))?;
+    if list.class != *b"PRLS" || items.len() != 16 || !effect_envelope(ctx, effect, "3DWarp") {
+        return None;
+    }
+    let input = ordered_picture_input(ctx, effect, length, rate)?;
+    let input = if input.class == *b"SEQU" { single_picture_segment(ctx, input, length)? } else { input };
+    if input.class != *b"SCLP" || int(input, "length") != Some(length)
+        || int(input, "media_kind_id") != Some(KIND_PICTURE)
+        || float(input, "edit_rate").and_then(Rate::from_avid) != Some(rate)
+    {
+        return None;
+    }
+    let mut controls = HashMap::new();
+    for item in items {
+        let item = ctx.deref(Some(item)).filter(|n| n.class == *b"PRIT")?;
+        let Value::Uuid(id) = item.get("uuid")? else { return None };
+        if item.get("enable") != Some(&Value::Bool(true)) || controls.insert(file_order_hex(id), item).is_some() {
+            return None;
+        }
+    }
+    let mut take = |prefix: &str| controls.remove(&format!("{prefix}568d7e84d511935a50f857c10000"));
+    for (id, expected) in crate::transform::COMPACT_WARP_DEFAULTS.into_iter()
+        .chain([("a981", 1.0), ("b281", 1.0), ("b481", 100.0), ("b781", 1.0)])
+    {
+        let n = take(id)?;
+        if has_curve(n) || float(n, "value").or_else(|| int(n, "value").map(|v| v as f64)) != Some(expected) {
+            return None;
+        }
+    }
+    let read = |n: &Node| -> Option<(WarpRollInterpolation, [(i64, f64); 3])> {
+        let curve = ctx.deref(n.get("control_track")).filter(|c| c.class == *b"PRCL")?;
+        let mode = int(curve, "interp_kind")?;
+        let interpolation = match mode {
+            2 => WarpRollInterpolation::Shelf,
+            3 => WarpRollInterpolation::Linear,
+            5 => WarpRollInterpolation::Bezier,
+            6 => WarpRollInterpolation::Spline,
+            _ => return None,
+        };
+        if !curve_header(n, curve, length, rate, mode) {
+            return None;
+        }
+        let Value::List(points) = curve.get("control_points")? else { return None };
+        let [a, b, c] = points.as_slice() else { return None };
+        let result = [trim_point(a, 4)?, trim_point(b, 4)?, trim_point(c, 4)?];
+        let [(first, _), (middle, _), (last, _)] = result;
+        if first != 0 || !(1..length-1).contains(&middle) || last != length - 1 {
+            return None;
+        }
+        if matches!(interpolation, WarpRollInterpolation::Bezier | WarpRollInterpolation::Spline)
+            && !warp_roll_flat_handles([a, b, c], middle, last - middle)
+        {
+            return None;
+        }
+        Some((interpolation, result))
+    };
+    let (mode, x) = read(take("aa81")?)?;
+    let (width_mode, width) = read(take("b381")?)?;
+    let (rotation_mode, rotation) = read(take("ba81")?)?;
+    if !controls.is_empty() || width_mode != mode || rotation_mode != mode
+        || x.map(|k| k.0) != width.map(|k| k.0)
+        || x.map(|k| k.0) != rotation.map(|k| k.0)
+        || x.iter().any(|k| !(-60.0..=90.0).contains(&k.1))
+        || width.iter().any(|k| !(70.0..=100.0).contains(&k.1))
+        || rotation.iter().any(|k| !(-15.0..=25.0).contains(&k.1))
+    {
+        return None;
+    }
+    Some(PictureExtension::WarpRoll {
+        keys: std::array::from_fn(|i| WarpRollKey {
+            frame: x[i].0, x: x[i].1 / 999.0, width: width[i].1, rotation: rotation[i].1,
+        }),
+        interpolation: mode,
+    })
+}
+
+fn warp_roll_flat_handles(points: [&Value; 3], first_span: i64, second_span: i64) -> bool {
+    let first = first_span as f64 * 0.4;
+    let second = second_span as f64 * 0.4;
+    points.into_iter().zip([[-first, first], [-first, second], [-second, second]])
+        .all(|(point, [incoming, outgoing])| {
+            let Value::Node(point) = point else { return false };
+            let Some(Value::List(props)) = point.get("pp") else { return false };
+            let [a, b, c, d, _] = props.as_slice() else { return false };
+            [a, b, c, d].into_iter().zip([incoming, 0.0, outgoing, 0.0])
+                .all(|(prop, expected)| {
+                    matches!(prop, Value::Node(prop)
+                        if float(prop, "value").is_some_and(|v| (v - expected).abs() <= 1e-12))
+                })
+        })
+}
+
 pub(super) fn warp(ctx: &Ctx<'_>, effect: &Node) -> Option<PictureExtension> {
     let list = ctx.deref(effect.get("param_list"))?;
     let Value::RefList(items) = list.get("items")? else { return None; };
     if !items.iter().filter_map(|item| ctx.deref(Some(item))).any(|item| curve_differs_from_inline(ctx, item)) {
         return None;
+    }
+    if let Some(roll) = warp_roll(ctx, effect, list, items) {
+        return Some(roll);
     }
     let candidate = (|| {
         let length = int(effect, "length")?;
@@ -777,6 +1288,6 @@ pub(super) fn warp(ctx: &Ctx<'_>, effect: &Node) -> Option<PictureExtension> {
         warp_trim(ctx, items, length, rate, compact_promotion).map(PictureExtension::WarpTrim)
     })();
     Some(candidate.unwrap_or(PictureExtension::UnsupportedTransform(
-        "3D Warp animation requires the qualified Linear motion and crop controls with neutral background",
+        "3D Warp animation uses an unsupported control set, interpolation or tangent shape",
     )))
 }

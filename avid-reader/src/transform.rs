@@ -19,6 +19,15 @@ use crate::color::{ColorCorrection, ParamValue};
 
 const SUFFIX: &str = "568d7e84d511935a50f857c10000";
 
+// Observed compact Warp baseline (AVB-0009). These are harmless together
+// in the measured crop/scale/roll profile; nonneutral values, unknown controls
+// and duplicate assignments leave the original diagnostics intact.
+pub(crate) const COMPACT_WARP_DEFAULTS: [(&str, f64); 9] = [
+    ("2b81", 0.0), ("a181", 0.5900000000000001), ("a281", 0.0),
+    ("a481", 0.0), ("d081", 0.0), ("ed81", 1.0), ("fc81", 255.0),
+    ("1c82", 0.0), ("8e82", 0.0),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Kind {
     Resize,
@@ -29,6 +38,20 @@ pub enum Kind {
 pub struct PictureEffect {
     pub kind: Kind,
     pub params: ColorCorrection,
+    pub corner_pin: Option<CornerPin>,
+    /// The saved static compact envelope has only the measured affine controls.
+    pub compact_affine_warp: bool,
+}
+
+/// Static projective mapping on the measured 1920×1080 square-pixel canvas.
+/// Points are TL, TR, BR, BL in full-image edge fractions, X right and Y down.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CornerPin {
+    pub corners: [[f64; 2]; 4],
+    /// Source-space clip margins in left, top, right, bottom order.
+    pub crop: [f64; 4],
+    /// True when other Warp controls supplied the geometry instead of saved pin points.
+    pub from_transform: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +153,9 @@ impl PictureEffect {
         };
         for (id, v) in &self.params.params {
             let name = id.strip_suffix(SUFFIX).and_then(|p| known.iter().find(|(k, _)| *k == p));
-            if name.is_none() {
+            let neutral = self.compact_affine_warp && id.strip_suffix(SUFFIX)
+                .is_some_and(|prefix| COMPACT_WARP_DEFAULTS.iter().any(|&(key, _)| key == prefix));
+            if name.is_none() && !neutral {
                 out.not_converted.push(match v {
                     ParamValue::Float(f) => format!("{} control {} = {}", self.name(), &id[..8], trim(*f)),
                     ParamValue::Int(i) => format!("{} control {} = {}", self.name(), &id[..8], i),
@@ -205,6 +230,8 @@ mod tests {
         PictureEffect {
             kind,
             params: ColorCorrection { params: values.iter().map(|(p, v)| (format!("{}{}", p, SUFFIX), ParamValue::Float(*v))).collect() },
+            corner_pin: None,
+            compact_affine_warp: false,
         }
     }
 

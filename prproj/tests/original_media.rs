@@ -94,9 +94,16 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         texts: Vec::new(),
         multicams: Vec::new(),
         multicam_uses: Vec::new(),
+        picture_subclips: Vec::new(),
+        av_subclips: Vec::new(),
+        av_subclip_uses: Vec::new(),
+        constant_speeds: Vec::new(),
+        picture_nests: Vec::new(),
+        png_mattes: Default::default(),
         video_dissolves: Vec::new(),
         audio_edge_fades: Vec::new(),
         audio_crossfades: Vec::new(),
+        audio_pans: Vec::new(),
         audio_mixers: Default::default(),
         track_states: Default::default(),
         picture_effects: Vec::new(),
@@ -238,6 +245,53 @@ fn sequence(events: Vec<Event>) -> Sequence {
         audio_crossfades: vec![],
         start: 0,
     }
+}
+
+#[test]
+fn mono_clip_pan_targets_one_edit_and_uses_the_file_clock() {
+    let scratch = Scratch::new();
+    let out = scratch.0.join("clip-pan.prproj");
+    let mut project = input(original("wav24mono"));
+    project.options.match_avid_default_pan = true;
+    let mut mono = event();
+    mono.video_track = None;
+    mono.stereo.clear();
+    mono.audio_tracks = vec![1];
+    mono.source_in = TICKS_PER_SECOND / 2;
+    project.sequences.push(sequence(vec![mono]));
+    let pan = PreparedAudioPan {
+        sequence: 0,
+        event: 0,
+        track: 1,
+        keys: vec![
+            AudioPanKey { ticks: TICKS_PER_SECOND / 2, value: 0.0 },
+            AudioPanKey { ticks: TICKS_PER_SECOND + 1, value: 1.0 },
+        ],
+    };
+    project.audio_pans.push(pan.clone());
+    let mut ids = SeededUuids::new("mono-clip-pan");
+    prepare_typed_project(&project, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&out).unwrap();
+    let clip_pan = doc.tree.find1(doc.root, "AudioClipTrackItem/Panner").unwrap();
+    let processor = doc.resolve(clip_pan).unwrap();
+    assert_eq!(doc.tree.tag(processor), "MonoToStereoPanProcessor");
+    let reference = doc.tree.find1(processor, "PanProcessor/AudioComponent/Component/Params/Param").unwrap();
+    let param = doc.resolve(reference).unwrap();
+    assert_eq!(doc.tree.findtext(param, "Name").unwrap().as_deref(), Some("Pan"));
+    assert!(doc.tree.find1(param, "IsTimeVarying").is_none());
+    let keys = doc.tree.findtext(param, "Keyframes").unwrap().unwrap();
+    let ticks: Vec<_> = keys.split_terminator(';').map(|key| {
+        key.split_once(',').unwrap().0.parse::<i64>().unwrap()
+    }).collect();
+    assert_eq!(ticks, [TICKS_PER_SECOND / 2, TICKS_PER_SECOND + 1]);
+    project.audio_pans.push(pan);
+    assert!(project.validate().is_err());
+    project.audio_pans.pop();
+    project.audio_pans[0].track = 2;
+    assert!(project.validate().is_err());
+    project.audio_pans[0].track = 1;
+    project.audio_pans[0].keys[1].ticks = 2 * TICKS_PER_SECOND;
+    assert!(project.validate().is_err());
 }
 
 #[test]

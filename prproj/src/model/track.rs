@@ -449,12 +449,13 @@ impl Project {
         let fade = self.attach_transition(
             track, clip, None, at_start, start, end, alignment, "Constant Gain", "Constant Gain",
         )?;
-        self.set_constant_gain_shape(track, fade)
+        self.set_constant_gain_shape(track, fade, true)
     }
 
     pub(crate) fn add_prepared_audio_crossfade(
         &mut self, track: TrackId, outgoing: TrackItemId, incoming: TrackItemId,
         start: i64, end: i64, offset: i64,
+        follow_track_layout: bool,
     ) -> Result<()> {
         let cut = self.start(incoming)?.ticks;
         if self.track(track).media_type != MediaType::Audio
@@ -464,17 +465,21 @@ impl Project {
         {
             return value("prepared audio crossfade endpoints do not match the written cut");
         }
+        let after = end.checked_sub(cut).ok_or_else(|| Error::Value("crossfade span overflows".into()))?;
+        if offset > self.handle_before(incoming)? || after > self.handle_after(outgoing)? {
+            return value("prepared audio crossfade exceeds the available source handles");
+        }
         let fade = self.attach_transition(
             track, incoming, Some(outgoing), true, start, end, offset, "Constant Gain", "Constant Gain",
         )?;
-        self.set_constant_gain_shape(track, fade)
+        self.set_constant_gain_shape(track, fade, follow_track_layout)
     }
 
-    fn set_constant_gain_shape(&mut self, track: TrackId, fade: NodeId) -> Result<()> {
+    fn set_constant_gain_shape(&mut self, track: TrackId, fade: NodeId, follow_track_layout: bool) -> Result<()> {
         let mono = self.doc.tree.findtext(self.track(track).element, "AudioTrack/ChannelType")?
             .as_deref() == Some("0");
         let tree = &mut self.doc.tree;
-        if !mono {
+        if follow_track_layout && !mono {
             if let Some(layout) = tree.child_by_tag(fade, "AudioChannelLayout") {
                 tree.set_text(layout, Some(r#"[{"channellabel":100},{"channellabel":101}]"#));
             }

@@ -34,6 +34,201 @@ from a bounded native archive profile. Its saved Resolve clocks and channel
 selectors retain their own provenance. Product route qualification remains
 separate from the source adapter.
 
+## Saved Avid subclip ranges
+
+The bin-owned `avid.subclips` sidecar retains one entry per saved usage-2
+occurrence, including its native mob ID, occurrence ID, name, owner edit
+rate, backing length, and separate raw `_START` and `_END` observations.
+Track rows retain the label, media kind, component class, clock and length.
+For an immediate source clip they also retain the target mob and track
+and the stored target offset. Missing or ambiguous marks are unresolved.
+Duplicate display names remain distinct. Wrapped tracks retain their
+immediate component facts without resolving a new source range.
+
+In the retained 24 fps case, the bin range is 76–163 (87 frames) and the
+backing composition is 242 frames. The edit already starts at frame 76.
+In the 29.97 case, the stored range is 116–229 (113 frames) over a
+334-frame composition. The saved timeline route remains the authority
+for the edit's source trim. Nested, mixed-rate and overrun playback
+remain separate cases.
+CONV-0097
+
+Premiere preparation uses the saved receipts to make reusable
+picture-only bin items in Separate files mode (CONV-0098). The profile
+requires one direct same-rate V1 reference to a uniquely identified,
+qualified 23.976 DNxHR LB parent, zero backing offset, and a range within
+the backing composition and verified file. Each item has its own bounds
+and logging range and shares the parent media. Premiere's native subclip
+logging time starts at the physical file clock plus the subclip In.
+Existing timeline edits
+retain their source ranges. Other subclips receive a scoped loss.
+
+Premiere 27.0.0 build 88 kept two same-named items after Save As and
+reopen. Fresh insertion used file frames 5–12 and 17–28. All 20 decoded
+frames matched Premiere's own subclip construction. A derived AVB
+exercises the production entry points.
+
+A later native Avid test saved two V1 subclips with the same name and
+distinct identities at file ranges [274, 275) and [586, 598). The direct
+CLI and saved job retained both from an isolated copy of the bin.
+After Save As and reopen in Premiere 27 build 88, fresh insertion from
+the CLI project matched all 13 rendered frames from equivalent parent
+trims and from the subclip bin items imported through linked AAF.
+The standalone AAF exports used Avid's `.Exported.NN` names. Premiere's
+AAF import also made two full-source sequences; those sequences did not
+preserve the subclip ranges. The imported subclip bin items did.
+
+A separate 23.976 Avid control places a marked range from one V1/A1/A2
+subclip over managed DNx/PCM16 media. The bin receipt records the subclip's
+full [0, 96) backing range. Each edit's source chain starts at the subclip
+with a 59-frame offset, then reaches the master with a zero offset. The
+direct CLI, saved job and reopened Premiere project all use file range
+[59, 83) on all three lanes at sequence start 01:00:00:00. The linked AAF
+from that exact sequence keeps the original subclip identity and the same
+range. Premiere 27 retained a separate reusable subclip after Save As and
+reopen. All three edits refer to it, and fresh insertion from that item
+produced 96 frames with V1 and both mono lanes. The 24 decoded frames of
+the original edit match Any NLE. Both isolated 48 kHz lanes use the same
+samples; Premiere's AAF import centers the mono audio, while the selected
+Any NLE policy follows Avid's default left/right pan.
+
+Separate files now builds one reusable Premiere master for a full-range
+23.976 V1/A1/A2 subclip over verified DNxHD LB and two mono PCM16 MXFs.
+It reuses the original file objects. The saved occurrence route binds
+each edit lane to that subclip when the full native identities, clocks
+and ranges agree. Direct CLI and saved jobs retained that master reference
+on all three lanes after Save As and reopen in Premiere 27. Fresh insertion
+also reopened with 96 frames and two mono lanes. Both picture renders
+matched the linked AAF, and audio matched under each sequence's pan policy.
+
+Shortened subclips in the same profile retain the saved bin bounds on
+the picture and both audio sources. In the native control the subclip
+stores [59, 83) and the AVB edit already starts at file frame 59.
+The linked AAF expresses the same range with a subclip-relative edit
+start of zero and a subclip-to-master start of 59. The Premiere writer
+keeps file-relative edit ranges and adds the boundaries to the reusable
+item. Both entry points matched the 24-frame AAF picture after reopen
+and fresh insertion. Both mono lanes matched the same-pan references
+sample for sample. Nonzero backing offsets and edits requiring a
+separate marker copy remain outside this profile.
+
+The verified 23.976 DNxHR LB route with two original mono PCM24 siblings
+also preserves a shortened A/V subclip. The native AVB stores file range
+[8, 32) on a 36-frame backing master with zero offsets. Premiere 27 build
+88 reopened the CLI and saved-job conversions with a shared subclip item
+on V1/A1/A2. Fresh insertion retained that range and all three lanes. The
+imported linked AAF timeline used the same trim and original files, with
+separate recovered picture and mono items. Fresh insertion from its
+picture item produced only V1. The converter timeline and fresh insertion
+matched all 24 AAF picture frames. Under default center pan, A2 matched all
+48,048 samples and A1 differed by at most one PCM24 count per output
+channel. Separate files mode requires two siblings of the same bit depth.
+
+## Trimmed Avid Submaster nests
+
+Avid Collapse saves the picture inputs inside the parent’s Submaster.
+In the 23.976 test, extracting seven frames from the parent head changes
+the inner source range from [2, 35) to [7, 35). The nonzero parent TC1
+survives, and A1 and A2 remain independent parent edits. The linked AAF
+retains a Submaster operation. Premiere 27 flattens it to an ordinary
+picture edit on import.
+
+The direct Separate files route recognizes the saved neutral single-input
+Submaster and writes one editable picture child for each qualified
+occurrence. The child’s display start is the parent’s sequence origin plus
+the placement’s record offset. The parent reads the child from local zero.
+The child reads its saved range from the original file. This keeps the
+child’s display timecode separate from both trims. The native control
+timeline remains separate because the AVB does not link it to the inline
+Submaster.
+
+After Save As and reopen in Premiere 27, the head-trimmed CLI and saved-job
+projects match all 29 linked AAF picture frames. The two isolated mono
+lanes cover 58,058 samples each. A2 matches exactly, and A1 differs by
+at most one PCM24 count per output channel under center pan. A parent with
+the nest two frames into the sequence also retains its later child clock.
+The qualified profile covers same-rate online 1080p23.976 direct managed
+picture. Other Submaster shapes keep the existing conversion behavior and
+report a flattened boundary where the picture edit survives.
+
+## Static Avid Corner Pin
+
+The Avid sequence sidecar retains `controls.picture.corner_pin` on each
+matching native event. It includes the measured 1920×1080 reference
+canvas, four target points in top-left, top-right, bottom-right,
+bottom-left order, and four source crop margins. The points use
+full-image edge fractions, with X right and Y down. Apply source crop
+before mapping the surviving picture through the full-image pin.
+The geometry receipt survives when the graph cannot place the media.
+
+This capture uses the compact static 24 fps control set from the
+retained Avid renders, with one direct picture input, a filler
+background and a convex target. It checks saved parameter identities
+and the absence of curve references. Other controls remain in the
+native parameter receipt. An isolated pin with verified square-pixel
+1080p24 picture also becomes a `picture.corner_pin` effect on the
+placement. It carries optional `source_crop_ltrb` fractions. An absent
+field means zero crop. Premiere 27 writes editable Corner Pin and, for
+nonzero margins, Rounded Crop. The Rounded Crop offset places the matte
+around the intended source rectangle. The two effects render in the
+measured order, with the saved component list placing Corner Pin first.
+Resolve writing remains open.
+CONV-0099 through CONV-0101
+
+Static 3D Warp pitch and yaw with neutral position, scale, pivot and roll
+can also produce `picture.corner_pin`. This path allows up to one
+nondefault Perspective axis in the measured range. It records the computed
+corners under `controls.picture.projected_corners` and retains the original
+parameter values. Premiere exposes editable target points and reports the
+loss of the original Rotation and Perspective controls. The full source
+plane must have positive projective depth. CONV-0102
+
+The default camera profile also accepts bounded static Z/X/Y rotation
+combined with independent X/Y scaling, an XYZ Axis and XYZ Position.
+Avid scales the Axis pivot with the image, rotates around that pivot
+in Z/X/Y order, and adds Position before projection. The same
+`projected_corners` receipt retains the result alongside the original
+controls. CONV-0103
+
+Compact three-key Linear Warp can also carry animated X Position,
+Scale Width and Z Rotation together. Graph/2 records the three exact
+edit-relative frame positions, normalized X and the saved width and
+rotation values in `avid.warp_roll_linear`. Premiere adds the verified
+source in-point once to place the editable Motion keys. The admitted
+1080p24 profile uses a centered anchor, neutral crop, full height and no
+retiming or stack. CONV-0109
+
+The same bounded profile also carries Avid Shelf as
+`avid.warp_roll_shelf`, with the identical edit-relative key layout.
+All three source curves must use Shelf. Premiere writes Hold to the
+editable Position, Width and Rotation keys, with no spatial tangents on
+the held Position values. The value changes at the next saved key, as
+confirmed after reopen. CONV-0110
+
+For the same three-control layout, graph/2 distinguishes
+`avid.warp_roll_bezier` and `avid.warp_roll_spline`. Both require
+zero saved value tangents and temporal handles of 40% of the adjacent
+key span. Premiere writes editable Bezier timing with zero slopes and
+40% influence, and keeps the Position path straight.
+CONV-0111
+
+Static Skew uses simultaneous X and Y shear on the source coordinates.
+In the tested X-only profile with Z Rotation, rotation follows the
+shear. The four derived corners use the same graph/2 receipt and
+editable Premiere effect. CONV-0104
+
+Isolated static Position Z in the default-camera profile changes
+magnification about the picture center even with zero rotation. The
+retained 1080p24 cases at +100 and −100 use the same projected-corners
+receipt and editable Premiere output. Other model controls must be
+neutral for this depth-only profile. CONV-0105
+
+The retained compact static crop, Scale and Z Rotation profile stays
+in the ordinary editable Motion representation. Its exact neutral
+controls remain in the Avid receipt without spurious loss entries.
+Controls outside the verified envelope retain their previous
+diagnostics. CONV-0106
+
 ## Nested Avid picture effects
 
 Graph/2 preserves simple chains of Flip, Flop, Resize, and 3D Warp
@@ -48,6 +243,21 @@ The retained Avid control saves Flop as the input to an animated Warp.
 Graph/2 retains both stages and all of Warp's keys. Branches, split
 inputs, and mixed-rate or unsupported wrappers remain outside this
 profile. See the [graph contract](GRAPH-MODEL.md).
+
+A bounded static Corner Pin can be a stage rather than a standalone
+effect. The source reader follows same-rate full-span reflection inputs
+to the media edit, and the graph retains the pin and reflection in saved
+order. The native event receipt lists each qualified projective stage
+by index, with its original controls and source-space crop, including
+when the media does not resolve.
+CONV-0107
+
+Premiere 27 writes one static Corner Pin and one horizontal reflection,
+with optional source crop, on a same-rate 1080p24 picture edit. For this
+combination the standard components execute in reverse saved-list order.
+Both orders survived reopening, with the crop adjacent to the pin.
+Combined native Avid rendering and Resolve writing remain unqualified.
+CONV-0108
 
 ### Writing ordered picture chains
 
@@ -135,9 +345,11 @@ origin-correction interface; a future slice needs its own qualification.
 Markers retain owner-local position/rate and occurrence bindings in the source.
 Only a qualified transform yields portable record time. Unsupported marker timing
 is a scoped loss. A known record marker whose edit ownership is removed by trimming
-moves to the sequence with an ownership-loss report. Inheritance uses the retained
-content/creation-stamp rule at an exact source time; marker UUID equality is not
-assumed. Unqualified retimed marker transforms are not reconstructed heuristically.
+moves to the sequence with an ownership-loss report. Master clip markers carry
+their saved track. Older graph/2 files can recover the track from their native
+marker receipt. Inheritance requires matching duration, content and creation
+stamp on the same source track at the exact source time. Unqualified retimed
+marker transforms remain unresolved.
 
 Typed writer models are validated before native routing or document construction.
 This closes paths where malformed public Rust values could panic before validation.

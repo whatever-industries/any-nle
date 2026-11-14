@@ -223,6 +223,9 @@ pub(crate) fn prepare_bindings(
                     return Err(format!("{}: unqualified Resolve clip fade points", p.id).into());
                 }
                 edit.envelope = audio::prepare(p, source_in, length, rate(), receipt)?;
+                if edit.envelope.and_then(|e| e.fades).is_some_and(audio::Fades::fractional) {
+                    return Err(format!("{}: fractional clip fades require the linked WAV profile", p.id).into());
+                }
                 if let Some(loss) = edit.envelope.and_then(Envelope::recovered_loss) {
                     recovered.insert(p.id.as_str(), loss);
                 }

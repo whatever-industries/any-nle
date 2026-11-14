@@ -571,6 +571,25 @@ pub fn set_param_color(tree: &mut Tree, param: NodeId, color: Color) -> Result<(
 /// A static parameter turns time-varying: `Keyframes` is created after `CurrentValue` (audio)
 /// or `StartKeyframe`, and the `IsTimeVarying` flag set, created or (audio scalars) removed.
 pub fn set_param_keyframes(tree: &mut Tree, param: NodeId, keys: &[(Time, Num, KeyframeInterpolation)]) -> Result<()> {
+    write_scalar_keyframes(tree, param, keys, build_keyframe_string)
+}
+
+/// Flat temporal Bezier tangents with the same influence on either side of each key.
+pub(crate) fn set_flat_bezier_keyframes(tree: &mut Tree, param: NodeId, keys: &[(Time, Num); 3]) -> Result<()> {
+    let keys = keys.map(|(time, value)| (time, value, KeyframeInterpolation::Bezier));
+    write_scalar_keyframes(tree, param, &keys, |keys| {
+        let mut records = String::new();
+        for (time, value, _) in keys {
+            records.push_str(&format!("{},{},5,0,0,0.4,0,0.4;", time.ticks, format_scalar(float32(*value))?));
+        }
+        Ok(records)
+    })
+}
+
+fn write_scalar_keyframes(
+    tree: &mut Tree, param: NodeId, keys: &[(Time, Num, KeyframeInterpolation)],
+    encode: impl FnOnce(&[(Time, f64, KeyframeInterpolation)]) -> Result<String>,
+) -> Result<()> {
     let class_id = param_class_id(tree, param);
     if !SCALAR_VALUE_CLASSES.contains(&class_id.as_str()) {
         return value("keyframes are only settable on scalar parameters");
@@ -588,7 +607,7 @@ pub fn set_param_keyframes(tree: &mut Tree, param: NodeId, keys: &[(Time, Num, K
             return value(format!("duplicate keyframe time {}", pair[0].0.ticks));
         }
     }
-    let text = build_keyframe_string(&ordered)?;
+    let text = encode(&ordered)?;
     let element = match tree.child_by_tag(param, "Keyframes") {
         Some(e) => e,
         None => {

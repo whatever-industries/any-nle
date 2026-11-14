@@ -57,6 +57,7 @@ enum ReviewAction {
     Step(Page),
     Choose(Pick),
     Media(MediaJump),
+    SwitchToOffline,
 }
 #[derive(Default)]
 struct Tree {
@@ -328,6 +329,7 @@ impl App {
                 ClipMode::Merged => job::ClipMode::Merged,
                 ClipMode::Separate => job::ClipMode::Separate,
             },
+            allow_offline_media: c.mode != ClipMode::Rewrap && c.allow_offline_media,
             new_media: if c.mode == ClipMode::Rewrap {
                 i.new_media.clone()
             } else {
@@ -539,6 +541,7 @@ impl App {
                         job::ClipMode::Merged => ClipMode::Merged,
                         job::ClipMode::Separate => ClipMode::Separate,
                     },
+                    allow_offline_media: s.allow_offline_media,
                     include_dependencies: s.include_dependencies,
                     include_trash_attic: s.include_trash_attic,
                     policy_json: if s.policy_json.is_empty() {
@@ -940,6 +943,13 @@ impl App {
                                 MUTED
                             }),
                     );
+                    if mode != ClipMode::Rewrap {
+                        let mut allow = self.wizard.choices.allow_offline_media && selected;
+                        if ui.checkbox(&mut allow, "Allow offline media").changed() {
+                            self.wizard.choices.mode = mode;
+                            self.wizard.choices.allow_offline_media = allow;
+                        }
+                    }
                 });
         }
         ui.horizontal(|ui| {
@@ -1182,6 +1192,11 @@ impl App {
                 "Add or correct the Avid media folders. If there are duplicate copies, select the intended source folders. Then return to Review.",
                 Some(("Open media locations", ReviewAction::Media(MediaJump::Locations))),
             ),
+            RewrapMissingMedia => (
+                "Required media is missing",
+                "Locate the source media to rewrap, or switch to Separate files to preserve the edits as offline clips.",
+                Some(("Locate media", ReviewAction::Media(MediaJump::Locations))),
+            ),
             OriginalLocator => (
                 "Locate the linked original",
                 "Reconnect the original drive or map the saved path prefix to its current folder. Then return to Review.",
@@ -1239,6 +1254,9 @@ impl App {
                         action = Some(target);
                     }
                 }
+                if issue.kind == RewrapMissingMedia && ui.button("Switch to Separate files").clicked() {
+                    action = Some(ReviewAction::SwitchToOffline);
+                }
                 if ui.link("Copy details").clicked() {
                     let mut details = vec![issue.message.as_str()];
                     details.extend(issue.affected.iter().map(String::as_str));
@@ -1257,6 +1275,12 @@ impl App {
         match action {
             ReviewAction::Step(page) => self.wizard.page = page,
             ReviewAction::Choose(pick) => self.pick(pick, ctx),
+            ReviewAction::SwitchToOffline => {
+                self.wizard.choices.mode = ClipMode::Separate;
+                self.wizard.choices.allow_offline_media = true;
+                self.invalidate();
+                self.wizard.page = Page::Clips;
+            }
             ReviewAction::Media(jump) => {
                 self.media_jump = Some(jump);
                 self.wizard.page = Page::Clips;

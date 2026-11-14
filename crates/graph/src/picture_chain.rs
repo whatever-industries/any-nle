@@ -141,6 +141,11 @@ impl<'a> Chain<'a> {
                 };
                 *slot = slot.then(flip);
             } else {
+                if kind == "picture.corner_pin" {
+                    return Err(Error::Unsupported(
+                        "ordered Corner Pin is retained in graph/2; destination effect order is unqualified",
+                    ));
+                }
                 if !matches!(
                     kind.as_str(),
                     "avid.resize_static"

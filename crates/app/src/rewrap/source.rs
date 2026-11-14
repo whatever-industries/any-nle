@@ -22,8 +22,8 @@ pub(super) fn stamp(path: &Path) -> R<Stamp> {
         modified: m.modified().map_err(|e| e.to_string())?,
     })
 }
-pub(super) struct EssenceSpan {
-    pub(super) kind: u8,
+pub(crate) struct EssenceSpan {
+    pub(crate) kind: u8,
     pub(super) bytes: u64,
     pub(super) offset: u64,
     pub(super) key: [u8; 16],
@@ -41,7 +41,7 @@ pub(super) struct Layout {
 
 // Walk complete KLV boundaries. UUID-keyed private sets are skipped only within
 // declared header metadata, as in IDENTITY-0006; never resynchronize arbitrary bytes.
-pub(super) fn essence_spans(path: &Path) -> R<Vec<EssenceSpan>> {
+pub(crate) fn essence_spans(path: &Path) -> R<Vec<EssenceSpan>> {
     Ok(layout(path)?.essence)
 }
 pub(super) fn layout(path: &Path) -> R<Layout> {
@@ -142,7 +142,7 @@ pub(super) fn layout(path: &Path) -> R<Layout> {
 }
 
 // Count actual sound payloads without loading essence or trusting descriptor duration.
-pub(super) fn pcm_essence_bytes(path: &Path) -> R<u64> {
+pub(crate) fn pcm_essence_bytes(path: &Path) -> R<u64> {
     essence_spans(path)?
         .iter()
         .filter(|s| s.kind == 0x16)

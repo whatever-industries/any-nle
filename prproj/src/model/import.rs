@@ -501,6 +501,24 @@ impl Project {
             _ => probe::read_png_size(&data)?,
         };
         let (width, height) = (fit(width, "frame width")?, fit(height, "frame height")?);
+        self.build_still(path, profile, width, height, preferences, uuids)
+    }
+
+    /// The caller has already decoded and pinned this PNG in source preparation.
+    pub(crate) fn import_prepared_png(
+        &mut self, path: &Path, bin: ItemId, uuids: &mut dyn UuidSource,
+    ) -> Result<ItemId> {
+        self.check_target_bin(Some(bin))?;
+        let previous = self.import_target.replace(bin);
+        let result = self.build_still(path, m::still_profile(".png").unwrap(), 1920, 1080, None, uuids);
+        self.import_target = previous;
+        result
+    }
+
+    fn build_still(
+        &mut self, path: &Path, profile: m::StillProfile, width: i64, height: i64,
+        preferences: Option<&Preferences>, uuids: &mut dyn UuidSource,
+    ) -> Result<ItemId> {
         let mut frame_rate = m::STILL_FRAME_RATE;
         let mut out_ticks = m::STILL_DEFAULT_OUT;
         if let Some(p) = preferences {

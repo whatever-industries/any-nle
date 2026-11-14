@@ -186,6 +186,35 @@ impl Project {
         let content = self.sequence_end(sequence)?.ticks;
         self.grow_source_duration_to(sequence, content)
     }
+    /// Set the backing extent of a prepared nested sequence to its final span.
+    pub(crate) fn set_nested_source_duration(&mut self, sequence: SequenceId, duration: i64) -> Result<()> {
+        let uid = self.sequence_id(sequence);
+        let Some(item) = self.sequence_item(sequence) else { return value("nested sequence is missing its item") };
+        let [audio, video] = self.item(item).clip_elements.as_slice() else {
+            return value("nested sequence needs two source templates");
+        };
+        let tree = &self.doc.tree;
+        let mut duration_nodes = Vec::with_capacity(2);
+        for (template, tag) in [(*audio, "AudioSequenceSource"), (*video, "VideoSequenceSource")] {
+            let Some(reference) = tree.find1(template, "Clip/Source") else {
+                return value("missing nested sequence source reference");
+            };
+            let source = self.doc.resolve(reference)?;
+            if tree.tag(source) != tag || !tree.find1(source, "SequenceSource/Sequence")
+                .is_some_and(|reference| tree.get(reference, "ObjectURef") == uid.as_deref())
+            {
+                return value("nested source template does not refer to its sequence");
+            }
+            let Some(node) = tree.child_by_tag(source, "OriginalDuration") else {
+                return value("nested sequence source has no OriginalDuration");
+            };
+            duration_nodes.push(node);
+        }
+        for node in duration_nodes {
+            self.doc.tree.set_text(node, Some(duration.to_string()));
+        }
+        Ok(())
+    }
     /// Embedded captions are data-track items and are not in `sequence_clips`.
     /// Grow their backing sequence sources without inventing a picture edit.
     pub(crate) fn grow_source_duration_to(&mut self, sequence: SequenceId, content: i64) -> Result<()> {

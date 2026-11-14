@@ -711,7 +711,7 @@ pub struct AudioCrossfade {
     pub duration: i64,
     /// Ticks from the crossfade start to the cut (Premiere `Alignment`).
     pub cut_offset: i64,
-    /// `constant_power` or `custom_fade`.
+    /// `constant_power`, `constant_gain`, or `custom_fade`.
     pub style: String,
 }
 
@@ -1857,7 +1857,7 @@ fn sequence(obj: &Json, where_: &str) -> R<Sequence> {
         let style_default = Json::Str("constant_power".to_string());
         let style = fo.or("style", &style_default);
         let style = match style {
-            Json::Str(s) if s == "constant_power" || s == "custom_fade" => s.clone(),
+            Json::Str(s) if ["constant_power", "constant_gain", "custom_fade"].contains(&s.as_str()) => s.clone(),
             _ => return fail(format!("{w}.style: constant_power or custom_fade")),
         };
         let Some(track) = int_in(fo.req("audio_track"), 1, 99, false) else {
@@ -2429,8 +2429,8 @@ pub(crate) fn validate_sequence(s: &Sequence, w: &str) -> R<()> {
     }
     for (i, f) in s.audio_crossfades.iter().enumerate() {
         let w = format!("{w}.audio_crossfades[{i}]");
-        require(["constant_power", "custom_fade"].contains(&f.style.as_str()), || {
-            format!("{w}.style: constant_power or custom_fade")
+        require(["constant_power", "constant_gain", "custom_fade"].contains(&f.style.as_str()), || {
+            format!("{w}.style: constant_power, constant_gain, or custom_fade")
         })?;
         require((1..=99).contains(&f.track), || format!("{w}.audio_track: expected 1..99"))?;
         check_ticks(f.duration as i128, &format!("{w}.duration_ticks"), true)?;
