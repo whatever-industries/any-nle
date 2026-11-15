@@ -109,6 +109,32 @@ selector variant kept both lanes sample-identical. A fresh bin insertion
 created one picture edit and two mono edits and kept them on reopen.
 CONV-0095
 
+### DNxHD LB cameras with PCM24
+
+Separate files also supports online 1920×1080 DNxHD LB cameras at exact
+24000/1001 with two independent 48 kHz PCM24 mono siblings. Each camera uses
+the Premiere descriptor for its verified picture coding. A saved Avid Group
+with one continuous camera on all lanes reopened in Premiere 27 build 88.
+The integrated CLI reproduces the input to that native check byte for byte,
+and the saved-job output agrees after generated IDs are normalized. The
+retained DNxHR Group project and graph are byte-identical to their baseline.
+
+A separate graph-authored switch uses the same originals. After Save As and
+reopen it retains A/B/A picture and A1, and A/A/A on A2. All 120 frames match
+the expected source colors, and both 240,240-sample lanes match the selected
+sources at PCM16 export precision with Avid pan matching. See the native
+[independent A1 comparison](#native-independent-a1-switch) below.
+CONV-0096
+
+The native DNxHD picture-switch control also passed a linked AAF comparison.
+The AAF stores alternate picture and audio choices in Selectors. After
+Save As and reopen, Premiere 27 uses ordinary linked picture edits for the
+AAF import. Any NLE keeps the picture angles editable. Both retain the
+sequence start and exact edit ranges, and all 120 decoded frames match.
+With Avid pan matching, Any NLE matches each original mono file sample
+for sample over 240,240 PCM24 samples. The AAF import center-pans each
+lane to both sides. Both audio lanes use the default camera in this control.
+
 ### Independent mono audio edits
 
 An exact saved alternate audio selection on the Separate files route writes
@@ -129,3 +155,56 @@ reopened the result, and all 145 picture frames matched the retained
 fixed-audio AAF. Both lanes in that AVB use silent sources. A newly
 authored Avid Group and its linked AAF remain pending for this profile.
 CONV-0096
+
+A derived control with two audible DNxHD LB cameras changed only the middle
+A1 selector in copies of the native fixed-audio AVB and its linked AAF.
+Premiere 27 reopened both conversions at the saved start with all eight
+edit ranges and all 120 picture frames intact. With Avid pan matching,
+Any NLE matched all 240,240 PCM24 sample frames on each isolated lane.
+Only A1 switched during record frames 40–79, and A2 was sample-identical to
+the fixed control. The AAF import selected the same sources and center-panned
+each lane. Any NLE kept editable multicam picture and reported the middle A1
+edit's direct mono link. The direct CLI and saved job agreed on saved
+timeline facts.
+
+### Native independent A1 switch
+
+A Media Composer 25.12 test changed only the middle A1 segment, over
+record frames 40–79 at 23.976. The native bin and linked Edit Protocol
+AAF both retained that selection and the continuous A2 binding. Premiere
+27 build 88 reopened both paths with all eight edit ranges and identical
+decoded picture on all 120 frames. The AAF imported the four picture
+edits as ordinary clips. Any NLE kept an editable multicam picture and
+linked the switched A1 edit directly to its original mono MXF, with an
+occurrence-specific editability notice. Direct CLI and saved jobs agree
+on the saved timeline facts.
+
+With Avid pan matching, Any NLE matched all 240,240 PCM24 samples per
+lane from the selected original MXFs. It also matched all 240,239
+samples per lane in Avid's two-channel Direct Out export. Premiere wrote
+one additional final sample per lane, equal to the original media at
+that position. The linked AAF chose the same source ranges and
+center-panned each lane, with a residual below two PCM24 codes after
+accounting for the pan law. A2 matched the earlier fixed-audio conversion
+sample for sample. This closes the independent mono switch comparison
+for the two-camera DNxHD LB/PCM24 Separate files profile.
+
+### Audio layouts and Groups
+
+Ordinary source clips, timeline tracks and multicam output describe
+different parts of audio routing. A mono MXF can remain on a separate
+mono edit, and a saved pair or surround channel group describes how its
+member channels move together as one clip. The native rewrap route has
+separate coverage for ordered stereo pairs, 5.1 and eight-channel
+Adaptive. The master output mix is a distinct saved choice, retained
+and reported separately from clip routing.
+See [native AV-master construction](MEDIA-REWRAP.md#optional-native-av-master-construction).
+
+The tested editable Group has two mono outputs. Default Group audio
+still comes from the multicam source. An independently switched edit
+keeps its selected mono source and range as an ordinary clip, so a later
+camera change on that edit requires replacing its audio source.
+Longer-term work should start with one Avid Group using more than two
+independent mono lanes and distinct signals. Verify both saved channel
+assignments and fresh insertion in Premiere before extending to stereo
+pairs or surround inside Groups.

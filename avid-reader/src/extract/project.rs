@@ -103,7 +103,7 @@ struct CompileCache {
     segments: HashMap<usize, Arc<Vec<RouteSegment>>>,
     colors: HashMap<usize, Arc<ColorCorrection>>,
     pictures: HashMap<usize, Arc<PictureEffect>>,
-    mattes: HashMap<(u32, u32, u32, u32), Option<Arc<AniMatteData>>>,
+    mattes: HashMap<(u32, u32, u32, u32, bool), Option<Arc<AniMatteData>>>,
     freezes: HashMap<MobId, freeze::Freeze>,
     ambiguous: std::collections::HashSet<MobId>,
     gain_renders: HashMap<MobId, MobId>,
@@ -631,6 +631,9 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
             b"SLCT" => {
                 let tracks = ctx.tracks(c);
                 let selected = int(c, "selected").unwrap_or(0) as usize;
+                if let (Some(source), [active, backing]) = (&mut self.source, tracks.as_slice()) {
+                    source.note_disabled_clip(ctx, c, active, backing, position, self.kind, self.track);
+                }
                 match tracks.get(selected).and_then(|t| ctx.deref(t.get("component"))) {
                     Some(inner) => {
                         let mut via = via.to_vec();
@@ -936,11 +939,15 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     {
                         let frames = u32::try_from(length).unwrap_or(0);
                         if ctx.is_empty(background) {
+                            let source = self.source.is_some();
                             let data = self
                                 .cache
                                 .mattes
-                                .entry((keyframes, manager, frames, acceleration))
-                                .or_insert_with(|| animatte(ctx.file, keyframes, manager, frames, acceleration).map(Arc::new))
+                                .entry((keyframes, manager, frames, acceleration, source))
+                                .or_insert_with(|| {
+                                    let read = if source { crate::animatte::source_animatte } else { animatte };
+                                    read(ctx.file, keyframes, manager, frames, acceleration).map(Arc::new)
+                                })
                                 .clone();
                             if let Some(data) = data {
                                 let before = self.ops.len();
@@ -1026,7 +1033,11 @@ fn compile_sequence_inner(ctx: &Ctx<'_>, f: usize, mob: &Node, cache: &mut Compi
         });
     }}
     let mut tc_index = i64::MAX;
-    for (track_ordinal, track) in ctx.tracks(mob).into_iter().enumerate() {
+    let tracks = ctx.tracks(mob);
+    if let Some(source) = &mut source {
+        source.track_names(ctx, &tracks);
+    }
+    for (track_ordinal, track) in tracks.into_iter().enumerate() {
         let index = int(track, "index").unwrap_or(0);
         let component = match ctx.deref(track.get("component")) {
             Some(c) => c,
@@ -1547,6 +1558,7 @@ mod tests {
         }
         let matte = Arc::new(AniMatteData {
             states: vec![],
+            acceleration_q30: 0,
             tracker_xy: None,
             not_converted: vec![],
         });
@@ -2527,6 +2539,112 @@ mod tests {
         }
         let mut n=node(*b"SLCT","Selector");n.put("length",Value::Int(length));n.put("media_kind_id",Value::Int(kind));
         n.put("edit_rate",Value::Float(25.0));n.put("selected",Value::Int(selected));n.put("tracks",Value::List(tracks));add(f,n)
+    }
+    #[test]
+    fn disabled_selector_reports_a_gap_without_changing_later_edits() {
+        use crate::source::{Observed, SourceIssueKind};
+        for (flag, filler_length, expected) in [(1, 10, true), (0, 10, false), (1, 9, false)] {
+            let mut f = file();
+            mob(&mut f, id(1), "Master", MOB_MASTER, 0, &[]);
+            let selector = group_selector(&mut f, KIND_PICTURE, 0, 7, 10, &[id(1), id(1)]);
+            let mut filler = node(*b"FILL", "Filler");
+            filler.put("length", Value::Int(filler_length));
+            filler.put("media_kind_id", Value::Int(KIND_PICTURE));
+            filler.put("edit_rate", Value::Float(25.0));
+            let filler = add(&mut f, filler);
+            let Object::Decoded(selector_node) = f.objects[selector as usize].as_mut().unwrap() else { unreachable!() };
+            let Value::List(tracks) = &mut selector_node.fields.iter_mut().find(|(key, _)| *key == "tracks").unwrap().1 else { unreachable!() };
+            let Value::Node(track) = &mut tracks[0] else { unreachable!() };
+            track.fields[0].1 = Value::Ref(filler);
+            let mut attrs = node(*b"ATTR", "Attributes");
+            attrs.put("entries", Value::Attrs(vec![("_DISABLE_CLIP_FLAG".into(), Value::Int(flag))]));
+            let attrs = add(&mut f, attrs);
+            set(&mut f, selector, "attributes", Value::Ref(attrs));
+            let tail = source(&mut f, id(1), KIND_PICTURE, 1, 3, 7);
+            let timeline = segments(&mut f, KIND_PICTURE, &[selector, tail]);
+            mob(&mut f, id(2), "Cuts", MOB_COMPOSITION, 0, &[(1, timeline)]);
+
+            let out = source_project(&[f]);
+            let sequence = &out.sequences[0];
+            let [edit] = sequence.events.as_slice() else { panic!("expected only the following edit") };
+            let span = edit.range.as_ref().unwrap();
+            assert_eq!((span.record_start, span.source_in, span.length), (10, 3, 7));
+            assert_eq!(sequence.unresolved.len(), usize::from(expected));
+            if expected {
+                let issue = &sequence.unresolved[0];
+                assert_eq!(issue.issue_kind, SourceIssueKind::DisabledClip { length: 10, backing_class: *b"SCLP", plain_mono: false, plain_stereo: false, neutral_picture: None });
+                assert!(matches!(issue.record_start, Observed::Known(0)));
+                assert_eq!(issue.route[0].mob, id(1));
+                assert!(matches!(issue.route[0].source_offset, Observed::Known(7)));
+            }
+        }
+    }
+    #[test]
+    fn disabled_stereo_selector_keeps_only_a_neutral_aligned_pair() {
+        use crate::source::{Observed, SourceIssueKind};
+        for (labels, shifts, expected) in [([1, 2], [7, 7], true),
+                                           ([2, 1], [7, 7], false),
+                                           ([1, 2], [7, 8], false)] {
+            let mut f = file();
+            let component = |class, name| {
+                let mut n = node(class, name);
+                n.put("length", Value::Int(10));
+                n.put("media_kind_id", Value::Int(KIND_SOUND));
+                n.put("edit_rate", Value::Float(24.0));
+                n
+            };
+            let track = |part, index: Option<i64>| {
+                let mut t = node([0; 4], "Track");
+                t.put("component", Value::Ref(part));
+                t.put("lock_number", Value::Int(0));
+                if let Some(index) = index {
+                    t.put("index", Value::Int(index));
+                }
+                Value::Node(Box::new(t))
+            };
+            let mut effect = component(*b"TKFX", "TrackEffect");
+            effect.put("effect_id", Value::Str("EFF2_AUDIO_CHANNEL_COMBINER".into()));
+            for key in ["mc_mode", "num_scalars", "info_current", "info_smooth", "info_is_reversed"] {
+                effect.put(key, Value::Int(0));
+            }
+            let inputs = labels.into_iter().zip(shifts).enumerate().map(|(i, (label, start))| {
+                let part = source(&mut f, id(1), KIND_SOUND, label, start, 10);
+                set(&mut f, part, "edit_rate", Value::Float(24.0));
+                track(part, Some(i as i64 + 1))
+            }).collect();
+            effect.put("tracks", Value::List(inputs));
+            let backing = add(&mut f, effect);
+            let filler = add(&mut f, component(*b"FILL", "Filler"));
+            let mut attrs = node(*b"ATTR", "Attributes");
+            attrs.put("entries", Value::Attrs(vec![("_DISABLE_CLIP_FLAG".into(), Value::Int(1))]));
+            let attrs = add(&mut f, attrs);
+            let mut selector = component(*b"SLCT", "Selector");
+            selector.put("tracks", Value::List(vec![track(filler, None), track(backing, None)]));
+            selector.put("selected", Value::Int(0));
+            selector.put("attributes", Value::Ref(attrs));
+            let selector = add(&mut f, selector);
+            let seq = segments(&mut f, KIND_SOUND, &[selector]);
+            set(&mut f, seq, "edit_rate", Value::Float(24.0));
+            let comp = mob(&mut f, id(2), "Stereo disable", MOB_COMPOSITION, 0, &[(3, seq)]);
+            set(&mut f, comp, "edit_rate", Value::Float(24.0));
+
+            let out = source_project(&[f]);
+            let sequence = &out.sequences[0];
+            assert!(sequence.events.is_empty());
+            let [issue] = sequence.unresolved.as_slice() else { panic!("expected one disabled receipt") };
+            assert!(matches!(issue.issue_kind, SourceIssueKind::DisabledClip {
+                backing_class, plain_stereo, .. } if backing_class == *b"TKFX" && plain_stereo == expected));
+            if expected {
+                assert_eq!(issue.route.len(), 2);
+                for (lane, input) in issue.route.iter().enumerate() {
+                    assert_eq!(input.mob, id(1));
+                    assert_eq!(input.track, lane as i64 + 1);
+                    assert!(matches!(input.source_offset, Observed::Known(7)));
+                }
+            } else {
+                assert!(issue.route.is_empty());
+            }
+        }
     }
     fn native_group_fixture()->AvbFile{
         let mut f=file();mob(&mut f,id(1),"Camera A",MOB_MASTER,0,&[]);mob(&mut f,id(2),"Camera B",MOB_MASTER,0,&[]);

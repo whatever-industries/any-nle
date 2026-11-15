@@ -111,6 +111,7 @@ fn fixture() -> SourceGraph {
                 placements.insert(0, p);
             }
             SourceSequence {
+            disabled_placements: Vec::new(),
             texts: Vec::new(),
                 clock: None,
                 id: s.id,
@@ -118,7 +119,8 @@ fn fixture() -> SourceGraph {
                 rate: s.rate,
                 frame_size: Some(s.frame_size),
                 start: None,
-                tracks: s.tracks,
+                tracks: s.tracks.into_iter().map(|t|
+                    graph::source::SourceTrack::new(t.kind, t.index, t.level_db)).collect(),
                 placements,
                 transitions: Vec::new(),
                 markers: s
@@ -194,6 +196,90 @@ fn q(n: i64) -> Q {
 }
 fn options() -> Options {
     Options::default()
+}
+
+#[test]
+fn direct_24_combined_preserves_media_state_and_discrete_audio() {
+    let mut graph = fixture();
+    let rate = q(24);
+    graph.items[0].rate = Some(rate);
+    for (index, media) in graph.media.iter_mut().enumerate() {
+        let picture = media.kind == StreamKind::Video;
+        let source_rate = if picture { rate } else { q(48_000) };
+        media.online = Some(true);
+        media.clock = Some(SourceClock {
+            effective_count: 0,
+            rate,
+            display_base: 24,
+            drop: false,
+            provenance: SourceClockProvenance {
+                origin_count: 0,
+                source_offset: 0,
+                source_rate,
+                source_package: "synthetic source".into(),
+                timecode_track: format!("physical track {index}"),
+                route: "file_source_clip_to_physical_timecode_track".into(),
+            },
+        });
+        let descriptor = if picture {
+            v(vec![
+                ("compression", Value::Str("AVHD".into())),
+                ("resolution_id", Value::Int(1253)),
+                ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)])),
+            ])
+        } else {
+            v(vec![("bits", Value::Int(16)), ("channels", Value::Int(1))])
+        };
+        let facts = graph.sidecars.iter_mut().find(|s| s.object == media.id).unwrap();
+        facts.data = v(vec![
+            ("legacy_clock", clock(0, 24, false)),
+            ("file_package", Value::Str(format!("file {index}"))),
+            ("descriptor_length", Value::Int(media.duration.to_units(source_rate.num()).unwrap())),
+            ("descriptor", descriptor),
+            ("picture_coding", if picture {
+                Value::Str("060E2B340401010A0401020271130000".into())
+            } else { Value::Null }),
+        ]);
+    }
+    for mode in ["grouped", "merged"] {
+        let opts = Options { bin_mode: mode.into(), ..options() };
+        let prepared = premiere_adapter::prepare_originals(&graph, &opts, ClockProfile::LegacyImport).unwrap();
+        assert_eq!(prepared.input.direct_dnxhr_origins.values().copied().collect::<Vec<_>>(), [0]);
+        let out = std::env::temp_dir().join(format!("anynle-{mode}-media-state-{}-{}.prproj", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut ids = prproj::SeededUuids::new("combined-media-state");
+        prproj::convert::writer::prepare_typed_project(&prepared.input, &out, &mut ids, &[], false)
+            .unwrap().publish().unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        std::fs::remove_file(out).unwrap();
+        let doc = prproj::PremiereDocument::from_bytes(&bytes).unwrap();
+        let tree = &doc.tree;
+        let states: Vec<_> = tree.iter_tag(doc.root, "Media")
+            .filter(|&id| tree.child_by_tag(id, "ActualMediaFilePath").is_some())
+            .map(|id| tree.child_by_tag(id, "ModificationState").and_then(|state| tree.text(state)))
+            .collect();
+        assert_eq!(states.len(), 3);
+        assert!(states.iter().all(|state| state.is_some_and(|blob| !blob.trim().is_empty())));
+        assert!(tree.iter_tag(doc.root, "TimecodeFormat").any(|id| tree.text(id) == Some("100")));
+        if mode == "grouped" {
+            let pans: Vec<_> = tree.iter_tag(doc.root, "MonoToStereoPanProcessor")
+                .map(|panner| {
+                    let param = tree.find1(panner, "PanProcessor/AudioComponent/Component/Params/Param").unwrap();
+                    let param = doc.resolve(param).unwrap();
+                    assert_eq!(tree.findtext(param, "Name").unwrap().as_deref(), Some("Pan"));
+                    tree.child_by_tag(param, "CurrentValue").and_then(|value| tree.text(value))
+                })
+                .collect();
+            assert_eq!(pans, [Some("0"), None]);
+        }
+    }
+
+    graph.media.iter_mut().find(|media| media.kind == StreamKind::Audio).unwrap().bits = Some(24);
+    for mode in ["grouped", "merged"] {
+        let opts = Options { bin_mode: mode.into(), ..options() };
+        let changed = premiere_adapter::prepare_originals(&graph, &opts, ClockProfile::LegacyImport).unwrap();
+        assert!(changed.input.direct_dnxhr_origins.is_empty());
+    }
 }
 
 #[test]
@@ -1441,8 +1527,8 @@ fn trimmed_marker_keeps_record_time_on_sequence() {
 fn unknown_marker_transform_is_scoped_loss() {
     let mut g = two_edits();
     let p = g.sequences[0].placements[0].clone();
-    g.sequences[0].markers.push(SourceMarker {
-        name: "Unresolved".into(),
+    let unresolved = SourceMarker {
+        name: String::new(),
         comment: "".into(),
         user: "".into(),
         color: None,
@@ -1459,10 +1545,23 @@ fn unknown_marker_transform_is_scoped_loss() {
         },
         source: None,
         inherited: false,
-    });
+    };
+    let sequence = &mut g.sequences[0];
+    let marker_index = sequence.markers.len();
+    sequence.markers.push(unresolved.clone());
+    sequence.markers.push(unresolved);
+    let sequence_id = sequence.id.clone();
     let r = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
     assert!(r.model.sequences[0].markers.is_empty());
-    assert!(r.losses.iter().any(|l| l.aspect == "marker_timing"));
+    let losses: Vec<_> = r.losses.iter().filter(|l| l.aspect == "marker_timing").collect();
+    let [first, second] = losses.as_slice() else {
+        panic!("expected one timing loss per marker: {losses:?}");
+    };
+    for (index, entry) in [(marker_index, first), (marker_index + 1, second)] {
+        assert_eq!(entry.object, sequence_id);
+        assert!(entry.reason.starts_with(&format!("{sequence_id}/marker/{index}: ")));
+        assert!(entry.reason.contains("owner-to-record transform unresolved"));
+    }
 }
 
 #[test]
@@ -1985,6 +2084,105 @@ fn original_fixture() -> SourceGraph {
 }
 
 #[test]
+fn animatte_acceleration50_samples_paths_without_mutating_the_source_graph() {
+    let mut g = fixture();
+    let scene = &mut g.sequences[0];
+    let frame = Q::new(1, 24).unwrap();
+    scene.frame_size = Some((1920, 1080));
+    let p = scene.placements.iter_mut().find(|p| p.video_track.is_some()).unwrap();
+    p.duration = Q::new(5, 24).unwrap();
+    let point = |x| Value::Arr([x, 0.25, 0.0, 0.0, 0.0, 0.0].map(Value::Float).into());
+    let key = |f, x| v(vec![
+        ("frame", Value::Int(f)),
+        ("points", Value::Arr(vec![point(x), point(x + 0.1), point(x + 0.2)])),
+    ]);
+    let shape = |keyframes| v(vec![
+        ("opacity", Value::Float(100.0)),
+        ("feather", Value::Arr(vec![Value::Float(0.0); 2])),
+        ("keyframes", Value::Arr(keyframes)),
+    ]);
+    let matte = |inverted| graph::Effect {
+        kind: "avid.animatte".into(),
+        params: v(vec![
+            ("inverted", Value::Bool(inverted)),
+            ("acceleration_q30", Value::Int(1 << 29)),
+            ("shapes", Value::Arr(vec![
+                shape(vec![key(0, 0.0), key(4, 1.0)]),
+                shape(vec![key(0, 0.1)]),
+            ])),
+        ]),
+    };
+    p.source_in = frame;
+    p.effects = vec![matte(false)];
+    let source_text = g.to_json_text().unwrap();
+    let saved = SourceGraph::from_json_text(&source_text).unwrap();
+    let prepared = prepare(&saved, &options(), ClockProfile::LegacyImport).unwrap();
+    let event = prepared.model.sequences[0].events.iter()
+        .find(|e| e.matte.is_some()).unwrap();
+    let m = event.matte.as_ref().unwrap();
+    assert_eq!(m.shapes[0].iter().map(|(f, _)| *f).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+    assert!(m.shapes[0][1].1[0][0] < 0.25);
+    assert_eq!(m.shapes[0][2].1[0][0], 0.5);
+    assert_eq!(m.shapes[0][4].1[0][0], 1.0);
+    assert_eq!(m.shapes[1].len(), 1);
+    assert!(prepared.losses.iter().any(|l| l.aspect == "matte_approximation"));
+    assert_eq!(g.to_json_text().unwrap(), source_text);
+
+    g.sequences[0].placements.iter_mut().find(|p| p.video_track.is_some()).unwrap()
+        .effects = vec![matte(true)];
+    let refused = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let m = refused.model.sequences[0].events.iter()
+        .find_map(|e| e.matte.as_ref()).unwrap();
+    assert_eq!(m.shapes[0].len(), 2);
+    let owner = g.sequences[0].placements.iter().find(|p| p.video_track.is_some()).unwrap();
+    assert!(refused.losses.iter().any(|l| l.aspect == "matte"
+        && l.object == owner.id && l.reason.contains("omits this multi-shape AniMatte Key Out")));
+    assert!(!refused.losses.iter().any(|l| l.aspect == "matte_approximation"));
+}
+
+#[test]
+fn partial_animatte_key_out_keeps_its_mask_and_reports_the_compositing_difference() {
+    for (inverted, opacity, expect_notice) in [
+        (true, 50, true),
+        (true, 100, false),
+        (false, 50, false),
+    ] {
+        let mut g = fixture();
+        let placement = g.sequences[0].placements.iter_mut()
+            .find(|p| p.video_track.is_some()).unwrap();
+        let owner = placement.id.clone();
+        let points = [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]]
+            .map(|[x, y]| Value::Arr([x, y, 0.0, 0.0, 0.0, 0.0].map(Value::Float).into()));
+        placement.effects = vec![graph::Effect {
+            kind: "avid.animatte".into(),
+            params: v(vec![
+                ("inverted", Value::Bool(inverted)),
+                ("shapes", Value::Arr(vec![v(vec![
+                    ("opacity", Value::Int(opacity)),
+                    ("feather", Value::Arr(vec![Value::Int(0); 2])),
+                    ("keyframes", Value::Arr(vec![v(vec![
+                        ("frame", Value::Int(0)),
+                        ("points", Value::Arr(points.into())),
+                    ])])),
+                ])])),
+            ]),
+        }];
+        let prepared = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+        let (sequence, event) = prepared.ownership[&owner];
+        let matte = prepared.model.sequences[sequence].events[event].matte.as_ref().unwrap();
+        assert_eq!(matte.inverted, inverted);
+        assert_eq!(matte.opacities, [opacity as f64]);
+        let notices = prepared.losses.iter().filter(|loss| {
+            loss.aspect == "matte_approximation" && loss.reason.starts_with("Partial AniMatte Key Out")
+        }).collect::<Vec<_>>();
+        assert_eq!(notices.len(), usize::from(expect_notice));
+        if let Some(notice) = notices.first() {
+            assert_eq!(notice.object, owner);
+        }
+    }
+}
+
+#[test]
 fn linked_originals_use_typed_codec_channels_and_keep_legacy_projection_strict() {
     use prproj::convert::prepared::{PreparedClip, SampleRepresentation};
     let mut g = original_fixture();
@@ -2303,10 +2501,7 @@ fn editable_multicam_resolves_independent_audio_order_and_refuses_unsupported_us
     assert!(premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).err().unwrap().0.contains("two original mono PCM24 siblings"));
 }
 
-#[test]
-fn linked_editable_multicam_uses_the_six_original_streams() {
-    use prproj::convert::{multicam::FRAME, writer::prepare_typed_project};
-
+fn linked_group_camera_fixture() -> SourceGraph {
     let mut g = fixed_audio_group();
     let rate = Q::new(24000, 1001).unwrap();
     for (i, m) in g.media.iter_mut().enumerate() {
@@ -2345,6 +2540,60 @@ fn linked_editable_multicam_uses_the_six_original_streams() {
             ("picture_coding", if picture { Value::Str("060E2B340401010D0401020271280000".into()) } else { Value::Null }),
         ]);
     }
+    g
+}
+
+#[test]
+fn linked_group_selects_picture_templates_independently_of_pcm_depth() {
+    use prproj::convert::writer::prepare_typed_project;
+    let mut graph = linked_group_camera_fixture();
+    let first_id = graph.media.iter().find(|m| m.kind == StreamKind::Video).unwrap().id.clone();
+    let facts = graph.sidecars.iter_mut()
+        .find(|s| s.adapter == "avid.source" && s.object == first_id).unwrap();
+    let Value::Obj(fields) = &mut facts.data else { panic!("missing media facts") };
+    for (key, value) in fields {
+        if key == "descriptor" {
+            *value = v(vec![
+                ("compression", Value::Str("AVHD".into())),
+                ("resolution_id", Value::Int(1253)),
+                ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)])),
+            ]);
+        }
+        if key == "picture_coding" {
+            *value = Value::Str("060E2B340401010A0401020271130000".into());
+        }
+    }
+    let item = &graph.items[0];
+    let audio_ids: Vec<_> = item.media.iter().map(|b| &b.media).filter(|id| **id != first_id).collect();
+    for side in graph.sidecars.iter_mut().filter(|s| audio_ids.contains(&&s.object)) {
+        let Value::Obj(fields) = &mut side.data else { panic!("missing audio facts") };
+        let desc = fields.iter_mut().find(|(key, _)| key == "descriptor").unwrap();
+        desc.1 = v(vec![("channels", Value::Int(1)), ("bits", Value::Int(24))]);
+    }
+    let prepare = |graph: &SourceGraph| premiere_adapter::prepare_originals(graph, &options(), ClockProfile::LegacyImport);
+    let prepared = prepare(&graph).unwrap();
+    assert_eq!(prepared.input.direct_dnxhd_pcm24, [item.id.strip_prefix("clip:").unwrap().into()].into());
+    assert_eq!(prepared.input.direct_dnxhr_origins.len(), 2);
+    let dir = std::env::temp_dir().join(format!("anynle-mixed-dnx-group-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir(&dir).unwrap();
+    let out = dir.join("Mixed DNx.prproj");
+    prepare_typed_project(&prepared.input, &out, &mut prproj::SeededUuids::new("mixed-dnx-group"), &[], false)
+        .unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(out).unwrap()).unwrap();
+    let types: std::collections::HashSet<_> = doc.tree.iter_tag(doc.root, "CodecType")
+        .filter_map(|node| doc.tree.text(node)).collect();
+    assert!(types.contains("1096180846") && types.contains("1096180840"), "{types:?}");
+    graph.media.iter_mut().find(|m| m.id == first_id).unwrap().online = Some(false);
+    assert!(prepare(&graph).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn linked_editable_multicam_uses_the_six_original_streams() {
+    use prproj::convert::{multicam::FRAME, writer::prepare_typed_project};
+
+    let g = linked_group_camera_fixture();
     let g = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
     let prepare_linked = |g: &SourceGraph, options: &Options| {
         premiere_adapter::prepare_originals(g, options, ClockProfile::LegacyImport)
@@ -2508,4 +2757,116 @@ fn editable_multicam_writes_reusable_source_with_two_output_lanes() {
     let panel = project.sequence_item(source).unwrap();
     assert_eq!(project.item_name(panel), "Synthetic Group");
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+}
+
+fn autosync_fixture(duplicate_package: bool) -> SourceGraph {
+    let mut graph = fixture();
+    graph.sequences.clear();
+    graph.sidecars.clear();
+    graph.losses.clear();
+    let camera_mob = format!("{:064X}", 1);
+    let sound_mob = format!("{:064X}", 2);
+    let sync_mob = format!("{:064X}", 3);
+    let mut picture = graph.media.iter().find(|m| m.kind == StreamKind::Video).unwrap().clone();
+    let audio_template = graph.media.iter().find(|m| m.kind == StreamKind::Audio).unwrap().clone();
+    picture.locations = vec!["/Synthetic/Camera.mov".into()];
+    picture.codec = Some("avc1".into());
+    picture.rate = Some(Q::integer(24));
+    picture.duration = Q::integer(2);
+    picture.online = Some(true);
+    picture.original = Some(OriginalStream {
+        saved_locators: picture.locations.clone(),
+        container: "mov".into(), stream_index: 0, channel_index: None, channels: None,
+        time_base: Q::new(1, 24).unwrap(), start_pts: 0, duration_ts: 48,
+        sample_representation: None,
+    });
+    let source_ref = |m: &SourceMedia| SourceItemMedia {
+        media: m.id.clone(), gain_db: 0.0, source_offset: Some(Q::ZERO),
+    };
+    let mut camera = graph.items[0].clone();
+    camera.umid = Some(camera_mob.clone());
+    camera.rate = Some(Q::integer(24));
+    camera.stream_groups.clear();
+    camera.media = vec![source_ref(&picture)];
+    let mut sound = camera.clone();
+    sound.id = "controlled-sound".into();
+    sound.name = "Controlled sound".into();
+    sound.umid = Some(sound_mob.clone());
+    sound.media.clear();
+    graph.media = vec![picture];
+    let track = |kind, label, mob: &str, offset| v(vec![
+        ("kind", Value::Int(kind)), ("label", Value::Int(label)),
+        ("component_class", Value::Str("SCLP".into())), ("rate", Value::Str("24".into())),
+        ("length", Value::Int(48)), ("target_mob", Value::Str(mob.into())),
+        ("target_track", Value::Int(label)), ("target_offset", Value::Int(offset)),
+    ]);
+    let mut tracks = vec![track(1, 1, &camera_mob, 0)];
+    for lane in 1..=8 {
+        let mut mono = audio_template.clone();
+        mono.id = format!("controlled-sound-{lane}");
+        mono.locations = vec![format!("/Synthetic/Mic{lane}.mxf")];
+        mono.stream = Some(lane);
+        mono.duration = Q::integer(3);
+        mono.online = Some(true);
+        mono.bits = Some(16);
+        sound.media.push(source_ref(&mono));
+        let package = if duplicate_package && lane == 8 { 17 } else { 16 + lane };
+        graph.sidecars.push(Sidecar {
+            object: mono.id.clone(), adapter: "avid.source".into(),
+            data: v(vec![
+                ("file_package", Value::Str(format!("{package:064X}"))),
+                ("legacy_clock", clock(0, 24, false)),
+                ("legacy_file_clock", clock(0, 24, false)),
+            ]),
+        });
+        graph.media.push(mono);
+        tracks.push(track(2, lane, &sound_mob, 2));
+    }
+    graph.bins[0].items = vec![camera.id.clone(), sound.id.clone()];
+    graph.items = vec![camera, sound];
+    graph.sidecars.push(Sidecar {
+        adapter: "avid.subclips".into(),
+        object: graph.bins[0].id.clone(),
+        data: Value::Arr(vec![v(vec![
+            ("id", Value::Str("source/bin/sync".into())),
+            ("mob", Value::Str(sync_mob)),
+            ("name", Value::Str("Synced interview".into())),
+            ("rate", Value::Str("24".into())),
+            ("backing_length", Value::Int(48)),
+            ("start", v(vec![("value", Value::Int(4))])),
+            ("end", v(vec![("value", Value::Int(28))])),
+            ("tracks", Value::Arr(tracks)),
+        ])]),
+    });
+    graph
+}
+
+#[test]
+fn autosync_subclip_uses_exact_separate_picture_and_mono_source_ranges() {
+    let graph = autosync_fixture(false);
+    let graph = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    let prepared = premiere_adapter::prepare_originals(&graph, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(prepared.input.autosync_bins.get(&0), Some(&0));
+    let [source] = &prepared.input.sequences[..] else { panic!("expected reusable sequence"); };
+    let frame = prproj::convert::model::TICKS_PER_SECOND / 24;
+    assert_eq!(source.events.len(), 9);
+    assert_eq!(source.events[0].video_track, Some(1));
+    assert_eq!(source.events[0].source_in, 4 * frame);
+    for (lane, event) in (1..=8).zip(&source.events[1..]) {
+        assert_eq!(event.audio_tracks, [lane]);
+        assert_eq!(event.audio_channels, [lane]);
+        assert_eq!(event.source_in, 6 * frame);
+        assert_eq!(event.clip, source.events[1].clip);
+    }
+    assert!(source.events.iter().all(|e| e.record_start == 0 && e.duration == 24 * frame));
+    assert_ne!(source.events[0].clip, source.events[1].clip);
+    assert!(prepared.losses.iter().any(|loss| loss.aspect == "subclip_timecode"));
+    assert!(!prepared.losses.iter().any(|loss| loss.aspect == "subclip_bin_item"));
+
+    let duplicate = autosync_fixture(true);
+    let p = premiere_adapter::prepare_originals(&duplicate, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(p.input.autosync_bins.is_empty());
+    assert!(p.input.sequences.is_empty());
+    assert!(p.losses.iter().any(|loss| loss.aspect == "subclip_bin_item"
+        && loss.reason.contains("distinct PCM16 mono siblings")));
 }

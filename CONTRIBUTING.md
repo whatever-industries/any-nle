@@ -19,6 +19,11 @@ python3 scripts/public_acceptance.py --output crates/target/public-checks
 python3 -m unittest discover -s scripts/release -p test_release.py -v
 ```
 
+Use `public_acceptance.py` for the test profile supported by a public clone.
+The full Premiere writer test suite uses local fixtures and helpers from the
+private corpus. The public profile includes standalone Premiere preparation,
+graph output, media links, and bin layout checks.
+
 Cargo places the executables in `crates/target/release/` by default. For
 development, commands such as `any-nle --help` and `any-nle-gui --version`
 work without the media backend. Source builds use external `ffmpeg` and

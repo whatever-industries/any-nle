@@ -170,7 +170,7 @@ pub fn create_merged(
     }
     // Qualified direct parts already reference the same Media objects. Replacing
     // their state with hash references would erase the only copy of each payload.
-    if !media.is_direct_dnxhr_picture(&video.path) {
+    if !media.is_direct_picture(&video.path) {
         project.share_file_identity(video_item, video_copy)?;
         for (&source, &copy) in audio_items.iter().zip(&audio_copies) {
             project.share_file_identity(source, copy)?;
@@ -418,7 +418,7 @@ pub(crate) fn create_grouped_with_media(
         .and_then(|video| media?.picture_format_override(&video.path))
         .and_then(|format| format.parse().ok());
     let discrete_direct_audio = clip.video.as_ref()
-        .is_some_and(|video| media.is_some_and(|media| media.is_direct_dnxhr_picture(&video.path)));
+        .is_some_and(|video| media.is_some_and(|media| media.is_direct_picture(&video.path)));
     let Some(display) = display_override.or_else(||display_format(timebase)) else {
         return Err(other(format!("no observed display format for {rate} fps grouped clips")));
     };

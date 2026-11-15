@@ -5,6 +5,7 @@ use std::path::PathBuf;
 fn input() -> PreparedProjectInput {
     let frame = TICKS_PER_SECOND / 24;
     PreparedProjectInput {
+        autosync_bins: Default::default(),
         video_dissolves: Vec::new(),
         audio_edge_fades: Vec::new(),
         audio_crossfades: Vec::new(),
@@ -13,7 +14,9 @@ fn input() -> PreparedProjectInput {
         track_states: Default::default(),
         picture_effects: Vec::new(),
         edit_labels: Vec::new(),
+        disabled_edits: Default::default(),
         direct_dnxhr_origins: Default::default(),
+        direct_dnxhd_pcm24: Default::default(),
         project_name: "Synthetic caption and title".into(),
         options: Options::default(),
         clips: vec![],

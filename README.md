@@ -29,13 +29,15 @@ See the [release notes](RELEASE_NOTES.md) for installation and checksums.
 Supported transfers include bin organization and logging metadata, trims and
 sequence timecode, markers and clip colors, and selected editable picture,
 audio, and text controls. Support depends on the saved controls, media
-profile, and clip mode.
+profile, and clip mode. See the [linked AAF comparisons](docs/ROADMAP.md#avid--premiere)
+for what Any NLE preserves and where equivalent transfer still needs work.
 
 | To find | Read |
 | --- | --- |
 | Wizard setup, saved jobs, and Review | [Wizard guide](docs/GUI-WIZARD.md) |
 | Direct links and rewrap profiles | [Direct linking](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#premiere-27-direct-linking) and [media rewrap](docs/MEDIA-REWRAP.md) |
 | Editable groups and text | [Avid Groups](docs/EDITABLE-GROUPS-2026-11-08.md) and [caption and text translation](docs/CAPTION-TEXT-TRANSLATION-2026-11-08.md) |
+| Reusable AutoSync, track names, and disabled edits | [AutoSync source sequences](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#reusable-autosync-source-sequences), [timeline track names](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#timeline-track-names), and [disabled edits](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#disabled-clip-occurrences) |
 | Moved files and relinking | [Verified relink](docs/VERIFIED-RELINK.md) |
 | Conversion behavior and coverage by direction | [Decisions explained](docs/DECISIONS-EXPLAINED.md) and [roadmap](docs/ROADMAP.md#linked-media-conversion-parity) |
 

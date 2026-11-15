@@ -286,12 +286,27 @@ ramps). Each key sits a quarter frame into its source frame so Premiere cannot r
 frame before. Speed graph handles are therefore not editable as a smooth curve in Premiere;
 the picture timing is what is kept.
 
-### AniMatte becomes masks on Opacity [provisional]
+### AniMatte becomes editable masks on Opacity
 
-An Avid AniMatte (Key In) shape becomes a mask on the clip's Opacity in Premiere, which shows
-the inside of the shape like Avid. A shape moved by Avid's tracker becomes a mask path with a
-keyframe on every frame. Several shapes become several masks. Key Out, feathering and shapes
-whose number of points changes are reported, not converted yet.
+Fixed-topology Key In contours become separate Premiere Opacity masks. Graph/2
+retains the shape geometry, handles, and saved key frames. The qualified
+one-point tracker path and the bounded Acceleration 50 approximation use one
+editable Mask Path key per frame. The latter applies to isolated, full-span,
+1080p24 Key In edits at full opacity with zero feather, within the sampled
+path budget. The saved Avid acceleration value remains in graph/2.
+
+Premiere 27 reopened and rendered all 201 frames of each six-shape control
+using an equivalent square-pixel white source. The zero-acceleration and
+earlier-key cases both averaged 99.43% filled-mask overlap with the retained
+Avid frames at half resolution. The Acceleration 50 sample approximation
+also averaged 99.43%, compared with 98.19% using the sparse keys alone.
+The original imported media was unavailable for this replay.
+
+Single-shape Key Out uses mask inversion. At 50% opacity, the retained Avid
+render dims the inside of the contour and the Premiere render dims the
+outside. Review flags that approximation at the affected edit. Key Out
+with several shapes, feather, Bias, and topology changes have separate
+limits. See the [AniMatte qualification queue](ROADMAP.md#timeline-and-effects).
 
 ### Keeping stereo edits together through a transition (reliability fix, 2026-10-29)
 

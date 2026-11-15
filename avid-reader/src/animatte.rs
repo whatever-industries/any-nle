@@ -67,10 +67,38 @@ pub struct AniMatteState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AniMatteData {
     pub states: Vec<AniMatteState>,
+    /// Effect-wide Acceleration in Q30 units, with 1.0 representing 100%.
+    pub acceleration_q30: u32,
     /// Sampled foreground Point A coordinates in normalized frame space, one per frame.
     pub tracker_xy: Option<Vec<[f64; 2]>>,
     /// Controls whose stored facts survive in the model but whose rendering is not translated.
     pub not_converted: Vec<String>,
+}
+
+/// Legacy model/1 uses this notice even when the source graph carries the raw control.
+pub const ACCELERATION50_LEGACY_LOSS: &str =
+    "AniMatte Acceleration raw 536870912 (rendered easing not converted)";
+
+impl AniMatteData {
+    /// The current render model has one mode per effect and static shape controls.
+    pub fn has_uniform_mode_and_static_shape_controls(&self) -> bool {
+        uniform_mode_and_static_shape_controls(&self.states)
+    }
+}
+
+fn uniform_mode_and_static_shape_controls(states: &[AniMatteState]) -> bool {
+    let Some(first) = states.first().map(|state| &state.shapes) else {
+        return false;
+    };
+    let Some(mode) = first.first().map(|shape| shape.key_out) else {
+        return false;
+    };
+    states.iter().all(|state| {
+        state.shapes.len() == first.len()
+            && state.shapes.iter().zip(first).all(|(shape, base)| {
+                shape.key_out == mode && shape.opacity == base.opacity && shape.feather == base.feather
+            })
+    })
 }
 
 fn le32(data: &[u8], at: usize) -> Option<u32> {
@@ -108,7 +136,7 @@ fn shape_header(data: &[u8]) -> Option<(bool, f64, [f64; 2])> {
     Some((data[56] == 1, opacity, feather))
 }
 
-fn shapes(blob: &[u8]) -> Option<Vec<AniMatteShape>> {
+fn shapes(blob: &[u8]) -> Option<Vec<(AniMatteShape, Vec<u32>)>> {
     if blob.get(..8)? != b"BZFX\0\0\0\0" || be32(blob, 12)? != 4 {
         return None;
     }
@@ -130,11 +158,13 @@ fn shapes(blob: &[u8]) -> Option<Vec<AniMatteShape>> {
         }
         at = at.checked_add(272)?;
         let mut points = Vec::with_capacity(count);
+        let mut point_ids = Vec::with_capacity(count);
         for _ in 0..count {
             let p = blob.get(at..at.checked_add(62)?)?;
             if p.get(..4)? != [0; 4] || p.get(8) != Some(&1) || !matches!(p.get(9), Some(0 | 1)) || p.get(10..14)? != [0, 0, 0, 2] {
                 return None;
             }
+            point_ids.push(be32(p, 4)?);
             points.push(AniMattePoint {
                 xy: [be64f(p, 14)?, be64f(p, 22)?],
                 incoming: [be64f(p, 30)?, be64f(p, 38)?],
@@ -143,7 +173,7 @@ fn shapes(blob: &[u8]) -> Option<Vec<AniMatteShape>> {
             });
             at += 62;
         }
-        out.push(AniMatteShape { id, key_out, opacity, feather, points });
+        out.push((AniMatteShape { id, key_out, opacity, feather, points }, point_ids));
     }
     (at == blob.len()).then_some(out)
 }
@@ -158,6 +188,7 @@ fn states(payload: &[u8], frames: u32) -> Option<Vec<AniMatteState>> {
     }
     let mut header_at = 17usize;
     let mut out: Vec<AniMatteState> = Vec::with_capacity(count);
+    let mut topology = None;
     for _ in 0..count {
         let header = payload.get(header_at..header_at.checked_add(106)?)?;
         let timing = le32(header, 1)?;
@@ -176,16 +207,21 @@ fn states(payload: &[u8], frames: u32) -> Option<Vec<AniMatteState>> {
         }
         let blob_at = size_at.checked_add(4)?;
         let end = blob_at.checked_add(size)?;
-        let shape_state = shapes(payload.get(blob_at..end)?)?;
-        out.push(AniMatteState { frame, shapes: shape_state });
+        let (shapes, point_ids): (Vec<_>, Vec<_>) = shapes(payload.get(blob_at..end)?)?.into_iter().unzip();
+        // Path interpolation pairs vertices by ordinal. A matching count is
+        // insufficient if a vertex was reordered or replaced between states.
+        let identities: Vec<_> = shapes.iter().map(|shape| shape.id).zip(point_ids).collect();
+        if let Some(first) = &topology {
+            if *first != identities {
+                return None;
+            }
+        } else {
+            topology = Some(identities);
+        }
+        out.push(AniMatteState { frame, shapes });
         header_at = end;
     }
     if header_at != payload.len() - 2 || out.first()?.frame != 0 || out.last()?.frame != frames - 1 {
-        return None;
-    }
-    // Fixed topology: the same shapes with the same point counts in every state.
-    let first_ids: Vec<_> = out.first()?.shapes.iter().map(|s| (s.id, s.points.len())).collect();
-    if out.iter().any(|state| state.shapes.iter().map(|s| (s.id, s.points.len())).collect::<Vec<_>>() != first_ids) {
         return None;
     }
     Some(out)
@@ -281,6 +317,15 @@ fn point_a_tracking(file: &AvbFile, reference: u32, shape_id: u32, frames: u32) 
 /// `manager` = its `trackman` or 0, `frames` = its length). Acceleration is preserved as a
 /// reported loss because its exact interpolation law is unknown. Unknown layouts are refused.
 pub fn animatte(file: &AvbFile, keyframes: u32, manager: u32, frames: u32, acceleration_raw: u32) -> Option<AniMatteData> {
+    let data = source_animatte(file, keyframes, manager, frames, acceleration_raw)?;
+    data.has_uniform_mode_and_static_shape_controls().then_some(data)
+}
+
+/// Read bounded native states for the source graph, including shape controls the
+/// legacy render model cannot represent.
+pub(crate) fn source_animatte(
+    file: &AvbFile, keyframes: u32, manager: u32, frames: u32, acceleration_raw: u32,
+) -> Option<AniMatteData> {
     if file.big_endian || frames > 8192 || acceleration_raw > (1 << 30) {
         return None;
     }
@@ -290,16 +335,6 @@ pub fn animatte(file: &AvbFile, keyframes: u32, manager: u32, frames: u32, accel
     }
     let states = states(payload, frames)?;
     let first = &states.first()?.shapes;
-    let mode = first.first()?.key_out;
-    // model/1 currently has effect-wide inversion and static per-shape opacity/feather.
-    // Refuse mixed modes or animated header controls rather than silently flattening them.
-    if states.iter().any(|state| {
-        state.shapes.iter().zip(first).any(|(shape, base)| {
-            shape.key_out != mode || shape.opacity != base.opacity || shape.feather != base.feather
-        })
-    }) {
-        return None;
-    }
     let tracker_xy = if manager == 0 {
         None
     } else {
@@ -310,13 +345,15 @@ pub fn animatte(file: &AvbFile, keyframes: u32, manager: u32, frames: u32, accel
         Some(point_a_tracking(file, manager, states[0].shapes[0].id, frames)?)
     };
     let mut not_converted = Vec::new();
-    if acceleration_raw != 0 {
+    if acceleration_raw == 1 << 29 {
+        not_converted.push(ACCELERATION50_LEGACY_LOSS.into());
+    } else if acceleration_raw != 0 {
         not_converted.push(format!("AniMatte Acceleration raw {} (rendered easing not converted)", acceleration_raw));
     }
     if first.iter().any(|shape| shape.feather != [0.0, 0.0]) {
         not_converted.push("AniMatte feather values retained in stored order; H/V assignment and rendering units uncalibrated".into());
     }
-    Some(AniMatteData { states, tracker_xy, not_converted })
+    Some(AniMatteData { states, acceleration_q30: acceleration_raw, tracker_xy, not_converted })
 }
 
 /// The model's neutral matte: per shape, keyframes (frame within the edit) of closed paths;
@@ -438,5 +475,35 @@ mod tests {
         header[23..31].copy_from_slice(&46f64.to_be_bytes());
         header[50] ^= 1; // Unmapped header controls must not be silently ignored.
         assert!(shape_header(&header).is_none());
+    }
+
+    #[test]
+    fn equal_vertex_counts_cannot_hide_an_identity_change() {
+        let mut payload = sample();
+        let first_blob = 17 + 106 + 4;
+        let blob_size = le32(&payload, first_blob - 4).unwrap() as usize;
+        let second_blob = first_blob + blob_size + 106 + 4;
+        let first_point_id = second_blob + 12 + 272 + 4;
+        payload[first_point_id..first_point_id + 4].copy_from_slice(&99u32.to_be_bytes());
+        assert!(states(&payload, 46).is_none());
+    }
+
+    #[test]
+    fn animated_shape_headers_are_read_without_qualifying_the_render_model() {
+        let mut payload = sample();
+        let states_with_static_controls = states(&payload, 46).unwrap();
+        assert!(uniform_mode_and_static_shape_controls(&states_with_static_controls));
+        let first_blob = 17 + 106 + 4;
+        let last_header = first_blob + le32(&payload, first_blob - 4).unwrap() as usize + 110 + 12;
+        for (offset, value) in [(23, 46.0_f64), (31, 21.0), (39, 7.0)] {
+            payload[last_header + offset..last_header + offset + 8]
+                .copy_from_slice(&value.to_be_bytes());
+        }
+        payload[last_header + 56] = 1;
+        let captured = states(&payload, 46).unwrap();
+        assert_eq!(captured[0], states_with_static_controls[0]);
+        let last = &captured[1].shapes[0];
+        assert_eq!((last.key_out, last.opacity, last.feather), (true, 46.0, [21.0, 7.0]));
+        assert!(!uniform_mode_and_static_shape_controls(&captured));
     }
 }

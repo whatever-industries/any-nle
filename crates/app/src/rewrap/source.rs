@@ -8,11 +8,11 @@ use std::path::Path;
 use std::time::SystemTime;
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Stamp {
+pub(crate) struct Stamp {
     pub(super) len: u64,
     pub(super) modified: SystemTime,
 }
-pub(super) fn stamp(path: &Path) -> R<Stamp> {
+pub(crate) fn stamp(path: &Path) -> R<Stamp> {
     let m = fs::metadata(path).map_err(|e| e.to_string())?;
     if !m.is_file() {
         return Err("media input is not a regular file".into());
@@ -24,9 +24,9 @@ pub(super) fn stamp(path: &Path) -> R<Stamp> {
 }
 pub(crate) struct EssenceSpan {
     pub(crate) kind: u8,
-    pub(super) bytes: u64,
-    pub(super) offset: u64,
-    pub(super) key: [u8; 16],
+    pub(crate) bytes: u64,
+    pub(crate) offset: u64,
+    pub(crate) key: [u8; 16],
     pub(super) body_sid: u32,
 }
 pub(super) struct IndexSpan {

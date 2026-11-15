@@ -158,8 +158,8 @@ mod tests {
     use super::*;
     use crate::source::{mixer::DIRECT_PROFILE, ADAPTER};
     use graph::{
-        source::{SourceGraph, SourceSequence},
-        Project, Rational, Sidecar, Track,
+        source::{SourceGraph, SourceSequence, SourceTrack},
+        Project, Rational, Sidecar,
     };
 
     const ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -173,6 +173,7 @@ mod tests {
             media: vec![],
             items: vec![],
             sequences: vec![SourceSequence {
+                disabled_placements: Vec::new(),
                 id: ID.into(),
                 name: "Test".into(),
                 rate: Rational::new(24, 1).unwrap(),
@@ -180,11 +181,7 @@ mod tests {
                 start: None,
                 clock: None,
                 tracks: track_state::LANES
-                    .map(|(kind, index)| Track {
-                        kind,
-                        index,
-                        level_db: None,
-                    })
+                    .map(|(kind, index)| SourceTrack::new(kind, index, None))
                     .into(),
                 placements: vec![],
                 transitions: vec![],

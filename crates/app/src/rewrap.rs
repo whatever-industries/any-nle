@@ -7,7 +7,7 @@ mod planning;
 mod mov;
 mod mono;
 mod receipts;
-mod source;
+pub(crate) mod source;
 mod terminal;
 mod validation;
 

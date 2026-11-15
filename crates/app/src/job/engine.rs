@@ -1,6 +1,6 @@
 //! Read-only preparation followed by one explicit execution of the prepared document.
 use super::*;
-use crate::{backend_bundle, output, rewrap, source_input};
+use crate::{backend_bundle, output, premiere_preparation, rewrap, source_input};
 use avid_reader::source::SourceInput;
 use mapping::{AvidToPremiere, BinMode};
 use prproj::convert::{prepared::PreparedClip, writer::PreparedProject};
@@ -447,11 +447,15 @@ pub fn prepare_for_review(
             .map_err(blocker(AvidMedia))?;
         read = again;
     }
-    media_inputs.extend(read.original_inputs.iter().cloned());
     let mappings = spec.path_mappings.iter().map(|m| avid_adapter::original::RootMapping {
         saved_root: m.saved_prefix.clone(),
         current_root: m.actual_root.clone(),
     }).collect::<Vec<_>>();
+    if spec.mode == ClipMode::Separate {
+        crate::wav_original::select(&mut read, &mappings, &tools.ffprobe, &mut || cancel.check())
+            .map_err(blocker(OriginalMedia))?;
+    }
+    media_inputs.extend(read.original_inputs.iter().cloned());
     let mut matte = crate::png_mattes::prepare(&read, &mappings, spec.mode == ClipMode::Separate,
         &mut || cancel.check()).map_err(blocker(OriginalMedia))?;
     let png_count = matte.inputs.len();
@@ -509,31 +513,21 @@ pub fn prepare_for_review(
         return Err(issue);
     }
     crate::offline::check_edit_routes(&read.graph).map_err(blocker(SourceContent))?;
-    for l in read
-        .graph
-        .losses
-        .iter()
-        .filter(|loss| loss.aspect != "subclip_bin_item"
-            && loss.aspect != avid_adapter::PAN_AUTOMATION_LOSS && matte.keeps_loss(loss))
-        .chain(policy.losses_source(&read.graph).iter())
-    {
-        notes.push(note("loss", &l.object, &l.reason, &l.aspect));
+    for l in policy.losses_source(&read.graph) {
+        notes.push(note("loss", l.object, l.reason, l.aspect));
     }
     let native = spec.mode == ClipMode::RewrapNative;
     let gain = rewrap::gain_paths(&read.graph);
     if !native && !gain.is_empty() {
         return Err(ReviewBlocker::new(Rewrap, "AudioSuite Gain requires the native prepared-media mode to copy the saved render to WAV"));
     }
-    let prepared = premiere_adapter::prepare_originals(
+    let prepared = premiere_preparation::prepare_typed(
         &read.graph,
         &policy.to_options(),
-        if native {
-            premiere_adapter::ClockProfile::VerifiedRewrap
-        } else {
-            premiere_adapter::ClockProfile::LegacyImport
-        },
+        premiere_preparation::clock_profile(native),
+        &mut matte,
     )
-    .map_err(|e| ReviewBlocker::new(SourceContent, format!("Premiere preparation failed: {e}")))?;
+    .map_err(blocker(SourceContent))?;
     for d in prepared.diagnostics {
         notes.push(note(
             "info",
@@ -543,13 +537,10 @@ pub fn prepare_for_review(
         ));
     }
     for l in prepared.losses {
-        if matte.keeps_loss(&l) {
-            notes.push(note("loss", l.object, l.reason, l.aspect));
-        }
+        notes.push(note("loss", l.object, l.reason, l.aspect));
     }
     drop(prepared.ownership);
     let mut input = prepared.input;
-    matte.apply(&mut input, &read.graph).map_err(blocker(SourceContent))?;
     let offline = crate::offline::paths(&read.graph);
     let offline_relink = crate::offline::report(&read.graph, &spec.output).map_err(blocker(ProjectOutput))?;
     if let Some((path, _)) = &offline_relink {
@@ -694,26 +685,9 @@ pub fn prepare_for_review(
     } else {
         None
     };
-    let document = match (&layout, offline.is_empty()) {
-        (Some(layout), true) => prproj::convert::writer::prepare_typed_project_with_layout(
-            &input,
-            &spec.output,
-            &mut ids,
-            &bindings,
-            native,
-            layout,
-        ),
-        (None, true) => prproj::convert::writer::prepare_typed_project(
-            &input,
-            &spec.output,
-            &mut ids,
-            &bindings,
-            native,
-        ),
-        (_, false) => prproj::convert::writer::prepare_offline_project(
-            &input, &spec.output, &mut ids, layout.as_ref(), &offline,
-        ),
-    }
+    let document = premiere_preparation::prepare_document(
+        &input, &spec.output, &mut ids, &bindings, native, layout.as_ref(), &offline,
+    )
     .map_err(|e| ReviewBlocker::new(SourceContent, format!("Premiere document preparation failed: {e}")))?;
     document
         .check_reserved_output(&receipt)

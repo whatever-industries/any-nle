@@ -125,6 +125,18 @@ fn saved_image_bounds(ctx: &Ctx<'_>, clip: &Node) -> bool {
     else {
         return false;
     };
+    equal_1600_picture_bounds(xml)
+        && attrs.iter().all(|(name, value)| match name.as_str() {
+            "_IMAGE_BOUNDS_OVERRIDE" | "_TMP_CRM" => true,
+            "_BOUNDS_REFORMATTING_OPTION" => {
+                value.as_int() == Some(1) && unique_attribute(attrs, name).is_some()
+            }
+            _ => false,
+        })
+}
+
+/// The retained 16:9 override uses one equal, centered rectangle for all four fields.
+pub(super) fn equal_1600_picture_bounds(xml: &str) -> bool {
     // The validated render used these equal framing, valid, essence and
     // source rectangles. Keep changed framing out of this profile.
     const RECTANGLES: &str = concat!(
@@ -135,13 +147,6 @@ fn saved_image_bounds(ctx: &Ctx<'_>, clip: &Node) -> bool {
         "  <Source>-800/1 -450/1 1600/1 900/1</Source></Bounds>",
     );
     xml == RECTANGLES
-        && attrs.iter().all(|(name, value)| match name.as_str() {
-            "_IMAGE_BOUNDS_OVERRIDE" | "_TMP_CRM" => true,
-            "_BOUNDS_REFORMATTING_OPTION" => {
-                value.as_int() == Some(1) && unique_attribute(attrs, name).is_some()
-            }
-            _ => false,
-        })
 }
 
 fn picture_leaf<'a>(ctx: &Ctx<'a>, node: &'a Node) -> Option<&'a Node> {

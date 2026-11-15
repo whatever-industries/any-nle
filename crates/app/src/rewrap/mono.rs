@@ -289,6 +289,7 @@ pub(super) fn writer_clip(clip: &Clip, output: &Path) -> R<OriginalClip> {
         container: "wav".into(),
         video: None,
         audio: Some(OriginalAudio {
+            source_start: 0,
             sample_rate: RATE,
             channels: 1,
             duration: a.duration,

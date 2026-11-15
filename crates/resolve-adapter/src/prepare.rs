@@ -109,6 +109,9 @@ pub(crate) fn prepare_bindings(
         .iter()
         .find(|s| s.id == sequence_id)
         .ok_or("selected sequence identity absent")?;
+    if let Some(edit) = sequence.disabled_placements.first() {
+        return Err(format!("{}: disabled source edit has no qualified Resolve mapping", edit.id).into());
+    }
     if sequence.rate != rate()
         || sequence.frame_size.is_some_and(|size| size != (1920, 1080))
         || !sequence.transitions.is_empty()

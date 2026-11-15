@@ -4,6 +4,7 @@
 //! The held FCPXML route retains its explicit legacy graph/1 input profile.
 
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -12,8 +13,12 @@ use avid_reader::model::{build, MediaIndex};
 use graph::{Graph, Loss};
 use mapping::{AvidToPremiere, BinMode};
 use crate::premiere_route::PremiereRoute;
-use crate::{media_prompt, output, rewrap, source_input};
-use prproj::convert::model::{parse_model_str, MAX_MODEL_BYTES};
+use crate::{media_prompt, output, premiere_preparation, rewrap, source_input};
+use prproj::convert::{
+    model::{parse_model_str, Model, MAX_MODEL_BYTES},
+    prepared::PreparedProjectInput,
+    writer::Editorial,
+};
 use prproj::{RandomUuids, SeededUuids, UuidSource};
 
 pub(crate) const USAGE: &str = "usage:
@@ -455,6 +460,23 @@ pub(crate) fn publication_failure(
     message
 }
 
+enum DirectPremiereInput {
+    Compatibility(premiere_adapter::PreparedPremiere),
+    Typed {
+        input: PreparedProjectInput,
+        media: Model,
+    },
+}
+
+impl DirectPremiereInput {
+    fn media_parts(&mut self) -> (&Model, Option<&mut PreparedProjectInput>) {
+        match self {
+            Self::Compatibility(prepared) => (&prepared.model, None),
+            Self::Typed { input, media } => (media, Some(input)),
+        }
+    }
+}
+
 pub(crate) fn convert(a: &Args) -> Result<(), String> {
     if a.wants_rewrap() && a.to.as_deref() != Some("premiere") {
         return Err("media rewrap is only supported for Avid -> Premiere".into());
@@ -472,6 +494,13 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     let policy = policy(a)?;
     let route = if a.rewrap_media {PremiereRoute::NativeMedia}else{PremiereRoute::resolve(a.rewrap_native_master, policy.bin_mode)};
     let mut read = read_avid_source(a)?;
+    if a.link_originals && policy.bin_mode == BinMode::Separate && !a.wants_rewrap() {
+        crate::wav_original::select(
+            &mut read.result, &a.original_mappings,
+            &crate::backend_bundle::resolve(None, a.ffprobe.as_deref(), false)?.ffprobe,
+            &mut || Ok(()),
+        )?;
+    }
     let mut matte = crate::png_mattes::prepare(
         &read.result, &a.original_mappings, !a.wants_rewrap() && policy.bin_mode == BinMode::Separate,
         &mut || Ok(()),
@@ -501,42 +530,59 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         a.rewrap.clone()
     };
     let policy_losses = policy.losses_source(&graph);
+    let typed_disabled = !a.wants_rewrap() && policy.bin_mode == BinMode::Separate
+        && premiere_adapter::has_disabled_edit_candidates(&graph);
+    let typed_pan = !a.wants_rewrap()
+        && premiere_adapter::has_managed_pan_candidates(&graph);
+    let typed_track_names = !a.wants_rewrap() && premiere_adapter::has_track_name_candidates(&graph);
     let source_losses: Vec<_> = graph.losses.iter()
         .filter(|loss| loss.aspect != "subclip_bin_item"
+            && !(typed_disabled && loss.aspect == "disabled_clip")
             && loss.aspect != avid_adapter::PAN_AUTOMATION_LOSS && matte.keeps_loss(loss))
         .cloned().collect();
-    let clock = if a.wants_rewrap() { premiere_adapter::ClockProfile::VerifiedRewrap }
-        else { premiere_adapter::ClockProfile::LegacyImport };
-    let (model, texts, video_dissolves, picture_effects, direct_dnxhr_origins, constant_speeds, mut typed, preparation_notes, bridge_losses) =
-        if has_matte || a.link_originals || a.allow_offline_media || !gain.is_empty() || !graph.multicams.is_empty() || !graph.multicam_uses.is_empty() {
-            if !a.link_originals && !a.allow_offline_media
-                && (!graph.multicams.is_empty() || !graph.multicam_uses.is_empty()) && matches!(route, PremiereRoute::Bin(_)) {
-                return Err("multicam_native_route_required: use --link-originals with Separate files or select the native rewrap route for editable Groups".into());
-            }
-            let mut p = premiere_adapter::prepare_originals(&graph, &policy.to_options(), clock)
-                .map_err(|e| format!("Premiere preparation failed: {e}"))?;
-            matte.apply(&mut p.input, &graph)?;
-            p.losses.retain(|loss| matte.keeps_loss(loss));
-            let media = p.input.build_native_media_model().map_err(|e| e.to_string())?;
-            (media, Vec::new(), Vec::new(), Vec::new(), Default::default(), Vec::new(), Some(p.input), p.diagnostics, p.losses)
-        } else {
-            let p = premiere_adapter::prepare(&graph, &policy.to_options(), clock)
-                .map_err(|e| format!("Premiere preparation failed: {e}"))?;
-            (p.model, p.texts, p.video_dissolves, p.picture_effects, p.direct_dnxhr_origins, p.constant_speeds, None, p.diagnostics, p.losses)
-        };
-    let prepared_event_count: usize = typed.as_ref().map_or(&model.sequences, |p| &p.sequences)
-        .iter().map(|s| s.events.len()).sum::<usize>()
+    let clock = premiere_preparation::clock_profile(a.wants_rewrap());
+    let typed_link = has_matte || typed_disabled || typed_pan || typed_track_names
+        || a.link_originals || a.allow_offline_media;
+    let editable_groups = !graph.multicams.is_empty() || !graph.multicam_uses.is_empty();
+    let use_typed = typed_link || !gain.is_empty() || editable_groups;
+    if editable_groups && !a.link_originals && !a.allow_offline_media
+        && matches!(route, PremiereRoute::Bin(_))
+    {
+        return Err("multicam_native_route_required: use --link-originals with Separate files or select the native rewrap route for editable Groups".into());
+    }
+    let (mut destination, preparation_notes, mut bridge_losses) = if use_typed {
+        let p = premiere_preparation::prepare_typed(&graph, &policy.to_options(), clock, &mut matte)?;
+        let media = p.input.build_native_media_model().map_err(|e| e.to_string())?;
+        (DirectPremiereInput::Typed { input: p.input, media }, p.diagnostics, p.losses)
+    } else {
+        let mut p = premiere_adapter::prepare(&graph, &policy.to_options(), clock)
+            .map_err(|e| format!("Premiere preparation failed: {e}"))?;
+        let diagnostics = std::mem::take(&mut p.diagnostics);
+        let losses = std::mem::take(&mut p.losses);
+        drop(std::mem::take(&mut p.ownership));
+        (DirectPremiereInput::Compatibility(p), diagnostics, losses)
+    };
+    let reported_source_losses: HashSet<_> = source_losses.iter()
+        .map(|loss| (loss.object.as_str(), loss.aspect.as_str(), loss.reason.as_str()))
+        .collect();
+    bridge_losses.retain(|loss| {
+        !reported_source_losses.contains(&(loss.object.as_str(), loss.aspect.as_str(), loss.reason.as_str()))
+    });
+    let (model, typed) = destination.media_parts();
+    let prepared_sequences = typed.as_ref().map_or(&model.sequences, |p| &p.sequences);
+    let prepared_sequence_count = prepared_sequences.len();
+    let prepared_event_count: usize = prepared_sequences.iter().map(|s| s.events.len()).sum::<usize>()
         + typed.as_ref().map_or(0, |p| p.png_mattes.edits.len());
     let prepared_stills = typed.as_ref().map_or(0, |p| p.png_mattes.stills.len());
     let native_media = a.rewrap_media.then(|| rewrap::NativeMediaPreparation {
-        model: &model,
-        writer_input: typed.as_mut(),
+        model,
+        writer_input: typed,
         gain: &gain,
     });
     if let Some(native) = &native_media {
         native.preflight()?;
     } else {
-        route.preflight(&model).map_err(|e| e.to_string())?;
+        route.preflight(model).map_err(|e| e.to_string())?;
     }
     if gain.is_empty() {
         if let Some(notice) = route.notice() {
@@ -552,7 +598,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
                 .prepare(dir, &a.media, &output, a.graph_out.as_deref(), ffmpeg, ffprobe)
                 .map_err(rewrap::PrepareIssue::into_message)?,
             None => rewrap::Plan::prepare(
-                &model, dir, &a.media, &output, a.graph_out.as_deref(), ffmpeg, ffprobe,
+                model, dir, &a.media, &output, a.graph_out.as_deref(), ffmpeg, ffprobe,
             )?,
         };
         plan.describe();
@@ -576,25 +622,30 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             output::preflight(snapshot, Some(path))?;
         }
     }
-    let mut prepared = match &typed {
-        Some(p) if !offline.is_empty() => prproj::convert::writer::prepare_offline_project(p, &output, ids.as_mut(), None, &offline),
-        Some(p) => prproj::convert::writer::prepare_typed_project(p, &output, ids.as_mut(), &bindings, !(has_matte || a.link_originals || a.allow_offline_media)),
-        None => route.prepare(&model, &output, ids.as_mut(), &bindings, prproj::convert::writer::Editorial {
-            texts: &texts, video_dissolves: &video_dissolves, picture_effects: &picture_effects,
-            direct_dnxhr_origins: &direct_dnxhr_origins,
-            constant_speeds: &constant_speeds,
-        }),
+    let mut prepared = match &destination {
+        DirectPremiereInput::Typed { input, .. } => premiere_preparation::prepare_document(
+            input, &output, ids.as_mut(), &bindings, !typed_link, None, &offline,
+        ),
+        DirectPremiereInput::Compatibility(p) => route.prepare(
+            &p.model, &output, ids.as_mut(), &bindings,
+            Editorial {
+                texts: &p.texts,
+                video_dissolves: &p.video_dissolves,
+                picture_effects: &p.picture_effects,
+                direct_dnxhr_origins: &p.direct_dnxhr_origins,
+                constant_speeds: &p.constant_speeds,
+            },
+        ),
     }.map_err(|e| format!("Premiere document preparation failed: {e}"))?;
     if let Some((path, _)) = &offline_relink {
         prepared.check_reserved_output(path).map_err(|e| e.to_string())?;
     }
-    drop(typed);
     if let Some(path) = &a.graph_out {
         prepared
             .check_reserved_output(path)
             .map_err(|e| e.to_string())?;
     }
-    drop(model);
+    drop(destination);
     if a.rewrap_dry_run {
         for problem in &problems {
             println!("Reader note: {problem}");
@@ -701,7 +752,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         output.display(),
         graph.items.len() + prepared_stills,
         graph.bins.len(),
-        graph.sequences.len(),
+        prepared_sequence_count,
         placements,
         preparation.as_ref().map_or_else(|| route.to_string(), |p| p.mode(route.receipt_mode()).to_owned())
     );

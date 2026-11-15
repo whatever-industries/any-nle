@@ -82,7 +82,7 @@ pub struct MediaTable {
 pub(crate) struct DirectDnxhrFile {
     pub origin: i64,
     pub picture: bool,
-    pub drop_frame: bool,
+    pub display: &'static str,
     pub dnxhr: bool,
 }
 
@@ -91,9 +91,13 @@ impl MediaTable {
         self.direct_dnxhr.get(path).is_some_and(|file| file.picture && file.dnxhr)
     }
 
+    pub(super) fn is_direct_picture(&self, path: &str) -> bool {
+        self.direct_dnxhr.get(path).is_some_and(|file| file.picture)
+    }
+
     pub(super) fn picture_format_override(&self, path: &str) -> Option<&str> {
         if let Some(file) = self.direct_dnxhr.get(path).filter(|file| file.picture) {
-            Some(if file.drop_frame { "102" } else { "110" })
+            Some(file.display)
         } else {
             self.rewrap_formats.get(path).map(String::as_str)
         }

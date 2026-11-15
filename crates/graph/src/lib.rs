@@ -10,6 +10,7 @@
 //! Loading is strict like the converter's model: unknown keys, wrong types, dangling references
 //! and duplicate IDs are errors.
 
+pub mod audio_pan;
 pub mod json;
 pub mod picture_chain;
 pub mod picture_motion;

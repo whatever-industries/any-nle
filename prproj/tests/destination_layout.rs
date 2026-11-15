@@ -139,6 +139,7 @@ fn linked_original_and_sequence_only_sources_remain_under_the_import_root() {
         container: "wav".into(),
         video: None,
         audio: Some(OriginalAudio {
+            source_start: 0,
             sample_rate: 48000,
             channels: 2,
             duration: 2 * model::TICKS_PER_SECOND,

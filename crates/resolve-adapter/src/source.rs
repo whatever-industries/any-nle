@@ -26,9 +26,9 @@ use encoding::{extent, frames, hex_bytes, pb_bytes, qt, raster, rate, timecode, 
 use graph::{
     source::{
         SourceClock, SourceClockProvenance, SourceGraph, SourceItem, SourceItemMedia, SourceMedia,
-        SourceSequence,
+        SourceSequence, SourceTrack,
     },
-    Bin, Loss, Placement, Project, Rational, Sidecar, StreamKind, Track, Value,
+    Bin, Loss, Placement, Project, Rational, Sidecar, StreamKind, Value,
 };
 use mixer::Mixer;
 use std::{
@@ -231,6 +231,7 @@ fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<S
         let grid = Grid::read(child)?;
         let clock = clock(id, "Sm2Sequence.MediaExtents", grid.origin, grid.rate)?;
         let mut sequence = SourceSequence {
+            disabled_placements: Vec::new(),
             id: id.into(),
             name: clip.get("Name")?.into(),
             rate: grid.rate,
@@ -1053,6 +1054,7 @@ fn sequence<'a>(
     let grid = Grid::read(node)?;
     let clock = clock(id, "Sm2Sequence.MediaExtents", grid.origin, grid.rate)?;
     let mut out = SourceSequence {
+        disabled_placements: Vec::new(),
         id: id.into(),
         name: handle.get("Name")?.into(),
         rate: grid.rate,
@@ -1293,11 +1295,7 @@ fn read_tracks<'a>(
         let index = *counter;
         let track_id = track.id()?;
         claim(&mut context.ids, track_id)?;
-        out.tracks.push(Track {
-            kind,
-            index,
-            level_db: None,
-        });
+        out.tracks.push(SourceTrack::new(kind, index, None));
         let flags = track.get("Flags")?;
         let name = track.maybe("UserDefinedName")?.unwrap_or("");
         let locked = matches!(flags, "1" | "3");

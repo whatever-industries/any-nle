@@ -32,7 +32,7 @@ use prproj::{
         colors::LABEL_NAMES,
         model::{Options, TICKS_PER_SECOND},
         prepared::{PictureEffect, PreparedAudioCrossfade, PreparedAudioEdgeFade, PreparedAudioMixer,
-            PreparedEditLabel, PreparedPictureEffect, PreparedTrackState, PreparedVideoDissolve},
+            PreparedEditLabel, PreparedPictureEffect, PreparedTrackLane, PreparedTrackState, PreparedVideoDissolve},
         writer::prepare_typed_project,
     },
     RandomUuids,
@@ -65,6 +65,9 @@ pub fn write_with_options(
         .position(|seq| seq.id == sequence_id)
         .ok_or("selected Resolve sequence is absent")?;
     let sequence = &graph.sequences[index];
+    if let Some(edit) = sequence.disabled_placements.first() {
+        return Err(format!("{}: disabled source edit has no qualified Resolve export mapping", edit.id).into());
+    }
     let track_state = crate::track_state::TrackState::prepare(&graph, sequence)?;
     let (mut mixer, mapped_direct_mixer) = validate_sequence(&graph, sequence, track_state.is_some())?;
     let mut metadata_losses = omitted_timeline_marks(&graph, sequence)?;
@@ -182,10 +185,11 @@ pub fn write_with_options(
     if let Some(state) = track_state {
         let states = state.0.into_iter().enumerate().filter_map(|(lane, track)| {
             (!track.name.is_empty() || track.locked || track.disabled).then(|| PreparedTrackState {
-                audio_track: (lane != 0).then_some(lane as i64),
+                lane: if lane == 0 { PreparedTrackLane::Picture(1) } else { PreparedTrackLane::Audio(lane as i64) },
                 name: (!track.name.is_empty()).then_some(track.name),
                 locked: track.locked,
                 picture_disabled: track.disabled,
+                create_empty: false,
             })
         }).collect();
         prepared.input.track_states.insert(0, states);

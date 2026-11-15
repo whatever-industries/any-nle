@@ -1,9 +1,11 @@
 //! Shared Any NLE application engine. The CLI and native wizard share preparation and publication.
 mod application;
 mod png_mattes;
+mod wav_original;
 mod media_prompt;
 mod offline;
 mod output;
+mod premiere_preparation;
 mod premiere_route;
 mod rewrap;
 mod source_input;

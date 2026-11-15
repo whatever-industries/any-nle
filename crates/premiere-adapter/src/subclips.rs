@@ -1,20 +1,20 @@
-//! Prepare reusable subclips on the verified direct MXF route.
+//! Prepare reusable Avid subclips from verified direct and original-file links.
 use super::*;
 use prproj::convert::prepared::{av_subclip_edit_fits, PreparedAvSubclip, PreparedAvSubclipUse, PreparedPictureSubclip};
 
 const RATE: &str = "24000/1001";
 
-fn field_int(object: &Value, field: &str) -> Option<i64> {
+pub(super) fn field_int(object: &Value, field: &str) -> Option<i64> {
     key(object, field).and_then(integer)
 }
 
-fn mob_id(value: &str) -> bool {
+pub(super) fn mob_id(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 // The bin receipt uses full uppercase hex. The edit's route uses the same
 // 32 bytes in SMPTE URN form.
-fn urn(mob: &str) -> String {
+pub(super) fn urn(mob: &str) -> String {
     let groups = (0..8).map(|i| mob[i * 8..i * 8 + 8].to_ascii_lowercase()).collect::<Vec<_>>();
     format!("urn:smpte:umid:{}", groups.join("."))
 }
@@ -33,35 +33,30 @@ fn track_matches(track: &Value, kind: i64, label: i64, backing: i64, target: &st
 enum Subclip {
     Picture(PreparedPictureSubclip),
     Av(PreparedAvSubclip),
+    AutoSync(Sequence, bool),
 }
 
 pub(super) fn prepare(
     graph: &SourceGraph,
+    media: &HashMap<&str, &SourceMedia>,
     sidecars: &Sidecars<'_>,
     input: &mut PreparedProjectInput,
     ownership: &HashMap<String, (usize, usize)>,
     typed: bool,
+    clock: ClockProfile,
     losses: &mut Vec<Loss>,
-) -> R<()> {
+) -> R<Vec<(usize, Sequence)>> {
     if !graph.bins.iter().any(|bin| side(sidecars, "avid.subclips", &bin.id).is_some()) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut parents = HashMap::new();
     for item in &graph.items {
         if let Some(mob) = item.umid.as_deref() {
-            parents.entry(mob).and_modify(|entry| *entry = None).or_insert(Some(item.id.as_str()));
+            parents.entry(mob).and_modify(|entry| *entry = None).or_insert(Some(item));
         }
     }
-    let masters: HashMap<_, _> = input.clips.iter().filter_map(|clip| match clip {
-        PreparedClip::Legacy(clip) => Some((clip.id.as_str(), clip)),
-        _ => None,
-    }).collect();
-    let online_items: HashSet<_> = {
-        let online_media: HashSet<_> = graph.media.iter().filter(|m| m.online == Some(true))
-            .map(|m| m.id.as_str()).collect();
-        graph.items.iter().filter(|i| i.media.iter().all(|m| online_media.contains(m.media.as_str())))
-            .map(|i| i.id.as_str()).collect()
-    };
+    let clips: HashMap<_, _> = input.clips.iter().map(|clip| (clip.id(), clip)).collect();
+    let mut autosyncs = Vec::new();
     let mut av_routes = HashMap::new();
     let mut seen = HashSet::new();
     let mut native_ids = HashSet::new();
@@ -91,6 +86,21 @@ pub(super) fn prepare(
                 if name.is_empty() || name.len() > 4096 || !mob_id(native_id) {
                     return Err("saved subclip name or identity is invalid");
                 }
+                if clock == ClockProfile::LegacyImport && key(row, "rate").and_then(str_value) == Some("24") {
+                    if let Some(Value::Arr(tracks)) = key(row, "tracks") {
+                        let target = |kind| tracks.iter().find(|t| field_int(t, "kind") == Some(kind))
+                            .and_then(|t| key(t, "target_mob")).and_then(str_value);
+                        if target(1).zip(target(2)).is_some_and(|(picture, sound)| picture != sound) {
+                            if autosyncs.len() >= 10_000usize.saturating_sub(input.sequences.len()) {
+                                return Err("AutoSync source sequence limit reached");
+                            }
+                            let (sequence, has_clock) = super::autosync::prepare(
+                                row, name, tracks, &parents, media, &clips, sidecars,
+                            )?;
+                            return Ok((native_id, Subclip::AutoSync(sequence, has_clock)));
+                        }
+                    }
+                }
                 let (Some(Value::Arr(tracks)), Some(RATE)) = (
                     key(row, "tracks"), key(row, "rate").and_then(str_value),
                 ) else { return Err("reusable subclips require a saved 23.976 picture track") };
@@ -104,9 +114,10 @@ pub(super) fn prepare(
                 let parent = parents.get(target).copied()
                     .ok_or("backing master is unavailable in the selected bins")?
                     .ok_or("more than one selected master has the backing identity")?;
-                let parent_clip = clip_id(parent);
-                let master = masters.get(parent_clip.as_str())
-                    .ok_or("backing master is not a prepared managed-media clip")?;
+                let parent_clip = clip_id(&parent.id);
+                let Some(PreparedClip::Legacy(master)) = clips.get(parent_clip.as_str()).copied() else {
+                    return Err("backing master is not a prepared managed-media clip");
+                };
                 let video = master.video.as_ref()
                     .ok_or("backing master has no prepared picture")?;
                 if video.rate != model::Fraction::new(24_000, 1001)
@@ -141,7 +152,9 @@ pub(super) fn prepare(
                 }
                 let uniform_pcm = matches!(master.audio.as_slice(), [a, b]
                     if matches!(a.bits, 16 | 24) && a.bits == b.bits);
-                if !online_items.contains(parent) || !uniform_pcm
+                if !parent.media.iter().all(|reference|
+                    media.get(reference.media.as_str()).is_some_and(|m| m.online == Some(true)))
+                    || !uniform_pcm
                     || backing * unit != video.duration
                     || !master.markers.is_empty()
                 {
@@ -157,24 +170,34 @@ pub(super) fn prepare(
                     av_routes.insert(urn(mob), Some(input.av_subclips.len()));
                     input.av_subclips.push(subclip);
                 }
+                Ok((mob, Subclip::AutoSync(sequence, has_clock))) => autosyncs.push((urn(mob), bin, sequence, has_clock, id)),
                 Err(reason) => loss(losses, id, "subclip_bin_item", format!("{name:?}: {reason}")),
             }
         }
     }
-    for id in duplicate_native_ids {
-        if let Some(route) = av_routes.get_mut(&id) {
+    for id in &duplicate_native_ids {
+        if let Some(route) = av_routes.get_mut(id) {
             *route = None;
         }
     }
-    input.av_subclip_uses = bind_av_uses(graph, sidecars, ownership, &masters, &av_routes, input, losses);
-    Ok(())
+    input.av_subclip_uses = bind_av_uses(graph, sidecars, ownership, &clips, &av_routes, input, losses);
+    Ok(autosyncs.into_iter().filter_map(|(mob, bin, sequence, has_clock, id)| {
+        if duplicate_native_ids.contains(&mob) {
+            loss(losses, id, "subclip_bin_item", "AutoSync native identity is ambiguous");
+            return None;
+        }
+        if !has_clock {
+            loss(losses, id, "subclip_timecode", "AutoSync source sequence uses a zero display start because the picture clock is unqualified");
+        }
+        Some((bin, sequence))
+    }).collect())
 }
 
 fn bind_av_uses(
     graph: &SourceGraph,
     sidecars: &Sidecars<'_>,
     ownership: &HashMap<String, (usize, usize)>,
-    masters: &HashMap<&str, &Clip>,
+    clips: &HashMap<&str, &PreparedClip>,
     routes: &HashMap<String, Option<usize>>,
     input: &PreparedProjectInput,
     losses: &mut Vec<Loss>,
@@ -210,7 +233,9 @@ fn bind_av_uses(
             let seq = &input.sequences[sequence];
             let edit = &seq.events[event];
             let definition = &input.av_subclips[subclip];
-            let parent = masters[definition.parent_clip.as_str()];
+            let PreparedClip::Legacy(parent) = clips.get(definition.parent_clip.as_str()).copied()? else {
+                return None;
+            };
             if multicam.contains(&(sequence, event)) || marked.contains(&(sequence, event))
                 || !av_subclip_edit_fits(seq, edit, parent, definition)
                 || key(second, "mob").and_then(str_value) != Some(parent_urns.get(p.item.as_str())?.as_str())

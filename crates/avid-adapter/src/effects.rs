@@ -397,6 +397,10 @@ pub(super) fn receipt(event: &SeqEvent) -> Value {
                             ),
                         ),
                         (
+                            "acceleration_q30",
+                            Value::Int(i64::from(a.acceleration_q30)),
+                        ),
+                        (
                             "tracker_xy",
                             a.tracker_xy
                                 .as_ref()
@@ -611,6 +615,15 @@ pub(super) fn apply(
             )?;
             return Ok(());
         }
+        if !data.has_uniform_mode_and_static_shape_controls() {
+            return loss(
+                out,
+                budget,
+                &p.id,
+                "matte",
+                "AniMatte has mixed or animated Key In/Out, opacity, or feather controls. Saved shape states are retained in the source graph.",
+            );
+        }
         // Reserve the full expansion before allocating keyframe/point values. Each normalized
         // point owns a Vec and six Value slots. This deliberately overcharges repeated states.
         let keys = data.tracker_xy.as_ref().map_or(data.states.len(), Vec::len);
@@ -694,14 +707,24 @@ pub(super) fn apply(
                 ])
             })
             .collect();
+        let mut params = vec![
+            ("inverted", Value::Bool(first.shapes[0].key_out)),
+            ("shapes", Value::Arr(shapes)),
+        ];
+        if data.acceleration_q30 != 0 && data.tracker_xy.is_none() {
+            params.push(("acceleration_q30", Value::Int(i64::from(data.acceleration_q30))));
+        }
         p.effects.push(Effect {
             kind: "avid.animatte".into(),
-            params: obj(vec![
-                ("inverted", Value::Bool(first.shapes[0].key_out)),
-                ("shapes", Value::Arr(shapes)),
-            ]),
+            params: obj(params),
         });
         for reason in &data.not_converted {
+            if data.acceleration_q30 == 1 << 29 && data.tracker_xy.is_none()
+                && reason == avid_reader::animatte::ACCELERATION50_LEGACY_LOSS
+            {
+                // The typed source value lets each destination decide its own support.
+                continue;
+            }
             loss(out, budget, &p.id, "matte", reason.clone())?;
         }
     }

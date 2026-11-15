@@ -67,6 +67,7 @@ fn original(shape: &str) -> OriginalClip {
             stream_index: 0,
         }),
         audio: (!prores).then_some(OriginalAudio {
+            source_start: 0,
             sample_rate: 48000,
             channels: n,
             duration: 2 * TICKS_PER_SECOND,
@@ -91,6 +92,7 @@ fn original(shape: &str) -> OriginalClip {
 }
 fn input(c: OriginalClip) -> PreparedProjectInput {
     PreparedProjectInput {
+        autosync_bins: Default::default(),
         texts: Vec::new(),
         multicams: Vec::new(),
         multicam_uses: Vec::new(),
@@ -108,7 +110,9 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         track_states: Default::default(),
         picture_effects: Vec::new(),
         edit_labels: Vec::new(),
+        disabled_edits: Default::default(),
         direct_dnxhr_origins: Default::default(),
+        direct_dnxhd_pcm24: Default::default(),
         project_name: "Synthetic".into(),
         options: Options::default(),
         clips: vec![PreparedClip::Original(c)],
@@ -314,23 +318,33 @@ fn track_state_keeps_locked_edits_and_does_not_mute_audio() {
     input.sequences.push(sequence(vec![picture, a1, a2]));
     let states = vec![
         PreparedTrackState {
-            audio_track: None, name: Some("Image & café".into()), locked: true, picture_disabled: true,
+            lane: PreparedTrackLane::Picture(1), name: Some("Image & café".into()), locked: true, picture_disabled: true, create_empty: false,
         },
         PreparedTrackState {
-            audio_track: Some(1), name: Some("Dialogue".into()), locked: false, picture_disabled: false,
+            lane: PreparedTrackLane::Audio(1), name: Some("Dialogue".into()), locked: false, picture_disabled: false, create_empty: false,
         },
         PreparedTrackState {
-            audio_track: Some(2), name: Some("Dialogue".into()), locked: true, picture_disabled: false,
+            lane: PreparedTrackLane::Audio(2), name: Some("Dialogue".into()), locked: true, picture_disabled: false, create_empty: false,
+        },
+        PreparedTrackState {
+            lane: PreparedTrackLane::Picture(5), name: Some("Graphics".into()), locked: false, picture_disabled: false, create_empty: true,
+        },
+        PreparedTrackState {
+            lane: PreparedTrackLane::Audio(6), name: Some("Voiceover".into()), locked: false, picture_disabled: false, create_empty: true,
         },
     ];
     let mut invalid = states.clone();
-    invalid[2].audio_track = Some(1);
+    invalid[2].lane = PreparedTrackLane::Audio(1);
     input.track_states.insert(0, invalid);
     let mut ids = SeededUuids::new("track-state");
     assert!(prepare_typed_project(&input, &path, &mut ids, &[], false).is_err());
     assert!(!path.exists());
     let mut invalid = states.clone();
     invalid[2].picture_disabled = true;
+    input.track_states.insert(0, invalid);
+    assert!(input.validate().is_err());
+    let mut invalid = states.clone();
+    invalid[1].create_empty = true;
     input.track_states.insert(0, invalid);
     assert!(input.validate().is_err());
     input.track_states.insert(0, states.clone());
@@ -340,13 +354,18 @@ fn track_state_keeps_locked_edits_and_does_not_mute_audio() {
     let seq = project.sequences()[0];
     let video = project.video_tracks(seq);
     let audio = project.audio_tracks(seq);
-    for (lane, (track, state)) in [video[0], audio[0], audio[1]].into_iter().zip(states).enumerate() {
-        assert_eq!(project.track_clips(track).len(), 1);
+    assert_eq!((video.len(), audio.len()), (5, 6));
+    for state in states {
+        let (tracks, lane, tag) = match state.lane {
+            PreparedTrackLane::Picture(lane) => (&video, lane, "VideoClipTrack"),
+            PreparedTrackLane::Audio(lane) => (&audio, lane, "AudioClipTrack"),
+        };
+        let index = (lane - 1) as usize;
+        let track = tracks[index];
+        assert_eq!(project.track_clips(track).len(), usize::from(!state.create_empty));
         assert_eq!(project.is_locked(track).unwrap(), state.locked);
         assert_eq!(project.is_muted(track).unwrap(), state.picture_disabled);
-        let tag = if lane == 0 { "VideoClipTrack" } else { "AudioClipTrack" };
         let tree = &project.doc.tree;
-        let index = if lane == 0 { 0 } else { lane - 1 };
         let node = tree.findall(project.doc.root, tag).unwrap().into_iter()
             .find(|&track| tree.findtext(track, "ClipTrack/Track/Index").unwrap() == Some(index.to_string()))
             .unwrap();
@@ -664,4 +683,36 @@ fn original_refusals_are_atomic_and_legacy_model_remains_strict() {
     let c = legacy.clips.get_mut(&id).unwrap();
     c.audio[0].bits = 0;
     assert!(validate_model(&legacy).is_err());
+}
+
+#[test]
+fn disabled_mono_edit_round_trips_and_leaves_neighbors_enabled() {
+    let scratch = Scratch::new();
+    let mut input = input(original("wav16mono"));
+    let mut first = event();
+    first.video_track = None;
+    first.stereo.clear();
+    first.audio_tracks = vec![1];
+    first.audio_channels = vec![1];
+    let mut second = first.clone();
+    second.record_start = TICKS_PER_SECOND;
+    input.options.bin_mode = "separate".into();
+    input.sequences.push(sequence(vec![first, second]));
+    let target = scratch.0.join("disabled.prproj");
+    input.disabled_edits.insert((0, 2));
+    assert!(prepare_typed_project(&input, &target, &mut SeededUuids::new("disabled"), &[], false).is_err());
+    assert!(!target.exists());
+    input.disabled_edits.clear();
+    input.disabled_edits.insert((0, 1));
+    prepare_typed_project(&input, &target, &mut SeededUuids::new("disabled"), &[], false)
+        .unwrap().publish().unwrap();
+
+    let project = prproj::model::Project::from_document(
+        prproj::xml::parse_prproj(&target).unwrap(), &target,
+    ).unwrap();
+    let track = project.audio_tracks(project.sequences()[0])[0];
+    let [a, b] = project.track_clips(track) else { panic!("expected two mono placements") };
+    assert!(!project.is_disabled(*a).unwrap());
+    assert!(project.is_disabled(*b).unwrap());
+    assert!(!project.is_muted(track).unwrap());
 }

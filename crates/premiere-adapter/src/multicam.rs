@@ -140,7 +140,7 @@ pub(super) fn prepare(
             let clip = clip_id(picture.item.as_deref().unwrap());
             if direct && !pcm24_direct.contains(clip.as_str()) {
                 return Err(refusal(&m.id, &format!(
-                    "linked camera {} requires qualified DNxHR LB and two original mono PCM24 siblings",
+                    "linked camera {} requires qualified DNx LB and two original mono PCM24 siblings",
                     i + 1
                 )));
             }

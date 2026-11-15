@@ -8,7 +8,7 @@ use crate::base64::b64encode;
 use crate::build::mask::{attach_sub_mask, build_mask_component, build_mask_params};
 use crate::build::fmt::format_lumetri_value;
 use crate::build::{leaf, top};
-use crate::error::{value, Result};
+use crate::error::{value, Error, Result};
 use crate::model::{Project, TrackItemId};
 use crate::payload::set_payload;
 use crate::xml::mutations::remove_child;
@@ -200,8 +200,16 @@ pub fn apply_matte(project: &mut Project, placed: TrackItemId, matte: &Matte, so
             let at = tree.children(path).iter().position(|&c| c == control).unwrap();
             tree.insert(path, at + 1, varying);
             let position = tree.child_by_tag(path, "StartKeyframePosition").unwrap();
-            let text: String =
-                keys.iter().map(|(frame, points)| format!("{},{};", source_in + frame * unit, b64encode(&path_payload(points)))).collect();
+            let mut text = String::new();
+            for (frame, points) in keys {
+                let tick = frame.checked_mul(unit)
+                    .and_then(|offset| source_in.checked_add(offset))
+                    .ok_or_else(|| Error::Value(format!(
+                        "AniMatte shape {} key at frame {frame} exceeds the Premiere tick range",
+                        index + 1
+                    )))?;
+                text.push_str(&format!("{tick},{};", b64encode(&path_payload(points))));
+            }
             let frames = tree.new_element("Keyframes");
             tree.set_text(frames, Some(text));
             let tail = tree.tail(position).map(String::from);

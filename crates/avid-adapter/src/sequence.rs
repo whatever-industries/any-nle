@@ -1,5 +1,11 @@
 use super::*;
 use avid_reader::source as av;
+mod disabled;
+
+fn portable_track_name(track: &av::SourceTrackName) -> Option<&str> {
+    (!track.ambiguous && !track.name.chars().any(char::is_control))
+        .then_some(track.name.as_str())
+}
 
 fn routes(routes: &[av::RouteWitness]) -> Value {
     Value::Arr(
@@ -217,6 +223,22 @@ fn source_issue_receipt(issue: &av::SourceIssue) -> Value {
         ("record_rate", issue.record_rate.map(|r| s(rational(r))).unwrap_or(Value::Null)),
         ("route", routes(&issue.route)),
     ];
+    if let av::SourceIssueKind::DisabledClip { length, backing_class, plain_mono, plain_stereo, neutral_picture } = issue.issue_kind {
+        fields.extend([
+            ("disabled_clip", Value::Bool(true)),
+            ("record_length", Value::Int(length)),
+            ("backing_class", s(String::from_utf8_lossy(&backing_class))),
+        ]);
+        if plain_mono {
+            fields.push(("plain_mono_backing", Value::Bool(true)));
+        }
+        if plain_stereo {
+            fields.push(("plain_stereo_backing", Value::Bool(true)));
+        }
+        if let Some(package) = neutral_picture {
+            fields.push(("neutral_picture_file", s(package.umid_hex())));
+        }
+    }
     extend_effect_issue(issue, &mut fields);
     obj(fields)
 }
@@ -334,6 +356,7 @@ pub(super) fn append(
         .map(|c| c.exact_start().ok_or("qualified sequence clock overflow"))
         .transpose()?;
     let mut seq = SourceSequence {
+            disabled_placements: Vec::new(),
             texts: Vec::new(),
         id: id.clone(),
         name: source.info.name.clone(),
@@ -566,6 +589,29 @@ pub(super) fn append(
                 }
             }
         }
+        if let Some(av::PanAutomation::Keys(points)) = &event.pan_automation {
+            if e.kind == KIND_SOUND && e.combined.is_none() && e.via.is_empty()
+                && range.record_rate == rate && Some(rate) == av::Rate::new(24, 1)
+                && range.source_rate == rate && range.source_length == range.length
+                && event.motion_adapter_phase.is_none() && p.speed.is_none() && p.frame_map.is_none()
+                && (2..=audio_pan::MAX_KEYS).contains(&points.len())
+            {
+                let keys = points.iter().map(|point| {
+                    if point.frame_numerator < 0 || point.frame_denominator <= 0 {
+                        return None;
+                    }
+                    Some(audio_pan::PanKey {
+                        at: Rational::new(i128::from(point.frame_numerator),
+                            i128::from(point.frame_denominator) * 24)?,
+                        pan: Rational::new(i128::from(point.raw_pan) - 16_384, 16_384)?,
+                    })
+                }).collect::<Option<Vec<_>>>();
+                if let Some(keys) = keys.filter(|keys| audio_pan::valid_keys(keys, p.duration)) {
+                    budget.charge(keys.len() * 384 + 512)?;
+                    p.effects.push(audio_pan::linear_effect(&keys));
+                }
+            }
+        }
         let corner_pin = e.picture.as_ref().and_then(|fx| fx.corner_pin).filter(|_|
             e.kind == KIND_PICTURE && !e.picture_nested
                 && e.color.is_none() && e.animatte.is_none() && event.picture_extension.is_none()
@@ -763,10 +809,16 @@ pub(super) fn append(
     out.graph
         .losses
         .retain(|l| !removed_ids.contains(&l.object));
+    let portable_pan: HashSet<_> = seq.placements.iter()
+        .filter(|edit| edit.effects.iter().any(|effect| effect.kind == audio_pan::LINEAR_KIND))
+        .map(|edit| edit.id.as_str())
+        .collect();
+    seq.disabled_placements = disabled::capture(source, copies, &out.graph, budget)?;
     let mut reported_pan = HashSet::new();
     for event in &source.events {
         if let (Some(automation), Some(placement)) = (&event.pan_automation, map.get(&event.id)) {
             let reason = match automation {
+                av::PanAutomation::Keys(_) if portable_pan.contains(placement.as_str()) => continue,
                 av::PanAutomation::Keys(_) => "Avid clip pan keys are retained in source facts and omitted from the converted edit",
                 av::PanAutomation::Unsupported(reason) => reason,
             };
@@ -910,14 +962,23 @@ pub(super) fn append(
             tracks.insert((t.kind, t.index));
         }
     }
-    seq.tracks = tracks
-        .into_iter()
-        .map(|(kind, index)| Track {
-            kind,
-            index,
-            level_db: None,
+    let named_lanes: HashMap<_, _> = source.track_names.iter()
+        .filter_map(|track| {
+            let name = portable_track_name(track)?;
+            let kind = kind(track.kind)?;
+            Some(((kind, track.label), (name, track.plain_empty)))
         })
         .collect();
+    tracks.extend(named_lanes.keys().copied());
+    seq.tracks = tracks.into_iter().map(|(kind, index)| {
+        let mut track = SourceTrack::new(kind, index, None);
+        if let Some(&(name, empty)) = named_lanes.get(&(kind, index)) {
+            budget.charge(name.len())?;
+            track.name = Some(name.into());
+            track.empty = empty;
+        }
+        Ok(track)
+    }).collect::<Result<_, String>>()?;
     seq.tracks
         .sort_by_key(|t| (if t.kind == StreamKind::Video { 0 } else { 1 }, t.index));
     for issue in &source.unresolved {
@@ -943,6 +1004,17 @@ pub(super) fn append(
                 };
                 loss(out, budget, id, aspect,
                     format!("V{} {position}: {}", issue.track, issue.reason))?;
+            }
+            av::SourceIssueKind::DisabledClip { length, .. } => {
+                let lane = if issue.kind == KIND_PICTURE { "V" } else { "A" };
+                let position = match &issue.record_start {
+                    Observed::Known(frame) => format!("at record frame {frame}"),
+                    Observed::Unresolved(_) => "at unresolved record position".into(),
+                };
+                loss(out, budget, id, "disabled_clip", format!(
+                    "{}: {lane}{} {position} for {length} frames. {}",
+                    issue.owner, issue.track, issue.reason,
+                ))?;
             }
             av::SourceIssueKind::Route => {
                 loss(out, budget, id, "source_route", issue.reason.clone())?;
@@ -1096,6 +1168,23 @@ pub(super) fn append(
             ("marker_native", Value::Arr(marker_receipts)),
         ].into_iter().chain((!source.group_uses.is_empty()).then(||("native_group_uses",Value::Arr(source.group_uses.iter().map(group_use_native).collect())))).collect()),
     )?;
+    let unresolved_names: Vec<_> = source.track_names.iter()
+        .filter(|track| portable_track_name(track).is_none())
+        .map(|track| {
+            let mut fields = vec![
+                ("kind", Value::Int(track.kind)),
+                ("track", Value::Int(track.label)),
+                ("name", s(&track.name)),
+                ("ambiguous", Value::Bool(track.ambiguous)),
+            ];
+            if track.plain_empty {
+                fields.push(("plain_empty", Value::Bool(true)));
+            }
+            obj(fields)
+        }).collect();
+    if !unresolved_names.is_empty() {
+        sidecar(out, budget, "avid.track_names", id, Value::Arr(unresolved_names))?;
+    }
     for issue in &source.info.problems {
         out.diagnostics
             .push(format!("{:?}: {issue}", source.info.name));
@@ -1104,7 +1193,7 @@ pub(super) fn append(
         size_of::<SourceSequence>()
             + seq.id.len()
             + seq.name.capacity()
-            + seq.tracks.len() * size_of::<Track>(),
+            + seq.tracks.len() * size_of::<SourceTrack>(),
     )?;
     out.graph.sequences.push(seq);
     multicams.append_uses(source, &map, out, budget)?;

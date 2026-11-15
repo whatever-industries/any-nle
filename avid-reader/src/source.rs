@@ -161,12 +161,31 @@ pub struct SourceMaster {
     pub originals: Vec<Option<OriginalTrack>>,
     /// Saved direct file-to-physical timecode routes, in master track order.
     pub file_clocks: Vec<Option<SavedFileClock>>,
+    /// A saved import route. The original WAV bytes have not been verified.
+    pub imported_audio: Option<Box<SavedPcmImport>>,
     /// Observed on the directly referenced picture file mob, in master track order.
     pub input_transforms: Vec<SourceInputTransform>,
     /// Picture master selected by a qualified traditional Freeze Frame owner.
     pub rendered_freeze: bool,
     /// Upstream precompute identity for a timeline-bound AudioSuite Gain master.
     pub rendered_gain: Option<crate::io::MobId>,
+}
+#[derive(Debug)]
+pub struct SavedPcmImport {
+    pub locator: String,
+    pub physical_package: crate::io::MobId,
+    pub start_frame: i64,
+    pub frames: i64,
+    /// Saved ordinal within the physical package. File channel identity needs
+    /// independent verification against the eight managed files.
+    pub lanes: [SavedPcmImportLane; 8],
+}
+#[derive(Debug, Clone, Copy)]
+pub struct SavedPcmImportLane {
+    pub master_track: i64,
+    pub file_package: crate::io::MobId,
+    pub file_track: i64,
+    pub physical_track: i64,
 }
 #[derive(Debug)]
 pub struct SourceInputTransform {
@@ -377,6 +396,7 @@ pub enum SourceIssueKind {
     RouteTiming,
     MatteKey { length: Option<i64> },
     ColorAdapter { length: Option<i64> },
+    DisabledClip { length: i64, backing_class: [u8; 4], plain_mono: bool, plain_stereo: bool, neutral_picture: Option<MobId> },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatteInput {
@@ -438,6 +458,7 @@ pub struct SourceSequence {
     pub info: SequenceInfo,
     pub rate: Option<Rate>,
     pub clock: Option<SequenceClock>,
+    pub track_names: Vec<SourceTrackName>,
     /// Native input-channel count for each sequence-local `event.combined` group.
     /// Includes unresolved/unsupported inputs that emitted no qualified event.
     /// An absent group witness cannot establish a complete atomic combiner.
@@ -448,6 +469,16 @@ pub struct SourceSequence {
     pub unresolved: Vec<SourceIssue>,
     pub texts: Vec<SourceText>,
     pub group_uses: Vec<SourceGroupUse>,
+}
+
+#[derive(Debug)]
+pub struct SourceTrackName {
+    pub kind: i64,
+    pub label: i64,
+    pub name: String,
+    pub ambiguous: bool,
+    /// Direct filler only, with a standard mono format on audio tracks.
+    pub plain_empty: bool,
 }
 
 /// Absolute frame count from the qualified direct primary timecode track.
@@ -561,6 +592,7 @@ impl SourceSequence {
             info: SequenceInfo::source_metadata(name, bin, edit_rate, length),
             rate,
             clock: None,
+            track_names: Vec::new(),
             combiner_channels: Vec::new(),
             events: Vec::new(),
             transitions: Vec::new(),

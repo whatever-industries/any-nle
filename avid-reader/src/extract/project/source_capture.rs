@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::mem::size_of;
 use std::rc::Rc;
 mod groups;
+mod imported_audio;
 mod matte;
 mod timewarp;
 pub(super) use timewarp::{direct_input as timewarp_input, is_sampled_effect, uses_editable_position};
@@ -362,6 +363,7 @@ pub(super) struct MasterMeta {
     pub(super) marker_witnesses: Vec<MasterMarkerWitness>,
     pub(super) originals: Vec<Option<OriginalTrack>>,
     pub(super) file_clocks: Vec<Option<SavedFileClock>>,
+    pub(super) imported_audio: Option<Box<SavedPcmImport>>,
     pub(super) input_transforms: Vec<SourceInputTransform>,
     pub(super) rendered_freeze: bool,
     pub(super) rendered_gain: Option<MobId>,
@@ -507,7 +509,7 @@ impl InputContext {
                 let file_track = matched.and_then(|t| ctx.only_source_clip(t).ok()).and_then(|c| int(c, "track_id"));
                 let descriptor = file.and_then(|m| ctx.deref(m.get("descriptor")));
                 if !reserve(&self.budget, &mut file_clocks, 1) { break; }
-                file_clocks.push(file.and_then(|file| saved_file_clock(ctx, file, native, file_track?)));
+                file_clocks.push(file.and_then(|file| saved_file_clock(ctx, file, native, file_track?, ambiguous)));
                 let original = descriptor.and_then(|d| {
                     let mut locators = Vec::new();
                     let mut current = Some(d);
@@ -591,6 +593,9 @@ impl InputContext {
             }
         }
         let imported_still = self.imported_still(ctx, mob, &id, ambiguous);
+        let imported_audio = master.and_then(|master| {
+            imported_audio::capture(ctx, mob, master, &offsets, &file_clocks, ambiguous, &self.budget)
+        });
         MasterMeta {
             rendered_freeze: false,
             rendered_gain: None,
@@ -598,6 +603,7 @@ impl InputContext {
             offsets,
             marker_witnesses,
             originals,
+            imported_audio,
             file_clocks,
             input_transforms,
             imported_still,
@@ -667,11 +673,25 @@ impl InputContext {
 
 fn saved_file_clock(
     ctx: &Ctx<'_>, file: &Node, native: &MediaTrack, file_track: i64,
+    ambiguous: &HashSet<MobId>,
 ) -> Option<SavedFileClock> {
     let file_tracks = ctx.tracks(file);
     let [track] = file_tracks.as_slice() else { return None; };
     if int(track, "index") != Some(file_track) { return None; }
-    let clip = ctx.deref(track.get("component"))?;
+    let component = ctx.deref(track.get("component"))?;
+    let wrapped = component.class == *b"SEQU";
+    let clip = if wrapped {
+        if native.kind != KIND_PICTURE || file_track != 1
+            || ambiguous.contains(&native.file_mob)
+            || float(file, "edit_rate") != Some(24.0)
+            || int(file, "mob_type_id") != Some(MOB_SOURCE)
+        {
+            return None;
+        }
+        bracketed_24_component(ctx, component, KIND_PICTURE, *b"SCLP")?
+    } else {
+        component
+    };
     if clip.class != *b"SCLP" || int(clip, "media_kind_id") != Some(native.kind)
         || int(clip, "length") != Some(native.clip_length)
     {
@@ -679,6 +699,11 @@ fn saved_file_clock(
     }
     let rate = float(clip, "edit_rate").and_then(Rate::from_avid)?;
     let package = mob_id(clip)?;
+    if wrapped && (package == native.file_mob || ambiguous.contains(&package)
+        || int(clip, "track_id") != Some(1))
+    {
+        return None;
+    }
     let physical = ctx.mobs.get(&package)?;
     if int(physical, "mob_type_id") != Some(MOB_SOURCE)
         || float(physical, "edit_rate").and_then(Rate::from_avid) != Some(rate)
@@ -691,10 +716,15 @@ fn saved_file_clock(
         .filter(|c| int(c, "media_kind_id") == Some(KIND_TIMECODE));
     let owner = tc.next()?;
     if tc.next().is_some() { return None; }
-    let segments = ctx.segments(owner);
-    let mut segments = segments.into_iter().filter(|(_, s)| int(s, "length").is_some_and(|n| n > 0));
-    let (0, segment) = segments.next()? else { return None; };
-    if segments.next().is_some() { return None; }
+    let segment = if wrapped {
+        bracketed_24_component(ctx, owner, KIND_TIMECODE, *b"TCCP")?
+    } else {
+        let segments = ctx.segments(owner);
+        let mut segments = segments.into_iter().filter(|(_, s)| int(s, "length").is_some_and(|n| n > 0));
+        let (0, segment) = segments.next()? else { return None; };
+        if segments.next().is_some() { return None; }
+        segment
+    };
     if segment.class != *b"TCCP"
         || float(segment, "edit_rate").and_then(Rate::from_avid) != Some(rate)
     {
@@ -711,6 +741,29 @@ fn saved_file_clock(
         package, rate, count, offset, base: int(segment, "fps")?,
         drop: int(segment, "flags")? & 1 != 0, file_track,
     })
+}
+
+// Avid's linked 24p file and physical TC1 tracks use explicit zero-length
+// boundary fillers. Other children can change the origin or the binding.
+fn bracketed_24_component<'a>(
+    ctx: &Ctx<'a>, wrapper: &'a Node, kind: i64, class: [u8; 4],
+) -> Option<&'a Node> {
+    let matching = |node: &Node| {
+        int(node, "media_kind_id") == Some(kind) && float(node, "edit_rate") == Some(24.0)
+    };
+    if wrapper.class != *b"SEQU" || !matching(wrapper) {
+        return None;
+    }
+    let Value::RefList(children) = wrapper.get("components")? else { return None; };
+    let [first, middle, last] = children.as_slice() else { return None; };
+    for filler in [first, last] {
+        let node = ctx.deref(Some(filler))?;
+        if node.class != *b"FILL" || int(node, "length") != Some(0) || !matching(node) {
+            return None;
+        }
+    }
+    let node = ctx.deref(Some(middle))?;
+    (node.class == class && matching(node) && int(node, "length")? > 0).then_some(node)
 }
 
 struct Scope {
@@ -855,6 +908,7 @@ pub(super) struct Capture {
     charged_ops: usize,
     primary_timecode_seen: bool,
     clock: Option<SequenceClock>,
+    track_names: Vec<crate::source::SourceTrackName>,
 }
 impl std::fmt::Debug for Capture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -862,6 +916,51 @@ impl std::fmt::Debug for Capture {
     }
 }
 impl Capture {
+    pub(super) fn track_names(&mut self, ctx: &Ctx<'_>, tracks: &[&Node]) {
+        // An unnamed duplicate slot can also make a named lane ambiguous.
+        let mut lanes = std::collections::BTreeMap::new();
+        for track in tracks {
+            let Some(label @ 1..=99) = int(track, "index") else { continue };
+            let Some(component) = ctx.deref(track.get("component")) else { continue };
+            let Some(kind @ (KIND_PICTURE | KIND_SOUND)) = int(component, "media_kind_id") else { continue };
+            let entry = lanes.entry((kind, label)).or_insert((None, 0usize, false));
+            entry.1 += 1;
+            if let Some(Value::Attrs(attrs)) = ctx.deref(track.get("attributes")).and_then(|node| node.get("entries")) {
+                let mut names = attrs.iter().filter(|(key, _)| key == "_COMMENT");
+                let first = names.next().and_then(|(_, value)| value.as_str());
+                if names.next().is_some() {
+                    entry.1 += 1;
+                }
+                if entry.0.is_none() {
+                    entry.0 = first.filter(|name| !name.is_empty());
+                    if entry.0.is_some() {
+                        let mut formats = attrs.iter().filter(|(key, _)| key == "_TRACK_FORMAT");
+                        let supported = kind == KIND_PICTURE || (formats.next()
+                            .is_none_or(|(_, value)| value.as_int() == Some(1)) && formats.next().is_none());
+                        let filler = |node: &Node| node.class == *b"FILL"
+                            && int(node, "media_kind_id") == Some(kind)
+                            && int(node, "length").is_some_and(|length| length >= 0);
+                        entry.2 = supported && (filler(component) || (component.class == *b"SEQU"
+                            && matches!(component.get("components"), Some(Value::RefList(children))
+                                if children.iter().all(|child| ctx.deref(Some(child)).is_some_and(filler)))));
+                    }
+                }
+            }
+        }
+        for ((kind, label), (name, count, plain_empty)) in lanes {
+            let Some(name) = name else { continue };
+            if !reserve(&self.budget, &mut self.track_names, 1) {
+                return;
+            }
+            self.track_names.push(crate::source::SourceTrackName {
+                kind, label,
+                name: copy_text(&self.budget, name),
+                ambiguous: count != 1,
+                plain_empty,
+            });
+        }
+    }
+
     pub(super) fn capture_pvol(
         &mut self, ctx: &Ctx<'_>, node: &Node, tracks: &[&Node], position: i64,
     ) -> (Option<super::volume::Capture<VolumePoint>>, Option<super::volume::Capture<PanPoint>>) {
@@ -891,6 +990,7 @@ impl Capture {
             charged_ops: 0,
             primary_timecode_seen: false,
             clock: None,
+            track_names: Vec::new(),
         }
     }
     pub(super) fn reserve_track_format(&mut self, values: &mut Vec<(i64, i64)>) -> bool {
@@ -1328,6 +1428,156 @@ impl Capture {
             constant_speed: None,
         });
     }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn note_disabled_clip(
+        &mut self,
+        ctx: &Ctx<'_>,
+        selector: &Node,
+        active_track: &Node,
+        backing_track: &Node,
+        record: i64,
+        kind: i64,
+        track: i64,
+    ) {
+        let (Some(active), Some(backing)) = (
+            ctx.deref(active_track.get("component")),
+            ctx.deref(backing_track.get("component")),
+        ) else { return };
+        let Some(scope) = self.stack.last().map(|&i| &self.scopes[i]) else {
+            return;
+        };
+        let mut flags = borrowed_attrs(ctx, selector).iter()
+            .filter(|(name, _)| name == "_DISABLE_CLIP_FLAG");
+        let Some(length) = scope.record_length.filter(|&n| n > 0) else { return };
+        if !matches!(flags.next(), Some((_, Value::Int(1))))
+            || flags.next().is_some()
+            || int(selector, "selected") != Some(0)
+            || active.class != *b"FILL"
+            || !matches!(&backing.class, b"SCLP" | b"TKFX")
+            || !matches!(kind, KIND_PICTURE | KIND_SOUND)
+            || !scope.group_path
+            || !scope.position_known
+            || [selector, active, backing].iter().any(|node| {
+                int(node, "length") != Some(length)
+                    || int(node, "media_kind_id") != Some(kind)
+                    || float(node, "edit_rate").and_then(Rate::from_avid) != self.rate
+            })
+        {
+            return;
+        }
+        let mut route = Vec::new();
+        if let (Some(mob), Some(label)) = (mob_id(backing), int(backing, "track_id")) {
+            if !reserve(&self.budget, &mut route, 1) {
+                return;
+            }
+            route.push(witness(mob, label, self.rate, int(backing, "start_time"), Some(length), &self.budget));
+        }
+        let absent = |node: &Node, key| matches!(node.get(key), None | Some(Value::Null));
+        let plain = |node: &Node| {
+            ["param_list", "precomputed", "session_attrs", "right_bob"]
+                .into_iter().all(|key| absent(node, key))
+        };
+        let neutral_selector = borrowed_attrs(ctx, selector).len() == 1
+            && [selector, active, backing].iter().all(|node| plain(node))
+            && absent(selector, "left_bob") && absent(active, "left_bob")
+            && absent(active, "attributes");
+        let plain_audio = neutral_selector && kind == KIND_SOUND
+            && absent(backing, "left_bob") && absent(backing, "attributes");
+        let direct = self.stack.iter().rev().skip(1).all(|&i| self.scopes[i].class == *b"SEQU");
+        let plain_mono = plain_audio && backing.class == *b"SCLP";
+        let picture_package = || {
+            if !neutral_selector || !direct || kind != KIND_PICTURE || track != 1
+                || self.rate != Rate::new(24, 1) || backing.class != *b"SCLP"
+                || int(backing, "track_id") != Some(1) || !absent(backing, "effect_id")
+                || int(active_track, "lock_number") != Some(0)
+                || int(backing_track, "lock_number") != Some(0)
+                || !absent(backing_track, "filler_proxy")
+                || !matches!(borrowed_attrs(ctx, backing), [(name, Value::Str(xml))]
+                    if name == "_IMAGE_BOUNDS_OVERRIDE" && matte::equal_1600_picture_bounds(xml))
+            {
+                return None;
+            }
+            let proxy = ctx.deref(active_track.get("filler_proxy"))?;
+            if proxy.class != *b"TRKR"
+                || int(proxy, "media_kind_id") != Some(KIND_PICTURE)
+                || float(proxy, "edit_rate").and_then(Rate::from_avid) != self.rate
+                || int(proxy, "relative_scope") != Some(1) || int(proxy, "relative_track") != Some(-1)
+                || !plain(proxy) || !absent(proxy, "left_bob") || !absent(proxy, "attributes")
+            {
+                return None;
+            }
+            // DIDP is a saved witness for this file and trim. Its byte offsets
+            // are unnecessary because the destination links the verified file.
+            let cache = ctx.deref(backing.get("left_bob"))?;
+            let start = int(backing, "start_time").filter(|&value| value >= 0)?;
+            if cache.class != *b"DIDP" || int(cache, "sample_num") != Some(start)
+                || int(cache, "length") != Some(length)
+                || int(cache, "track_type") != Some(KIND_PICTURE) || int(cache, "track_index") != Some(1)
+                || int(cache, "strip") != Some(0) || cache.get("spos_invalid") != Some(&Value::Bool(false))
+            {
+                return None;
+            }
+            mob_id(cache)
+        };
+        let stereo_sources = || {
+            if !plain_audio
+                || backing.class != *b"TKFX"
+                || self.rate != Rate::new(24, 1)
+                || !direct
+                || backing.get("effect_id").and_then(Value::as_str) != Some("EFF2_AUDIO_CHANNEL_COMBINER")
+                || !["keyframes", "trackman"].into_iter().all(|key| absent(backing, key))
+                || ["mc_mode", "num_scalars", "info_current", "info_smooth", "info_is_reversed"]
+                    .into_iter().any(|key| int(backing, key) != Some(0))
+            {
+                return None;
+            }
+            let inputs = ctx.tracks(backing);
+            let [left, right] = inputs.as_slice() else { return None };
+            let source = |input: &Node, channel| {
+                let node = ctx.deref(input.get("component"))?;
+                if int(input, "index") != Some(channel)
+                    || int(input, "lock_number") != Some(0)
+                    || node.class != *b"SCLP"
+                    || int(node, "track_id") != Some(channel)
+                    || int(node, "media_kind_id") != Some(KIND_SOUND)
+                    || int(node, "length") != Some(length)
+                    || float(node, "edit_rate").and_then(Rate::from_avid) != self.rate
+                    || !plain(node) || !absent(node, "left_bob") || !absent(node, "attributes") || !absent(node, "effect_id")
+                {
+                    return None;
+                }
+                Some((mob_id(node)?, int(node, "start_time").filter(|&start| start >= 0)?))
+            };
+            let (first_mob, first_start) = source(left, 1)?;
+            let (second_mob, second_start) = source(right, 2)?;
+            (first_mob == second_mob && first_start == second_start).then_some((first_mob, first_start))
+        };
+        let plain_stereo = if let Some((mob, start)) = stereo_sources() {
+            if !reserve(&self.budget, &mut route, 2) {
+                return;
+            }
+            route.extend([1, 2].map(|channel| witness(mob, channel, self.rate, Some(start), Some(length), &self.budget)));
+            true
+        } else {
+            false
+        };
+        add_classified_issue(
+            &IssueContext {
+                owner: &scope.id,
+                record,
+                position_known: true,
+                rate: self.rate,
+                kind,
+                track,
+            },
+            SourceIssueKind::DisabledClip { length, backing_class: backing.class, plain_mono, plain_stereo, neutral_picture: picture_package() },
+            "Disabled Avid clip kept as a gap. The inactive clip cannot be re-enabled in the converted timeline.",
+            route,
+            &self.budget,
+            &mut self.adapter_issues,
+        );
+    }
+
     pub(super) fn unresolved_motion_adapter(&mut self, record: i64, kind: i64, track: i64) {
         self.unresolved_motion(record, kind, track, "Avid Motion Adapter timing is not supported");
     }
@@ -2166,10 +2416,9 @@ fn binding_scope(scope: &Scope, starts: &[usize], events: &[SourceEvent], issues
         placements.push(copy_text(budget, &e.id));
     }
     let reason = if issues.iter().any(|i| {
-        i.owner == scope.id
-            || i.owner
-                .strip_prefix(&scope.id)
-                .is_some_and(|rest| rest.starts_with('/'))
+        !matches!(i.issue_kind, SourceIssueKind::DisabledClip { .. })
+            && (i.owner == scope.id
+                || i.owner.strip_prefix(&scope.id).is_some_and(|rest| rest.starts_with('/')))
     }) {
         Some(copy_text(
             budget,
@@ -2595,6 +2844,7 @@ fn finish_source(
         info,
         rate: capture.rate,
         clock: capture.clock,
+        track_names: capture.track_names,
         combiner_channels,
         events,
         transitions,
@@ -2744,6 +2994,7 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
                                 marker_witnesses: meta.marker_witnesses,
                                 originals: meta.originals,
                                 file_clocks: meta.file_clocks,
+                                imported_audio: meta.imported_audio,
                                 input_transforms: meta.input_transforms,
                                 rendered_freeze: meta.rendered_freeze,
                                 rendered_gain: meta.rendered_gain,
@@ -3026,5 +3277,49 @@ mod budget_tests {
         let text = formatted(&budget, format_args!("more than two"));
         assert_eq!(text.capacity(), 0);
         assert!(budget.as_ref().borrow().error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod wrapped_clock_tests {
+    use super::*;
+    use crate::{document::AvbDocument, file::Object};
+
+    #[test]
+    fn linked_picture_clock_wrapper_rejects_position_changing_filler() {
+        let bytes = AvbDocument::new_empty_bin(19, "Clock control", 1, false).to_bytes().unwrap();
+        let mut file = AvbFile::parse(&bytes).unwrap();
+        let start = file.objects.len() as u32;
+        let build = |class, length| Object::Decoded(Node {
+            class,
+            type_name: "clock control",
+            fields: vec![
+                ("media_kind_id", Value::Int(KIND_TIMECODE)),
+                ("edit_rate", Value::Float(24.0)),
+                ("length", Value::Int(length)),
+            ],
+        });
+        file.objects.extend([
+            Some(build(*b"FILL", 0)),
+            Some(build(*b"TCCP", 48)),
+            Some(build(*b"FILL", 0)),
+        ]);
+        let wrapper = Node {
+            class: *b"SEQU",
+            type_name: "clock control wrapper",
+            fields: vec![
+                ("media_kind_id", Value::Int(KIND_TIMECODE)),
+                ("edit_rate", Value::Float(24.0)),
+                ("components", Value::RefList((start..start + 3).map(Value::Ref).collect())),
+            ],
+        };
+        let clock_leaf = |file: &AvbFile| {
+            let ctx = Ctx { file, mobs: HashMap::new() };
+            bracketed_24_component(&ctx, &wrapper, KIND_TIMECODE, *b"TCCP")
+                .and_then(|component| int(component, "length"))
+        };
+        assert_eq!(clock_leaf(&file), Some(48));
+        file.objects[start as usize] = Some(build(*b"FILL", 1));
+        assert_eq!(clock_leaf(&file), None);
     }
 }

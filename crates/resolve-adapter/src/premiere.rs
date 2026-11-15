@@ -17,9 +17,9 @@ use crate::{
 use graph::{
     source::{
         OriginalStream, SourceClock, SourceClockProvenance, SourceGraph, SourceItem,
-        SourceBinding, SourceItemMedia, SourceMedia, SourceSequence, SourceText, SourceTransition, TextKind,
+        SourceBinding, SourceItemMedia, SourceMedia, SourceSequence, SourceTrack, SourceText, SourceTransition, TextKind,
     },
-    Bin, Loss, Placement, Project as GraphProject, Rational, Sidecar, StreamKind, Track, Value,
+    Bin, Loss, Placement, Project as GraphProject, Rational, Sidecar, StreamKind, Value,
 };
 use prproj::{
     build::time::TICKS_PER_SECOND,
@@ -189,6 +189,7 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         &mut graph.bins,
     )?;
     let mut out = SourceSequence {
+        disabled_placements: Vec::new(),
         id: id.clone(),
         name: project.sequence_name(sequence),
         rate,
@@ -257,11 +258,7 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
             } else {
                 None
             };
-            out.tracks.push(Track {
-                kind,
-                index,
-                level_db,
-            });
+            out.tracks.push(SourceTrack::new(kind, index, level_db));
             for &clip in &track.clips {
                 if out.placements.len() == MAX_EDITS {
                     return Err("Premiere sequence exceeds edit limit".into());

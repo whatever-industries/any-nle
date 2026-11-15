@@ -125,6 +125,7 @@ fn fixture(channels: i64) -> (av::SourceProject, index::MediaIndex) {
         marker_witnesses: vec![],
         originals: vec![],
         file_clocks: vec![],
+        imported_audio: None,
         input_transforms: vec![],
         rendered_freeze: false,
         rendered_gain: None,
@@ -268,7 +269,7 @@ fn matte_key_loss_is_locatable_after_graph_reload() {
 }
 
 #[test]
-fn avid_pan_keys_survive_graph_reload_with_an_occurrence_loss() {
+fn avid_pan_keys_survive_graph_reload_on_the_owning_placement() {
     let (mut facts, index) = fixture(1);
     let mut edit = event("pan-edit", 1, 1, 0, 24, None);
     edit.pan_automation = Some(av::PanAutomation::Keys(vec![
@@ -294,9 +295,12 @@ fn avid_pan_keys_survive_graph_reload_with_an_occurrence_loss() {
     assert_eq!(keys[1].get("frame_denominator"), Some(&Value::Int(2)));
     assert_eq!(keys[1].get("raw_pan"), Some(&Value::Int(32768)));
     assert!(placement.volume_keys.is_empty());
-    assert_eq!(graph.losses.iter().filter(|l| {
-        l.object == placement.id && l.aspect == "pan_automation"
-    }).count(), 1);
+    let [effect] = placement.effects.as_slice() else { panic!("expected one clip pan curve") };
+    let keys = graph::audio_pan::read_linear(effect, placement.duration).unwrap();
+    assert_eq!(keys[0].pan, Rational::integer(-1));
+    assert_eq!(keys[1].at, Rational::new(25, 48).unwrap());
+    assert_eq!(keys[1].pan, Rational::integer(1));
+    assert!(!graph.losses.iter().any(|l| l.object == placement.id && l.aspect == "pan_automation"));
 }
 fn run(f: &av::SourceProject, i: &index::MediaIndex) -> ReadResult {
     build(f, i, "project", &["bin".into()]).unwrap()
@@ -435,6 +439,71 @@ fn source_resize_curves_override_the_cached_static_values() {
     assert_eq!(p.transform.as_ref().unwrap().scale, (80.0, 120.0));
     assert_eq!(p.effects[0].kind, "avid.resize_linear");
 }
+#[test]
+fn mixed_and_animated_animatte_controls_survive_graph_reload() {
+    use avid_reader::animatte::{AniMatteData, AniMattePoint, AniMatteShape, AniMatteState};
+    let (mut facts, mut index) = fixture(1);
+    let track = &mut facts.masters[0].master.tracks[0];
+    track.kind = KIND_PICTURE;
+    track.edit_rate = 24.0;
+    track.length = 48;
+    track.essence = Some(Essence::Picture {
+        compression: "AVHD".into(), resolution_id: 0, width: 1920, height: 1080,
+        display_aspect: Some((16, 9)),
+    });
+    index.identities.values_mut().next().unwrap().file_tracks = vec![(24, 1, 48)];
+    let rectangle = [[-120.0, -80.0], [0.0, -80.0], [0.0, 0.0], [-120.0, 0.0]];
+    let inside = AniMatteShape {
+        id: 1,
+        key_out: false,
+        opacity: 100.0,
+        feather: [0.0, 0.0],
+        points: rectangle.into_iter().map(|xy| AniMattePoint {
+            xy, incoming: [0.0; 2], outgoing: [0.0; 2], corner: true,
+        }).collect(),
+    };
+    let mut outside = inside.clone();
+    outside.id = 2;
+    outside.key_out = true;
+    for point in &mut outside.points {
+        point.xy[0] += 66.0;
+    }
+    let mut end = outside.clone();
+    end.opacity = 46.0;
+    end.feather = [21.0, 7.0];
+    let mut edit = event("animatte-edit", 1, 1, 0, 48, None);
+    edit.event.kind = KIND_PICTURE;
+    edit.event.animatte = Some(AniMatteData {
+        states: vec![
+            AniMatteState { frame: 0, shapes: vec![inside.clone(), outside] },
+            AniMatteState { frame: 47, shapes: vec![inside, end] },
+        ],
+        acceleration_q30: 0,
+        tracker_xy: None,
+        not_converted: vec![],
+    });
+    facts.sequences.push(sequence(vec![edit]));
+    let graph = run(&facts, &index).graph;
+    let graph = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    let sequence = &graph.sequences[0];
+    let placement = &sequence.placements[0];
+    assert!(placement.effects.is_empty());
+    let receipt = graph.sidecar("avid.source", &sequence.id).unwrap();
+    let Some(Value::Arr(events)) = receipt.get("native_events") else { panic!("missing native events") };
+    assert_eq!(events[0].get("placement_id"), Some(&s(&placement.id)));
+    let matte = events[0].get("controls").and_then(|c| c.get("animatte")).unwrap();
+    let Some(Value::Arr(states)) = matte.get("states") else { panic!("missing shape states") };
+    assert_eq!(states.len(), 2);
+    let Some(Value::Arr(shapes)) = states[1].get("shapes") else { panic!("missing shapes") };
+    assert_eq!(states[1].get("frame"), Some(&Value::Int(47)));
+    assert_eq!(shapes[0].get("key_out"), Some(&Value::Bool(false)));
+    assert_eq!(shapes[1].get("key_out"), Some(&Value::Bool(true)));
+    assert_eq!(shapes[1].get("opacity"), Some(&Value::Float(46.0)));
+    assert_eq!(shapes[1].get("feather"), Some(&Value::Arr(vec![Value::Float(21.0), Value::Float(7.0)])));
+    assert!(graph.losses.iter().any(|loss| loss.object == placement.id
+        && loss.reason.contains("mixed or animated Key In/Out")));
+}
+
 #[test]
 fn exact_clock_and_unknown_offset_are_distinct_from_compatibility() {
     let (mut f, mut i) = fixture(1);

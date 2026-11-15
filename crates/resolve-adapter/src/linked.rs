@@ -794,6 +794,9 @@ pub(crate) fn prepare_project(
             .iter()
             .find(|s| s.id == row.id)
             .ok_or("selected timeline ID absent")?;
+        if let Some(edit) = sequence.disabled_placements.first() {
+            return Err(format!("{}: disabled source edit has no qualified Resolve mapping", edit.id).into());
+        }
         let mut build = || -> Result<(Timeline, Vec<String>)> {
             if !seen.insert(row.id.as_str())
                 || row.canvas != (1920, 1080)

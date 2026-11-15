@@ -271,6 +271,7 @@ pub(super) fn resize(ctx: &Ctx<'_>, effect: &Node) -> Option<PictureExtension> {
     let mut animated = false;
     let mut unsupported = false;
     let mut independent_scale = None;
+    let mut background_seen = [false; 3];
     for item in items.iter().filter_map(|r| ctx.deref(Some(r))) {
         let Some(Value::Uuid(uuid)) = item.get("uuid") else {
             continue;
@@ -280,6 +281,21 @@ pub(super) fn resize(ctx: &Ctx<'_>, effect: &Node) -> Option<PictureExtension> {
             unsupported |= independent_scale
                 .replace(int(item, "value") == Some(0))
                 .is_some();
+        }
+        if let Some(index) = RESIZE_BACKGROUND.iter().position(|(key, _)| *key == id) {
+            unsupported |= std::mem::replace(&mut background_seen[index], true);
+            unsupported |= float(item, "value") != Some(0.0) && int(item, "value") != Some(0);
+            if has_curve(item) {
+                let pair = ctx.deref(item.get("control_track")).and_then(|curve| {
+                    let Value::List(points) = curve.get("control_points")? else {
+                        return None;
+                    };
+                    linear_pair(item, curve, points, length, rate)
+                });
+                unsupported |= pair != Some([0.0; 2]);
+                animated |= pair.is_none_or(|[first, last]| first != last);
+            }
+            continue;
         }
         let Some(curve) = ctx.deref(item.get("control_track")) else {
             continue;

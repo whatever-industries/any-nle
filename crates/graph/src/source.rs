@@ -178,12 +178,32 @@ pub struct SourceSequence {
     pub frame_size: Option<(i64, i64)>,
     pub start: Option<Rational>,
     pub clock: Option<SourceClock>,
-    pub tracks: Vec<Track>,
+    pub tracks: Vec<SourceTrack>,
     pub placements: Vec<Placement>,
+    /// Retained cuts explicitly disabled in the source timeline.
+    pub disabled_placements: Vec<Placement>,
     pub transitions: Vec<SourceTransition>,
     pub markers: Vec<SourceMarker>,
     /// Source text occurrences, independent of underlying picture/media edits.
     pub texts: Vec<SourceText>,
+}
+
+/// A timeline lane, including declared lanes with no portable placements.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceTrack {
+    pub kind: StreamKind,
+    pub index: i64,
+    pub level_db: Option<f64>,
+    pub name: Option<String>,
+    /// True only when the source confirms a plain empty lane. Absence of a
+    /// portable placement does not establish that a lane was empty.
+    pub empty: bool,
+}
+
+impl SourceTrack {
+    pub fn new(kind: StreamKind, index: i64, level_db: Option<f64>) -> Self {
+        Self { kind, index, level_db, name: None, empty: false }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,7 +312,7 @@ impl SourceGraph {
         }
         for s in &self.sequences {
             add_id(&mut ids, &s.id, "sequence")?;
-            for p in &s.placements {
+            for p in s.placements.iter().chain(&s.disabled_placements) {
                 add_id(&mut ids, &p.id, "placement")?;
             }
             for t in &s.transitions {
@@ -370,7 +390,12 @@ impl SourceGraph {
                 match m.kind {
                     StreamKind::Video => require(o.channels.is_none() && o.channel_index.is_none() && o.sample_representation.is_none(), &w, "picture cannot have audio channel facts")?,
                     StreamKind::Audio => {
-                        require(matches!((o.channels,o.channel_index),(Some(n),Some(c)) if (1..=2).contains(&n) && (0..n).contains(&c)), &w, "invalid physical audio channel")?;
+                        require(matches!((o.channels,o.channel_index),(Some(n),Some(c))
+                            if (0..n).contains(&c)
+                                && ((1..=2).contains(&n) || n == 8 && o.container == "wav"
+                                    && m.sample_rate == Some(48000)
+                                    && o.sample_representation.as_deref() == Some("pcm16"))),
+                            &w, "invalid physical audio channel")?;
                         require(match o.sample_representation.as_deref() { Some("aac") => m.bits.is_none(), Some("pcm16") => m.bits==Some(16), Some("pcm24") => m.bits==Some(24), _=>false }, &w, "audio sample representation contradicts bit depth")?;
                     }
                 }
@@ -489,6 +514,7 @@ impl SourceGraph {
             for n in [
                 s.tracks.len(),
                 s.placements.len(),
+                s.disabled_placements.len(),
                 s.transitions.len(),
                 s.markers.len(),
                 s.texts.len(),
@@ -513,6 +539,7 @@ impl SourceGraph {
                 require(t.reason.is_some() || (t.content.is_some() && t.record_start.is_some() && t.duration.is_some()), &w, "unresolved text needs a reason")?;
             }
             let mut tracks = HashSet::new();
+            let mut empty_tracks = HashSet::new();
             for t in &s.tracks {
                 positive_labels(&[t.index], &w)?;
                 require(
@@ -520,13 +547,21 @@ impl SourceGraph {
                     &w,
                     "duplicate declared track",
                 )?;
+                if let Some(name) = &t.name {
+                    text(name, &w)?;
+                    require(!name.is_empty() && !name.chars().any(char::is_control),
+                        &w, "invalid source track name")?;
+                }
+                if t.empty {
+                    empty_tracks.insert((t.kind, t.index));
+                }
                 if let Some(n) = t.level_db {
                     finite(n, &w)?;
                 }
             }
             let placements: HashMap<_, _> =
                 s.placements.iter().map(|p| (p.id.as_str(), p)).collect();
-            for p in &s.placements {
+            for p in s.placements.iter().chain(&s.disabled_placements) {
                 require(
                     usize::from(p.video_track.is_some())
                         + p.audio_tracks.len()
@@ -535,6 +570,11 @@ impl SourceGraph {
                     &w,
                     "source placement must occupy exactly one lane",
                 )?;
+                let lane = p.video_track.map(|index| (StreamKind::Video, index))
+                    .or_else(|| p.audio_tracks.first().map(|&index| (StreamKind::Audio, index)))
+                    .or_else(|| p.grouped_audio.first().map(|group| (StreamKind::Audio, group.track)));
+                require(lane.is_none_or(|lane| !empty_tracks.contains(&lane)),
+                    &w, "placement contradicts an empty source track")?;
                 let routing = routes
                     .get(p.item.as_str())
                     .ok_or_else(|| GraphError(format!("{w}: unknown item {:?}", p.item)))?;
@@ -544,7 +584,17 @@ impl SourceGraph {
                     s.rate,
                     &format!("{w} placement {:?}", p.id),
                 )?;
+                let mut has_linear_pan = false;
                 for effect in &p.effects {
+                    if effect.kind == crate::audio_pan::LINEAR_KIND {
+                        require(
+                            !has_linear_pan && p.audio_tracks.len() == 1
+                                && crate::audio_pan::read_linear(effect, p.duration).is_some(),
+                            &w,
+                            "Linear pan needs one mono audio placement and ordered edit-local keys within its span",
+                        )?;
+                        has_linear_pan = true;
+                    }
                     if effect.kind == crate::picture_chain::REFLECTION_KIND {
                         require(
                             p.video_track.is_some()
@@ -1106,10 +1156,19 @@ impl<W: Write> JsonOut<'_, W> {
                     member!(o, f, "kind", o.text(t.kind.as_str()));
                     member!(o, f, "index", o.integer(t.index));
                     member!(o, f, "level_db", o.optional(t.level_db, Self::float));
+                    if let Some(name) = &t.name {
+                        member!(o, f, "name", o.text(name));
+                    }
+                    if t.empty {
+                        member!(o, f, "empty", o.boolean(true));
+                    }
                     Ok(())
                 }))
             );
             member!(o, f, "placements", o.array(&s.placements, Self::placement));
+            if !s.disabled_placements.is_empty() {
+                member!(o, f, "disabled_placements", o.array(&s.disabled_placements, Self::placement));
+            }
             member!(
                 o,
                 f,
@@ -1512,6 +1571,7 @@ impl SourceGraph {
                     "start",
                     "clock",
                     "tracks",
+                    "disabled_placements",
                     "transitions",
                     "markers",
                     "texts",
@@ -1523,12 +1583,14 @@ impl SourceGraph {
                     t,
                     &format!("{w}.tracks[{j}]"),
                     &["kind", "index"],
-                    &["level_db"],
+                    &["level_db", "name", "empty"],
                 )?;
-                tracks.push(Track {
+                tracks.push(SourceTrack {
                     kind: t.kind("kind")?,
                     index: t.int("index")?,
                     level_db: t.opt_float("level_db")?,
+                    name: t.opt_str("name")?,
+                    empty: t.opt_bool("empty")?.unwrap_or(false),
                 });
             }
             let placements = s
@@ -1580,6 +1642,9 @@ impl SourceGraph {
                     .transpose()?,
                 tracks,
                 placements,
+                disabled_placements: s.opt_list("disabled_placements")?.iter().enumerate()
+                    .map(|(j, p)| super::placement(p, &format!("{w}.disabled_placements[{j}]")))
+                    .collect::<R<_>>()?,
                 transitions,
                 markers: parse_markers(&s)?,
                 texts: s.opt_list("texts")?.iter().enumerate().map(|(j, v)| {
@@ -1735,6 +1800,63 @@ mod tests {
           "sidecars":[{"adapter":"avid.source","object":"s","data":null}]
         }"#).unwrap()
     }
+    #[test]
+    fn named_empty_source_track_round_trips_and_refuses_a_conflicting_edit() {
+        let mut graph = example();
+        assert!(!graph.sequences[0].tracks[0].empty);
+        assert_eq!(graph.sequences[0].tracks[0].name, None);
+        graph.sequences[0].tracks.push(SourceTrack {
+            kind: StreamKind::Video,
+            index: 5,
+            name: Some("Graphics & café".into()),
+            empty: true,
+            level_db: None,
+        });
+        let saved = graph.to_json_text().unwrap();
+        assert_eq!(SourceGraph::from_json_text(&saved).unwrap(), graph);
+
+        graph.sequences[0].tracks[1].index = 1;
+        let error = graph.to_json_text().unwrap_err();
+        assert!(error.to_string().contains("placement contradicts an empty source track"));
+    }
+
+    #[test]
+    fn edit_local_pan_rejects_duplicate_curves_and_keys_outside_the_span() {
+        use crate::audio_pan::{linear_effect, PanKey};
+        let mut graph = example();
+        let edit = &mut graph.sequences[0].placements[1];
+        edit.grouped_audio.clear();
+        edit.audio_tracks = vec![3];
+        edit.audio_streams = vec![1];
+        let keys = [
+            PanKey { at: Rational::ZERO, pan: Rational::integer(-1) },
+            PanKey { at: edit.duration, pan: Rational::integer(1) },
+        ];
+        edit.effects.push(linear_effect(&keys));
+        graph.validate().unwrap();
+        let edit = &mut graph.sequences[0].placements[1];
+        edit.effects.push(linear_effect(&keys));
+        assert!(graph.validate().unwrap_err().to_string().contains("Linear pan"));
+        let edit = &mut graph.sequences[0].placements[1];
+        edit.effects = vec![linear_effect(&[
+            keys[0], PanKey { at: Rational::integer(2), ..keys[1] },
+        ])];
+        assert!(graph.validate().unwrap_err().to_string().contains("Linear pan"));
+    }
+
+    #[test]
+    fn disabled_placement_survives_reload_and_uses_a_distinct_id() {
+        let mut graph = example();
+        let sequence = &mut graph.sequences[0];
+        let mut disabled = sequence.placements[0].clone();
+        disabled.id = "disabled-picture".into();
+        sequence.disabled_placements.push(disabled);
+        let text = graph.to_json_text().unwrap();
+        assert_eq!(SourceGraph::from_json_text(&text).unwrap(), graph);
+        graph.sequences[0].disabled_placements[0].id = "picture".into();
+        assert!(graph.validate().is_err());
+    }
+
     fn multicam_example()->SourceGraph{
         let mut g=example();
         let media=|stream|MulticamPiece{start:Rational::new(1,1).unwrap(),duration:Rational::new(3,1).unwrap(),item:Some("i".into()),stream:Some(stream),source_in:Some(Rational::ZERO)};

@@ -436,6 +436,49 @@ fn video_filler_markers_keep_overlapping_ranges_without_covering_picture() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn animatte_keys_use_the_source_trim_and_refuse_unrepresentable_ticks() {
+    use prproj::convert::model::{ticks_per_unit, Matte};
+
+    let dir = scratch("animatte-key-time");
+    let mut model = example();
+    let frame = ticks_per_unit(model.sequences[0].rate);
+    let event = &mut model.sequences[0].events[0];
+    event.source_in = 24 * frame;
+    let contour = vec![
+        [0.2, 0.2, 0.0, 0.0, 0.0, 0.0],
+        [0.5, 0.2, 0.0, 0.0, 0.0, 0.0],
+        [0.5, 0.6, 0.0, 0.0, 0.0, 0.0],
+    ];
+    event.matte = Some(Matte {
+        shapes: vec![vec![(0, contour.clone()), (3, contour)]],
+        inverted: false,
+        opacities: vec![100.0],
+        feathers: vec![(0.0, 0.0)],
+        not_converted: vec![],
+    });
+    let saved = dir.join("keys.prproj");
+    write_project(&model, &saved, &mut SeededUuids::new(SEED)).unwrap();
+    let doc = PremiereDocument::from_bytes(&std::fs::read(saved).unwrap()).unwrap();
+    let path = doc.tree.iter(doc.root).find(|&node| {
+        doc.tree.findtext(node, "Name").unwrap().as_deref() == Some("Path")
+            && doc.tree.child_by_tag(node, "Keyframes").is_some()
+    }).unwrap();
+    let keys = doc.tree.findtext(path, "Keyframes").unwrap().unwrap();
+    let positions: Vec<i64> = keys.split_terminator(';')
+        .map(|key| key.split_once(',').unwrap().0.parse().unwrap())
+        .collect();
+    assert_eq!(positions, [24 * frame, 27 * frame]);
+
+    let invalid = dir.join("overflow.prproj");
+    // The key index passes model/1 validation, but its Premiere tick value overflows i64.
+    model.sequences[0].events[0].matte.as_mut().unwrap().shapes[0][1].0 = (1 << 31) - 1;
+    let error = write_project(&model, &invalid, &mut SeededUuids::new(SEED)).unwrap_err();
+    assert!(error.to_string().contains("AniMatte shape 1 key at frame 2147483647 exceeds the Premiere tick range"));
+    assert!(!invalid.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Absurd-but-valid tick values: a clean error, never an overflow panic.
 #[test]
 fn huge_ticks_do_not_panic() {

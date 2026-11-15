@@ -92,6 +92,10 @@ const RESIZE: &[(&str, &str)] = &[
     ("5381", "unknown 5381"),
 ];
 
+// AVB-0033. Zero hue, saturation and luminance leave the Resize background
+// black. Keep reporting nonzero values because the writer cannot recreate them.
+const RESIZE_BACKGROUND: [&str; 3] = ["4781", "4881", "4981"];
+
 const WARP: &[(&str, &str)] = &[
     ("a981", "Position"),
     ("aa81", "Position X"),
@@ -152,9 +156,14 @@ impl PictureEffect {
             Kind::Warp => WARP,
         };
         for (id, v) in &self.params.params {
-            let name = id.strip_suffix(SUFFIX).and_then(|p| known.iter().find(|(k, _)| *k == p));
-            let neutral = self.compact_affine_warp && id.strip_suffix(SUFFIX)
-                .is_some_and(|prefix| COMPACT_WARP_DEFAULTS.iter().any(|&(key, _)| key == prefix));
+            let prefix = id.strip_suffix(SUFFIX);
+            let name = prefix.and_then(|p| known.iter().find(|(k, _)| *k == p));
+            let neutral = prefix.is_some_and(|prefix| match self.kind {
+                Kind::Resize => RESIZE_BACKGROUND.contains(&prefix)
+                    && matches!(v, ParamValue::Float(0.0) | ParamValue::Int(0)),
+                Kind::Warp => self.compact_affine_warp
+                    && COMPACT_WARP_DEFAULTS.iter().any(|&(key, _)| key == prefix),
+            });
             if name.is_none() && !neutral {
                 out.not_converted.push(match v {
                     ParamValue::Float(f) => format!("{} control {} = {}", self.name(), &id[..8], trim(*f)),
@@ -256,6 +265,18 @@ mod tests {
             }
             assert!(a.not_converted.is_empty() && b.not_converted.is_empty());
         }
+    }
+
+    #[test]
+    fn neutral_resize_background_does_not_report_a_loss() {
+        let mut resize = effect(Kind::Resize, &[("4781", 0.0), ("4881", 0.0), ("4981", 0.0)]);
+        assert!(resize.interpret().not_converted.is_empty());
+
+        resize.params.params[2].1 = ParamValue::Float(10.0);
+        assert_eq!(resize.interpret().not_converted, ["Resize control 4981568d = 10"]);
+
+        resize.kind = Kind::Warp;
+        assert_eq!(resize.interpret().not_converted.len(), 3);
     }
 
     #[test]

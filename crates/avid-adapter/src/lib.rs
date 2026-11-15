@@ -1268,6 +1268,33 @@ fn master(
                 ("native_track", Value::Int(t.index)),
                 ("file_track", raw.file_track.map(Value::Int).unwrap_or(Value::Null)),
             ];
+            let original_clock = if selected.online && selected.kind == StreamKind::Video
+                && selected.codec == "avc1" && selected.rate == Some(Rational::integer(24))
+                && selected.stream.container == "mov" && m.tracks.len() == 1
+                && offset == Some(Rational::ZERO)
+            {
+                source.file_clocks.get(tindex).and_then(Option::as_ref)
+                    .filter(|clock| (clock.rate.num, clock.rate.den, clock.base, clock.drop) == (24, 1, 24, false))
+                    .and_then(|clock| {
+                        let effective = u64::try_from(clock.count.checked_add(clock.offset)?).ok()?;
+                        (effective < 24 * 60 * 60 * 24).then(|| SourceClock {
+                            effective_count: effective,
+                            rate: Rational::integer(24),
+                            display_base: 24,
+                            drop: false,
+                            provenance: SourceClockProvenance {
+                                origin_count: clock.count as u64,
+                                source_offset: clock.offset,
+                                source_rate: Rational::integer(24),
+                                source_package: clock.package.umid_hex(),
+                                timecode_track: "TC1".into(),
+                                route: "avid_saved_original_to_physical_timecode".into(),
+                            },
+                        })
+                    })
+            } else {
+                None
+            };
             if let Some(origin) = selected.motion_audio_origin {
                 native_original.push(("motion_adapter_file_track_start", Value::Int(origin)));
                 native_original.push(("verified_aac_priming_samples", Value::Int(1024)));
@@ -1294,8 +1321,8 @@ fn master(
                 sample_rate: selected.sample_rate,
                 bits: selected.bits,
                 duration: selected.duration,
-                start: None,
-                clock: None,
+                start: original_clock.as_ref().and_then(SourceClock::exact_start),
+                clock: original_clock,
                 stream: (selected.kind == StreamKind::Audio).then_some(t.index),
                 online: Some(selected.online),
                 original: Some(original.clone()),
@@ -1716,6 +1743,23 @@ fn master(
         ("source_path", opt_s(m.source_path.as_deref())),
     ]);
     sidecar(out, budget, "avid", id, avid).map_err(MasterError::Budget)?;
+    if let Some(import) = &source.imported_audio {
+        sidecar(out, budget, "avid.audio_import", id, obj(vec![
+            ("saved_locators", Value::Arr(vec![s(&import.locator)])),
+            ("physical_package", s(import.physical_package.umid_hex())),
+            ("source_edit_rate", s("24")),
+            ("source_timecode_frame", Value::Int(import.start_frame)),
+            ("frames", Value::Int(import.frames)),
+            ("managed_sample_rate", Value::Int(48_000)),
+            ("managed_bit_depth", Value::Int(16)),
+            ("lanes", Value::Arr(import.lanes.iter().map(|lane| obj(vec![
+                ("master_track", Value::Int(lane.master_track)),
+                ("file_package", s(lane.file_package.umid_hex())),
+                ("file_track", Value::Int(lane.file_track)),
+                ("physical_track", Value::Int(lane.physical_track)),
+            ])).collect())),
+        ])).map_err(MasterError::Budget)?;
+    }
     let mix = output_mix(&m.output_mix, budget).map_err(MasterError::Budget)?;
     let mut native = vec![
         ("occurrence", s(&source.id)),

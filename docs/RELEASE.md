@@ -79,7 +79,8 @@ a missing redistribution dependency silently.
 
 The public profile uses synthetic tests only. It covers the graph, Avid adapter,
 mapping, GUI model, inventory, job engine, backend resolution, media preparation,
-writer and reader cancellation. `scripts/public_acceptance.py` defines the
+Premiere preparation, graph output, writer and reader cancellation.
+`scripts/public_acceptance.py` defines the
 required test counts and platform exclusions. It rejects empty, failed, ignored
 or skipped selected suites. Each architecture also runs the bundled backend
 against synthetic picture and PCM. Full converter qualification uses the

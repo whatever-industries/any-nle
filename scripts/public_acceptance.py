@@ -7,7 +7,12 @@ APP_TESTS=['rewrap::source::space_tests::available_space_queries_existing_volume
 def run(output):
     output=pathlib.Path(output); output.mkdir(parents=True,exist_ok=True)
     results=[]; failures=[]
-    selected=[(n,args,minimum,ROOT/'crates/Cargo.toml') for n,args,minimum in SUITES+[(n,['-p','anynle-app','--lib',n],1) for n in APP_TESTS]]
+    workspace=ROOT/'crates/Cargo.toml'
+    selected=[(n,args,minimum,workspace) for n,args,minimum in SUITES+[(n,['-p','anynle-app','--lib',n],1) for n in APP_TESTS]]
+    selected += [
+        ('premiere_preparation', ['-p', 'anynle-premiere-adapter', '--test', 'preparation'], 54, workspace),
+        ('graph_output', ['-p', 'anynle-app', '--test', 'graph_output'], 11 if os.name == 'nt' else 13, workspace),
+    ]
     selected += [(n,['--test',n],minimum,ROOT/'prproj/Cargo.toml') for n,minimum in [('original_media',3),('destination_layout',6)]]
     selected += [('source_open_cancellation',['--lib','source::progress_tests::cancellation_observer_runs_before_a_bin_is_opened'],1,ROOT/'avid-reader/Cargo.toml')]
     for name,args,minimum,manifest in selected:

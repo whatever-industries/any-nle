@@ -30,6 +30,8 @@ pub enum SampleRepresentation {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct OriginalAudio {
+    /// BWF display origin, independent of file-relative PCM trims.
+    pub source_start: i64,
     pub sample_rate: i64,
     pub channels: i64,
     pub duration: i64,
@@ -190,6 +192,23 @@ pub fn qualifies_audio_pan(clip: &OriginalClip) -> bool {
     is_mono_pcm24_wav(clip) && clip.channels[0].gain_db == 0.0
 }
 
+fn managed_audio_pan_covers(clip: &Clip, event: &Event, end: i64) -> bool {
+    let [channel @ (1 | 2)] = event.audio_channels.as_slice() else {
+        return false;
+    };
+    clip.rate == Some(Fraction::new(24, 1))
+        && clip.video.as_ref().is_some_and(|video| video.start == 0
+            && video.rate == Fraction::new(24, 1)
+            && (video.width, video.height) == (1920, 1080))
+        && clip.multichannel_groups.is_empty()
+        && clip.audio.len() == 2
+        && clip.audio.iter().any(|audio|
+            audio.avid_track == Some(*channel) && audio.bits == 16
+            && audio.sample_rate == 48_000 && audio.start == 0 && audio.gain_db == 0.0
+            && end <= audio.duration && std::path::Path::new(&audio.path).extension()
+                .and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("mxf")))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedProjectInput {
     pub project_name: String,
@@ -197,6 +216,8 @@ pub struct PreparedProjectInput {
     pub clips: Vec<PreparedClip>,
     pub bins: Vec<Bin>,
     pub sequences: Vec<Sequence>,
+    /// Destination sequence index -> bin for reusable AutoSync items.
+    pub autosync_bins: BTreeMap<usize, usize>,
     pub texts: Vec<PreparedText>,
     pub video_dissolves: Vec<PreparedVideoDissolve>,
     pub audio_edge_fades: Vec<PreparedAudioEdgeFade>,
@@ -207,9 +228,13 @@ pub struct PreparedProjectInput {
     pub picture_effects: Vec<PreparedPictureEffect>,
     /// A label on one placed clip, independent of its source item.
     pub edit_labels: Vec<PreparedEditLabel>,
+    /// Verified single-lane edits to write using the native Enable switch.
+    pub disabled_edits: HashSet<(usize, usize)>,
     /// Verified direct DNx OP-Atom clip IDs and their physical media start ticks.
     /// The legacy clip fields carry the effective logging timecode.
     pub direct_dnxhr_origins: std::collections::HashMap<String, i64>,
+    /// Verified 23.976 DNxHD LB/PCM24 cameras using the DNxHD media template.
+    pub direct_dnxhd_pcm24: HashSet<String>,
     pub constant_speeds: Vec<PreparedConstantSpeed>,
     pub multicams: Vec<super::multicam::PreparedMulticam>,
     pub multicam_uses: Vec<super::multicam::PreparedMulticamUse>,
@@ -427,11 +452,29 @@ pub struct PreparedEditLabel {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedTrackState {
-    /// None selects V1. Some selects the one-based mono audio lane.
-    pub audio_track: Option<i64>,
+    pub lane: PreparedTrackLane,
     pub name: Option<String>,
     pub locked: bool,
     pub picture_disabled: bool,
+    /// A named lane backed by saved empty track data, with no placements to create it.
+    pub create_empty: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PreparedTrackLane {
+    Picture(i64),
+    Audio(i64),
+}
+
+impl PreparedTrackLane {
+    pub fn populated(sequence: &Sequence) -> HashSet<Self> {
+        sequence.events.iter().flat_map(|edit|
+            edit.video_track.into_iter().map(Self::Picture)
+                .chain(edit.audio_tracks.iter().copied().map(Self::Audio))
+                .chain(edit.stereo.iter().map(|stereo| Self::Audio(stereo.audio_track))))
+            .filter(|lane| matches!(lane, Self::Picture(1..=99) | Self::Audio(1..=99)))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -814,12 +857,20 @@ impl PreparedProjectInput {
             let event = seq.events.get(pan.event).ok_or_else(fail)?;
             let owner = (pan.sequence, pan.event, pan.track);
             let end = event.source_in.checked_add(event.duration).ok_or_else(fail)?;
-            if self.options.bin_mode != "separate" || seq.rate != Fraction::new(24, 1)
+            let source_covers_range = match clips.get(event.clip.as_str()) {
+                Some(PreparedClip::Original(clip)) => self.options.bin_mode == "separate"
+                    && qualifies_audio_pan(clip)
+                    && clip.audio.as_ref().is_some_and(|audio| end <= audio.duration),
+                Some(PreparedClip::Legacy(clip)) =>
+                    (self.options.bin_mode != "merged" || self.direct_dnxhr_origins.get(&clip.id) == Some(&0))
+                    && managed_audio_pan_covers(clip, event, end),
+                None => false,
+            };
+            if seq.rate != Fraction::new(24, 1)
                 || (seq.width, seq.height) != (1920, 1080)
                 || !seen.insert(owner) || fades.contains(&owner) || crossfades.contains(&owner)
                 || self.audio_mixers.get(&pan.sequence).and_then(|mixer| mixer.mono_track_pans).is_some()
-                || !matches!(clips.get(event.clip.as_str()), Some(PreparedClip::Original(clip))
-                    if qualifies_audio_pan(clip) && clip.audio.as_ref().is_some_and(|a| end <= a.duration))
+                || !source_covers_range
                 || !(1..=99).contains(&pan.track) || event.audio_tracks != [pan.track]
                 || event.video_track.is_some() || !event.stereo.is_empty()
                 || event.speed_ratio.is_some() || event.source_duration.is_some() || event.time_remap.is_some()
@@ -910,6 +961,7 @@ impl PreparedProjectInput {
                 .collect(),
             bins: m.bins.clone(),
             sequences: m.sequences.clone(),
+            autosync_bins: BTreeMap::new(),
             texts: Vec::new(),
             video_dissolves: Vec::new(),
             audio_edge_fades: Vec::new(),
@@ -919,7 +971,9 @@ impl PreparedProjectInput {
             track_states: BTreeMap::new(),
             picture_effects: Vec::new(),
             edit_labels: Vec::new(),
+            disabled_edits: Default::default(),
             direct_dnxhr_origins: Default::default(),
+            direct_dnxhd_pcm24: Default::default(),
             constant_speeds: Vec::new(),
             multicams: Vec::new(),
             multicam_uses: Vec::new(),
@@ -981,16 +1035,23 @@ impl PreparedProjectInput {
         let fail = |s: &str| ModelError(s.into());
         for (&sequence, states) in &self.track_states {
             let seq = self.sequences.get(sequence).ok_or_else(|| fail("unknown sequence for track state"))?;
+            let populated = PreparedTrackLane::populated(seq);
             let mut seen = HashSet::new();
-            if states.is_empty() || states.len() > 3 || states.iter().any(|state| {
-                let has_lane = match state.audio_track {
-                    None => seq.events.iter().any(|edit| edit.video_track == Some(1)),
-                    Some(lane @ (1 | 2)) => !state.picture_disabled
-                        && seq.events.iter().any(|edit| edit.audio_tracks.contains(&lane))
+            if states.is_empty() || states.len() > 198 || states.iter().any(|state| {
+                let supported_state = !(state.locked || state.picture_disabled) || match state.lane {
+                    PreparedTrackLane::Picture(1) => true,
+                    PreparedTrackLane::Audio(lane @ (1 | 2)) => !state.picture_disabled
                         && seq.events.iter().all(|edit| edit.stereo.iter().all(|s| s.audio_track != lane)),
                     _ => false,
                 };
-                !has_lane || !seen.insert(state.audio_track)
+                let has_placements = populated.contains(&state.lane);
+                let valid_lane = if state.create_empty {
+                    !has_placements && state.name.is_some() && !state.locked && !state.picture_disabled
+                        && matches!(state.lane, PreparedTrackLane::Picture(1..=99) | PreparedTrackLane::Audio(1..=99))
+                } else {
+                    has_placements
+                };
+                !valid_lane || !seen.insert(state.lane) || !supported_state
                     || state.name.as_ref().is_some_and(|name| {
                         name.is_empty() || name.len() > 255 || name.chars().any(char::is_control)
                     })
@@ -1017,6 +1078,22 @@ impl PreparedProjectInput {
             {
                 return Err(fail("prepared label needs one unique edit lane and a Premiere palette index"));
             }
+        }
+        if self.disabled_edits.len() > MAX_ITEMS || self.disabled_edits.iter().any(|&(si, ei)| {
+            self.options.bin_mode != "separate" || self.sequences.get(si)
+                .and_then(|s| s.events.get(ei)).is_none_or(|e| {
+                    let mono = e.audio_tracks.len() == 1 && e.stereo.is_empty();
+                    let stereo = e.audio_tracks.is_empty()
+                        && matches!(e.stereo.as_slice(), [edit] if edit.channels == [1, 2]
+                            && edit.gain_db.is_none() && edit.pans.iter().all(Option::is_none));
+                    let picture = e.audio_tracks.is_empty() && e.stereo.is_empty()
+                        && e.video_track == Some(1) && e.transform.is_none()
+                        && e.color_correction.is_none() && e.matte.is_none();
+                    let audio = e.video_track.is_none() && (mono || stereo);
+                    !(picture || audio) || e.speed_ratio.is_some() || e.time_remap.is_some()
+                })
+        }) {
+            return Err(fail("disabled edit requires one plain picture or audio placement in Separate files mode"));
         }
         // Count every retained nested payload without allocating another text/value tree.
         // This conservative bounded representation is separate from peak RSS.
@@ -1054,6 +1131,11 @@ impl PreparedProjectInput {
             || self.sequences.len() > 10_000
         {
             return Err(fail("prepared input collection limit"));
+        }
+        if !self.autosync_bins.is_empty() && (self.options.bin_mode != "separate"
+            || self.autosync_bins.iter().any(|(&seq, &bin)| seq >= self.sequences.len() || bin >= self.bins.len()))
+        {
+            return Err(fail("invalid reusable AutoSync sequence or bin assignment"));
         }
         for (&sequence, mixer) in &self.audio_mixers {
             let mut muted = HashSet::new();
@@ -1402,8 +1484,20 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         )?;
     }
     if let Some(a) = &c.audio {
+        let wav8 = a.channels == 8 && c.container == "wav" && c.video.is_none()
+            && a.sample_rate == 48000 && a.representation == SampleRepresentation::Pcm16
+            && c.metadata.rate == Some(Fraction::new(24, 1))
+            && c.groups.len() == 8
+            && c.groups.iter().enumerate().all(|(i, group)| group == &[i as i64 + 1])
+            && c.channels.iter().all(|ch| ch.avid_track == ch.channel_index + 1);
+        let frame = ticks_per_unit(Fraction::new(24, 1));
+        require(if wav8 {
+            a.source_start >= 0 && a.source_start < 24 * 60 * 60 * 24 * frame
+                && a.source_start % frame == 0
+                && a.source_start.checked_add(a.duration).is_some()
+        } else { a.source_start == 0 }, "original audio start is outside the qualified BWF profile")?;
         require(
-            matches!(a.channels, 1 | 2)
+            (matches!(a.channels, 1 | 2) || wav8)
                 && matches!(a.sample_rate, 44100 | 48000 | 96000)
                 && a.stream_index == if c.video.is_some() { 1 } else { 0 },
             "unqualified original audio shape/stream",

@@ -34,6 +34,51 @@ from a bounded native archive profile. Its saved Resolve clocks and channel
 selectors retain their own provenance. Product route qualification remains
 separate from the source adapter.
 
+## Avid timeline track declarations and names
+
+Graph/2 stores qualified Avid track names on `sequences[].tracks[]`, keyed
+by media kind and one-based index. A saved name can declare a track with
+no portable edits. The optional `empty: true` flag requires a verified
+plain picture or mono filler lane. The graph rejects a placement on a
+lane declared empty. An omitted flag leaves the lane's emptiness
+unverified. Unnamed track inference follows the existing placement,
+transition, and marker rules.
+
+The Avid name record retains ambiguous or unrepresentable text. Premiere
+preparation still accepts previously saved graphs with names in the
+`avid.track_names` sidecar. It reports conflicting rows for the same lane.
+Destination preparation decides which names and layouts it can write.
+Graph/1 tracks and saved job formats keep their existing contracts.
+[Timeline track checks](SPLIT-EDIT-AUDIO-2026-11-06.md#timeline-track-names)
+
+## Avid Linear clip pan
+
+Qualified Avid pan curves on direct 24 fps mono edits use the
+`audio.pan_linear` placement effect. Each key stores exact seconds from
+the start of the edit and a rational pan from −1 at left to +1 at right.
+The graph checks key order, edit extent, and mono ownership. The original
+PVOL points remain in the source record.
+
+Premiere preparation converts the edit-local times to the prepared
+clip's source clock and rounds fractional ticks at that boundary. It
+also reads the original pan records in older snapshots. The same
+media and timeline requirements apply, and unknown pan layouts and
+rendering differences continue to receive scoped reports.
+[Managed mono pan checks](SPLIT-EDIT-AUDIO-2026-11-06.md#editable-managed-mono-clip-pan)
+
+## Disabled Avid edits
+
+Graph/2 carries a verified inactive backing cut in
+`sequences[].disabled_placements[]`. It retains the occurrence ID, exact
+record and source spans, item identity, and ordered audio channel
+selection. The selected filler stays a gap in the active timeline.
+The Avid record and scoped loss retain the native selector evidence.
+
+Premiere preparation still checks the destination route, physical media,
+and overlap with other edits before writing a disabled clip. It also
+reads older snapshots containing just the original Avid record.
+[Disabled clip qualification](SPLIT-EDIT-AUDIO-2026-11-06.md#disabled-clip-occurrences)
+
 ## Saved Avid subclip ranges
 
 The bin-owned `avid.subclips` sidecar retains one entry per saved usage-2
@@ -324,6 +369,11 @@ Python oracle. Broader corrected clocks and other changed native output require
 their own evidence and application check before becoming default support.
 
 ## Destination preparation
+
+The direct CLI and saved jobs share typed Premiere preparation, including the
+clock profile, PNG Matte Key recovery and its loss filtering, and selection of
+the online, offline or folder-layout writer. The direct CLI retains its
+compatibility writer for inputs that use the legacy project construction.
 
 All transition endpoints resolve against immutable original spans before any trim.
 Lane-specific trim bounds are calculated together, then compatible picture/audio
