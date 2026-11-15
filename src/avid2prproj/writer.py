@@ -486,7 +486,14 @@ def write_project(model: Model, out_path: Path, *, media_relinks=(), native_op1a
             FORMATS[preset] = base._replace(audio_tracks=needed)
             report.notes.append(f"sequence {seq.name!r}: expanded audio track capacity to {needed}; output bus unchanged")
             report.unverified.append(f"sequence {seq.name!r}: expanded audio-track count requires fresh native Premiere read-back; structural checks do not qualify playback")
-        sequence = project.add_sequence(seq.name, preset)
+        picture_tracks = max(chain(
+            (e.video_track for e in seq.events if e.video_track is not None),
+            (int(m.track[1:]) for m in seq.markers if m.owner == "filler" and m.track and m.track.startswith("V")),
+        ), default=0)
+        expanded_video_tracks = picture_tracks if picture_tracks > base.video_tracks else None
+        if expanded_video_tracks is not None:
+            report.notes.append(f"sequence {seq.name!r}: expanded video track capacity to {picture_tracks}")
+        sequence = project.add_sequence(seq.name, preset, video_tracks=expanded_video_tracks)
         if destination_layout is not None:
             sequence.project_item.move_to(root)
         extra_markers: list = []  # (marker, sequence ticks, note) placed on the sequence
@@ -729,12 +736,17 @@ def write_project(model: Model, out_path: Path, *, media_relinks=(), native_op1a
                 mk.add_sequence_marker(sequence, m, m.start, options, report, f"on empty {m.track}")
         for m, start, note in extra_markers:
             mk.add_sequence_marker(sequence, m, start, options, report, note)
+        picture_by_lane = [
+            [(clip.start.ticks, clip.end.ticks) for clip in lane.clips]
+            for lane in vtracks[:max(filler_video, default=0)]
+        ]
         for track_no, ms in sorted(filler_video.items()):
             if track_no > len(vtracks):
                 raise UnverifiedShape(f"sequence {seq.name!r}: filler marker on missing video track {track_no}")
             track = vtracks[track_no - 1]
             starts, ends = [], []
-            for start, end in sorted((c.start.ticks, c.end.ticks) for c in track.clips):
+            # The carrier can render black over picture on a lower lane.
+            for start, end in sorted(span for lane in picture_by_lane[:track_no] for span in lane):
                 starts.append(start)
                 ends.append(max(ends[-1], end) if ends else end)
             carried, spans = [], {}

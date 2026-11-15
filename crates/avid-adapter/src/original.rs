@@ -3,12 +3,14 @@ use crate::SourceReadIssue;
 use avid_reader::source as av;
 use graph::{source::OriginalStream, Rational, StreamKind, Value};
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     io::Read,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
 mod still;
+mod source_media;
+pub const SOURCE_MEDIA_UNAVAILABLE: &str = "preferred source media unavailable";
 pub use still::{verify_imported_png, PngRole};
 #[derive(Clone, Debug)]
 pub struct RootMapping {
@@ -17,17 +19,28 @@ pub struct RootMapping {
 }
 #[derive(Clone, Debug)]
 pub struct OriginalOptions {
+    pub link_managed_op1a: bool,
     pub root_mappings: Vec<RootMapping>,
     pub ffprobe: PathBuf,
+    pub prefer_source_media: bool,
+    pub attach_avid_proxies: bool,
+    pub proxy_rewrap_dir: Option<PathBuf>,
+    pub ffmpeg: PathBuf,
 }
 impl Default for OriginalOptions {
     fn default() -> Self {
         Self {
+            link_managed_op1a: false,
             root_mappings: vec![],
             ffprobe: PathBuf::from("ffprobe"),
+            prefer_source_media: false,
+            attach_avid_proxies: false,
+            proxy_rewrap_dir: None,
+            ffmpeg: "ffmpeg".into(),
         }
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct Selected {
     pub path: PathBuf,
@@ -42,6 +55,12 @@ pub struct Selected {
     pub duration: Rational,
     /// Source-frame origin for the qualified automatic adapter only.
     pub motion_audio_origin: Option<i64>,
+    /// The verified same-rate Avid AAC file-track start is one frame.
+    pub same_rate_aac_origin: bool,
+    /// Physical source clock corroborated by the saved managed clock and the MOV.
+    pub column_timecode: Option<av::SavedFileClock>,
+    /// A file-declared 24 fps MOV timecode, separate from Avid logging and stream PTS.
+    pub(crate) embedded_mov_timecode: Option<av::Observed<i64>>,
 }
 #[derive(Default)]
 pub struct OriginalIndex {
@@ -50,6 +69,31 @@ pub struct OriginalIndex {
     pub original_inputs: Vec<av::SourceInput>,
     /// Explicit destination defaults, never observations of missing source tags.
     pub notes: Vec<String>,
+    pub(crate) proxies: HashMap<String, crate::proxy::Binding>,
+    pub(crate) managed_op1a: HashMap<String, crate::managed_multistream::VerifiedManagedDirectOut>,
+}
+
+impl OriginalIndex {
+    pub(crate) fn select_avid_proxies(
+        &mut self, facts: &av::SourceProject, options: &OriginalOptions, index: &crate::index::MediaIndex,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), SourceReadIssue> {
+        let mut claims = HashMap::<LocatorClaimKey, LocatorClaim>::new();
+        for track in self.tracks.values() {
+            let Some((path, claim)) = resolve_with_claim(&track.stream.saved_locators, &options.root_mappings)? else { continue; };
+            if path == track.path {
+                match claims.entry(locator_claim_key(&path)?) {
+                    Entry::Occupied(mut entry) => entry.get_mut().intersect(&claim),
+                    Entry::Vacant(entry) => {
+                        entry.insert(claim);
+                    }
+                }
+            }
+        }
+        let mut pinned = self.original_inputs.iter().map(|i| (i.path.clone(),i.revision.clone())).collect();
+        let mut used = 0;
+        source_media::select(facts, options, self, &mut claims, &mut pinned, &mut used, check, Some(index))
+    }
 }
 
 fn selection_cost(master: &av::SourceMaster, raw: &av::OriginalTrack, path: &Path) -> usize {
@@ -125,15 +169,18 @@ fn offline_original(master: &av::SourceMaster, index: usize) -> Result<Selected,
         duration: Rational::new(raw.descriptor_length.into(), time_base.den().into())
             .ok_or("offline original extent exceeds the time model")?,
         motion_audio_origin: None,
+        same_rate_aac_origin: false,
+        column_timecode: None,
+        embedded_mov_timecode: None,
     })
 }
-fn text(v: &Value, k: &str) -> Option<String> {
+pub(crate) fn text(v: &Value, k: &str) -> Option<String> {
     match v.get(k)? {
         Value::Str(s) => Some(s.clone()),
         _ => None,
     }
 }
-fn number(v: &Value, k: &str) -> Option<i64> {
+pub(crate) fn number(v: &Value, k: &str) -> Option<i64> {
     match v.get(k)? {
         Value::Str(s) => s.parse().ok(),
         Value::Int(n) => Some(*n),
@@ -146,7 +193,7 @@ fn ratio(v: &Value, k: &str) -> Option<Rational> {
         Rational::new(n.parse().ok()?, d.parse().ok()?)
     })
 }
-const ORIGINAL_PROBE_ENTRIES:&str="stream=index,codec_type,codec_name,codec_tag_string,profile,level,pix_fmt,width,height,avg_frame_rate,r_frame_rate,sample_aspect_ratio,field_order,color_range,color_space,color_transfer,color_primaries,sample_rate,channels,channel_layout,bits_per_sample,bits_per_raw_sample,time_base,start_pts,duration_ts,nb_frames:stream_side_data=side_data_type:stream_tags=rotate,timecode:format=format_name:format_tags=major_brand:packet=stream_index,pts,duration:packet_side_data=side_data_type,skip_samples,discard_padding";
+const ORIGINAL_PROBE_ENTRIES:&str="stream=index,codec_type,codec_name,codec_tag_string,profile,level,pix_fmt,width,height,avg_frame_rate,r_frame_rate,sample_aspect_ratio,field_order,color_range,color_space,color_transfer,color_primaries,sample_rate,channels,channel_layout,bits_per_sample,bits_per_raw_sample,time_base,start_pts,duration_ts,nb_frames:stream_side_data=side_data_type:stream_tags=rotate,timecode,reel_name:format=format_name:format_tags=major_brand,timecode:packet=stream_index,pts,duration:packet_side_data=side_data_type,skip_samples,discard_padding";
 const UNTAGGED_COLOR_NOTE:&str="Original picture has incomplete or unspecified color/range tags. The writer uses its BT.709 destination profile as a default; this is not observed source color or range.";
 
 /// A suffix chooses a supported route only after the physical demuxer family
@@ -258,9 +305,74 @@ fn qualify_movie(video: &Value, audio: Option<&Value>, allow_adapter_rate: bool)
 }
 
 fn qualify_prores_hq(path: &Path, probe: &Value, streams: &[Value]) -> Result<bool, String> {
+    qualify_prores_hq_timecode(path, probe, streams, Rational::integer(24), "00:00:00:00")
+}
+
+fn qualify_prores_hq_timecode(
+    path: &Path, probe: &Value, streams: &[Value], rate: Rational, expected: &str,
+) -> Result<bool, String> {
     let [video, timecode] = streams else {
         return Err("linked ProRes HQ requires one picture stream and one timecode track".into());
     };
+    qualify_prores_hq_parts(path, probe, video, timecode, 1, rate, expected)
+}
+
+fn embedded_avc_mov_timecode(
+    probe: &Value, streams: &[Value], video: &Value,
+) -> Option<av::Observed<i64>> {
+    let format_tags = probe.get("format").and_then(|f| f.get("tags"));
+    if format_tags.and_then(|tags| text(tags, "major_brand")).as_deref() != Some("qt  ") {
+        return None;
+    }
+    let tag = |stream: &Value| stream.get("tags").and_then(|tags| text(tags, "timecode"));
+    let video_label = tag(video);
+    let format_label = format_tags.and_then(|tags| text(tags, "timecode"));
+    let mut tracks = streams.iter().filter(|s| text(s, "codec_tag_string").as_deref() == Some("tmcd"));
+    let track = tracks.next();
+    if track.is_none() && video_label.is_none() && format_label.is_none() {
+        return None;
+    }
+    let count = (|| {
+        let track = track?;
+        let label = video_label.as_deref()?;
+        let base = ratio(video, "time_base").filter(|base| base.num() > 0)?;
+        let duration = number(video, "duration_ts").filter(|&n| n > 0)?;
+        if tracks.next().is_some()
+            || tag(track).as_deref() != Some(label)
+            || format_label.as_deref().is_some_and(|other| other != label)
+            || number(track, "index") != Some(2)
+            || text(track, "codec_type").as_deref() != Some("data")
+            || number(track, "nb_frames") != Some(1)
+            || number(track, "start_pts") != Some(0)
+            || ratio(track, "avg_frame_rate") != Some(Rational::integer(24))
+            || ratio(track, "time_base") != Some(base)
+            || number(track, "duration_ts") != Some(duration)
+        {
+            return None;
+        }
+        let parts = label.as_bytes();
+        if parts.len() != 11 || [2, 5, 8].into_iter().any(|i| parts[i] != b':') {
+            return None;
+        }
+        let mut fields = [0; 4];
+        for (field, pair) in fields.iter_mut().zip(parts.split(|&c| c == b':')) {
+            if pair.len() != 2 || !pair.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            *field = i64::from((pair[0] - b'0') * 10 + pair[1] - b'0');
+        }
+        let [h, m, s, f] = fields;
+        (h < 24 && m < 60 && s < 60 && f < 24).then_some((h * 3600 + m * 60 + s) * 24 + f)
+    })();
+    Some(match count {
+        Some(count) => av::Observed::Known(count),
+        None => av::Observed::Unresolved("embedded MOV timecode lacks one matching 24 fps non-drop track and picture declaration".into()),
+    })
+}
+
+fn qualify_prores_hq_parts(
+    path: &Path, probe: &Value, video: &Value, timecode: &Value, index: i64, rate: Rational, expected: &str,
+) -> Result<bool, String> {
     let brand = probe.get("format").and_then(|f| f.get("tags"))
         .and_then(|tags| text(tags, "major_brand"));
     if !path.extension().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("mov"))
@@ -274,27 +386,28 @@ fn qualify_prores_hq(path: &Path, probe: &Value, streams: &[Value]) -> Result<bo
     {
         return Err("linked ProRes picture requires QuickTime ProRes 422 HQ/apch, 10-bit 4:2:2".into());
     }
-    let zero_timecode = |stream: &Value| {
-        stream.get("tags").and_then(|tags| text(tags, "timecode")).as_deref() == Some("00:00:00:00")
+    let matching_timecode = |stream: &Value| {
+        stream.get("tags").and_then(|tags| text(tags, "timecode")).as_deref() == Some(expected)
     };
     let picture_base = ratio(video, "time_base").filter(|base| base.num() > 0);
     let picture_duration = number(video, "duration_ts").filter(|&duration| duration > 0);
-    if number(timecode, "index") != Some(1)
+    if number(timecode, "index") != Some(index)
         || text(timecode, "codec_type").as_deref() != Some("data")
         || text(timecode, "codec_tag_string").as_deref() != Some("tmcd")
         || number(timecode, "nb_frames") != Some(1)
-        || ratio(timecode, "avg_frame_rate") != Some(Rational::integer(24))
+        || ratio(timecode, "avg_frame_rate") != Some(rate)
+        || ratio(video, "avg_frame_rate") != Some(rate)
         || picture_base.is_none()
         || ratio(timecode, "time_base") != picture_base
         || picture_duration.is_none()
         || number(timecode, "duration_ts") != picture_duration
         || number(timecode, "start_pts") != Some(0)
-        || !zero_timecode(video)
-        || !zero_timecode(timecode)
+        || !matching_timecode(video)
+        || !matching_timecode(timecode)
     {
-        return Err("linked ProRes HQ requires one matching 24 fps non-drop timecode track starting at zero".into());
+        return Err(format!("linked ProRes HQ requires one matching {rate} fps non-drop timecode track at {expected}"));
     }
-    qualify_movie_picture(video, false)
+    qualify_movie_picture(video, rate == Rational::new(24_000, 1001).unwrap())
 }
 
 /// Saved path syntax is parsed independently of the current OS. Only an explicit
@@ -359,6 +472,34 @@ fn saved_parts(raw: &str) -> Result<(String, Vec<String>), String> {
 struct LocatorClaim {
     saved_paths: HashSet<String>,
     mapped: bool,
+}
+
+impl LocatorClaim {
+    fn intersect(&mut self, other: &Self) {
+        self.saved_paths.retain(|saved| other.saved_paths.contains(saved));
+        self.mapped |= other.mapped;
+    }
+}
+
+#[cfg(unix)]
+type LocatorClaimKey = (u64, u64);
+#[cfg(not(unix))]
+type LocatorClaimKey = PathBuf;
+
+fn locator_claim_key(path: &Path) -> Result<LocatorClaimKey, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("original locator is not a file: {}", path.display()));
+        }
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(path.to_owned())
+    }
 }
 
 pub fn resolve(locators: &[String], mappings: &[RootMapping]) -> Result<PathBuf, String> {
@@ -437,12 +578,24 @@ fn resolve_with_claim(
         }
     }
     if paths.len() > 1 {
-        return Err(format!("original locator resolution has {} exact candidates; an explicit unambiguous root mapping is required",paths.len()));
+        let mut candidates: Vec<_> = paths.keys().collect();
+        candidates.sort_unstable();
+        let shown = candidates
+            .iter()
+            .take(4)
+            .map(|path| format!("{path:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if candidates.len() > 4 { ", …" } else { "" };
+        return Err(format!(
+            "original locator resolution has {} exact candidates: {shown}{more}. Check the saved path and root mappings so only the intended file resolves",
+            candidates.len()
+        ));
     }
     Ok(paths.into_iter().next())
 }
 
-fn bounded_probe(mut command: Command, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
+pub(crate) fn bounded_probe(mut command: Command, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
     use std::{sync::mpsc, time::Instant};
     let mut child = command
         .stdout(Stdio::piped())
@@ -548,7 +701,7 @@ fn verify_prores_packets(packets: &str, count: i64, ticks_per_frame: i128) -> Re
             || fields.next().is_some()
         {
             return Err(format!(
-                "linked ProRes HQ packet {seen} does not match the exact 24 fps picture clock"
+                "linked ProRes HQ packet {seen} does not match the exact picture clock"
             ));
         }
         seen += 1;
@@ -561,20 +714,21 @@ fn verify_prores_packets(packets: &str, count: i64, ticks_per_frame: i128) -> Re
     Ok(())
 }
 
-fn prove_prores_cadence(path: &Path, tool: &Path, video: &Value) -> Result<(), String> {
+fn prove_prores_cadence(path: &Path, tool: &Path, video: &Value, rate: Rational) -> Result<(), String> {
     let count = number(video, "nb_frames")
         .filter(|count| (1..=MAX_PRORES_PICTURE_PACKETS).contains(count))
         .ok_or("linked ProRes HQ requires a declared picture count within the 16,384-packet proof limit")?;
     let base = ratio(video, "time_base")
         .filter(|base| base.num() > 0)
         .ok_or("linked ProRes HQ picture time base is missing")?;
-    let denominator = i128::from(base.num()) * 24;
-    let ticks_per_frame = i128::from(base.den()) / denominator;
+    let numerator = i128::from(base.den()) * i128::from(rate.den());
+    let denominator = i128::from(base.num()) * i128::from(rate.num());
+    let ticks_per_frame = numerator / denominator;
     if ticks_per_frame == 0
-        || i128::from(base.den()) % denominator != 0
+        || numerator % denominator != 0
         || number(video, "duration_ts").map(i128::from) != Some(i128::from(count) * ticks_per_frame)
     {
-        return Err("linked ProRes HQ picture extent does not fit its exact 24 fps clock".into());
+        return Err(format!("linked ProRes HQ picture extent does not fit its exact {rate} fps clock"));
     }
     let mut command = Command::new(tool);
     command
@@ -600,6 +754,22 @@ struct OriginalProbe {
 }
 
 fn probe(path: &Path, tool: &Path) -> Result<OriginalProbe, String> {
+    let metadata = probe_metadata(path, tool)?;
+    let prores_color_defaulted = match metadata.get("streams") {
+        Some(Value::Arr(streams))
+            if streams.iter().any(|stream| text(stream, "codec_name").as_deref() == Some("prores")) =>
+        {
+            qualify_container(path, &metadata)?;
+            let defaulted = qualify_prores_hq(path, &metadata, streams)?;
+            prove_prores_cadence(path, tool, &streams[0], Rational::integer(24))?;
+            Some(defaulted)
+        }
+        _ => None,
+    };
+    Ok(OriginalProbe { metadata, prores_color_defaulted })
+}
+
+fn probe_metadata(path: &Path, tool: &Path) -> Result<Value, String> {
     let mut command = Command::new(tool);
     command
         .args([
@@ -624,27 +794,10 @@ fn probe(path: &Path, tool: &Path) -> Result<OriginalProbe, String> {
         )
     };
     let bytes = bounded_probe(command, std::time::Duration::from_secs(30)).map_err(context)?;
-    let metadata = graph::json::parse(
+    graph::json::parse(
         std::str::from_utf8(&bytes).map_err(|_| context("stdout is not UTF-8".into()))?,
     )
-    .map_err(&context)?;
-    let prores_color_defaulted = match metadata.get("streams") {
-        Some(Value::Arr(streams))
-            if streams
-                .iter()
-                .any(|stream| text(stream, "codec_name").as_deref() == Some("prores")) =>
-        {
-            qualify_container(path, &metadata).map_err(&context)?;
-            let defaulted = qualify_prores_hq(path, &metadata, streams).map_err(&context)?;
-            prove_prores_cadence(path, tool, &streams[0]).map_err(&context)?;
-            Some(defaulted)
-        }
-        _ => None,
-    };
-    Ok(OriginalProbe {
-        metadata,
-        prores_color_defaulted,
-    })
+    .map_err(context)
 }
 
 /// Compare a relink candidate with the same bounded source profiles used by
@@ -709,6 +862,71 @@ pub fn probe_offline_atom(path: &Path, tool: &Path) -> Result<Value, String> {
     let bytes = bounded_probe(command, std::time::Duration::from_secs(30))?;
     graph::json::parse(std::str::from_utf8(&bytes).map_err(|_| "MXF probe output is not UTF-8")?)
 }
+
+/// Prove that the declared 48 kHz mono PCM16 span is present in the file.
+pub(super) fn complete_mono_pcm16_packets(path: &Path, tool: &Path, samples: i64) -> bool {
+    let mut command = Command::new(tool);
+    command.args(["-v", "error", "-protocol_whitelist", "file,pipe", "-f", "mxf",
+        "-select_streams", "a:0", "-show_packets",
+        "-show_entries", "packet=pts,duration,size", "-of", "csv=p=0"]).arg(path);
+    let Ok(bytes) = bounded_probe(command, std::time::Duration::from_secs(30)) else { return false };
+    let Ok(rows) = std::str::from_utf8(&bytes) else { return false };
+    let mut end = 0_i64;
+    for row in rows.lines() {
+        let mut fields = row.split(',');
+        let (Some(pts), Some(duration), Some(bytes), None) = (
+            fields.next().and_then(|s| s.parse::<i64>().ok()),
+            fields.next().and_then(|s| s.parse::<i64>().ok()),
+            fields.next().and_then(|s| s.parse::<i64>().ok()),
+            fields.next(),
+        ) else { return false };
+        if pts != end || duration <= 0 || duration.checked_mul(2) != Some(bytes) {
+            return false;
+        }
+        let Some(next) = end.checked_add(duration).filter(|&next| next <= samples) else { return false };
+        end = next;
+    }
+    end > 0 && end == samples
+}
+
+/// Verify the physical picture interpretation required by the Avid source LUT profile.
+pub fn verify_source_lut_picture(
+    path: &Path, tool: &Path, package: &str, frames: i64,
+) -> Result<(), String> {
+    let mut command = Command::new(tool);
+    command.args(["-v", "error", "-protocol_whitelist", "file,pipe", "-f", "mxf",
+        "-select_streams", "v", "-show_entries",
+        "stream=index,codec_name,profile,width,height,sample_aspect_ratio,field_order,pix_fmt,color_range,color_space,color_transfer,color_primaries,r_frame_rate,start_pts,time_base,duration_ts:stream_tags=file_package_umid",
+        "-of", "json"]).arg(path);
+    let bytes = bounded_probe(command, std::time::Duration::from_secs(30))?;
+    let probe = graph::json::parse(std::str::from_utf8(&bytes)
+        .map_err(|_| "MXF picture probe output is not UTF-8")?)?;
+    let Some(Value::Arr(streams)) = probe.get("streams") else {
+        return Err("source LUT picture probe has no stream list".into());
+    };
+    let [picture] = streams.as_slice() else {
+        return Err("source LUT requires one verified picture stream".into());
+    };
+    let saved_package = package.strip_prefix("urn:smpte:umid:").unwrap_or_default().replace('.', "");
+    let actual_package = picture.get("tags").and_then(|tags| text(tags, "file_package_umid"));
+    let qualified = [
+        ("codec_name", "dnxhd"), ("profile", "DNXHD"), ("sample_aspect_ratio", "1:1"),
+        ("field_order", "progressive"), ("pix_fmt", "yuv422p"), ("color_range", "tv"),
+        ("color_space", "bt709"), ("color_transfer", "bt709"), ("color_primaries", "bt709"),
+        ("r_frame_rate", "24/1"), ("time_base", "1/24"),
+    ].iter().all(|(key, expected)| text(picture, key).as_deref() == Some(*expected));
+    if qualified && number(picture, "width") == Some(1920)
+        && number(picture, "height") == Some(1080) && number(picture, "index") == Some(0)
+        && number(picture, "start_pts") == Some(0) && number(picture, "duration_ts") == Some(frames)
+        && saved_package.len() == 64 && actual_package.as_deref()
+            .and_then(|tag| tag.strip_prefix("0x"))
+            .is_some_and(|tag| tag.eq_ignore_ascii_case(&saved_package))
+    {
+        Ok(())
+    } else {
+        Err("source picture package, extent or Rec.709 DNxHD interpretation does not match the qualified LUT profile".into())
+    }
+}
 fn has_aac_priming_packet(probe: &Value, stream: i64) -> bool {
     let Some(Value::Arr(packets)) = probe.get("packets") else { return false; };
     let mut audio = packets.iter().filter(|p| number(p, "stream_index") == Some(stream));
@@ -719,6 +937,35 @@ fn has_aac_priming_packet(probe: &Value, stream: i64) -> bool {
             side.len() == 1 && text(s, "side_data_type").as_deref() == Some("Skip Samples")
                 && number(s, "skip_samples") == Some(1024) && number(s, "discard_padding") == Some(0)
         }))
+}
+
+fn same_rate_aac_master(master: &av::SourceMaster, samples: i64, picture: &Value) -> bool {
+    let [a, b, c] = master.master.tracks.as_slice() else { return false; };
+    let Some(encoded_length) = samples.checked_add(1024) else { return false; };
+    let mut lanes = [(a.kind, a.index), (b.kind, b.index), (c.kind, c.index)];
+    lanes.sort_unstable();
+    lanes == [(avid_reader::extract::KIND_PICTURE, 1),
+        (avid_reader::extract::KIND_SOUND, 1), (avid_reader::extract::KIND_SOUND, 2)]
+        && master.rate == av::Rate::new(24, 1)
+        && ratio(picture, "avg_frame_rate") == Some(Rational::integer(24))
+        && number(picture, "nb_frames").and_then(|n| n.checked_mul(2000)) == Some(samples)
+        && master.master.tracks.iter().all(|t| match t.kind {
+            avid_reader::extract::KIND_PICTURE =>
+                t.edit_rate == 24.0 && t.length.checked_mul(2000) == Some(samples),
+            _ => t.edit_rate == 46.875 && t.length == encoded_length,
+        })
+        && master.master.stereo_pairs.as_slice() == [(1, 2)]
+        && master.master.other_groups.is_empty()
+        && master.offsets.len() == 3
+        && master.offsets.iter().all(|o| matches!(o, av::Observed::Known(0)))
+        && master.master.markers.is_empty()
+        && master.originals.iter().zip(&master.master.tracks)
+            .filter(|(_, t)| t.kind == avid_reader::extract::KIND_SOUND)
+            .all(|(original, t)| original.as_ref().is_some_and(|raw|
+                raw.descriptor_class == "MPGA" && raw.descriptor_rate == 46.875
+                    && raw.descriptor_length == encoded_length
+                    && raw.sample_rate == Some(48000.0) && raw.channels == Some(2)
+                    && raw.motion_audio_track_start == Some(1) && raw.file_track == Some(t.index)))
 }
 impl OriginalIndex {
     pub fn scan(facts: &av::SourceProject, options: &OriginalOptions) -> Result<Self, String> {
@@ -770,10 +1017,13 @@ impl OriginalIndex {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, SourceReadIssue> {
         let mut out = Self { allow_offline, ..Self::default() };
-        let mut last_probe: Option<(PathBuf, OriginalProbe)> = None;
+        // Keep one additional file for interleaved selections without retaining
+        // probe metadata for the entire bin.
+        const PROBE_CACHE_FILES: usize = 2;
+        let mut probes = VecDeque::<(PathBuf, OriginalProbe)>::with_capacity(PROBE_CACHE_FILES);
         let mut used = 0usize;
         let mut pinned = HashMap::<PathBuf, String>::new();
-        let mut locator_claims = HashMap::<PathBuf, LocatorClaim>::new();
+        let mut locator_claims = HashMap::<LocatorClaimKey, LocatorClaim>::new();
         let adapter_masters: std::collections::HashSet<_> = facts.sequences.iter()
             .flat_map(|s| &s.events)
             .filter(|e| e.motion_adapter_phase.is_some())
@@ -814,14 +1064,14 @@ impl OriginalIndex {
                     out.tracks.insert((m.id.clone(), i), selected);
                     continue;
                 };
-                if !options.root_mappings.is_empty() {
-                    match locator_claims.entry(path.clone()) {
+                if !options.root_mappings.is_empty() || options.prefer_source_media {
+                    let key = locator_claim_key(&path).map_err(locator_error)?;
+                    match locator_claims.entry(key) {
                         Entry::Occupied(mut entry) => {
                             let previous = entry.get_mut();
                             // Require a common witness across all selections of this path.
                             // An intermediate row with several aliases cannot join two sources.
-                            previous.saved_paths.retain(|saved| claim.saved_paths.contains(saved));
-                            previous.mapped |= claim.mapped;
+                            previous.intersect(&claim);
                             if previous.mapped && previous.saved_paths.is_empty() {
                                 let saved = raw.locators.first().map_or("no saved path", String::as_str);
                                 return Err(SourceReadIssue::OriginalLocator(format!(
@@ -833,7 +1083,7 @@ impl OriginalIndex {
                         Entry::Vacant(entry) => {
                             used = used
                                 .checked_add(
-                                    std::mem::size_of::<(PathBuf, LocatorClaim)>()
+                                    std::mem::size_of::<(LocatorClaimKey, LocatorClaim)>()
                                         + path.as_os_str().len()
                                         + claim.saved_paths.capacity() * std::mem::size_of::<String>()
                                         + claim.saved_paths.iter().map(String::capacity).sum::<usize>(),
@@ -845,8 +1095,15 @@ impl OriginalIndex {
                     }
                 }
                 let describe = |why: String| format!("{:?} · {}: {why}", m.master.name, path.display());
-                let fresh_probe = last_probe.as_ref().is_none_or(|(p, _)| p != &path);
-                if fresh_probe {
+                let cached = probes.iter().position(|(p, _)| p == &path);
+                let fresh_probe = cached.is_none();
+                if let Some(index) = cached {
+                    let probe = probes.remove(index).unwrap();
+                    probes.push_front(probe);
+                } else {
+                    if probes.len() == PROBE_CACHE_FILES {
+                        probes.pop_back();
+                    }
                     // Pin bytes on both sides of the probe. Neither mtime nor a post-probe
                     // hash alone establishes which bytes supplied the stream facts.
                     let before = crate::revision::file_revision_checked(&path, check)
@@ -877,9 +1134,9 @@ impl OriginalIndex {
                             revision: before,
                         });
                     }
-                    last_probe = Some((path.clone(), observed));
+                    probes.push_front((path.clone(), observed));
                 }
-                let physical = &last_probe.as_ref().unwrap().1;
+                let physical = &probes.front().unwrap().1;
                 let v = &physical.metadata;
                 let physical_container = qualify_container(&path, v)?;
                 let Value::Arr(streams) = v.get("streams").ok_or("probe lacks streams")? else {
@@ -1014,6 +1271,9 @@ impl OriginalIndex {
                     duration: Rational::new(len as i128 * tb.num() as i128, tb.den() as i128)
                         .ok_or("original duration overflow")?,
                     motion_audio_origin: None,
+                    same_rate_aac_origin: false,
+                    column_timecode: None,
+                    embedded_mov_timecode: None,
                 };
                 if kind == StreamKind::Video {
                     let rate =
@@ -1040,6 +1300,11 @@ impl OriginalIndex {
                         );
                     }
                     selected.rate = Some(rate);
+                    if container == "mov" && picture_codec == "avc1"
+                        && rate == Rational::integer(24) && audios.len() == 1
+                    {
+                        selected.embedded_mov_timecode = embedded_avc_mov_timecode(v, streams, stream);
+                    }
                     selected.raster = Some((
                         number(stream, "width").ok_or("original width absent")?,
                         number(stream, "height").ok_or("original height absent")?,
@@ -1047,17 +1312,21 @@ impl OriginalIndex {
                 } else {
                     let sr = number(stream, "sample_rate").ok_or("original sample clock absent")?;
                     let channels = number(stream, "channels").ok_or("original channels absent")?;
-                    let qualified_priming = representation == Some("aac")
-                        && adapter_masters.contains(&m.master.mob_id)
+                    let has_priming = representation == Some("aac")
                         && raw.motion_audio_track_start == Some(1)
                         && raw.descriptor_rate == 46.875 && sr == 48000 && channels == 2
                         && len.checked_add(1024) == Some(raw.descriptor_length)
                         && has_aac_priming_packet(v, index);
+                    let qualified_priming = has_priming && adapter_masters.contains(&m.master.mob_id);
+                    let same_rate_priming = has_priming
+                        && !adapter_masters.contains(&m.master.mob_id)
+                        && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+                        && videos.first().is_some_and(|picture| same_rate_aac_master(m, len, picture));
                     if !matches!(channels, 1 | 2)
                         || raw.channels != Some(channels)
                         || raw.sample_rate != Some(sr as f64)
                         || tb != Rational::new(1, sr as i128).ok_or("invalid sample rate")?
-                        || (raw.descriptor_length != len && !qualified_priming)
+                        || (raw.descriptor_length != len && !qualified_priming && !same_rate_priming)
                         || index != if videos.is_empty() { 0 } else { 1 }
                     {
                         return Err(
@@ -1084,12 +1353,18 @@ impl OriginalIndex {
                     if qualified_priming {
                         selected.motion_audio_origin = raw.motion_audio_track_start;
                     }
+                    selected.same_rate_aac_origin = same_rate_priming;
                 }
                 out.tracks.insert((m.id.clone(), i), selected);
             }
         }
-        // A reused cached probe still needs a final revision check after all
-        // selected tracks/masters have consumed it. Publication rechecks these pins.
+        if options.prefer_source_media && !options.attach_avid_proxies {
+            source_media::select(
+                facts, options, &mut out, &mut locator_claims, &mut pinned, &mut used,
+                check, None,
+            )?;
+        }
+        // Recheck every selected file, including cache hits. Publication rechecks these pins.
         for input in &out.original_inputs {
             if crate::revision::file_revision_checked(&input.path, check)
                 .map_err(|e| format!("original final revision read failed: {e}"))?
@@ -1105,6 +1380,34 @@ impl OriginalIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn embedded_avc_clock_requires_agreeing_timecode_witnesses() {
+        let fixture = r#"{
+            "format":{"tags":{"major_brand":"qt  "}},
+            "streams":[
+                {"time_base":"1/12288","duration_ts":24576,"tags":{"timecode":"10:02:03:04"}},
+                {"index":1,"codec_type":"audio"},
+                {"index":2,"codec_type":"data","codec_tag_string":"tmcd","nb_frames":"1",
+                 "avg_frame_rate":"12288/512","time_base":"1/12288","start_pts":0,
+                 "duration_ts":24576,"tags":{"timecode":"10:02:03:04"}}
+            ]
+        }"#;
+        let observe = |json: &str| {
+            let probe = graph::json::parse(json).unwrap();
+            let Value::Arr(streams) = probe.get("streams").unwrap() else { panic!("expected streams") };
+            embedded_avc_mov_timecode(&probe, streams, &streams[0])
+        };
+        assert!(matches!(observe(fixture), Some(av::Observed::Known(866_956))));
+        for invalid in [
+            fixture.replacen("10:02:03:04", "10:02:03:05", 1),
+            fixture.replace("10:02:03:04", "10:02:03;04"),
+            fixture.replace("10:02:03:04", "10:02:03:24"),
+            fixture.replace("\"start_pts\":0", "\"start_pts\":1"),
+        ] {
+            assert!(matches!(observe(&invalid), Some(av::Observed::Unresolved(_))));
+        }
+    }
+
     #[test]
     fn original_adapter_priming_needs_observed_skip_packet_and_playable_zero() {
         let raw = r#"{"packets":[{"stream_index":0,"pts":0,"duration":512},
@@ -1436,7 +1739,11 @@ mod tests {
             std::fs::canonicalize(&mapped).unwrap()
         );
         std::fs::write(&saved, b"other synthetic").unwrap();
-        assert!(resolve(&[saved.to_string_lossy().into_owned()], &mappings).is_err());
+        let error = resolve(&[saved.to_string_lossy().into_owned()], &mappings).unwrap_err();
+        assert!(error.contains("2 exact candidates"));
+        for path in [&mapped, &saved] {
+            assert!(error.contains(&format!("{:?}", path.canonicalize().unwrap())));
+        }
         assert!(resolve(
             &[a.join("../mapped/nested/source.mp4")
                 .to_string_lossy()

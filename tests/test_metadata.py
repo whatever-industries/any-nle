@@ -12,7 +12,14 @@ from avid2prproj.writer import write_project
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "opatom_clip.model.json"
 AVID = AvidInfo(
     mob_id="urn:smpte:umid:test",
-    columns=(("Camroll", "A001"), ("Take", "3"), ("Comments", "nice"), ("Soundroll", "SR1"), ("UNC Path", "/x/y.mov")),
+    columns=(
+        ("Camroll", "A001"),
+        ("Take", "3"),
+        ("Comments", "nice"),
+        ("Soundroll", "SR1"),
+        ("Soundroll TC Rate", "25"),
+        ("UNC Path", "/x/y.mov"),
+    ),
     start_timecode="01:00:00:00",
     aux_timecodes=(AuxTimecode(5, "00:00:00:09", 9, 24),),
     source_file="y.mov",
@@ -23,12 +30,13 @@ AVID = AvidInfo(
 class MetadataTest(unittest.TestCase):
     def test_mapping(self):
         logging, bag = metadata.premiere_fields(AVID)
-        self.assertEqual([k for k, _ in logging], ["ShotTake", "FilmCameraRoll", "Description", "LogNote"])
+        self.assertEqual([k for k, _ in logging], ["ShotTake", "FilmCameraRoll", "SoundRoll", "Description", "LogNote"])
         fields = dict(logging)
         self.assertEqual(fields["FilmCameraRoll"], "A001")
         self.assertEqual(fields["ShotTake"], "3")
         self.assertEqual(fields["Description"], "y.mov")
-        self.assertEqual(fields["LogNote"], "Soundroll: SR1 | Source Path: /x/ | Avid Start: 01:00:00:00 | Aux TC3: 00:00:00:09")
+        self.assertEqual(fields["SoundRoll"], "SR1")
+        self.assertEqual(fields["LogNote"], "Soundroll TC Rate: 25 | Source Path: /x/ | Avid Start: 01:00:00:00 | Aux TC3: 00:00:00:09")
         self.assertEqual(bag, [("Column.PropertyText.Comment", "nice")])
 
     def test_every_item_gets_the_fields_including_childless_video_items(self):
@@ -42,6 +50,7 @@ class MetadataTest(unittest.TestCase):
                 expected = 3 if mode == "separate" else 4
                 self.assertEqual(xml.count("<FilmCameraRoll>A001</FilmCameraRoll>"), expected, mode)
                 self.assertNotIn("<TapeName>A001</TapeName>", xml, mode)
+                self.assertEqual(xml.count("<SoundRoll>SR1</SoundRoll>"), expected, mode)
                 self.assertEqual(xml.count("<Column.PropertyText.Comment>nice<"), expected, mode)
                 self.assertEqual(xml.count("<ShotTake>3</ShotTake>"), expected, mode)
 

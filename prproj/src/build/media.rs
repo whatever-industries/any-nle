@@ -180,7 +180,8 @@ pub fn movie_stream_profile(container: &str, codec: &str) -> Option<VideoStreamP
         ("mov", "avc1") => mov_h264,
         ("mov", "hvc1") => VideoStreamProfile { codec_type: Some("HEVC"), ..mov_h264 },
         ("mov", "apch") | ("mov", "AVdh") => VideoStreamProfile { orientation: true, ..PROFILE_DEFAULT },
-        ("mxf", "MPEG") => PROFILE_DEFAULT,
+        ("mxf", "MPEG") | ("mxf", "AVdn") => PROFILE_DEFAULT,
+        ("mov", "AVdn") => VideoStreamProfile { orientation: true, ..PROFILE_DEFAULT },
         _ => return None,
     })
 }

@@ -1,16 +1,17 @@
-# Feature matrix: what converts, per program
+# Historical graph/1 feature matrix
 
-The planning tool for new directions (docs/GRAPH-MODEL.md). One row per feature: its form in
-`anynle.graph/1`, how each program reads it into the graph and writes it out, and the evidence.
-**A direction's to-do list is the empty cells in its two columns.**
+This is the graph/1 compatibility matrix, with a later caption note. It records
+the feature forms and evidence from that profile. For current support and open
+work by direction, start at the [main roadmap](ROADMAP.md#where-work-is-tracked).
+The [graph/2 preparation guide](SOURCE-GRAPH-MIGRATION.md) describes the current
+source contract.
 
 Evidence is cited, not restated:
 - CONV IDs: `research-dependencies.json`, with finding hashes;
 - PRPROJ IDs: `knowledge/premiere`;
 - AVB and IDENTITY IDs: `knowledge/avid`.
 
-`knowledge/shared/` points here: it is not under version control, and this table must change in
-step with the code.
+`knowledge/shared/` retains a pointer to this compatibility reference.
 
 Status words:
 - **verified**: checked by the User in the target program against the source;

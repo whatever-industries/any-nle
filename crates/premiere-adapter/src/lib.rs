@@ -6,7 +6,7 @@ use prproj::convert::model::{
     self, AudioCrossfade, AudioFile, Bin, Clip, Event, EventAudio, Fraction, Marker, Model,
     Options, Sequence, StereoEdit, TrackLevel, Transform, VideoFile, VolumeKey, MultichannelGroup, TICKS_PER_SECOND,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use prproj::convert::prepared::{PreparedProjectInput,PreparedClip,ClipMetadata,OriginalClip,OriginalVideo,OriginalAudio,OriginalChannel,SampleRepresentation,PreparedVideoDissolve,PreparedAudioPan};
 mod text;
 mod multicam;
@@ -16,6 +16,7 @@ mod autosync;
 mod pan;
 mod gain;
 mod nests;
+pub use nests::{has_layered_candidates, LAYERED_LOSS};
 mod disabled;
 mod track_names;
 
@@ -91,6 +92,44 @@ fn str_value(v: &Value) -> Option<&str> {
     } else {
         None
     }
+}
+fn external_source_lut_filename(transforms: &[Value]) -> Option<String> {
+    let [transform] = transforms else { return None };
+    let xml = str_value(key(transform, "text")?)?;
+    if xml.len() > 16 * 1024 {
+        return None;
+    }
+    let mut tree = prproj::xml::Tree::new();
+    let root = tree.parse_fragment(xml).ok()?;
+    let [entry] = tree.children(root) else { return None };
+    let [lut] = tree.children(*entry) else { return None };
+    if tree.tag(root) != "ColorTransformationList"
+        || tree.tag(*entry) != "ColorTransformation"
+        || tree.tag(*lut) != "ExternalLut"
+    {
+        return None;
+    }
+    let leaf_text = |tag| {
+        let mut fields = tree.children(*lut).iter().filter(|&&id| tree.tag(id) == tag);
+        let &field = fields.next()?;
+        if fields.next().is_some() || !tree.is_childless(field) {
+            return None;
+        }
+        tree.text(field)
+    };
+    if leaf_text("LutDimension")? != "3D" {
+        return None;
+    }
+    let filename = leaf_text("LutFileName")?;
+    let (stem, extension) = filename.rsplit_once('.')?;
+    if stem.is_empty()
+        || !extension.eq_ignore_ascii_case("cube")
+        || filename.len() > 255
+        || filename.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+    {
+        return None;
+    }
+    Some(filename.to_owned())
 }
 fn boolean(v: &Value) -> Option<bool> {
     if let Value::Bool(b) = v {
@@ -175,16 +214,17 @@ type InheritedKey<'a> = (
     &'a str,
     &'a str,
     &'a str,
-    Option<i64>,
+    i64,
 );
 type LossIndex<'a> = HashMap<(&'a str, &'a str), Vec<&'a str>>;
 struct PreparationFacts<'a> {
     sidecars: Sidecars<'a>,
+    same_rate_aac_views: HashMap<&'a str, String>,
     routes: HashMap<&'a str, Routes>,
     items_by_clip: HashMap<&'a str, &'a graph::source::SourceItem>,
     losses: LossIndex<'a>,
     native_markers: NativeMarkers<'a>,
-    inherited: HashSet<InheritedKey<'a>>,
+    source_marker_uniqueness: HashMap<InheritedKey<'a>, bool>,
 }
 fn source_losses(index: &LossIndex, object: &str, aspect: &str) -> Vec<String> {
     index
@@ -194,6 +234,7 @@ fn source_losses(index: &LossIndex, object: &str, aspect: &str) -> Vec<String> {
         .map(|s| (*s).to_owned())
         .collect()
 }
+
 fn sample_animatte_acceleration50(
     matte: &mut model::Matte,
     frames: i64,
@@ -259,19 +300,16 @@ fn sample_animatte_acceleration50(
 fn side<'a>(index: &Sidecars<'a>, adapter: &str, object: &str) -> Option<&'a Value> {
     index.get(&(adapter, object)).copied()
 }
-fn native_created(native: &Value) -> Option<Option<i64>> {
-    match key(native, "created") {
-        Some(Value::Null) => Some(None),
-        Some(Value::Int(n)) => Some(Some(*n)),
-        _ => None,
-    }
+fn native_created(native: &Value) -> Option<i64> {
+    // A missing timestamp is not evidence that two occurrences are copies.
+    key(native, "created").and_then(integer)
 }
 fn inherited_key<'a>(
     item: &'a str,
     marker: &'a SourceMarker,
     source_track: TrackRef,
     time: i64,
-    created: Option<i64>,
+    created: i64,
 ) -> InheritedKey<'a> {
     let (palette, color) = marker
         .color
@@ -387,14 +425,27 @@ fn direct_opatom_clocks(
     exact_24_pcm16: bool,
     group_camera: bool,
 ) -> Option<(i64, i64, &'static str, bool)> {
+    direct_opatom_profile(item, media, sc, separate, exact_24_pcm16, group_camera, 2)
+}
+
+fn direct_opatom_profile(
+    item: &SourceItem,
+    media: &HashMap<&str, &SourceMedia>,
+    sc: &Sidecars,
+    separate: bool,
+    exact_24_pcm16: bool,
+    group_camera: bool,
+    mono_lanes: usize,
+) -> Option<(i64, i64, &'static str, bool)> {
     let rate = item.rate?;
-    let pcm16 = (rate.num(), rate.den()) == (24_000, 1001) && separate
+    let pcm16 = (rate.num(), rate.den()) == (24_000, 1001)
         && item.media.iter().any(|binding| {
             let m = media[binding.media.as_str()];
             m.kind == StreamKind::Audio && m.bits == Some(16)
         });
     const DNXHD_LB: &str = "060E2B340401010A0401020271130000";
-    let dnxhd_group_camera = separate && group_camera && !pcm16
+    const DNXHR_LB_0A: &str = "060E2B340401010A0401020271280000";
+    let dnxhd_group_camera = separate && (group_camera || mono_lanes == 0) && !pcm16
         && (rate.num(), rate.den()) == (24_000, 1001)
         && item.media.iter().any(|binding| {
             let m = media[binding.media.as_str()];
@@ -406,19 +457,31 @@ fn direct_opatom_clocks(
         (24, 1) if exact_24_pcm16 =>
             (24, false, "AVHD", "060E2B340401010A0401020271130000", 16, "24 DNxHD LB/PCM16"),
         (24_000, 1001) if pcm16 => (24, false, "AVHD", "060E2B340401010A0401020271130000", 16, "23.976 DNxHD LB/PCM16"),
-        (24_000, 1001) if dnxhd_group_camera => (24, false, "AVHD", DNXHD_LB, 24, "23.976 DNxHD LB/PCM24"),
+        (24_000, 1001) if dnxhd_group_camera =>
+            (24, false, "AVHD", DNXHD_LB, 24, if mono_lanes == 0 { "23.976 DNxHD LB" } else { "23.976 DNxHD LB/PCM24" }),
         (24_000, 1001) => (24, false, "RI00", "060E2B340401010D0401020271280000", 24, "23.976 DNxHR LB"),
-        (30_000, 1001) if separate => (30, true, "AVHD", "060E2B340401010A0401020271130000", 24, "29.97 DF DNxHD LB"),
+        (30_000, 1001) => (30, true, "AVHD", "060E2B340401010A0401020271130000", 24, "29.97 DF DNxHD LB"),
         _ => return None,
     };
-    if item.media.len() != 3 || !item.stream_groups.is_empty()
+    if mono_lanes == 3 && (!separate || !group_camera || drop || bits != 24
+        || (rate.num(), rate.den()) != (24_000, 1001))
+    {
+        return None;
+    }
+    let wide_or_picture_only = matches!(mono_lanes, 0 | 8);
+    if wide_or_picture_only && (!separate || (mono_lanes == 8 && !group_camera)
+        || (rate.num(), rate.den()) != (24_000, 1001) || pcm16)
+    {
+        return None;
+    }
+    if item.media.len() != mono_lanes + 1 || !item.stream_groups.is_empty()
         || side(sc, "avid.source", &item.id).and_then(|v| key(v, "raw_groups"))
             .is_some_and(|v| !matches!(v, Value::Arr(groups) if groups.is_empty()))
     {
         return None;
     }
     let mut picture = None;
-    let mut audio = [None, None];
+    let mut audio = [None; 8];
     let mut paths = HashSet::new();
     let mut packages = HashSet::new();
     for binding in &item.media {
@@ -433,12 +496,13 @@ fn direct_opatom_clocks(
         let facts = side(sc, "avid.source", &m.id)?;
         let descriptor = key(facts, "descriptor")?;
         let package = key(facts, "file_package").and_then(str_value)?;
-        let offline = m.online == Some(false) && !drop && !pcm16 && !exact_24_pcm16 && !dnxhd_group_camera
+        let offline = mono_lanes == 2 && m.online == Some(false) && !drop && !pcm16 && !exact_24_pcm16 && !dnxhd_group_camera
             && clock.provenance.route == "avid_saved_file_to_physical_timecode";
         if m.original.is_some() || (!offline && m.online != Some(true))
             || binding.source_offset != Some(Rational::ZERO)
             || !path.to_ascii_lowercase().ends_with(".mxf") || !paths.insert(path)
-            || package.is_empty() || !packages.insert(package)
+            || package.is_empty() || !packages.insert(package.to_ascii_lowercase())
+            || ((mono_lanes == 3 || wide_or_picture_only) && !subclips::mob_id(package))
             || clock.rate != rate || clock.display_base != base || clock.drop != drop
             || (!offline && clock.provenance.route != "file_source_clip_to_physical_timecode_track")
             || m.start != Some(start)
@@ -466,7 +530,9 @@ fn direct_opatom_clocks(
                 && (compression != "AVHD" || key(descriptor, "resolution_id").and_then(integer) == Some(1253))
                 && matches!(key(descriptor, "display_aspect"),
                     Some(Value::Arr(a)) if a.as_slice() == [Value::Int(16), Value::Int(9)])
-                && (offline || key(facts, "picture_coding").and_then(str_value) == Some(coding)) =>
+                && (offline || key(facts, "picture_coding").and_then(str_value) == Some(coding)
+                    || (wide_or_picture_only && compression == "RI00"
+                        && key(facts, "picture_coding").and_then(str_value) == Some(DNXHR_LB_0A))) =>
             {
                 let units = Rational::new(
                     i128::from(m.duration.num()) * i128::from(rate.num()),
@@ -477,14 +543,12 @@ fn direct_opatom_clocks(
             StreamKind::Audio if m.sample_rate == Some(48_000) && m.bits == Some(bits)
                 && clock.provenance.source_rate == Rational::integer(48_000)
                 && (!(pcm16 || exact_24_pcm16) || key(descriptor, "bits").and_then(integer) == Some(16))
-                && (!dnxhd_group_camera || key(descriptor, "bits").and_then(integer) == Some(24))
+                && (!(dnxhd_group_camera || mono_lanes >= 3)
+                    || key(descriptor, "bits").and_then(integer) == Some(24))
                 && key(descriptor, "channels").and_then(integer) == Some(1) =>
             {
-                let slot = match m.stream {
-                    Some(1) => &mut audio[0],
-                    Some(2) => &mut audio[1],
-                    _ => return None,
-                };
+                let label = usize::try_from(m.stream?).ok()?;
+                let slot = audio[..mono_lanes].get_mut(label.checked_sub(1)?)?;
                 (slot, m.duration.to_units(48_000)?)
             }
             _ => return None,
@@ -496,11 +560,26 @@ fn direct_opatom_clocks(
         }
     }
     let (start, origin, duration) = picture?;
-    if audio != [Some((start, origin, duration)); 2] {
+    if audio[..mono_lanes].iter().any(|lane| *lane != Some((start, origin, duration))) {
         return None;
     }
     Some((start.to_units(TICKS_PER_SECOND)?, origin.to_units(TICKS_PER_SECOND)?, profile, dnxhd_group_camera))
 }
+
+fn linked_package_key<'a>(
+    item: &'a SourceItem, media: &HashMap<&str, &'a SourceMedia>,
+) -> Option<(&'a str, [&'a str; 3])> {
+    let mob = item.umid.as_deref().filter(|mob| subclips::mob_id(mob))?;
+    let [a, b, c] = item.media.as_slice() else { return None };
+    let path = |media_id: &str| {
+        let [path] = media[media_id].locations.as_slice() else { return None };
+        Some(path.as_str())
+    };
+    let mut paths = [path(&a.media)?, path(&b.media)?, path(&c.media)?];
+    paths.sort_unstable();
+    Some((mob, paths))
+}
+
 fn display(rate: Option<Rational>, drop: bool) -> Option<i64> {
     match rate.map(|r| (r.num(), r.den()))? {
         (24, 1) => Some(100),
@@ -515,7 +594,9 @@ fn display(rate: Option<Rational>, drop: bool) -> Option<i64> {
         _ => None,
     }
 }
-fn marker(m: &SourceMarker, losses: &mut Vec<Loss>, object: &str, index: usize) -> R<Option<Marker>> {
+fn marker(
+    m: &SourceMarker, losses: &mut Vec<Loss>, object: &str, index: usize, in_sequence: bool,
+) -> R<Option<Marker>> {
     let mut timing_loss = |reason: &str| {
         loss(
             losses,
@@ -535,13 +616,7 @@ fn marker(m: &SourceMarker, losses: &mut Vec<Loss>, object: &str, index: usize) 
             return Ok(None);
         }
     };
-    let timing: R<(i64, Option<i64>)> = (|| {
-        Ok((
-            ticks(m.duration, "marker duration")?,
-            m.source.map(|s| ticks(s, "marker source")).transpose()?,
-        ))
-    })();
-    let (duration, source) = match timing {
+    let duration = match ticks(m.duration, "marker duration") {
         Ok(v) => v,
         Err(e) => {
             timing_loss(&e.to_string());
@@ -552,6 +627,27 @@ fn marker(m: &SourceMarker, losses: &mut Vec<Loss>, object: &str, index: usize) 
         timing_loss("record span exceeds destination tick range");
         return Ok(None);
     }
+    let mut owner = m.owner;
+    let source = match m.source.map(|s| ticks(s, "marker source")).transpose() {
+        Ok(source) => source,
+        Err(e) if in_sequence && owner == MarkerOwner::Edit => {
+            loss(
+                losses,
+                object,
+                "marker_ownership",
+                format!(
+                    "{object}/marker/{index}: marker {:?}: record range preserved on sequence; {e}",
+                    m.name,
+                ),
+            );
+            owner = MarkerOwner::Sequence;
+            None
+        }
+        Err(e) => {
+            timing_loss(&e.to_string());
+            return Ok(None);
+        }
+    };
     let color = match m.color.as_ref() {
         Some(label) if label.palette == "avid" => label.name.clone(),
         Some(label) => {
@@ -604,10 +700,10 @@ fn marker(m: &SourceMarker, losses: &mut Vec<Loss>, object: &str, index: usize) 
                 t.index
             )
         }),
-        owner: m.owner.as_str().into(),
+        owner: owner.as_str().into(),
         event: None,
         source,
-        inherited: m.inherited,
+        inherited: m.inherited && owner == m.owner,
     }))
 }
 fn normalize_rewrap_clocks(
@@ -869,6 +965,39 @@ fn verified_stereo_siblings(
         })
 }
 
+pub fn has_avid_filler_fade(g: &SourceGraph) -> bool {
+    g.sidecars.iter().any(|sidecar| sidecar.adapter == "avid.source"
+        && matches!(key(&sidecar.data, "native_transitions"), Some(Value::Arr(rows))
+            if rows.iter().any(|row| key(row, "incoming_filler_frames").and_then(integer).is_some()
+                && key(row, "effect").and_then(str_value) == Some("BLEND_AUDIO_DISSOLVE"))))
+}
+
+fn avid_stereo_fade_sources<'a>(
+    g: &'a SourceGraph, media: &HashMap<&str, &SourceMedia>, sidecars: &Sidecars,
+) -> HashSet<&'a str> {
+    let rate = Rational::new(24_000, 1001).unwrap();
+    g.items.iter().filter(|item| {
+        let [left, right] = item.media.as_slice() else { return false };
+        let [a, b] = [media[left.media.as_str()], media[right.media.as_str()]];
+        let package = |m: &SourceMedia| side(sidecars, "avid.source", &m.id)
+            .and_then(|v| key(v, "file_package")).and_then(str_value);
+        item.rate == Some(rate) && item.stream_groups == [vec![1, 2]]
+            && left.gain_db == right.gain_db && a.duration == b.duration
+            && a.start == b.start && a.locations != b.locations
+            && matches!([a.stream, b.stream], [Some(1), Some(2)] | [Some(2), Some(1)])
+            && package(a).zip(package(b)).is_some_and(|(x, y)|
+                subclips::mob_id(x) && subclips::mob_id(y) && x != y)
+            && [(left, a), (right, b)].iter().all(|(binding, m)| {
+                m.kind == StreamKind::Audio && m.original.is_none() && m.online == Some(true)
+                    && m.sample_rate == Some(48_000) && m.bits == Some(24)
+                    && m.locations.len() == 1 && binding.source_offset == Some(Rational::ZERO)
+                    && m.clock.as_ref().is_some_and(|c| c.rate == rate && !c.drop
+                        && c.provenance.source_rate == Rational::integer(48_000)
+                        && c.provenance.route == "file_source_clip_to_physical_timecode_track")
+            })
+    }).map(|item| item.id.as_str()).collect()
+}
+
 /// A direct caller should use typed preparation when a disabled edit may be recovered.
 pub fn has_disabled_edit_candidates(g: &SourceGraph) -> bool {
     g.sequences.iter().any(|sequence| !sequence.disabled_placements.is_empty())
@@ -933,17 +1062,45 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         ClockProfile::VerifiedRewrap=>"native rewrap media clocks retained; sequence start uses a qualified sequence clock or the compatibility origin",
     }.into()];
     let media: HashMap<_, _> = g.media.iter().map(|m| (m.id.as_str(), m)).collect();
+    let layered_candidates = if allow_originals && clock == ClockProfile::LegacyImport && options.bin_mode == "separate" {
+        nests::layered_candidates(g, &sc, &media)
+    } else {
+        Vec::new()
+    };
+    let layered_sources: HashSet<_> = layered_candidates.iter()
+        .flat_map(|candidate| candidate.draft.layers.iter().map(|layer| layer.clip.as_str()))
+        .collect();
+    let layered_packages: HashSet<_> = if layered_sources.is_empty() {
+        HashSet::new()
+    } else {
+        g.items.iter().filter(|item| layered_sources.contains(clip_id(&item.id).as_str()))
+            .filter_map(|item| linked_package_key(item, &media))
+            .collect()
+    };
     let mut clips = Vec::new();
     let mut ids = HashSet::new();
     let native_markers = native_marker_index(g, &sc)?;
     let mut direct_dnxhr_origins = HashMap::new();
     let mut direct_dnxhd_pcm24 = HashSet::new();
-    let group_cameras: HashSet<_> = g.multicams.iter().flat_map(|group| &group.lanes)
-        .filter(|lane| lane.kind == StreamKind::Video)
-        .flat_map(|lane| &lane.alternatives)
-        .flat_map(|alternative| &alternative.pieces)
-        .filter_map(|piece| piece.item.as_deref())
-        .collect();
+    let mut same_rate_aac_views = HashMap::new();
+    let mut mono_view_ids = Vec::new();
+    let mut group_cameras = HashMap::new();
+    let media_counts: HashMap<_, _> = g.items.iter()
+        .map(|item| (item.id.as_str(), item.media.len())).collect();
+    for group in &g.multicams {
+        let audio_count = group.lanes.iter().filter(|lane| lane.kind == StreamKind::Audio).count();
+        for item in group.lanes.iter().filter(|lane| lane.kind == StreamKind::Video)
+            .flat_map(|lane| &lane.alternatives).flat_map(|alt| &alt.pieces)
+            .filter_map(|piece| piece.item.as_deref())
+        {
+            let count = group_cameras.entry(item).or_insert(2);
+            if audio_count == 3 {
+                *count = 3;
+            } else if audio_count == 1 && media_counts.get(item) == Some(&9) {
+                *count = 8;
+            }
+        }
+    }
     let mut direct_drop_frame_items = HashSet::new();
     let (timeline_stereo, unsupported_stereo) = if clock == ClockProfile::LegacyImport && options.bin_mode == "separate" {
         timeline_stereo_items(g)
@@ -971,12 +1128,28 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         let mut video = None;
         let mut audio = Vec::new();
         let mut original:Option<OriginalClip>=None;
+        let mut same_rate_aac_channels = 0;
+        for im in &item.media {
+            let m = media[im.media.as_str()];
+            let Some(receipt) = side(&sc, "avid.source", &m.id) else { continue; };
+            let Some(origin) = key(receipt, "same_rate_aac_file_track_start") else { continue; };
+            if m.original.is_none() || m.kind != StreamKind::Audio || integer(origin) != Some(1)
+                || key(receipt, "verified_aac_priming_samples").and_then(integer) != Some(1024)
+            {
+                return Err(error(format!("{}: invalid linked AAC source origin receipt", item.id)));
+            }
+            same_rate_aac_channels += 1;
+        }
         let direct_clocks = if clock == ClockProfile::LegacyImport {
             let combined_24 = combined_mode
                 && item.rate == Some(Rational::integer(24))
                 && !incompatible_combined_24.contains(item.id.as_str());
-            direct_opatom_clocks(item, &media, &sc, options.bin_mode == "separate", combined_24,
-                group_cameras.contains(item.id.as_str()))
+            direct_opatom_profile(item, &media, &sc, options.bin_mode == "separate", combined_24,
+                group_cameras.contains_key(item.id.as_str()) || layered_sources.contains(id.as_str())
+                    || (!layered_packages.is_empty()
+                        && linked_package_key(item, &media).is_some_and(|key| layered_packages.contains(&key))),
+                group_cameras.get(item.id.as_str()).copied()
+                    .unwrap_or(if item.media.len() == 1 { 0 } else { 2 }))
                 .filter(|&(start, origin, _, _)| !combined_24 || (start == 0 && origin == 0))
         } else {
             None
@@ -985,6 +1158,9 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             let m = media[im.media.as_str()];
             m.online == Some(false) && m.original.is_none()
         }) && direct_clocks.is_none() {
+            if group_cameras.get(item.id.as_str()) == Some(&3) {
+                return Err(error(format!("{}: three-mono Group cameras need all four original files online", item.name)));
+            }
             return Err(error(format!("{}: offline managed clips require one qualified picture and two matching mono siblings", item.name)));
         }
         if let Some((_, origin, profile, dnxhd_group_camera)) = direct_clocks {
@@ -995,7 +1171,14 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             if item.rate == Rational::new(30_000, 1001) {
                 direct_drop_frame_items.insert(item.id.as_str());
             }
-            diagnostics.push(format!("{}: direct {profile} OP-Atom with discrete A1/A2, separate file origin and clip timecode, and no new media", item.name));
+            let track_count = group_cameras.get(item.id.as_str()).copied().unwrap_or(if item.media.len() == 1 { 0 } else { 2 });
+            let lanes = match track_count {
+                0 => "picture only",
+                3 => "discrete A1/A2/A3",
+                8 => "discrete A1–A8",
+                _ => "discrete A1/A2",
+            };
+            diagnostics.push(format!("{}: direct {profile} OP-Atom with {lanes}, separate file origin and clip timecode, and no new media", item.name));
         }
         let original_count=item.media.iter().filter(|im|media[im.media.as_str()].original.is_some()).count();
         if original_count>0 && (!allow_originals || original_count!=item.media.len()){return Err(error("original-file media require the typed prepared route with complete original bindings"));}
@@ -1019,14 +1202,33 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             }
             if let Some(o)=&m.original {
                 if m.locations.len()!=1{return Err(error("original stream requires one unambiguous qualified physical path"));}
-                let c=original.get_or_insert_with(||OriginalClip{metadata:ClipMetadata{id:id.clone(),name:item.name.clone(),material_umid:item.umid.clone(),tape_name:item.tape.clone(),avid:None,time_display:None,rate:item.rate.map(fraction),markers:vec![]},path:path.clone(),container:o.container.clone(),video:None,audio:None,channels:vec![],groups:vec![]});
+                let c=original.get_or_insert_with(||OriginalClip{proxy_path:None,metadata:ClipMetadata{id:id.clone(),name:item.name.clone(),material_umid:item.umid.clone(),tape_name:item.tape.clone(),avid:None,time_display:None,rate:item.rate.map(fraction),markers:vec![]},path:path.clone(),container:o.container.clone(),video:None,audio:None,channels:vec![],groups:vec![]});
                 if c.path!=path||c.container!=o.container{return Err(error("one original master must resolve to one physical file"));}
                 let duration=ticks(m.duration,"original stream duration")?;
                 match m.kind {
                     StreamKind::Video=>{
                         if c.video.is_some(){return Err(error("multiple original picture streams"));}
                         let (Some(codec),Some((width,height)),Some(rate))=(&m.codec,m.frame_size,m.rate)else{return Err(error("original picture facts incomplete"));};
-                        c.video=Some(OriginalVideo{codec:codec.clone(),width,height,rate:fraction(rate),duration,stream_index:o.stream_index});
+                        let source_start = m.start.filter(|_| m.clock.as_ref().is_some_and(|clock|
+                            clock.provenance.route == graph::source::AVID_SOURCE_COLUMNS_TIMECODE))
+                            .map(|start| ticks(start, "original source timecode"))
+                            .transpose()?.unwrap_or_default();
+                        if let Some(receipt) = side(&sc, "avid.source", &m.id)
+                            .and_then(|native| key(native, "embedded_mov_timecode"))
+                        {
+                            if let Some(label) = key(receipt, "label").and_then(str_value) {
+                                diagnostics.push(format!(
+                                    "{}: embedded MOV timecode {label} is recorded in the source graph and does not change file-relative edit positions",
+                                    item.name
+                                ));
+                            } else {
+                                diagnostics.push(format!(
+                                    "{}: embedded MOV timecode could not be verified",
+                                    item.name
+                                ));
+                            }
+                        }
+                        c.video=Some(OriginalVideo{codec:codec.clone(),width,height,rate:fraction(rate),duration,stream_index:o.stream_index,source_start});
                     },
                     StreamKind::Audio=>{
                         let representation=match o.sample_representation.as_deref(){Some("aac")=>SampleRepresentation::Aac,Some("pcm16")=>SampleRepresentation::Pcm16,Some("pcm24")=>SampleRepresentation::Pcm24,_=>return Err(error("original audio representation unresolved"))};
@@ -1051,6 +1253,10 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             }
             let start = match direct_clocks {
                 Some((start, _, _, _)) => start,
+                None if sc.contains_key(&("avid.managed_op1a", m.id.as_str())) => {
+                    ticks(m.start.ok_or_else(|| error("managed OP1a source clock is missing"))?,
+                          "managed OP1a source timecode")?
+                }
                 None => old_clock(&sc, m)?,
             };
             let duration = ticks(m.duration, "media duration")?;
@@ -1091,13 +1297,20 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             loss(&mut losses,&item.id,"color","item label has no Avid metadata block for the current writer; source color retained only in graph");
         }
         let raw = side(&sc, "avid.source", &item.id);
-        if matches!(raw.and_then(|v| key(v, "input_color_transforms")), Some(Value::Arr(transforms)) if !transforms.is_empty()) {
-            loss(
-                &mut losses,
-                &item.id,
-                "source_color_transform",
-                format!("{}: Avid source color transformation was retained in graph/2 only. Check the clip's source color settings in Premiere.", item.name),
-            );
+        if let Some(Value::Arr(transforms)) = raw.and_then(|v| key(v, "input_color_transforms")) {
+            if !transforms.is_empty() {
+                let reason = match external_source_lut_filename(transforms) {
+                    Some(filename) => format!(
+                        "{}: Avid references the external source LUT {filename:?}. Check the timeline Color Adapter occurrences to see where Avid applies it.",
+                        item.name,
+                    ),
+                    None => format!(
+                        "{}: Avid source color transformation was retained in graph/2 only. Check the clip's source color settings in Premiere.",
+                        item.name,
+                    ),
+                };
+                loss(&mut losses, &item.id, "source_color_transform", reason);
+            }
         }
         if let Some(observation) = raw.and_then(|v| key(v, "master_output_mix")) {
             if let Some(reason) = output_mix_notice(observation)? {
@@ -1128,7 +1341,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             .unwrap_or(false);
         let mut markers = Vec::new();
         for (index, source) in item.markers.iter().enumerate() {
-            if let Some(mut output) = marker(source, &mut losses, &item.id, index)? {
+            if let Some(mut output) = marker(source, &mut losses, &item.id, index, false)? {
                 let native = native_markers.get(&(item.id.as_str(), index)).copied();
                 output.track = master_marker_track(source, native).map(|track| {
                     let prefix = if track.kind == StreamKind::Video { 'V' } else { 'A' };
@@ -1160,6 +1373,21 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             }
         }
         if let Some(mut c) = original {
+            if let Some(proxy) = sc.get(&("avid.proxy", item.id.as_str())) {
+                let path = key(proxy,"path").and_then(str_value).ok_or_else(||error("missing Avid proxy path"))?;
+                let v = c.video.as_ref().ok_or_else(||error("Avid proxy lacks its camera picture"))?;
+                let frame = model::ticks_per_unit(v.rate);
+                if key(proxy,"frames").and_then(integer) != Some(v.duration / frame)
+                    || key(proxy,"start").and_then(integer) != Some(v.source_start / frame)
+                    || match (key(proxy,"bits").and_then(integer), c.audio.as_ref().map(|a|&a.representation)) {
+                        (None,None) | (Some(16),Some(SampleRepresentation::Pcm16)) | (Some(24),Some(SampleRepresentation::Pcm24)) => false,
+                        _ => true,
+                    }
+                {
+                    return Err(error("Avid proxy does not agree with camera original extent, clock or PCM"));
+                }
+                c.proxy_path = Some(path.into());
+            }
             c.metadata.avid = avid;
             c.metadata.time_display = display(item.rate, drop);
             c.metadata.markers = markers;
@@ -1188,6 +1416,37 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 }
             }
             prproj::convert::prepared::validate_original(&c).map_err(|e| error(e.to_string()))?;
+            if same_rate_aac_channels != 0 {
+                if same_rate_aac_channels != 2 || clock != ClockProfile::LegacyImport
+                    || options.bin_mode != "separate"
+                    || !matches!(c.groups.as_slice(), [stereo] if stereo.as_slice() == [1, 2])
+                    || c.proxy_path.is_some() || !c.metadata.markers.is_empty()
+                    || !c.video.as_ref().is_some_and(|v| v.codec == "avc1"
+                        && v.rate == Fraction::new(24, 1))
+                    || !c.audio.as_ref().is_some_and(|a| a.representation == SampleRepresentation::Aac
+                        && a.channels == 2 && a.sample_rate == 48000
+                        && c.video.as_ref().is_some_and(|v| a.duration == v.duration))
+                    || !c.channels.iter().all(|ch| ch.avid_track == ch.channel_index + 1)
+                {
+                    return Err(error(format!("{}: linked AAC file-track origin requires the verified 24 fps stereo source in Separate files mode", item.name)));
+                }
+                loss(&mut losses, &item.id, "original_audio_insertion",
+                    "Existing edits use the saved Avid audio offset. Fresh insertions from this stereo source use the MOV's own audio origin.");
+                if items_used_for_sequence_audio.contains(item.id.as_str()) {
+                    // Keep the stereo bin item. Existing mono edits need separate
+                    // source controls in Premiere, backed by the very same file.
+                    let mut mono = c.clone();
+                    mono.metadata.id.push_str(":timeline-mono");
+                    mono.metadata.name.push_str(" [timeline mono]");
+                    mono.groups = vec![vec![1], vec![2]];
+                    if !ids.insert(mono.metadata.id.clone()) {
+                        return Err(error("timeline mono source identity collision"));
+                    }
+                    same_rate_aac_views.insert(item.id.as_str(), mono.metadata.id.clone());
+                    mono_view_ids.push(mono.metadata.id.clone());
+                    clips.push(PreparedClip::Original(mono));
+                }
+            }
             clips.push(PreparedClip::Original(c));
         } else {
         if timeline_stereo.contains(item.id.as_str()) && verified_stereo_siblings(item, &media, &sc) {
@@ -1276,6 +1535,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         audio_mixers: Default::default(),
         track_states: Default::default(),
         picture_effects: Vec::new(),
+        source_luts: Vec::new(),
         edit_labels: Vec::new(),
         disabled_edits: Default::default(),
         direct_dnxhr_origins,
@@ -1287,8 +1547,12 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         av_subclips: Vec::new(),
         av_subclip_uses: Vec::new(),
         picture_nests: Vec::new(),
+        layered_submasters: Vec::new(),
         png_mattes: Default::default(),
     };
+    if !mono_view_ids.is_empty() {
+        model.bins.push(Bin { name: "Avid timeline audio".into(), clips: mono_view_ids });
+    }
     if clock == ClockProfile::VerifiedRewrap {
         let mut legacy=model.clips.iter().filter_map(|c|match c{PreparedClip::Legacy(c)=>Some(c.clone()),_=>None}).collect();
         normalize_rewrap_clocks(g, &sc, &mut legacy, &mut diagnostics)?;
@@ -1301,7 +1565,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             .or_default()
             .push(&l.reason);
     }
-    let mut inherited = HashSet::new();
+    let mut source_marker_uniqueness = HashMap::new();
     for item in &g.items {
         for (mi, m) in item.markers.iter().enumerate() {
             let native = native_markers.get(&(item.id.as_str(), mi)).copied();
@@ -1310,19 +1574,30 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 m.start.and_then(|t| t.to_units(TICKS_PER_SECOND)),
                 native.and_then(native_created),
             ) {
-                inherited.insert(inherited_key(&item.id, m, track, time, created));
+                source_marker_uniqueness
+                    .entry(inherited_key(&item.id, m, track, time, created))
+                    .and_modify(|unique| *unique = false)
+                    .or_insert(true);
             }
         }
     }
     let facts = PreparationFacts {
         sidecars: sc,
+        same_rate_aac_views,
         routes,
         items_by_clip,
         losses: loss_index,
         native_markers,
-        inherited,
+        source_marker_uniqueness,
     };
     let mut ownership = HashMap::new();
+    let stereo_fade_sources = if options.bin_mode == "separate" && clock == ClockProfile::LegacyImport
+        && allow_originals && has_avid_filler_fade(g)
+    {
+        avid_stereo_fade_sources(g, &media, &facts.sidecars)
+    } else {
+        HashSet::new()
+    };
     // The mono source-layout Constant Gain has been tested on the direct Separate route.
     let linear_fade_clips: HashSet<_> = if options.bin_mode == "separate" {
         model.clips.iter().filter_map(|clip| match clip {
@@ -1345,8 +1620,8 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 Some(clip.id.as_str()),
             PreparedClip::Original(clip) if options.bin_mode == "separate"
                 && prproj::convert::prepared::qualifies_audio_pan(clip)
-                && facts.items_by_clip[clip.metadata.id.as_str()].media.iter()
-                    .all(|reference| media[reference.media.as_str()].online == Some(true)) =>
+                && facts.items_by_clip.get(clip.metadata.id.as_str()).is_some_and(|item|
+                    item.media.iter().all(|reference| media[reference.media.as_str()].online == Some(true))) =>
                 Some(clip.metadata.id.as_str()),
             _ => None,
         }).collect()
@@ -1370,6 +1645,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
     // Bound the extra sampled paths across the project, in addition to the
     // graph and destination writer limits on preserved source keys.
     let mut animatte_points_remaining = 500_000;
+    let mut record_only_markers = HashSet::new();
     for (si, s) in g.sequences.iter().enumerate() {
         let exact_start = qualified_sequence_start(s);
         if s.placements.iter().any(|p| direct_drop_frame_items.contains(p.item.as_str()))
@@ -1398,11 +1674,14 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             exact_start,
             &linear_fade_clips,
             &source_gain_clips,
+            &stereo_fade_sources,
             &mut ownership,
             &mut losses,
             &mut model.video_dissolves,
+            &mut model.audio_edge_fades,
             &mut model.picture_effects,
             &mut animatte_points_remaining,
+            &mut record_only_markers,
         )?;
         pan::prepare(&facts, s, &sequence, si, &ownership, &pan_clips,
             &mut model.audio_pans, &mut written_pan, &mut losses);
@@ -1418,7 +1697,11 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         g, &media, &facts.sidecars, &mut model, &ownership, allow_originals, clock, &mut losses,
     )?;
     text::prepare(g, &mut model, &mut losses)?;
-    nests::prepare(g, &facts.sidecars, &mut model, &ownership, allow_originals, clock, &mut losses);
+    nests::prepare(
+        g, &media, &facts.sidecars, &mut model, &ownership, &record_only_markers,
+        allow_originals, clock, &mut losses,
+    );
+    let restored_layered = nests::add_layered(layered_candidates, &mut model)?;
     if clock == ClockProfile::LegacyImport && options.bin_mode == "separate" {
         let mut qualified_items = HashMap::new();
         for source_sequence in &g.sequences {
@@ -1440,17 +1723,36 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 if !eligible {
                     continue;
                 }
-                if !item.markers.is_empty() || seq.markers.iter().any(|m| {
-                    m.owner == "edit" && m.event == i64::try_from(event).ok()
-                }) {
+                if !item.markers.is_empty() {
                     loss(&mut losses, &placement.id, "constant_speed",
-                        "Premiere 27 retime correction requires a separate marker timing check; this edit uses the compatibility retime");
+                        "Premiere 27 retime correction requires a separate source marker timing check; this edit uses the compatibility retime");
                     continue;
                 }
                 model.constant_speeds.push(prproj::convert::prepared::PreparedConstantSpeed {
                     sequence, event, ratio: (*num, *den),
                 });
                 diagnostics.push(format!("{}: editable Avid picture retime uses exact {num}/{den} speed and Premiere 27 source trims", placement.id));
+            }
+        }
+        // A retimed edit has a qualified record span, but the clip marker's
+        // source coordinates have not been qualified against Premiere playback.
+        if !model.constant_speeds.is_empty() {
+            let corrected: HashSet<_> = model.constant_speeds.iter()
+                .map(|speed| (speed.sequence, speed.event)).collect();
+            for (sequence, seq) in model.sequences.iter_mut().enumerate() {
+                for marker in &mut seq.markers {
+                    let event = marker.event.and_then(|event| usize::try_from(event).ok());
+                    if marker.owner == "edit"
+                        && event.is_some_and(|event| corrected.contains(&(sequence, event)))
+                    {
+                        marker.owner = "sequence".into();
+                        marker.event = None;
+                        marker.source = None;
+                        marker.inherited = false;
+                        loss(&mut losses, &g.sequences[sequence].id, "marker_ownership",
+                            format!("marker {:?}: record time preserved on sequence; edit ownership on a corrected constant retime is unqualified", marker.name));
+                    }
+                }
             }
         }
     }
@@ -1491,6 +1793,11 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         }
     }
     losses.extend(g.losses.iter().filter(|loss| {
+        if loss.aspect == LAYERED_LOSS && restored_layered.get(loss.object.as_str())
+            .is_some_and(|reasons| reasons.contains(&loss.reason))
+        {
+            return false;
+        }
         loss.aspect != "subclip_bin_item"
             && !(loss.aspect == "disabled_clip" && loss.reason.split_once(": ").is_some_and(
                 |(owner, _)| restored_disabled.contains(&(loss.object.as_str(), owner))))
@@ -1511,23 +1818,28 @@ struct Trim {
     end: Rational,
 }
 
-fn qualified_sequence_start(s: &SourceSequence) -> Option<Rational> {
+fn direct_avid_tc1(s: &SourceSequence, base: u16, drop: bool, frames_per_day: u64) -> Option<Rational> {
     let clock = s.clock.as_ref()?;
-    if (s.rate.num(), s.rate.den()) == (30_000, 1001)
-        && clock.rate == s.rate
-        && clock.display_base == 30
-        && clock.drop
+    (clock.rate == s.rate
+        && clock.display_base == base
+        && clock.drop == drop
         && clock.provenance.route == "direct sequence TC1"
         && clock.provenance.timecode_track.starts_with("TC1/")
         && clock.provenance.source_rate == s.rate
         && clock.provenance.origin_count == clock.effective_count
         && clock.provenance.source_offset == 0
-        && clock.effective_count < 2_589_408
-        && clock.exact_start() == s.start
-    {
+        && clock.effective_count < frames_per_day
+        && clock.exact_start() == s.start)
+        .then_some(s.start)
+        .flatten()
+}
+
+fn qualified_sequence_start(s: &SourceSequence) -> Option<Rational> {
+    if (s.rate.num(), s.rate.den()) == (30_000, 1001) {
         // The 1080p29.97 Premiere preset already uses drop-frame display 102.
-        return s.start;
+        return direct_avid_tc1(s, 30, true, 2_589_408);
     }
+    let clock = s.clock.as_ref()?;
     // The existing 23.976 Premiere sequence presets use non-drop display
     // code 110. This changes only the zero point, not any record-local times.
     ((s.rate.num() == 24000 && s.rate.den() == 1001
@@ -1553,11 +1865,14 @@ fn prepare_sequence(
     exact_start: Option<Rational>,
     linear_fade_clips: &HashSet<&str>,
     source_gain_clips: &HashMap<&str, i64>,
+    stereo_fade_sources: &HashSet<&str>,
     ownership: &mut HashMap<String, (usize, usize)>,
     losses: &mut Vec<Loss>,
     video_dissolves: &mut Vec<PreparedVideoDissolve>,
+    audio_edge_fades: &mut Vec<prproj::convert::prepared::PreparedAudioEdgeFade>,
     picture_effects: &mut Vec<prproj::convert::prepared::PreparedPictureEffect>,
     animatte_points_remaining: &mut usize,
+    record_only_markers: &mut HashSet<(usize, usize)>,
 ) -> R<Sequence> {
     // Avid's actual sequence canvas is currently unqualified. Keep the exact
     // old first-picture/default raster only in the destination compatibility profile.
@@ -1571,6 +1886,7 @@ fn prepare_sequence(
     };
     let source_gain = gain::SourceGain::new(facts, s, frame_size, source_gain_clips);
     let mut linear_audio = HashSet::new();
+    let mut incoming_fillers = HashMap::new();
     if let Some(raw) =
         side(&facts.sidecars, "avid.source", &s.id).and_then(|v| key(v, "native_transitions"))
     {
@@ -1600,6 +1916,9 @@ fn prepare_sequence(
                 && key(transition, "audio_curve_parameter").and_then(integer) == Some(0)
             {
                 linear_audio.insert(id);
+                if let Some(frames) = key(transition, "incoming_filler_frames").and_then(integer) {
+                    incoming_fillers.insert(id, frames);
+                }
             }
         }
     }
@@ -1619,9 +1938,33 @@ fn prepare_sequence(
         .collect::<R<_>>()?;
     let mut crossfades = Vec::new();
     let mut dissolve_endpoints = Vec::new();
+    let mut stereo_tail_fades = Vec::new();
     let mut seen = HashSet::new();
     // Resolve against original spans before making any edit, including chains.
     for t in &s.transitions {
+        if let Some(&frames) = incoming_fillers.get(t.id.as_str()) {
+            if t.kind == StreamKind::Audio && t.style == "avid.BLEND_AUDIO_DISSOLVE"
+                && s.rate == Rational::new(24_000, 1001).unwrap()
+                && t.cut_offset == t.duration && frames > 0
+                && Rational::new(i128::from(frames) * 1001, 24_000)
+                    .is_some_and(|extent| extent >= t.duration)
+                && t.incoming.placements.is_empty() && t.outgoing.reason.is_none()
+            {
+                if let [out] = t.outgoing.placements.as_slice() {
+                    let p = placements[out.as_str()];
+                    if stereo_fade_sources.contains(p.item.as_str())
+                        && matches!(p.grouped_audio.as_slice(), [st] if st.track == t.track
+                            && st.streams == [1, 2] && st.pans.iter().all(Option::is_none))
+                        && p.audio_tracks.is_empty() && p.video_track.is_none()
+                        && p.speed.is_none() && p.frame_map.is_none() && p.duration >= t.duration
+                        && add(p.record_start, p.duration)? == t.cut
+                    {
+                        stereo_tail_fades.push((t, out.as_str()));
+                        continue;
+                    }
+                }
+            }
+        }
         if t.outgoing.reason.is_some()
             || t.incoming.reason.is_some()
             || t.outgoing.placements.len() != 1
@@ -1640,10 +1983,21 @@ fn prepare_sequence(
                 t.id
             )));
         }
+        let managed_motion = t.kind == StreamKind::Audio
+            && t.style == "avid.BLEND_AUDIO_DISSOLVE"
+            && linear_audio.contains(t.id.as_str())
+            && s.rate == Rational::new(24_000, 1001).unwrap()
+            && t.cut_offset > Rational::ZERO && t.cut_offset < t.duration
+            && [out, input].iter().all(|p| {
+                p.video_track.is_none() && p.audio_tracks == [t.track]
+                    && p.audio_streams == [1] && p.grouped_audio.is_empty()
+                    && side(&facts.sidecars, "avid.motion_adapter", &p.id)
+                        .and_then(|a| key(a, "managed_pcm16")).and_then(boolean) == Some(true)
+            });
         if [out, input]
             .iter()
             .any(|p| p.speed.is_some() || p.frame_map.is_some()
-                || side(&facts.sidecars, "avid.motion_adapter", &p.id).is_some())
+                || (!managed_motion && side(&facts.sidecars, "avid.motion_adapter", &p.id).is_some()))
         {
             return Err(error(format!(
                 "retimed_transition_endpoint {}: ordinary trim arithmetic is unqualified",
@@ -1670,7 +2024,7 @@ fn prepare_sequence(
         let it = trims.get_mut(input.id.as_str()).unwrap();
         it.start = it.start.max(t.cut);
         if t.kind == StreamKind::Audio {
-            let linear = t.style == "avid.BLEND_AUDIO_DISSOLVE"
+            let linear = managed_motion || t.style == "avid.BLEND_AUDIO_DISSOLVE"
                 && linear_audio.contains(t.id.as_str())
                 && s.rate == Rational::new(24000, 1001).unwrap()
                 && t.cut_offset > Rational::ZERO
@@ -1715,6 +2069,12 @@ fn prepare_sequence(
             format!("native transition {:?} prepared as a video cut", t.style),
         );
     }
+    let edit_marker_owners: HashSet<_> = if facts.same_rate_aac_views.is_empty() {
+        HashSet::new()
+    } else {
+        s.markers.iter().filter(|m| m.owner == MarkerOwner::Edit)
+            .flat_map(|m| m.binding.placements.iter().map(String::as_str)).collect()
+    };
     let mut raw = Vec::new();
     let mut picture_edits = Vec::new();
     for p in &s.placements {
@@ -1773,6 +2133,7 @@ fn prepare_sequence(
         let adapter = side(&facts.sidecars, "avid.motion_adapter", &p.id);
         let mut sample_tail = false;
         if let Some(a) = adapter {
+            let managed = key(a, "managed_pcm16").and_then(boolean) == Some(true);
             let native = key(a, "native_record_frames").and_then(integer)
                 .filter(|n| (2..=16_384).contains(n));
             let sample = model::TICKS_PER_SECOND / 48_000;
@@ -1780,8 +2141,12 @@ fn prepare_sequence(
                 .filter(|n| (0..unit / sample).contains(n));
             let extent = native.zip(tail).and_then(|(n,t)| n.checked_mul(unit)?.checked_sub(t * sample));
             if !matches!((s.rate.num(), s.rate.den()), (24, 1) | (24_000, 1001))
-                || extent != Some(duration_ticks)
-                || delta != Rational::ZERO || p.speed.is_some()
+                || extent != Some(ticks(p.duration, "saved adapter duration")?)
+                || (!managed && (delta != Rational::ZERO || extent != Some(duration_ticks)))
+                || p.speed.is_some()
+                || (managed && (s.rate != Rational::new(24_000, 1001).unwrap()
+                    || p.video_track.is_some() || p.frame_map.is_some()
+                    || tail != Some(0) || p.audio_streams != [1]))
                 || (p.video_track.is_some() && (p.frame_map.is_none() || tail != Some(0)))
                 || (p.video_track.is_none() && (p.audio_tracks.len() != 1 || !p.grouped_audio.is_empty()
                     || ticks(p.source_in, "adapter audio in")? % sample != 0))
@@ -1796,6 +2161,32 @@ fn prepare_sequence(
         {
             return Err(error(format!("destination_record_grid {}: exact source record time/span is not representable on the current Premiere sequence frame grid",p.id)));
         }
+        let receipt = side(&facts.sidecars, "avid.same_rate_aac", &p.id);
+        let aac_view = facts.same_rate_aac_views.get(p.item.as_str())
+            .filter(|_| !p.audio_tracks.is_empty() || !p.grouped_audio.is_empty());
+        if receipt.is_some() && aac_view.is_none() {
+            return Err(error(format!("{}: linked AAC edit receipt has no matching original source", p.id)));
+        }
+        let clip = if let Some(view) = aac_view {
+            let original = sub(p.source_in, Rational::new(1, 24).unwrap())?;
+            let saved_source_in = original.to_string();
+            if s.rate != Rational::integer(24) || p.video_track.is_some()
+                || p.audio_tracks.len() != 1 || !matches!(p.audio_streams.as_slice(), [1] | [2])
+                || !p.grouped_audio.is_empty() || p.speed.is_some() || p.frame_map.is_some()
+                || !p.effects.is_empty() || !p.volume_keys.is_empty()
+                || delta != Rational::ZERO || tr.end != add(p.record_start, p.duration)?
+                || original.is_negative() || edit_marker_owners.contains(p.id.as_str())
+                || !route.video_duration.is_some_and(|extent|
+                    p.source_in.checked_add(p.duration).is_some_and(|end| end <= extent))
+                || receipt.and_then(|r| key(r, "file_track_start")).and_then(integer) != Some(1)
+                || receipt.and_then(|r| key(r, "saved_source_in")).and_then(str_value) != Some(saved_source_in.as_str())
+            {
+                return Err(error(format!("{}: linked AAC audio needs a verified one-frame offset and a playable straight mono route", p.id)));
+            }
+            view.clone()
+        } else {
+            clip_id(&p.item)
+        };
         let source = if p.frame_map.is_some() {
             p.source_in
         } else {
@@ -1957,7 +2348,7 @@ fn prepare_sequence(
         raw.push((
             p.id.as_str(),
             Event {
-                clip: clip_id(&p.item),
+                clip,
                 record_start: ticks(tr.start, "record start")?,
                 source_in: ticks(source, "source in")?,
                 duration: duration_ticks,
@@ -2082,14 +2473,21 @@ fn prepare_sequence(
             before_cut: ticks(t.cut_offset, "dissolve offset")?,
         });
     }
+    for (t, outgoing) in stereo_tail_fades {
+        audio_edge_fades.push(prproj::convert::prepared::PreparedAudioEdgeFade {
+            sequence: si, event: ownership[outgoing].1, track: t.track, head: 0,
+            tail: ticks(t.duration, "stereo fade duration")?,
+        });
+    }
     for (id, effect, reflection_before_motion) in picture_edits {
         picture_effects.push(prproj::convert::prepared::PreparedPictureEffect {
             sequence: si, event: ownership[id].1, effect, reflection_before_motion,
         });
     }
-    let mut markers = Vec::new();
+    let mut markers: Vec<Marker> = Vec::new();
+    let mut edit_matches = HashMap::new();
     for (marker_index, m) in s.markers.iter().enumerate() {
-        let Some(mut out) = marker(m, losses, &s.id, marker_index)? else {
+        let Some(mut out) = marker(m, losses, &s.id, marker_index, true)? else {
             continue;
         };
         if m.owner == MarkerOwner::Edit {
@@ -2112,6 +2510,13 @@ fn prepare_sequence(
                             })
                 })
                 .collect();
+            if out.owner == MarkerOwner::Sequence.as_str() {
+                if m.binding.reason.is_none() && candidates.len() == 1 {
+                    record_only_markers.insert((si, marker_index));
+                }
+                markers.push(out);
+                continue;
+            }
             if m.binding.reason.is_none() && candidates.len() == 1 {
                 let i = *candidates.iter().next().unwrap();
                 out.event = Some(i as i64);
@@ -2140,9 +2545,25 @@ fn prepare_sequence(
                         facts.items_by_clip.get(event.clip.as_str()),
                         track,
                     ) {
-                        out.inherited = facts
-                            .inherited
-                            .contains(&inherited_key(&item.id, m, track, source, created));
+                        out.inherited = false;
+                        let key = inherited_key(&item.id, m, track, source, created);
+                        if out.track.is_some()
+                            && facts.source_marker_uniqueness.get(&key) == Some(&true)
+                        {
+                            // A unique source marker can match once per edit lane.
+                            // Multiple matching edit markers need the conflict policy.
+                            match edit_matches.entry((i, m.track, key)) {
+                                Entry::Vacant(entry) => {
+                                    entry.insert(Some(markers.len()));
+                                    out.inherited = true;
+                                }
+                                Entry::Occupied(mut entry) => {
+                                    if let Some(first) = entry.get_mut().take() {
+                                        markers[first].inherited = false;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -183,6 +183,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -191,6 +192,7 @@ version = "0.1.0"
 dependencies = [
  "anynle-graph",
  "avid-reader",
+ "fs2",
  "hex",
  "png",
  "sha2",

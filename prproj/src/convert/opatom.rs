@@ -95,6 +95,13 @@ impl MediaTable {
         self.direct_dnxhr.get(path).is_some_and(|file| file.picture)
     }
 
+    // The admitted direct DNxHD profiles require the file and logging origins to agree.
+    pub(super) fn direct_combined_display_start(&self, path: &str) -> Option<i64> {
+        self.direct_dnxhr.get(path)
+            .filter(|file| file.picture && !file.dnxhr && file.origin != 0)
+            .map(|file| file.origin)
+    }
+
     pub(super) fn picture_format_override(&self, path: &str) -> Option<&str> {
         if let Some(file) = self.direct_dnxhr.get(path).filter(|file| file.picture) {
             Some(file.display)

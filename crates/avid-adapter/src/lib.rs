@@ -4,12 +4,15 @@
 mod effects;
 pub mod index;
 pub mod original;
+pub mod proxy;
 mod revision;
 mod sequence;
 mod multicam;
+pub mod managed_multistream;
 mod subclips;
 use avid_reader::{
     extract::{self, AvidMarker, Essence, KIND_PICTURE, KIND_SOUND},
+    io::MobId,
     source::{self as av, Observed, Rate},
 };
 use graph::{source::*, *};
@@ -23,6 +26,19 @@ use std::{
 pub const UNQUALIFIED_ROUTE_TIMING: &str = "source_route_timing";
 pub const PAN_AUTOMATION_LOSS: &str = "pan_automation";
 
+fn source_master_copy<'a>(
+    mob: MobId, bin: usize, copies: &HashMap<MobId, Vec<(usize, usize)>>, items: &'a [SourceItem],
+) -> Option<&'a SourceItem> {
+    let all = copies.get(&mob)?;
+    let mut local = all.iter().filter(|(owner, _)| *owner == bin);
+    let index = match (local.next(), local.next()) {
+        (Some((_, index)), None) => *index,
+        (None, None) if all.len() == 1 => all[0].1,
+        _ => return None,
+    };
+    items.get(index)
+}
+
 pub struct ReadResult {
     pub graph: SourceGraph,
     /// Saved bin ownership for consumers that assemble destination folders.
@@ -30,11 +46,14 @@ pub struct ReadResult {
     pub group_bins: HashMap<String, usize>,
     /// Exact original bytes pinned before/after stream probing and checked again at read completion.
     pub original_inputs: Vec<av::SourceInput>,
+    pub proxy_bindings: Vec<proxy::Binding>,
     /// A saved original-file route was not resolved as an original or native file.
     pub has_unresolved_original_links: bool,
     pub diagnostics: Vec<String>,
     pub audio_group_issues: Vec<String>,
     pub scan_issues: Vec<String>,
+    /// Scan diagnostics for ambiguous native packages needed by the selected bin tracks.
+    pub ambiguous_managed_packages: Vec<String>,
     pub missing_native_picture: bool,
     pub missing_managed_audio: Vec<String>,
     pub files_scanned: usize,
@@ -91,6 +110,17 @@ pub fn read_with_ffprobe(
     bin_names: &[String],
     ffprobe: &std::path::Path,
 ) -> Result<ReadResult, String> {
+    read_managed(inputs, media_roots, project, bin_names, ffprobe, false)
+}
+
+pub fn read_managed(
+    inputs: &[av::SourceInput],
+    media_roots: &[PathBuf],
+    project: &str,
+    bin_names: &[String],
+    ffprobe: &Path,
+    link_managed_op1a: bool,
+) -> Result<ReadResult, String> {
     let facts =
         av::extract_source_paths(inputs, av::SourceLimits::default()).map_err(|e| e.to_string())?;
     resolve_media_and_build(
@@ -98,8 +128,8 @@ pub fn read_with_ffprobe(
         media_roots,
         project,
         bin_names,
-        &original::OriginalIndex::default(),
-        ffprobe,
+        original::OriginalIndex::default(),
+        &original::OriginalOptions { ffprobe: ffprobe.into(), link_managed_op1a, ..Default::default() },
         &mut || Ok(()),
     )
     .map_err(SourceReadIssue::into_message)
@@ -185,8 +215,8 @@ pub fn read_with_media_policy(
         media_roots,
         project,
         bin_names,
-        &originals,
-        &options.ffprobe,
+        originals,
+        options,
         check,
     )
 }
@@ -196,8 +226,8 @@ fn resolve_media_and_build(
     media_roots: &[PathBuf],
     project: &str,
     bin_names: &[String],
-    originals: &original::OriginalIndex,
-    ffprobe: &Path,
+    mut originals: original::OriginalIndex,
+    options: &original::OriginalOptions,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<ReadResult, SourceReadIssue> {
     // Tracks qualified against linked originals do not need native MXF headers.
@@ -214,9 +244,15 @@ fn resolve_media_and_build(
         .collect();
     let index = index::MediaIndex::scan_controlled(media_roots, &wanted, check)
         .map_err(SourceReadIssue::MediaScan)?;
-    let square_mxf =
-        verify_motion_mxf(facts, &index, ffprobe, check).map_err(SourceReadIssue::MediaScan)?;
-    build_selected(facts, &index, project, bin_names, originals, &square_mxf)
+    if options.attach_avid_proxies {
+        originals.select_avid_proxies(facts, options, &index, check)?;
+    }
+    if options.link_managed_op1a {
+        managed_multistream::bind(facts, &index, &mut originals, &options.ffprobe, check)?;
+    }
+    let motion_mxf =
+        verify_motion_mxf(facts, &index, &options.ffprobe, check).map_err(SourceReadIssue::MediaScan)?;
+    build_selected(facts, &index, project, bin_names, &originals, &motion_mxf)
         .map_err(SourceReadIssue::SourceFacts)
 }
 
@@ -233,8 +269,14 @@ pub fn build(
         project,
         bin_names,
         &original::OriginalIndex::default(),
-        &HashMap::new(),
+        &MotionMxf::default(),
     )
+}
+
+#[derive(Default)]
+struct MotionMxf<'a> {
+    picture: HashMap<&'a std::path::Path, Option<(Rational, Rational)>>,
+    pcm16: HashMap<&'a std::path::Path, Rational>,
 }
 
 fn verify_motion_mxf<'a>(
@@ -242,7 +284,7 @@ fn verify_motion_mxf<'a>(
     index: &'a index::MediaIndex,
     ffprobe: &std::path::Path,
     check: &mut dyn FnMut() -> Result<(), String>,
-) -> Result<HashMap<&'a std::path::Path, Option<(Rational, Rational)>>, String> {
+) -> Result<MotionMxf<'a>, String> {
     let masters: HashSet<_> = facts.sequences.iter().flat_map(|seq| &seq.events)
         .filter(|e| e.saved_timewarp.is_some()
             || e.event.picture.as_ref().is_some_and(|p| p.corner_pin.is_some())
@@ -253,15 +295,60 @@ fn verify_motion_mxf<'a>(
             }))
         .map(|e| e.event.master).collect();
     let mut probed = HashSet::new();
-    let mut verified = HashMap::new();
+    let mut verified = MotionMxf::default();
     for master in facts.masters.iter().filter(|m| masters.contains(&m.master.mob_id)) {
         for track in master.master.tracks.iter().filter(|t| t.kind == KIND_PICTURE) {
             let Some(path) = index.files.get(&track.file_mob.umid_hex()).map(|p| p.as_path()) else { continue; };
             if probed.insert(path) {
                 check()?;
                 if let Some(clock) = original::square_1080p_mxf(path, ffprobe) {
-                    verified.insert(path, clock);
+                    verified.picture.insert(path, clock);
                 }
+            }
+        }
+    }
+    let managed_audio: HashSet<_> = facts.sequences.iter().flat_map(|seq| &seq.events)
+        .filter(|e| e.event.kind == KIND_SOUND && e.motion_adapter_phase.is_some())
+        .map(|e| e.event.master).collect();
+    for master in facts.masters.iter().filter(|m| managed_audio.contains(&m.master.mob_id)) {
+        let [track] = master.master.tracks.as_slice() else { continue };
+        if master.rate != Rate::new(24, 1) || track.kind != KIND_SOUND || track.index != 1
+            || !matches!(&track.essence, Some(Essence::Sound {
+                sample_rate: 48_000.0, bits: 16, channels: 1,
+            }))
+            || master.offsets.as_slice() != [Observed::Known(0)]
+        {
+            continue;
+        }
+        let package = track.file_mob.umid_hex();
+        let Some(path) = index.files.get(&package).map(|p| p.as_path()) else { continue };
+        if !probed.insert(path) { continue; }
+        let id = index.identity(path)?;
+        if id.file_packages != [package] || id.file_essence_tracks != 1
+            || id.file_tracks != [(48_000, 1, track.length)]
+            || !id.qualified_file_clock().is_some_and(|clock|
+                clock.rate == (24, 1) && !clock.drop && clock.source_offset == 0)
+        {
+            continue;
+        }
+        check()?;
+        if let Ok(probe) = original::probe_offline_atom(path, ffprobe) {
+            let ul = probe.get("format").and_then(|f| f.get("tags"))
+                .and_then(|tags| original::text(tags, "operational_pattern_ul"));
+            let Some(Value::Arr(streams)) = probe.get("streams") else { continue };
+            let [pcm] = streams.as_slice() else { continue };
+            if ul.as_deref() == Some("060e2b34.04010102.0d010201.10010000")
+                && original::text(pcm, "codec_type").as_deref() == Some("audio")
+                && original::text(pcm, "codec_name").as_deref() == Some("pcm_s16le")
+                && original::text(pcm, "time_base").as_deref() == Some("1/48000")
+                && original::number(pcm, "channels") == Some(1)
+                && original::number(pcm, "start_pts") == Some(0)
+                && original::number(pcm, "duration_ts") == Some(track.length)
+                && original::complete_mono_pcm16_packets(path, ffprobe, track.length)
+            {
+                let extent = Rational::new(i128::from(track.length), 48_000)
+                    .ok_or("managed Motion Adapter duration overflow")?;
+                verified.pcm16.insert(path, extent);
             }
         }
     }
@@ -274,7 +361,7 @@ fn build_selected(
     project: &str,
     bin_names: &[String],
     originals: &original::OriginalIndex,
-    square_mxf: &HashMap<&std::path::Path, Option<(Rational, Rational)>>,
+    motion_mxf: &MotionMxf,
 ) -> Result<ReadResult, String> {
     validate_rates(facts)?;
     if facts.accounted_bytes > av::MAX_SOURCE_FACT_BYTES {
@@ -305,6 +392,7 @@ fn build_selected(
         sequence_bins: HashMap::new(),
         group_bins: HashMap::new(),
         original_inputs: originals.original_inputs.clone(),
+        proxy_bindings: Vec::new(),
         has_unresolved_original_links: facts.masters.iter().any(|source| {
             source.master.tracks.iter().zip(&source.originals).enumerate().any(|(i, (track, original))| {
                 original.is_some()
@@ -333,6 +421,7 @@ fn build_selected(
             .collect(),
         audio_group_issues: vec![],
         scan_issues: vec![],
+        ambiguous_managed_packages: vec![],
         missing_native_picture: false,
         missing_managed_audio: vec![],
         files_scanned: index.files_scanned,
@@ -380,9 +469,26 @@ fn build_selected(
                 .ok_or("duplicate references unknown bin")?
         ));
     }
-    for uid in &index.ambiguous {
-        out.scan_issues
-            .push(format!("ambiguous MXF file package {uid}"));
+    if !index.ambiguous.is_empty() {
+        let ambiguous: HashSet<_> = index.ambiguous.iter().map(String::as_str).collect();
+        let mut required = HashSet::new();
+        for source in &facts.masters {
+            for (track, saved) in source.master.tracks.iter().enumerate() {
+                let package = saved.file_mob.umid_hex();
+                if ambiguous.contains(package.as_str())
+                    && !originals.tracks.contains_key(&(source.id.clone(), track))
+                {
+                    required.insert(package);
+                }
+            }
+        }
+        for uid in &index.ambiguous {
+            let issue = format!("ambiguous MXF file package {uid}");
+            if required.contains(uid) {
+                out.ambiguous_managed_packages.push(issue.clone());
+            }
+            out.scan_issues.push(issue);
+        }
     }
     for (p, e) in &index.unreadable {
         out.scan_issues.push(format!("{}: {e}", p.display()));
@@ -398,7 +504,7 @@ fn build_selected(
             budget.used,
         );
         let missing_audio_before = out.missing_managed_audio.len();
-        match master(source, index, &id, &mut out, &mut budget, originals) {
+        match master(source, index, &id, &mut out, &mut budget, originals, motion_mxf) {
             Ok(item) => {
                 let bin = out
                     .graph
@@ -457,16 +563,27 @@ fn build_selected(
             let mut square_pixels = false;
             let mut timewarp_picture = None;
             let mut motion_audio = HashMap::new();
+            let mut managed_motion_audio = None;
+            let mut same_rate_aac = HashMap::new();
             for im in &i.media {
                 let m = media_by_id[im.media.as_str()];
                 if m.kind == StreamKind::Audio {
                     if let Some(n) = m.stream {
                         audio.insert(n);
+                        if m.online == Some(true) && m.original.is_none() && n == 1
+                            && i.media.len() == 1 && i.stream_groups.is_empty()
+                            && im.source_offset == Some(Rational::ZERO)
+                            && m.bits == Some(16) && m.sample_rate == Some(48_000)
+                            && m.locations.first().and_then(|p| motion_mxf.pcm16.get(std::path::Path::new(p)))
+                                == Some(&m.duration)
+                        {
+                            managed_motion_audio = Some(m.duration);
+                        }
                     }
                 } else {
                     raster = m.frame_size;
                     let verified = m.locations.first()
-                        .and_then(|p| square_mxf.get(std::path::Path::new(p)));
+                        .and_then(|p| motion_mxf.picture.get(std::path::Path::new(p)));
                     square_pixels = m.original.is_some() || verified.is_some();
                     if m.original.is_none() && raster == Some((1920, 1080))
                         && im.source_offset == Some(Rational::ZERO)
@@ -489,6 +606,9 @@ fn build_selected(
                             i128::from(*num) * i128::from(height) == i128::from(*den) * i128::from(width));
                     }
                     if let Some(selected) = originals.tracks.get(&(master.id.clone(), ordinal)) {
+                        if selected.same_rate_aac_origin {
+                            same_rate_aac.insert(track.index, selected.duration);
+                        }
                         if let Some(origin) = selected.motion_audio_origin {
                             if matches!(master.offsets.get(ordinal), Some(Observed::Known(0))) {
                                 motion_audio.insert(track.index, (origin, selected.duration));
@@ -498,7 +618,7 @@ fn build_selected(
                 }
             }
             sequence::ItemRoutes {
-                audio, raster, square_pixels, motion_picture, motion_audio,
+                audio, raster, square_pixels, motion_picture, motion_audio, managed_motion_audio, same_rate_aac,
                 timewarp_picture: timewarp_picture.filter(|_| square_pixels),
             }
         })
@@ -956,6 +1076,9 @@ fn retain_unresolved_master(
     if let Some(transforms) = source_input_transforms(source, budget)? {
         raw.push(("input_color_transforms", transforms));
     }
+    if let Some(managed) = &source.managed_multistream {
+        raw.push(("managed_multistream", managed_multistream::saved_facts(managed, budget)?));
+    }
     append_bin_receipt(out, budget, m.bin, "unresolved_masters", obj(raw))?;
     loss(
         out,
@@ -990,6 +1113,24 @@ fn tc(n: i64, fps: i64) -> String {
         f / fps as i128 % 60,
         f % fps as i128
     )
+}
+fn master_start_timecode(start: &extract::Timecode) -> Option<String> {
+    if !start.drop {
+        return Some(tc(start.frames, start.fps));
+    }
+    let dropped = match start.fps {
+        30 => 2,
+        60 => 4,
+        _ => return None,
+    };
+    let per_minute = start.fps * 60 - dropped;
+    let per_ten_minutes = per_minute * 10 + dropped;
+    let count = start.frames.rem_euclid(per_ten_minutes * 6 * 24);
+    let omitted = dropped * (9 * (count / per_ten_minutes)
+        + ((count % per_ten_minutes - dropped).max(0) / per_minute));
+    let mut label = tc(count + omitted, start.fps);
+    label.replace_range(8..9, ";");
+    Some(label)
 }
 fn marker_native(m: &AvidMarker) -> Value {
     obj(vec![
@@ -1178,6 +1319,7 @@ fn master(
     out: &mut ReadResult,
     budget: &mut Budget,
     originals: &original::OriginalIndex,
+    motion_mxf: &MotionMxf,
 ) -> Result<SourceItem, MasterError> {
     let m = &source.master;
     budget
@@ -1216,12 +1358,34 @@ fn master(
     };
     let mut video = false;
     let mut labels = HashSet::new();
+    if let Some(proxy) = originals.proxies.get(&source.id) {
+        sidecar(out, budget, proxy::ADAPTER, id, proxy.fact()).map_err(MasterError::Budget)?;
+        out.proxy_bindings.push(proxy.clone());
+    }
     let mut raw_tracks = vec![];
     let mut audio_ordinal = 0;
     for (tindex, t) in m.tracks.iter().enumerate() {
         let audio_index = audio_ordinal;
         if t.kind == KIND_SOUND {
             audio_ordinal += 1;
+        }
+        if let Some(verified) = originals.managed_op1a.get(&source.id) {
+            let media = managed_multistream::add_media(source, t, id, audio_index, verified, index, out, budget)?;
+            video |= t.kind == KIND_PICTURE;
+            if t.kind == KIND_SOUND {
+                labels.insert(t.index);
+            }
+            item.media.push(SourceItemMedia {
+                media: media.id.clone(), gain_db: t.gain_db.unwrap_or(0.0), source_offset: Some(Rational::ZERO),
+            });
+            out.graph.media.push(media);
+            raw_tracks.push(obj(vec![
+                ("kind", Value::Int(t.kind)),
+                ("label", Value::Int(t.index)),
+                ("pan_raw", t.pan_raw.map(Value::Int).unwrap_or(Value::Null)),
+                ("offset", observed(&Observed::Known(0))),
+            ]));
+            continue;
         }
         if let Some(selected) = originals.tracks.get(&(source.id.clone(), tindex)) {
             let stream_id = if selected.kind == StreamKind::Video {
@@ -1254,20 +1418,49 @@ fn master(
                         + 512,
                 )
                 .map_err(MasterError::Budget)?;
-            let raw = source.originals[tindex]
-                .as_ref()
-                .ok_or("original descriptor witness missing")?;
             let mut native_original = vec![
                 ("file_package", s(t.file_mob.umid_hex())),
-                ("descriptor_class", s(&raw.descriptor_class)),
-                ("descriptor_rate", Value::Float(raw.descriptor_rate)),
-                ("descriptor_length", Value::Int(raw.descriptor_length)),
-                ("stored_quantization_bits", raw.stored_quantization_bits.map(Value::Int).unwrap_or(Value::Null)),
-                ("descriptor", descriptor(&t.essence)),
-                ("native_kind", Value::Int(t.kind)),
-                ("native_track", Value::Int(t.index)),
-                ("file_track", raw.file_track.map(Value::Int).unwrap_or(Value::Null)),
             ];
+            let source_clock = if let Some(clock) = &selected.column_timecode {
+                native_original.extend([
+                    ("binding", s("avid_source_columns")),
+                    ("descriptor_length", Value::Int(t.length)),
+                    ("descriptor", descriptor(&t.essence)),
+                    ("native_kind", Value::Int(t.kind)),
+                    ("native_track", Value::Int(t.index)),
+                    ("file_track", Value::Int(clock.file_track)),
+                ]);
+                Some(SourceClock {
+                    effective_count: clock.count as u64, rate: rational(clock.rate),
+                    display_base: 24, drop: false,
+                    provenance: SourceClockProvenance {
+                        origin_count: clock.count as u64, source_offset: 0, source_rate: rational(clock.rate),
+                        source_package: clock.package.umid_hex(), timecode_track: "TC1".into(),
+                        route: graph::source::AVID_SOURCE_COLUMNS_TIMECODE.into(),
+                    },
+                })
+            } else if originals.proxies.contains_key(&source.id) && selected.kind == StreamKind::Audio {
+                native_original.extend([
+                    ("binding", s("avid_source_columns")),
+                    ("descriptor", descriptor(&t.essence)),
+                    ("native_kind", Value::Int(t.kind)),
+                    ("native_track", Value::Int(t.index)),
+                ]);
+                None
+            } else {
+                let raw = source.originals[tindex].as_ref().ok_or("original descriptor witness missing")?;
+                native_original.extend([
+                    ("descriptor_class", s(&raw.descriptor_class)),
+                    ("descriptor_rate", Value::Float(raw.descriptor_rate)),
+                    ("descriptor_length", Value::Int(raw.descriptor_length)),
+                    ("stored_quantization_bits", raw.stored_quantization_bits.map(Value::Int).unwrap_or(Value::Null)),
+                    ("descriptor", descriptor(&t.essence)),
+                    ("native_kind", Value::Int(t.kind)),
+                    ("native_track", Value::Int(t.index)),
+                    ("file_track", raw.file_track.map(Value::Int).unwrap_or(Value::Null)),
+                ]);
+                None
+            };
             let original_clock = if selected.online && selected.kind == StreamKind::Video
                 && selected.codec == "avc1" && selected.rate == Some(Rational::integer(24))
                 && selected.stream.container == "mov" && m.tracks.len() == 1
@@ -1295,8 +1488,24 @@ fn master(
             } else {
                 None
             };
+            let source_clock = source_clock.or(original_clock);
+            if let Some(timecode) = &selected.embedded_mov_timecode {
+                let mut witness = vec![("observation", observed(timecode))];
+                if let Observed::Known(count) = timecode {
+                    witness.extend([
+                        ("label", s(tc(*count, 24))),
+                        ("rate", s("24")),
+                        ("stream", Value::Int(2)),
+                    ]);
+                }
+                native_original.push(("embedded_mov_timecode", obj(witness)));
+            }
             if let Some(origin) = selected.motion_audio_origin {
                 native_original.push(("motion_adapter_file_track_start", Value::Int(origin)));
+                native_original.push(("verified_aac_priming_samples", Value::Int(1024)));
+            }
+            if selected.same_rate_aac_origin {
+                native_original.push(("same_rate_aac_file_track_start", Value::Int(1)));
                 native_original.push(("verified_aac_priming_samples", Value::Int(1024)));
             }
             sidecar(
@@ -1321,8 +1530,8 @@ fn master(
                 sample_rate: selected.sample_rate,
                 bits: selected.bits,
                 duration: selected.duration,
-                start: original_clock.as_ref().and_then(SourceClock::exact_start),
-                clock: original_clock,
+                start: source_clock.as_ref().and_then(SourceClock::exact_start),
+                clock: source_clock,
                 stream: (selected.kind == StreamKind::Audio).then_some(t.index),
                 online: Some(selected.online),
                 original: Some(original.clone()),
@@ -1426,8 +1635,10 @@ fn master(
                             "apcs"
                         }
                         "RI00"
-                            if identity.picture_essence_coding
-                                == Some(avid_reader::mxf::DNXHR_LB_CODING) =>
+                            if matches!(
+                                identity.picture_essence_coding,
+                                Some(avid_reader::mxf::DNXHR_LB_CODING | avid_reader::mxf::DNXHR_LB_CODING_0A)
+                            ) =>
                         {
                             "AVdn"
                         }
@@ -1645,6 +1856,14 @@ fn master(
                 .charge(64 + 2 * size_of::<i64>())
                 .map_err(MasterError::Budget)?;
             item.stream_groups.push(vec![*a, *b]);
+        } else if (*a, *b) == (1, 2) && labels.contains(a)
+            && !originals.tracks.contains_key(&(source.id.clone(), 0))
+            && matches!(m.tracks.as_slice(), [track] if index.files.get(&track.file_mob.umid_hex())
+                .is_some_and(|path| motion_mxf.pcm16.contains_key(path.as_path())))
+        {
+            loss(out, budget, id, "audio_group",
+                "Saved stereo declaration has only its authored A1 track. The verified mono PCM file remains mono.")
+                .map_err(MasterError::Budget)?;
         } else {
             out.audio_group_issues.push(format!(
                 "{:?}: stereo A{a}/A{b} missing a channel; available media remains mono",
@@ -1720,7 +1939,8 @@ fn master(
             "start_timecode",
             m.start
                 .as_ref()
-                .map(|v| s(tc(v.frames, v.fps)))
+                .and_then(master_start_timecode)
+                .map(s)
                 .unwrap_or(Value::Null),
         ),
         (
@@ -1772,6 +1992,10 @@ fn master(
     ];
     if let Some(transforms) = source_input_transforms(source, budget).map_err(MasterError::Budget)? {
         native.push(("input_color_transforms", transforms));
+    }
+    if let Some(managed) = source.managed_multistream.as_ref().filter(|_| originals.managed_op1a.contains_key(&source.id)) {
+        native.push(("managed_multistream", managed_multistream::saved_facts(managed, budget)
+            .map_err(MasterError::Budget)?));
     }
     sidecar(
         out,

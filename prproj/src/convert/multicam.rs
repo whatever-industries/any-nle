@@ -24,8 +24,8 @@ pub struct PreparedCamera {
     pub start: i64,
     pub source_in: i64,
     pub duration: i64,
-    /// Leaf Avid channel labels in the order of the two independent group lanes.
-    pub audio_labels: [i64; 2],
+    /// Leaf Avid channel labels in the order of the independent group lanes.
+    pub audio_labels: Vec<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,8 +34,10 @@ pub struct PreparedMulticam {
     pub name: String,
     pub bin: usize,
     pub duration: i64,
-    /// Picture track order. Camera zero supplies the fixed audio for this profile.
+    /// Picture track order.
     pub cameras: [PreparedCamera; 2],
+    /// Saved camera index for each independent mono output.
+    pub audio_cameras: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,6 +47,8 @@ pub struct PreparedMulticamUse {
     pub group: usize,
     pub source_in: i64,
     pub video: Option<usize>,
+    /// Static Motion belongs on the outer video edit for this Avid Warp binding.
+    pub warp_picture_input: bool,
     /// Source per audio track in the prepared event's order.
     pub audio: Vec<PreparedGroupAudio>,
 }
@@ -73,6 +77,8 @@ pub(super) fn build(
     target: ItemId,
     ids: &mut dyn UuidSource,
 ) -> WriteResult<ItemId> {
+    let channels = g.audio_cameras.len();
+    let outputs = &[0, 1, 3][..channels];
     let fragment = crate::build::multicam::build_multicam_mono_audio_with_outputs(
         &mut project.doc.tree,
         ids,
@@ -83,9 +89,16 @@ pub(super) fn build(
         110,
         g.duration,
         2,
-        4,
-        2,
+        channels * 2,
+        outputs.iter().copied(),
     )?;
+    if channels == 3 {
+        // Premiere needs the native eight-channel adaptive count to render
+        // the third mono lane, which is exposed from physical output 4.
+        let count = project.doc.tree.find1(fragment, "AudioTrackGroup/NumAdaptiveChannels")
+            .ok_or_else(|| write_fail("missing multicam adaptive channel count"))?;
+        project.doc.tree.set_text(count, Some("8"));
+    }
     let nodes = project.splice(fragment, ids)?;
     let (Some(sequence_element), Some(item_element), Some(master)) = (
         nodes.get("Sequence"),
@@ -98,6 +111,15 @@ pub(super) fn build(
     let video = project.video_tracks(seq).to_vec();
     let audio = project.audio_tracks(seq).to_vec();
     super::combined::premiere_balances(project, sequence_element)?;
+    if channels == 3 {
+        let track = project.track(audio[2]).element;
+        let panner = project.doc.tree.find1(track, "AudioTrack/Panner")
+            .ok_or_else(|| write_fail("third active strip has no panner"))?;
+        let panner = project.doc.resolve(panner)?;
+        let matrix = project.doc.tree.find1(panner, "DirectPanProcessor/Matrix")
+            .ok_or_else(|| write_fail("third active strip has no output matrix"))?;
+        project.doc.tree.set_text(matrix, Some("[[0,[2]],[1,[3]]]"));
+    }
     for (i, (camera, (leaf, siblings, clip))) in g.cameras.iter().zip(leaves).enumerate() {
         let start = Time::new(camera.start);
         let mut placed = vec![project.add_clip(video[i], leaf, start, ids)?];
@@ -108,7 +130,10 @@ pub(super) fn build(
                 .iter()
                 .position(|a| a.avid_track == Some(label))
                 .ok_or_else(|| write_fail("camera audio label missing"))?;
-            let track = audio[2 * i + j];
+            let selected = i == g.audio_cameras[j];
+            // The selected inputs occupy the first slots. Each alternate has
+            // its own muted track after the active inputs.
+            let track = audio[if selected { j } else { j + channels }];
             let item = if siblings.is_empty() {
                 let group = groups
                     .iter()
@@ -120,7 +145,7 @@ pub(super) fn build(
                 project.add_clip(track, sibling, start, ids)?
             };
             super::audio::set_clip_gain(project, item, clip.audio[file].gain_db)?;
-            if i == 0 {
+            if selected {
                 let pan = if j == 0 {
                     super::combined::Pan::Left
                 } else {
@@ -234,7 +259,18 @@ pub(super) fn validate(
                 "group requires two distinct cameras and an exact positive span",
             ));
         }
+        let channels = g.audio_cameras.len();
+        if !matches!(channels, 1..=3)
+            || g.audio_cameras.iter().any(|&camera| camera >= g.cameras.len())
+            || ((channels == 3 || (channels == 2 && g.audio_cameras != [0; 2]))
+                && (input.options.bin_mode != "separate" || g.cameras.iter().any(|camera| {
+                    !input.direct_dnxhr_origins.contains_key(&camera.clip)
+                })))
+        {
+            return Err(fail("default audio needs exact camera assignments on the qualified linked route"));
+        }
         let mut latest = 0;
+        let mut camera_paths = HashSet::new();
         for c in &g.cameras {
             let Some(PreparedClip::Legacy(leaf)) = clips.get(c.clip.as_str()).copied() else {
                 return Err(fail("group requires managed Avid leaf masters"));
@@ -242,6 +278,11 @@ pub(super) fn validate(
             let Some(v) = &leaf.video else {
                 return Err(fail("camera has no picture"));
             };
+            if channels == 3 && (!camera_paths.insert(&v.path)
+                || leaf.audio.iter().any(|audio| !camera_paths.insert(&audio.path)))
+            {
+                return Err(fail("three-mono Group cameras require distinct picture and sibling paths"));
+            }
             let end = c
                 .start
                 .checked_add(c.duration)
@@ -259,11 +300,13 @@ pub(super) fn validate(
                 || v.rate != RATE
                 || (v.width, v.height) != (1920, 1080)
                 || !v.codec.eq_ignore_ascii_case("avdn")
-                || leaf.audio.len() != 2
+                || (channels > 1 && leaf.audio.len() != channels)
+                || c.audio_labels.len() != channels
                 || !leaf.stereo_pairs.is_empty()
                 || !leaf.multichannel_groups.is_empty()
-                || c.audio_labels[0] == c.audio_labels[1]
-                || leaf.audio.iter().any(|a| {
+                || c.audio_labels.iter().copied().collect::<HashSet<_>>().len() != channels
+                || leaf.audio.iter().filter(|a| channels > 1
+                    || a.avid_track.is_some_and(|t| c.audio_labels.contains(&t))).any(|a| {
                     a.sample_rate != 48000
                         || a.bits != 24
                         || a.duration < out
@@ -277,7 +320,7 @@ pub(super) fn validate(
                         != 1
                 })
             {
-                return Err(fail("camera needs aligned 1080p23.976 DNx picture and two exact, independent PCM24/48k mono lanes"));
+                return Err(fail("camera needs aligned 1080p23.976 DNx picture and exact, independent PCM24/48k mono lanes for each Group output"));
             }
             latest = latest.max(end);
         }
@@ -294,10 +337,12 @@ pub(super) fn validate(
         .flat_map(|(i, s)| {
             s.markers
                 .iter()
-                .filter_map(move |m| (m.owner == "edit").then_some((i, m.event?)))
+                .filter_map(move |m| (m.owner == "edit" && !m.inherited).then_some((i, m.event?)))
         })
         .collect();
     let mut bindings = HashSet::new();
+    let picture_effects: HashSet<_> = input.picture_effects.iter()
+        .map(|effect| (effect.sequence, effect.event)).collect();
     for u in &input.multicam_uses {
         let g = input
             .multicams
@@ -319,14 +364,16 @@ pub(super) fn validate(
                 .is_none_or(|end| end > g.duration)
             || u.video.is_some() != e.video_track.is_some()
             || u.audio.len() != e.audio_tracks.len()
-            || u.audio.len() > 2
-            || matches!(u.audio.as_slice(), [a,b] if a == b)
+            || u.audio.len() > g.audio_cameras.len()
+            || u.audio.iter().collect::<HashSet<_>>().len() != u.audio.len()
             || (u.audio.is_empty() && u.video.is_none())
             || !e.stereo.is_empty()
             || e.speed_ratio.is_some()
             || e.source_duration.is_some()
             || e.time_remap.is_some()
-            || e.transform.is_some()
+            || (e.transform.is_some() && !u.warp_picture_input)
+            || (u.warp_picture_input && (u.video.is_none()
+                || picture_effects.contains(&(u.sequence, u.event))))
             || e.matte.is_some()
             || e.color_correction.is_some()
             || edit_markers.contains(&(u.sequence, u.event as i64))
@@ -350,13 +397,15 @@ pub(super) fn validate(
                     .iter()
                     .zip(&e.audio_channels)
                     .any(|(&audio, label)| {
-                        let (camera, channel) = match audio {
-                            PreparedGroupAudio::Group(channel) => (0, channel),
-                            PreparedGroupAudio::LinkedAlternate(channel) => (1, channel),
+                        let (channel, alternate) = match audio {
+                            PreparedGroupAudio::Group(channel) => (channel, false),
+                            PreparedGroupAudio::LinkedAlternate(channel) => (channel, true),
                         };
+                        let Some(&default) = g.audio_cameras.get(channel) else { return true; };
+                        let camera = if alternate { 1 - default } else { default };
                         let c = &g.cameras[camera];
                         !matches(c) || c.audio_labels.get(channel) != Some(label)
-                            || (camera == 1 && (input.options.bin_mode != "separate"
+                            || (alternate && (input.options.bin_mode != "separate"
                                 || !input.direct_dnxhr_origins.contains_key(&c.clip)))
                     })
             {

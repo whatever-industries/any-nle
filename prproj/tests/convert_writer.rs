@@ -344,6 +344,40 @@ fn example() -> Model {
     load_model(&example_path()).unwrap()
 }
 
+#[test]
+fn sparse_picture_edits_expand_the_sequence_without_collapsing_tracks() {
+    let dir = scratch("sparse-picture");
+    let mut model = example();
+    let seq = &mut model.sequences[0];
+    let mut upper = seq.events[0].clone();
+    upper.video_track = Some(5);
+    upper.audio_tracks.clear();
+    let expected = (upper.record_start, upper.duration, upper.source_in);
+    seq.events.push(upper);
+
+    let out = dir.join("picture.prproj");
+    let report = write_project(&model, &out, &mut SeededUuids::new(SEED)).unwrap();
+    let doc = PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    let project = prproj::model::Project::from_document(doc, &out).unwrap();
+    let sequence = project.sequences()[0];
+    let video = project.video_tracks(sequence);
+    assert_eq!(video.len(), 5);
+    assert!(video[1..4].iter().all(|&track| project.track_clips(track).is_empty()));
+    for lane in [0, 4] {
+        let [item] = project.track_clips(video[lane]) else { panic!("expected one picture edit") };
+        assert_eq!(project.start(*item).unwrap().ticks, expected.0);
+        assert_eq!(project.end(*item).unwrap().ticks, expected.0 + expected.1);
+        assert_eq!(project.in_point(*item).unwrap().ticks, expected.2);
+        assert_eq!(project.out_point(*item).unwrap().ticks, expected.2 + expected.1);
+    }
+    let audio = project.audio_tracks(sequence);
+    assert_eq!(audio.len(), 4);
+    assert_eq!(project.track_clips(audio[0]).len(), 1);
+    assert_eq!(project.track_clips(audio[1]).len(), 1);
+    assert!(report.notes.iter().any(|n| n.contains("expanded video track capacity to 5")));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn marker(name: &str, start: i64, duration: i64, track: &str, owner: &str) -> Marker {
     Marker {
         name: name.into(),
@@ -412,6 +446,8 @@ fn video_filler_markers_keep_overlapping_ranges_without_covering_picture() {
         ("before picture", 18, 2),
         ("crosses picture", 19, 3),
     ].into_iter().map(|(name, start, duration)| marker(name, start * frame, duration * frame, "V1", "filler")).collect();
+    seq.markers.push(marker("upper filler", 4 * frame, 2 * frame, "V7", "filler"));
+    seq.markers.push(marker("upper over picture", 19 * frame, 3 * frame, "V7", "filler"));
     let out = dir.join("o.prproj");
     let report = write_project(&model, &out, &mut SeededUuids::new(SEED)).unwrap();
     assert!(report.notes.iter().any(|s| s.contains("crosses picture") && s.contains("kept on sequence")));
@@ -421,19 +457,144 @@ fn video_filler_markers_keep_overlapping_ranges_without_covering_picture() {
     let spans: Vec<_> = doc.tree.iter_tag(doc.root, "VideoClipTrackItem").map(|n| {
         (ticks(n, "ClipTrackItem/TrackItem/Start") / frame, ticks(n, "ClipTrackItem/TrackItem/End") / frame)
     }).collect();
-    assert_eq!(spans, [(20, 28), (2, 10), (10, 11), (18, 20)]);
+    assert_eq!(spans, [(20, 28), (2, 10), (10, 11), (18, 20), (4, 6)]);
     let owner = doc.tree.iter_tag(doc.root, "Sequence")
         .find_map(|n| doc.tree.find(n, "MarkerOwner/Markers").unwrap()).unwrap();
     let list = doc.resolve(owner).unwrap();
     let refs = doc.tree.findall(list, "Markers/Marker/Second").unwrap();
-    assert_eq!(refs.len(), 1);
-    let payload = doc.tree.findtext(doc.resolve(refs[0]).unwrap(), "DVAMarker").unwrap().unwrap();
-    let json = parse_json(&payload).unwrap();
-    let fallback = json.get("DVAMarker").unwrap();
-    assert_eq!(fallback.get("mName"), Some(&Json::Str("crosses picture".into())));
-    assert_eq!(fallback.get("mStartTime").unwrap().get("ticks"), Some(&Json::Int(i128::from(19 * frame))));
-    assert_eq!(fallback.get("mDuration").unwrap().get("ticks"), Some(&Json::Int(i128::from(3 * frame))));
+    assert_eq!(refs.len(), 2);
+    let mut names = Vec::new();
+    for marker_ref in refs {
+        let payload = doc.tree.findtext(doc.resolve(marker_ref).unwrap(), "DVAMarker").unwrap().unwrap();
+        let json = parse_json(&payload).unwrap();
+        let fallback = json.get("DVAMarker").unwrap();
+        let Some(Json::Str(name)) = fallback.get("mName") else { panic!("expected marker name") };
+        names.push(name.clone());
+        assert_eq!(fallback.get("mStartTime").unwrap().get("ticks"), Some(&Json::Int(i128::from(19 * frame))));
+        assert_eq!(fallback.get("mDuration").unwrap().get("ticks"), Some(&Json::Int(i128::from(3 * frame))));
+    }
+    names.sort();
+    assert_eq!(names, ["crosses picture", "upper over picture"]);
+    let project = prproj::model::Project::from_document(doc, &out).unwrap();
+    let tracks = project.video_tracks(project.sequences()[0]);
+    assert_eq!(tracks.len(), 7);
+    assert!(tracks[1..6].iter().all(|&track| project.track_clips(track).is_empty()));
+    let [carrier] = project.track_clips(tracks[6]) else { panic!("expected the V7 marker carrier") };
+    let source = project.track_item_source(*carrier).unwrap();
+    let [saved] = project.item_markers(source) else { panic!("expected one marker on the carrier") };
+    let tree = &project.doc.tree;
+    use prproj::model::marker::{marker_end, marker_name, marker_start};
+    assert_eq!(marker_name(tree, *saved).unwrap(), "upper filler");
+    assert_eq!(marker_start(tree, *saved).unwrap().ticks, 4 * frame);
+    assert_eq!(marker_end(tree, *saved).unwrap().ticks, 6 * frame);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn merged_marker_clock_notice_requires_the_verified_picture_profile() {
+    use prproj::convert::model::Fraction;
+    use prproj::convert::prepared::PreparedProjectInput;
+    use prproj::convert::writer::prepare_typed_project;
+
+    let dir = scratch("merged-marker-clock");
+    for (drop_frame, source_frame, track, expect_notice) in [
+        (true, 215_784, "V1", false),
+        (true, 215_784, "A1", true),
+        (true, 0, "V1", true),
+        (false, 172_800, "V1", true),
+        (false, 172_800, "A1", false),
+        (false, 0, "A1", true),
+    ] {
+        let mut model = example();
+        model.options.bin_mode = "merged".into();
+        let (rate, frame, bits) = if drop_frame {
+            (Fraction::new(30_000, 1001), 8_475_667_200, 24)
+        } else {
+            (Fraction::new(24_000, 1001), 10_594_584_000, 16)
+        };
+        let origin = source_frame * frame;
+        let clip = model.clips.get_mut("clip-1").unwrap();
+        clip.rate = Some(rate);
+        clip.time_display = Some(if drop_frame { 102 } else { 110 });
+        let picture = clip.video.as_mut().unwrap();
+        picture.rate = rate;
+        picture.start = origin;
+        picture.duration = 150 * frame;
+        for (i, audio) in clip.audio.iter_mut().enumerate() {
+            audio.avid_track = Some(i as i64 + 1);
+            audio.start = origin;
+            audio.duration = picture.duration;
+            audio.bits = bits;
+        }
+        clip.markers = vec![marker("Source range", 12 * frame, 2 * frame, track, "sequence")];
+        let sequence = &mut model.sequences[0];
+        sequence.rate = rate;
+        sequence.markers.clear();
+        sequence.events[0].source_in = 10 * frame;
+        sequence.events[0].duration = 5 * frame;
+        if track == "A1" {
+            // The first source sibling is used on timeline A2.
+            sequence.events[0].audio_channels = vec![2, 1];
+            let mut own = marker("Edit range", 2 * frame, 3 * frame, "A2", "edit");
+            own.event = Some(0);
+            own.source = Some(12 * frame);
+            sequence.markers.push(own);
+            model.options.marker_conflict_loser_to_sequence = true;
+            if !drop_frame && source_frame != 0 {
+                let mut picture = marker("Picture range", 2 * frame, 3 * frame, "V1", "edit");
+                picture.event = Some(0);
+                picture.source = Some(12 * frame);
+                sequence.markers.push(picture);
+            }
+        }
+        let mut input = PreparedProjectInput::from_model(&model).unwrap();
+        input.direct_dnxhr_origins.insert("clip-1".into(), origin);
+        let prepared = prepare_typed_project(
+            &input, dir.join("out.prproj"), &mut SeededUuids::new(SEED), &[], false,
+        ).unwrap();
+        assert_eq!(
+            prepared.report().unverified.iter().any(|s| s.contains("markers on a merged clip")),
+            expect_notice, "{drop_frame} {source_frame} {track}",
+        );
+        assert_eq!(
+            prepared.report().notes.iter().any(|s| s.contains("list each A1/A2 source range twice")),
+            !drop_frame && source_frame != 0 && track == "A1",
+        );
+        if track == "A1" {
+            let out = dir.join("out.prproj");
+            prepared.publish().unwrap();
+            let doc = PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+            let project = prproj::model::Project::from_document(doc, &out).unwrap();
+            let sequence = project.sequences().into_iter()
+                .find(|&s| project.sequence_name(s) == model.sequences[0].name).unwrap();
+            let tree = &project.doc.tree;
+            use prproj::model::marker::{marker_end, marker_name, marker_start};
+            let [loser] = project.sequence_markers(sequence) else { panic!("expected one sequence marker") };
+            assert_eq!(marker_start(tree, *loser).unwrap().ticks, 2 * frame);
+            if source_frame == 0 {
+                assert_eq!(marker_name(tree, *loser).unwrap(), "Edit range");
+            } else {
+                let track = project.audio_tracks(sequence)[1];
+                let path = &model.clips["clip-1"].audio[0].path;
+                let item = project.track(track).clips[0];
+                let source = project.track_item_source(item).unwrap();
+                assert_eq!(project.item_media_path(source), Some(path.as_str()));
+                let [edit] = project.item_markers(source) else { panic!("expected one clip marker") };
+                assert_eq!(marker_name(tree, *edit).unwrap(), "Edit range");
+                assert_eq!(marker_start(tree, *edit).unwrap().ticks, 12 * frame);
+                assert_eq!(marker_end(tree, *edit).unwrap().ticks, 15 * frame);
+                assert_eq!(marker_name(tree, *loser).unwrap(), "Source range");
+            }
+            if !drop_frame && source_frame != 0 {
+                let item = project.track(project.video_tracks(sequence)[0]).clips[0];
+                let source = project.track_item_source(item).unwrap();
+                let [picture] = project.item_markers(source) else { panic!("expected picture marker") };
+                assert_eq!(marker_name(tree, *picture).unwrap(), "Picture range");
+            }
+            std::fs::remove_file(&out).unwrap();
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

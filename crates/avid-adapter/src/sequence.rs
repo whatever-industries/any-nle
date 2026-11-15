@@ -62,6 +62,8 @@ pub(super) struct ItemRoutes {
     pub square_pixels: bool,
     pub motion_picture: Option<Rational>,
     pub motion_audio: HashMap<i64, (i64, Rational)>,
+    pub managed_motion_audio: Option<Rational>,
+    pub same_rate_aac: HashMap<i64, Rational>,
     pub timewarp_picture: Option<Rational>,
 }
 
@@ -82,18 +84,38 @@ fn adapter_audio_in_samples(
 fn motion_timing(
     event: &av::SourceEvent, range: &av::QualifiedRange, phase: i64, item: &ItemRoutes,
     covering_picture: bool, p: &mut Placement, budget: &mut Budget,
-) -> Result<i64, String> {
-    let picture = item.motion_picture.ok_or("requires qualified linked picture")?;
+) -> Result<(i64, bool), String> {
     let span_ratio = av::Rate::automatic_adapter_span(range.source_rate, range.record_rate)
         .ok_or("requires a qualified automatic adapter rate pair")?;
-    if item.motion_audio.len() != 2 { return Err("requires two proven linked mono lanes".into()); }
     if event.event.combined.is_some()
         || !event.event.via.is_empty() || event.volume_automation.is_some()
         || event.picture_extension.is_some() || event.event.picture.is_some()
         || !event.picture_chain.is_empty()
         || event.event.animatte.is_some() || event.event.color.is_some()
     { return Err("requires an unstacked automatic adapter".into()); }
-    if time(range.source_in.checked_add(range.source_length).ok_or("source extent overflow")?, range.source_rate)? > picture {
+    let source_end = time(range.source_in.checked_add(range.source_length)
+        .ok_or("source extent overflow")?, range.source_rate)?;
+    if let Some(extent) = item.managed_motion_audio {
+        if span_ratio != (1000, 1001) || event.event.kind != KIND_SOUND
+            || event.event.master_track != 1 || source_end > extent
+            || event.pan_automation.is_some()
+        {
+            return Err("requires a direct 24-to-23.976 mono PCM16 route with a verified source span".into());
+        }
+        let first = adapter_audio_in_samples(range.source_in, phase, 0, span_ratio, 2000);
+        let start = Rational::new(first, 48_000).ok_or("managed audio origin overflow")?;
+        if start.is_negative() || start.checked_add(p.duration).is_none_or(|end| end > extent) {
+            return Err("managed PCM edit exceeds the verified file sample extent".into());
+        }
+        p.source_in = start;
+        if event.motion_adapter_center_pan {
+            p.track_pans = vec![Some(0.0)];
+        }
+        return Ok((0, true));
+    }
+    let picture = item.motion_picture.ok_or("requires qualified linked picture or managed mono PCM16")?;
+    if item.motion_audio.len() != 2 { return Err("requires two proven linked mono lanes".into()); }
+    if source_end > picture {
         return Err("saved source interval exceeds linked picture".into());
     }
     if event.event.kind == KIND_PICTURE {
@@ -107,7 +129,7 @@ fn motion_timing(
             map.push(i64::try_from(f).map_err(|_|"adapter picture position overflow")?);
         }
         p.frame_map = Some(map);
-        return Ok(0);
+        return Ok((0, false));
     }
     let (origin, duration) = item.motion_audio.get(&event.event.master_track)
         .copied().ok_or("linked AAC file-track origin unresolved")?;
@@ -124,7 +146,7 @@ fn motion_timing(
     }
     p.source_in = start;
     p.duration = Rational::new(playable, 48_000).ok_or("adapter audio extent overflow")?;
-    Ok(tail as i64)
+    Ok((tail as i64, false))
 }
 
 fn apply_saved_timewarp(
@@ -165,24 +187,78 @@ fn automatic_adapter_picture_and_sound_use_separate_native_clocks() {
     assert_eq!(adapter_picture_frame(48, 0, 952, forward), 1000);
     assert_eq!(adapter_audio_in_samples(48, 48, 1, forward, 2000), 98_096);
     assert_eq!(adapter_audio_in_samples(48, 48, 0, forward, 2000), 96_096);
+    assert_eq!(adapter_audio_in_samples(68, 68, 0, forward, 2000), 136_136);
+    assert_eq!(adapter_audio_in_samples(65, 65, 0, forward, 2000), 130_130);
     assert_eq!([0, 952, 953, 954, 1103].map(|n| adapter_picture_frame(48, 49, n, reverse)),
         [48, 1000, 1000, 1001, 1150]);
     let start = adapter_audio_in_samples(48, 49, 1, reverse, 2002);
     assert_eq!(start, 100_002);
     assert_eq!(1104 * 2000 - (2_306_304 - start), 1698);
 }
-fn extend_effect_issue(issue: &av::SourceIssue, fields: &mut Vec<(&str, Value)>) {
+fn extend_effect_issue<'a>(
+    issue: &av::SourceIssue, fields: &mut Vec<(&str, Value)>,
+    resolve_item: impl Fn(MobId) -> Option<&'a str>,
+    color_placement: Option<&str>,
+) {
     let (id, length) = match issue.issue_kind {
         av::SourceIssueKind::MatteKey { length } => ("EFF2_2DMATTE", length),
         av::SourceIssueKind::ColorAdapter { length } => ("EFF2_LUTSFX", length),
+        av::SourceIssueKind::LayeredSubmaster { length, .. } => ("EFF_SUBMASTER", length),
         _ => return,
     };
     fields.push(("effect_id", s(id)));
     fields.push(("record_length", length.map(Value::Int).unwrap_or(Value::Null)));
+    if let Some(adapter) = &issue.color_adapter {
+        let mut facts = vec![
+            ("master", s(adapter.master.urn())),
+            ("master_track", Value::Int(adapter.master_track)),
+            ("source_in", Value::Int(adapter.source_in)),
+            ("text", s(&adapter.transform)),
+            ("placement", opt_s(color_placement)),
+            ("neutral_wrapper", Value::Bool(adapter.neutral_wrapper)),
+        ];
+        match &adapter.picture_file {
+            Observed::Known(mob) => facts.push(("picture_file", s(mob.urn()))),
+            Observed::Unresolved(reason) => facts.push(("source_match_reason", s(reason))),
+        }
+        fields.push(("color_adapter", obj(facts)));
+    }
+    if let av::SourceIssueKind::LayeredSubmaster { input_count, .. } = issue.issue_kind {
+        let class = |class: Option<[u8; 4]>| class
+            .map(|tag| s(String::from_utf8_lossy(&tag))).unwrap_or(Value::Null);
+        fields.extend([
+            ("input_count", Value::Int(input_count as i64)),
+            ("submaster_inputs", Value::Arr(issue.submaster_inputs.iter().map(|input| {
+                let mut layer = vec![
+                    ("track", input.track.map(Value::Int).unwrap_or(Value::Null)),
+                    ("component_class", class(input.component_class)),
+                    ("segment_class", class(input.segment_class)),
+                    ("segment_effect", opt_s(input.segment_effect.as_deref())),
+                ];
+                if let Some(source) = input.picture_source {
+                    let mut reference = vec![
+                        ("mob", s(source.mob.urn())),
+                        ("track", Value::Int(source.track)),
+                        ("source_start", Value::Int(source.source_start)),
+                        ("local_start", Value::Int(source.local_start)),
+                        ("length", Value::Int(source.length)),
+                        ("local_length", Value::Int(source.local_length)),
+                        ("rate", s(rational(source.rate))),
+                    ];
+                    if issue.picture_profile == Some(av::SourcePictureProfile::PlainLayeredSubmaster) {
+                        reference.push(("item", opt_s(resolve_item(source.mob))));
+                    }
+                    layer.push(("picture_source", obj(reference)));
+                }
+                obj(layer)
+            }).collect())),
+        ]);
+    }
     if let Some(profile) = issue.picture_profile {
         fields.push(("picture_profile", s(match profile {
             av::SourcePictureProfile::ImportedPngMatte => "imported_png_matte_controls",
             av::SourcePictureProfile::EmptyColorAdapter => "empty_color_adapter_controls",
+            av::SourcePictureProfile::PlainLayeredSubmaster => "plain_layered_submaster",
         })));
     }
     if let Some(inputs) = issue.matte_inputs {
@@ -213,7 +289,10 @@ fn extend_effect_issue(issue: &av::SourceIssue, fields: &mut Vec<(&str, Value)>)
     }
 }
 
-fn source_issue_receipt(issue: &av::SourceIssue) -> Value {
+fn source_issue_receipt<'a>(
+    issue: &av::SourceIssue, resolve_item: impl Fn(MobId) -> Option<&'a str>,
+    color_placement: Option<&str>,
+) -> Value {
     let mut fields = vec![
         ("owner", s(&issue.owner)),
         ("reason", s(&issue.reason)),
@@ -239,8 +318,62 @@ fn source_issue_receipt(issue: &av::SourceIssue) -> Value {
             fields.push(("neutral_picture_file", s(package.umid_hex())));
         }
     }
-    extend_effect_issue(issue, &mut fields);
+    extend_effect_issue(issue, &mut fields, resolve_item, color_placement);
     obj(fields)
+}
+
+type ColorEventIndex<'a> = HashMap<(i64, i64), (usize, Option<&'a av::SourceEvent>)>;
+
+fn source_color_events<'a>(
+    source: &'a av::SourceSequence, budget: &mut Budget,
+) -> Result<ColorEventIndex<'a>, String> {
+    let mut events = HashMap::new();
+    for issue in &source.unresolved {
+        if let (Some(adapter), Observed::Known(frame)) = (&issue.color_adapter, &issue.record_start) {
+            if !matches!(adapter.picture_file, Observed::Known(_)) {
+                continue;
+            }
+            budget.charge(96)?;
+            events.entry((issue.track, *frame)).or_insert((0usize, None));
+        }
+    }
+    if events.is_empty() {
+        return Ok(events);
+    }
+    for event in &source.events {
+        if event.event.kind != KIND_PICTURE {
+            continue;
+        }
+        if let Some(range) = &event.range {
+            if let Some((count, matched)) = events.get_mut(&(event.event.track, range.record_start)) {
+                *count += 1;
+                *matched = (*count == 1).then_some(event);
+            }
+        }
+    }
+    Ok(events)
+}
+
+fn color_adapter_placement<'a>(
+    issue: &av::SourceIssue, events: &ColorEventIndex<'_>, placements: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    let adapter = issue.color_adapter.as_ref()?;
+    let Observed::Known(_) = adapter.picture_file else { return None };
+    let Observed::Known(start) = issue.record_start else { return None };
+    let av::SourceIssueKind::ColorAdapter { length: Some(length) } = issue.issue_kind else {
+        return None;
+    };
+    let (1, Some(event)) = events.get(&(issue.track, start))? else { return None };
+    let range = event.range.as_ref()?;
+    if !event.owner.strip_prefix(&issue.owner).is_some_and(|tail| tail.starts_with("/component/"))
+        || event.event.master != adapter.master || event.event.master_track != adapter.master_track
+        || range.source_in != adapter.source_in || range.length != length || range.source_length != length
+        || Some(range.record_rate) != issue.record_rate || range.source_rate != range.record_rate
+        || event.event.speed.is_some() || event.motion_adapter_phase.is_some() || event.saved_timewarp.is_some()
+    {
+        return None;
+    }
+    placements.get(&event.id).map(String::as_str)
 }
 
 pub(super) fn append(
@@ -289,8 +422,19 @@ pub(super) fn append(
         budget.charge(issue.reason.len() + issue.owner.len() + issue.route.len() * 1024
             + if issue.matte_inputs.is_some() { 1024 } else { 0 }
             + if issue.picture_profile.is_some() { 128 } else { 0 })?;
+        if !issue.submaster_inputs.is_empty() {
+            budget.charge(issue.submaster_inputs.iter()
+                .map(|input| 512 + input.segment_effect.as_ref().map_or(0, String::len))
+                .sum::<usize>())?;
+        }
         if let Some(import) = &issue.matte_import {
             budget.charge(512 + import.locators.iter().map(|p| p.len() + 64).sum::<usize>())?;
+        }
+        if let Some(adapter) = &issue.color_adapter {
+            budget.charge(1024 + adapter.transform.len())?;
+            if let Observed::Unresolved(reason) = &adapter.picture_file {
+                budget.charge(reason.len())?;
+            }
         }
     }
     for text in &source.info.problems {
@@ -547,11 +691,14 @@ pub(super) fn append(
         } else if let Some(phase) = event.motion_adapter_phase {
             let covering = e.kind == KIND_PICTURE
                 || adapter_picture_spans.contains(&(e.master, phase, range.record_start, range.length));
-            let tail = match motion_timing(event, range, phase, &item_routes[index], covering, &mut p, budget) {
-                Ok(tail) => tail,
+            let (tail, managed) = match motion_timing(event, range, phase, &item_routes[index], covering, &mut p, budget) {
+                Ok(timing) => timing,
                 Err(why) => {
                     let lane = if e.kind == KIND_PICTURE { "V" } else { "A" };
-                    loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING, format!("{lane}{}: {why}", e.track))?;
+                    loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING, format!(
+                        "{lane}{} at record frame {} for {} frames: automatic Motion Adapter {why}",
+                        e.track, range.record_start, range.length
+                    ))?;
                     continue;
                 }
             };
@@ -559,15 +706,39 @@ pub(super) fn append(
                 loss(out, budget, &p.id, "motion_adapter_audio_tail",
                     format!("A{}: {tail} samples beyond the linked MP4 audio extent render as silence. Avid can emit decoded AAC packet padding within that interval.", e.track))?;
             }
-            sidecar(out, budget, "avid.motion_adapter", &p.id, obj(vec![
+            let mut timing = vec![
                 ("phase", Value::Int(phase)),
                 ("native_record_frames", Value::Int(range.length)),
                 ("silent_audio_tail_samples", Value::Int(tail)),
-            ]))?;
+            ];
+            if managed {
+                timing.push(("managed_pcm16", Value::Bool(true)));
+            }
+            sidecar(out, budget, "avid.motion_adapter", &p.id, obj(timing))?;
         } else if e.kind == KIND_SOUND && item_routes[index].motion_audio.contains_key(&e.master_track) {
             loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING,
                 format!("A{}: linked AAC file-track origin outside the qualified Motion Adapter route", e.track))?;
             continue;
+        }
+        if e.kind == KIND_SOUND {
+            if let Some(&extent) = item_routes[index].same_rate_aac.get(&e.master_track) {
+                let rate = av::Rate::new(24, 1).unwrap();
+                if range.source_rate != rate || range.record_rate != rate
+                    || e.speed.is_some() || !e.via.is_empty() || e.combined.is_some()
+                    || event.motion_adapter_phase.is_some() || event.volume_automation.is_some()
+                {
+                    return Err(format!("{}: linked AAC origin requires a straight 24 fps mono edit", p.id));
+                }
+                let unshifted = p.source_in;
+                p.source_in = unshifted.checked_add(time(1, rate)?).ok_or("AAC source trim overflow")?;
+                if unshifted.is_negative() || p.source_in.checked_add(p.duration).is_none_or(|end| end > extent) {
+                    return Err(format!("{}: linked AAC edit exceeds the playable audio after its one-frame source offset", p.id));
+                }
+                sidecar(out, budget, "avid.same_rate_aac", &p.id, obj(vec![
+                    ("saved_source_in", s(unshifted)),
+                    ("file_track_start", Value::Int(1)),
+                ]))?;
+            }
         }
         if let Some(automation) = &event.volume_automation {
             match automation {
@@ -981,15 +1152,29 @@ pub(super) fn append(
     }).collect::<Result<_, String>>()?;
     seq.tracks
         .sort_by_key(|t| (if t.kind == StreamKind::Video { 0 } else { 1 }, t.index));
+    let color_events = source_color_events(source, budget)?;
     for issue in &source.unresolved {
-        unresolved.push(source_issue_receipt(issue));
+        let color_placement = color_adapter_placement(issue, &color_events, &map);
+        unresolved.push(source_issue_receipt(
+            issue,
+            |mob| source_master_copy(mob, source.info.bin, copies, &out.graph.items)
+                .map(|item| item.id.as_str()),
+            color_placement,
+        ));
         match issue.issue_kind {
             av::SourceIssueKind::RouteTiming => {
                 let lane = if issue.kind == KIND_PICTURE { "V" } else { "A" };
                 loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING,
                     format!("{lane}{}: {}", issue.track, issue.reason))?;
             }
-            av::SourceIssueKind::MatteKey { length } | av::SourceIssueKind::ColorAdapter { length } => {
+            av::SourceIssueKind::MatteKey { length }
+            | av::SourceIssueKind::ColorAdapter { length }
+            | av::SourceIssueKind::LayeredSubmaster { length, .. } => {
+                if issue.picture_profile == Some(av::SourcePictureProfile::PlainLayeredSubmaster) {
+                    loss(out, budget, id, "layered_submaster",
+                        format!("V{} at {}: {}", issue.track, issue.owner, issue.reason))?;
+                    continue;
+                }
                 let position = match (&issue.record_start, length, issue.record_rate) {
                     (Observed::Known(frame), Some(len), Some(rate)) =>
                         format!("at record frame {frame} for {len} {} ({} fps)",
@@ -1002,7 +1187,7 @@ pub(super) fn append(
                 } else {
                     "picture_effect"
                 };
-                loss(out, budget, id, aspect,
+                loss(out, budget, color_placement.unwrap_or(id), aspect,
                     format!("V{} {position}: {}", issue.track, issue.reason))?;
             }
             av::SourceIssueKind::DisabledClip { length, .. } => {
@@ -1101,7 +1286,7 @@ pub(super) fn append(
         .transitions
         .iter()
         .map(|t| {
-            obj(vec![
+            let mut fields = vec![
                 ("id", s(&t.id)),
                 ("kind", Value::Int(t.kind)),
                 ("track", Value::Int(t.track)),
@@ -1117,7 +1302,11 @@ pub(super) fn append(
                 ("audio_curve_parameter", t.audio_curve_parameter.map_or(Value::Null, Value::Int)),
                 ("outgoing", binding_receipt(&t.outgoing)),
                 ("incoming", binding_receipt(&t.incoming)),
-            ])
+            ];
+            if let Some(frames) = t.incoming_filler {
+                fields.push(("incoming_filler_frames", Value::Int(frames)));
+            }
+            obj(fields)
         })
         .collect();
     sidecar(
@@ -1457,7 +1646,7 @@ fn raw_sequence(seq: &av::SourceSequence) -> Value {
                             ("kind", Value::Int(issue.kind)),
                             ("track", Value::Int(issue.track)),
                         ];
-                        extend_effect_issue(issue, &mut fields);
+                        extend_effect_issue(issue, &mut fields, |_| None, None);
                         obj(fields)
                     })
                     .collect(),

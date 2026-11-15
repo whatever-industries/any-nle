@@ -117,7 +117,10 @@ pub(super) fn layout(path: &Path) -> R<Layout> {
         if header_end.is_some_and(|limit| offset < limit && end > limit) {
             return Err("MXF KLV crosses header metadata boundary".into());
         }
-        if key[..12] == [6, 14, 43, 52, 1, 2, 1, 1, 13, 1, 3, 1] {
+        const AVID_DNX_PICTURE: [u8; 16] = [
+            6, 14, 43, 52, 1, 2, 1, 1, 14, 4, 3, 1, 0x15, 1, 6, 1,
+        ];
+        if key[..12] == [6, 14, 43, 52, 1, 2, 1, 1, 13, 1, 3, 1] || key == AVID_DNX_PICTURE {
             spans.push(EssenceSpan {
                 kind: key[12],
                 bytes: len,

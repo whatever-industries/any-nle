@@ -21,6 +21,8 @@ pub struct OriginalVideo {
     pub rate: Fraction,
     pub duration: i64,
     pub stream_index: i64,
+    /// Embedded, non-drop source timecode in Premiere ticks, independent of file PTS.
+    pub source_start: i64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SampleRepresentation {
@@ -46,6 +48,7 @@ pub struct OriginalChannel {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct OriginalClip {
+    pub proxy_path: Option<String>,
     pub metadata: ClipMetadata,
     pub path: String,
     pub container: String,
@@ -141,7 +144,7 @@ impl PreparedClip {
         }
     }
 }
-/// A one-sided Constant Gain fade attached to a specific mono edit.
+/// A one-sided Constant Gain fade attached to a specific audio edit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreparedAudioEdgeFade {
     pub sequence: usize,
@@ -226,6 +229,7 @@ pub struct PreparedProjectInput {
     pub audio_mixers: BTreeMap<usize, PreparedAudioMixer>,
     pub track_states: BTreeMap<usize, Vec<PreparedTrackState>>,
     pub picture_effects: Vec<PreparedPictureEffect>,
+    pub source_luts: Vec<PreparedSourceLut>,
     /// A label on one placed clip, independent of its source item.
     pub edit_labels: Vec<PreparedEditLabel>,
     /// Verified single-lane edits to write using the native Enable switch.
@@ -242,6 +246,7 @@ pub struct PreparedProjectInput {
     pub av_subclips: Vec<PreparedAvSubclip>,
     pub av_subclip_uses: Vec<PreparedAvSubclipUse>,
     pub picture_nests: Vec<PreparedPictureNest>,
+    pub layered_submasters: Vec<PreparedLayeredSubmaster>,
     pub png_mattes: PreparedPngMattes,
 }
 
@@ -396,8 +401,57 @@ pub struct PreparedPictureNest {
     pub event: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedLayeredSubmaster {
+    pub sequence: usize,
+    pub track: i64,
+    pub start: i64,
+    pub duration: i64,
+    /// Lower and upper picture in child V1/V2 order, in Premiere ticks.
+    pub layers: [PreparedPictureLayer; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedPictureLayer {
+    pub clip: String,
+    pub start: i64,
+    pub source_in: i64,
+    pub duration: i64,
+}
+
+pub const PICTURE_NEST_24_RATE: Fraction = Fraction { num: 24, den: 1 };
+pub const PICTURE_NEST_RATES: [Fraction; 2] = [
+    PICTURE_NEST_24_RATE,
+    Fraction { num: 24_000, den: 1001 },
+];
+
+impl PreparedLayeredSubmaster {
+    pub fn overlaps(&self, track: i64, start: i64, duration: i64) -> bool {
+        self.track == track && self.start < start.saturating_add(duration)
+            && start < self.start.saturating_add(self.duration)
+    }
+
+    pub fn has_picture_conflict(&self, input: &PreparedProjectInput) -> bool {
+        let Some(sequence) = input.sequences.get(self.sequence) else { return true };
+        sequence.events.iter().any(|e| {
+            e.video_track.is_some_and(|track| self.overlaps(track, e.record_start, e.duration))
+        }) || input.texts.iter().any(|text| {
+            text.sequence == self.sequence && text.kind == PreparedTextKind::Graphic
+                && self.overlaps(text.track, text.start, text.duration)
+        }) || input.video_dissolves.iter().filter(|transition| transition.sequence == self.sequence)
+            .any(|transition| {
+                sequence.events.get(transition.incoming).is_none_or(|edit| {
+                    edit.video_track.is_none_or(|track| {
+                        track == self.track && edit.record_start.checked_sub(transition.before_cut)
+                            .is_none_or(|start| self.overlaps(track, start, transition.duration))
+                    })
+                })
+            })
+    }
+}
+
 pub fn plain_picture_edit(edit: &Event) -> bool {
-    edit.video_track == Some(1) && edit.audio_tracks.is_empty() && edit.stereo.is_empty()
+    edit.video_track.is_some_and(|track| track > 0) && edit.stereo.is_empty()
         && edit.speed_ratio.is_none() && edit.source_duration.is_none() && edit.time_remap.is_none()
         && edit.transform.is_none() && edit.matte.is_none() && edit.color_correction.is_none()
 }
@@ -420,6 +474,29 @@ pub struct PreparedAvSubclip {
     pub name: String,
     pub start: i64,
     pub end: i64,
+}
+
+impl PreparedAvSubclip {
+    /// A shared marker collection can carry a picture marker at its backing-file position.
+    pub fn source_marker<'a>(&self, parent: &'a Clip) -> std::result::Result<Option<&'a Marker>, &'static str> {
+        let invalid = "A/V subclip source markers require one V1 range contained in the subclip";
+        let mut contained = None;
+        for marker in &parent.markers {
+            let end = marker.start.checked_add(marker.duration).ok_or(invalid)?;
+            // A range ending at In stays on the backing master. A point at
+            // In belongs to the subclip. Out is exclusive for both.
+            if marker.start >= self.end || (marker.start < self.start && end <= self.start) {
+                continue;
+            }
+            if marker.track.as_deref() != Some("V1")
+                || marker.start < self.start || end > self.end || contained.is_some()
+            {
+                return Err(invalid);
+            }
+            contained = Some(marker);
+        }
+        Ok(contained)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -572,6 +649,23 @@ pub struct PreparedPictureEffect {
     pub event: usize,
     pub effect: PictureEffect,
     pub reflection_before_motion: [bool; 2],
+}
+
+/// An embedded 2×2×2 cube attached to one plain picture edit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedSourceLut {
+    pub sequence: usize,
+    pub event: usize,
+    pub filename: String,
+    pub points: [(f64, f64, f64); 8],
+}
+
+impl PreparedSourceLut {
+    pub fn valid_filename(name: &str) -> bool {
+        name.strip_suffix(".cube").is_some_and(|stem| !stem.is_empty())
+            && name.len() <= 128
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b" ._()-".contains(&b))
+    }
 }
 
 pub(super) fn validate_picture_effects(effects: &[PreparedPictureEffect], sequences: &[Sequence]) -> Result<(), ModelError> {
@@ -790,6 +884,59 @@ pub fn validate_texts(texts: &[PreparedText], sequences: &[Sequence]) -> Result<
     Ok(())
 }
 impl PreparedProjectInput {
+    fn validate_layered_submasters(&self, clips: &HashMap<&str, &PreparedClip>) -> Result<(), ModelError> {
+        let fail = || ModelError("invalid layered Submaster track, picture source, or extent".into());
+        let total_children = self.layered_submasters.len().saturating_add(self.picture_nests.len());
+        if self.layered_submasters.is_empty() {
+            return Ok(());
+        }
+        if self.options.bin_mode != "separate" || self.sequences.len().saturating_add(total_children) > 10_000 {
+            return Err(fail());
+        }
+        let mut extents = Vec::with_capacity(self.layered_submasters.len());
+        for nest in &self.layered_submasters {
+            let seq = self.sequences.get(nest.sequence).ok_or_else(fail)?;
+            if !PICTURE_NEST_RATES.contains(&seq.rate) || (seq.width, seq.height) != (1920, 1080) {
+                return Err(fail());
+            }
+            let unit = ticks_per_unit(seq.rate);
+            let end = nest.start.checked_add(nest.duration).ok_or_else(fail)?;
+            if !(1..=64).contains(&nest.track) || nest.start < 0 || nest.start % unit != 0
+                || nest.duration <= 0 || nest.duration % unit != 0
+                || seq.start <= 0 || seq.start % unit != 0 || seq.start.checked_add(end).is_none()
+                || nest.layers[0].start != 0 || nest.layers[0].duration != nest.duration
+                || nest.has_picture_conflict(self)
+            {
+                return Err(fail());
+            }
+            extents.push((nest.sequence, nest.track, nest.start, end));
+            for layer in &nest.layers {
+                let Some(PreparedClip::Legacy(clip)) = clips.get(layer.clip.as_str()).copied() else {
+                    return Err(fail());
+                };
+                let video = clip.video.as_ref().ok_or_else(fail)?;
+                let zero_origin_24 = seq.rate == PICTURE_NEST_24_RATE && video.start == 0 && video.codec == "AVdn";
+                if (!zero_origin_24 && !self.direct_dnxhr_origins.contains_key(&layer.clip))
+                    || (video.width, video.height) != (1920, 1080) || video.rate != seq.rate
+                    || layer.start < 0 || layer.start % unit != 0 || layer.source_in < 0
+                    || layer.source_in % unit != 0 || layer.duration <= 0 || layer.duration % unit != 0
+                    || layer.start.checked_add(layer.duration).is_none_or(|end| end > nest.duration)
+                    || layer.source_in.checked_add(layer.duration).is_none_or(|end| end > video.duration)
+                {
+                    return Err(fail());
+                }
+            }
+        }
+        extents.sort_unstable();
+        if extents.windows(2).any(|pair| {
+            let [(sequence, track, _, end), (next_sequence, next_track, start, _)] = pair else { unreachable!() };
+            sequence == next_sequence && track == next_track && start < end
+        }) {
+            return Err(fail());
+        }
+        Ok(())
+    }
+
     fn validate_picture_nests(&self, clips: &HashMap<&str, &PreparedClip>) -> Result<(), ModelError> {
         let fail = || ModelError("invalid prepared picture nest, source clock, or edit owner".into());
         if self.picture_nests.is_empty() {
@@ -807,9 +954,12 @@ impl PreparedProjectInput {
             let event = seq.events.get(nest.event).ok_or_else(fail)?;
             let Some(PreparedClip::Legacy(clip)) = clips.get(event.clip.as_str()).copied() else { return Err(fail()); };
             let Some(video) = &clip.video else { return Err(fail()); };
-            let rate = Fraction::new(24_000, 1001);
-            let unit = ticks_per_unit(rate);
-            if !plain_picture_edit(event) || seq.rate != rate || video.rate != rate
+            if !PICTURE_NEST_RATES.contains(&seq.rate) || video.rate != seq.rate {
+                return Err(fail());
+            }
+            let unit = ticks_per_unit(seq.rate);
+            let zero_origin_24 = seq.rate == PICTURE_NEST_24_RATE && video.start == 0 && video.codec == "AVdn";
+            if !plain_picture_edit(event)
                 || (seq.width, seq.height) != (1920, 1080) || (video.width, video.height) != (1920, 1080)
                 || seq.start <= 0 || seq.start % unit != 0
                 || event.record_start < 0 || event.record_start % unit != 0
@@ -818,7 +968,7 @@ impl PreparedProjectInput {
                 || event.source_in < 0 || event.source_in % unit != 0
                 || event.duration <= 0 || event.duration % unit != 0
                 || event.source_in.checked_add(event.duration).is_none_or(|end| end > video.duration)
-                || !self.direct_dnxhr_origins.contains_key(&event.clip)
+                || (!zero_origin_24 && !self.direct_dnxhr_origins.contains_key(&event.clip))
             {
                 return Err(fail());
             }
@@ -970,6 +1120,7 @@ impl PreparedProjectInput {
             audio_mixers: BTreeMap::new(),
             track_states: BTreeMap::new(),
             picture_effects: Vec::new(),
+            source_luts: Vec::new(),
             edit_labels: Vec::new(),
             disabled_edits: Default::default(),
             direct_dnxhr_origins: Default::default(),
@@ -981,6 +1132,7 @@ impl PreparedProjectInput {
             av_subclips: Vec::new(),
             av_subclip_uses: Vec::new(),
             picture_nests: Vec::new(),
+            layered_submasters: Vec::new(),
             png_mattes: PreparedPngMattes::default(),
         })
     }
@@ -1021,6 +1173,25 @@ impl PreparedProjectInput {
     }
     pub fn validate(&self) -> Result<(), ModelError> {
         self.png_mattes.validate(self)?;
+        let mut lut_owners = HashSet::new();
+        let picture_effects: HashSet<_> = self.picture_effects.iter()
+            .map(|effect| (effect.sequence, effect.event)).collect();
+        for lut in &self.source_luts {
+            let key = (lut.sequence, lut.event);
+            let valid_edit = self.sequences.get(lut.sequence).is_some_and(|sequence|
+                sequence.rate == Fraction::new(24, 1) && (sequence.width, sequence.height) == (1920, 1080)
+                && sequence.events.get(lut.event).is_some_and(|event|
+                    event.video_track == Some(1) && event.transform.is_none() && event.matte.is_none()
+                    && event.color_correction.is_none() && event.speed_ratio.is_none()
+                    && event.time_remap.is_none()));
+            if !valid_edit || !lut_owners.insert(key) || picture_effects.contains(&key)
+                || !PreparedSourceLut::valid_filename(&lut.filename)
+                || lut.points.iter().any(|&(r, g, b)| [r, g, b].iter()
+                    .any(|v| !(0.0..=1.0).contains(v)))
+            {
+                return Err(ModelError("invalid prepared source LUT or unqualified picture stack".into()));
+            }
+        }
         if !self.constant_speeds.is_empty() {
             let clips: HashMap<_, _> = self.clips.iter().filter_map(|c| match c {
                 PreparedClip::Legacy(c) => Some((c.id.as_str(), c)),
@@ -1220,19 +1391,30 @@ impl PreparedProjectInput {
                 return Err(fail("A/V subclip requires backing picture"));
             };
             let frame = ticks_per_unit(picture.rate);
-            let uniform_pcm = matches!(parent.audio.as_slice(), [a, b]
-                if matches!(a.bits, 16 | 24) && a.bits == b.bits);
+            let supported_backing = match parent.audio.as_slice() {
+                [a, b] if picture.rate == Fraction::new(24, 1) =>
+                    picture.start == 0 && [a, b].into_iter().all(|lane| {
+                        lane.bits == 16 && lane.sample_rate == 48_000
+                            && lane.start == 0 && lane.duration == picture.duration
+                    })
+                        && a.avid_track == Some(1) && b.avid_track == Some(2),
+                [a, b] if picture.rate == Fraction::new(30_000, 1001) =>
+                    parent.time_display == Some(102) && a.bits == 24 && b.bits == 24
+                        && self.direct_dnxhr_origins.get(&subclip.parent_clip) == Some(&picture.start),
+                [a, b] => picture.rate == Fraction::new(24_000, 1001)
+                    && self.direct_dnxhr_origins.contains_key(&subclip.parent_clip)
+                    && matches!(a.bits, 16 | 24) && a.bits == b.bits,
+                _ => false,
+            };
             if self.options.bin_mode != "separate" || subclip.bin >= self.bins.len()
-                || !self.direct_dnxhr_origins.contains_key(&subclip.parent_clip)
-                || picture.rate != Fraction::new(24_000, 1001)
-                || !uniform_pcm
-                || !parent.markers.is_empty()
+                || !supported_backing
                 || !(0 <= subclip.start && subclip.start < subclip.end && subclip.end <= picture.duration)
                 || subclip.start % frame != 0 || subclip.end % frame != 0
                 || picture.start.checked_add(subclip.end - subclip.start).is_none()
             {
-                return Err(fail("A/V subclip requires verified 23.976 linked managed media with two uniform PCM16 or PCM24 lanes"));
+                return Err(fail("A/V subclip requires a verified linked managed master with two matching mono PCM lanes"));
             }
+            subclip.source_marker(parent).map_err(fail)?;
         }
         let mut subclip_lanes = HashSet::new();
         let group_uses: HashSet<_> = self.multicam_uses.iter().map(|u| (u.sequence, u.event)).collect();
@@ -1267,21 +1449,29 @@ impl PreparedProjectInput {
                 .ok_or_else(|| fail("audio edge fade references unknown sequence"))?;
             let event = sequence.events.get(fade.event)
                 .ok_or_else(|| fail("audio edge fade references unknown edit"))?;
+            let source = clips.get(event.clip.as_str());
+            let mono = event.audio_tracks.contains(&fade.track) && event.stereo.is_empty()
+                && matches!(source, Some(PreparedClip::Original(clip)) if clip.container == "wav");
+            let stereo = self.options.bin_mode == "separate"
+                && sequence.rate == Fraction::new(24_000, 1001)
+                && event.audio_tracks.is_empty() && fade.head == 0
+                && matches!(&event.stereo[..], [st] if st.audio_track == fade.track && st.channels == [1, 2])
+                && matches!(source, Some(PreparedClip::Legacy(clip)) if clip.video.is_none()
+                    && clip.audio.len() == 2
+                    && clip.audio.iter().all(|a| a.sample_rate == 48_000 && a.bits == 24));
             if !fade_owners.insert((fade.sequence, fade.event, fade.track))
-                || !event.audio_tracks.contains(&fade.track)
                 || event.video_track.is_some()
-                || !event.stereo.is_empty()
-                || !matches!(clips.get(event.clip.as_str()),
-                    Some(PreparedClip::Original(clip)) if clip.container == "wav")
+                || !(mono || stereo)
                 || fade.head < 0 || fade.tail < 0
                 || fade.head.checked_add(fade.tail).is_none_or(|n| n == 0 || n > event.duration)
                 || sequence.audio_crossfades.iter().any(|f| f.track == fade.track)
             {
-                return Err(fail("unqualified or duplicate mono audio edge fade"));
+                return Err(fail("unqualified or duplicate audio edge fade"));
             }
         }
         self.validate_audio_crossfades(&clips)?;
         self.validate_picture_nests(&clips)?;
+        self.validate_layered_submasters(&clips)?;
         self.validate_audio_pans(&clips)?;
         for b in &self.bins {
             super::model::check_text(&b.name, "prepared bin", 4096, false)?;
@@ -1469,7 +1659,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
             && std::path::Path::new(&c.path).extension()
                 .and_then(|suffix| suffix.to_str())
                 .is_some_and(|suffix| suffix.eq_ignore_ascii_case("mov"))
-            && c.audio.is_none() && v.width == 1920 && v.height == 1080
+            && (c.audio.is_none() || c.proxy_path.is_some()) && v.width == 1920 && v.height == 1080
             && (v.rate == Fraction::new(24, 1) || v.rate == Fraction::new(24000, 1001)));
         require(
             c.container == "mov" && qualified_codec && v.stream_index == 0,
@@ -1478,10 +1668,32 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         super::model::check_dimensions(v.width, v.height, "original video")?;
         super::model::check_rate(v.rate, "original video")?;
         super::model::check_ticks(v.duration as i128, "original video", true)?;
+        let frame = ticks_per_unit(v.rate);
+        require(
+            v.source_start >= 0
+                && v.source_start % frame == 0
+                && (v.source_start == 0 || v.codec == "apch"),
+            "unqualified original picture source timecode",
+        )?;
+        super::model::check_ticks(
+            i128::from(v.source_start) + i128::from(v.duration), "original video end", true,
+        )?;
         require(
             v.duration % ticks_per_unit(v.rate) == 0,
             "original picture extent is not whole frames",
         )?;
+    }
+    if let Some(path) = &c.proxy_path {
+        super::model::check_path(path, "Avid proxy path")?;
+        require(path != &c.path && std::path::Path::new(path).is_absolute()
+            && c.video.as_ref().is_some_and(|v| v.codec == "apch" && (v.width,v.height) == (1920,1080)
+                && v.rate == Fraction::new(24000,1001))
+            && std::path::Path::new(path).extension().and_then(|s| s.to_str())
+                == Some(if c.audio.is_some() {"mov"} else {"mxf"})
+            && c.audio.as_ref().is_none_or(|a| a.channels == 2 && a.sample_rate == 48000
+                && a.duration == c.video.as_ref().unwrap().duration
+                && matches!(a.representation, SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24)),
+            "unqualified Avid proxy shape or path")?;
     }
     if let Some(a) = &c.audio {
         let wav8 = a.channels == 8 && c.container == "wav" && c.video.is_none()
@@ -1505,6 +1717,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         require(
             match (&a.representation, c.container.as_str()) {
                 (SampleRepresentation::Aac, "mov") => a.channels == 2,
+                (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "mov") => c.proxy_path.is_some(),
                 (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "wav") => true,
                 _ => false,
             },

@@ -73,9 +73,9 @@ impl Document {
             let actual = unique_child(tree, media, "ActualMediaFilePath")?;
             let relative: Vec<_> = children(tree, media, "RelativePath").collect();
             let first = *relative.first().ok_or("missing Premiere RelativePath")?;
-            let value = scalar(tree, first)?;
+            let value = relative_locator(scalar(tree, first)?);
             for &node in &relative[1..] {
-                if scalar(tree, node)? != value {
+                if relative_locator(scalar(tree, node)?) != value {
                     return Err("contradictory Premiere RelativePath fields".into());
                 }
             }
@@ -219,6 +219,11 @@ fn scalar(tree: &Tree, node: NodeId) -> Result<&str> {
     tree.text(node)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("empty Premiere {}", tree.tag(node)).into())
+}
+
+fn relative_locator(value: &str) -> &str {
+    // Premiere Save As can store the same relative locator with and without "./".
+    value.strip_prefix("./").unwrap_or(value)
 }
 
 fn relative_path(from: &Path, to: &Path) -> PathBuf {

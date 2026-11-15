@@ -11,5 +11,6 @@ name = "avid_adapter"
 avid-reader = { path = "../../avid-reader" }
 anynle-graph = { path = "../graph" }
 hex = "0.4"
+fs2 = "=0.4.3"
 png = "=0.18.1"
 sha2 = "0.10"

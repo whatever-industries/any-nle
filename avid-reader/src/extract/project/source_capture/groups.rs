@@ -215,6 +215,8 @@ pub(super) fn capture_use(
         alternatives.push(endpoint(ctx.deref(t.get("component")).unwrap()));
     }
     let value = SourceGroupUse {
+        warp_picture_input: c.scopes[scope].group_path
+            && c.stack.iter().any(|&i| c.scopes[i].group_warp_input),
         is_ganged: node.get("is_ganged").and_then(|v| {
             if let Value::Bool(b) = v {
                 Some(*b)

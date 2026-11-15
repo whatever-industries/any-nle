@@ -37,6 +37,8 @@ pub struct ProjectSpec {
     pub(crate) media: Vec<MediaSpec>,
     #[serde(default)]
     pub(crate) atom_media: Vec<AtomSpec>,
+    #[serde(skip)]
+    pub(crate) proxy_audio: HashMap<String, [avid_reader::source::SourceInput; 2]>,
 }
 
 pub(crate) fn avid_original_spec(
@@ -83,6 +85,7 @@ pub(crate) fn avid_original_spec(
         }],
         media,
         atom_media: vec![],
+        proxy_audio: HashMap::new(),
     })
 }
 
@@ -162,13 +165,22 @@ pub(crate) enum Profile {
         frames: i64,
         tagged_rec709: bool,
         quicktime_timecode: bool,
+        avid_source_timecode: Option<i64>,
         h264: bool,
         aac: bool,
+        pcm: Option<i64>,
     },
     Wav {
         samples: i64,
         bits: i64,
         channels: i64,
+    },
+    MonoAtom {
+        frames: i64,
+        bits: i64,
+        start: i64,
+        package: [u8; 32],
+        material: [u8; 32],
     },
     Atom(Arc<VerifiedBinding>),
 }
@@ -180,6 +192,7 @@ pub(crate) struct Media {
     pub(crate) profile: Profile,
     pub(crate) modified_micros: u64,
     digest: [u8; 32],
+    pub(crate) proxy: Option<avid_adapter::proxy::Attachment>,
 }
 
 impl Media {
@@ -285,11 +298,27 @@ pub(crate) fn extent(count: i64, time_base: Rational) -> Result<Rational> {
     .ok_or_else(|| "physical media duration overflow".into())
 }
 
+pub(crate) fn non_drop_24(frames: i64) -> String {
+    format!("{:02}:{:02}:{:02}:{:02}", frames / 86400, frames / 1440 % 60,
+        frames / 24 % 60, frames % 24)
+}
+
 pub(crate) fn probe(
     spec: &MediaSpec,
     tool: &Path,
     name: String,
     bin: usize,
+) -> Result<(Media, Rational, i64)> {
+    probe_with_avid_clock(spec, tool, name, bin, None, None)
+}
+
+fn probe_with_avid_clock(
+    spec: &MediaSpec,
+    tool: &Path,
+    name: String,
+    bin: usize,
+    avid_source_timecode: Option<i64>,
+    proxy: Option<avid_adapter::proxy::Attachment>,
 ) -> Result<(Media, Rational, i64)> {
     if !spec.path.is_absolute() {
         return Err("linked media binding needs an absolute path".into());
@@ -326,10 +355,20 @@ pub(crate) fn probe(
         let frames = frames_on(duration, rate)?;
         let h264 = stream["codec_name"] == "h264";
         let aac = h264 && streams.len() == 2 && streams[1]["codec_name"] == "aac";
-        let zero_tc = |s: &Json| s["tags"]["timecode"] == "00:00:00:00";
-        let quicktime_timecode = match streams.as_slice() {
+        let pcm = proxy.as_ref().and_then(|p|p.bits);
+        let start = avid_source_timecode.unwrap_or(0);
+        if !(0..24 * 60 * 60 * 24).contains(&start) {
+            return Err("camera original timecode outside a 24-hour day".into());
+        }
+        let tc_text = non_drop_24(start);
+        let matching_tc = |s: &Json| s["tags"]["timecode"].as_str() == Some(tc_text.as_str());
+        let timing_streams: Vec<_> = if pcm.is_some() && streams.len() == 3 {
+            vec![&streams[0], &streams[2]]
+        } else { streams.iter().collect() };
+        let quicktime_timecode = match timing_streams.as_slice() {
             [_] | [_, _]
                 if (streams.len() == 1 || aac)
+                    && avid_source_timecode.is_none()
                     && stream["tags"]["timecode"].is_null()
                     && probe["format"]["tags"]["timecode"].is_null() =>
             {
@@ -337,8 +376,8 @@ pub(crate) fn probe(
             }
             [_, tc]
                 if !h264
-                    && rate == Rational::integer(24)
-                    && tc["index"] == 1
+                    && (rate == Rational::integer(24) || avid_source_timecode.is_some() && supported_rate(rate))
+                    && tc["index"] == if pcm.is_some() {2} else {1}
                     && tc["codec_type"] == "data"
                     && tc["codec_tag_string"] == "tmcd"
                     && tc["nb_frames"] == "1"
@@ -346,10 +385,10 @@ pub(crate) fn probe(
                     && tc["duration_ts"] == duration_ts
                     && ratio(&tc["avg_frame_rate"]).ok() == Some(rate)
                     && ratio(&tc["time_base"]).ok() == Some(time_base)
-                    && zero_tc(stream)
-                    && zero_tc(tc)
+                    && matching_tc(stream)
+                    && matching_tc(tc)
                     && (probe["format"]["tags"]["timecode"].is_null()
-                        || zero_tc(&probe["format"])) =>
+                        || matching_tc(&probe["format"])) =>
             {
                 true
             }
@@ -427,6 +466,22 @@ pub(crate) fn probe(
             }
             crate::media::verify_aac_packet_grid(tool, &path, frames * 2000)?;
         }
+        if let Some(p) = &proxy {
+            if h264 || !quicktime_timecode || p.path == path || p.frames != frames || p.start != start || p.rate != rate {
+                return Err("Resolve proxy disagrees with its original clock, raster or extent".into());
+            }
+        }
+        if let Some(bits) = pcm {
+            let audio = &streams[1];
+            let expected = if bits == 16 {"pcm_s16le"} else {"pcm_s24le"};
+            if audio["index"] != 1 || audio["codec_type"] != "audio" || audio["codec_name"] != expected
+                || audio["channels"] != 2 || audio["sample_rate"] != "48000" || audio["start_pts"] != 0
+                || audio["bits_per_sample"] != bits
+                || ratio(&audio["time_base"])? != Rational::new(1,48000).unwrap()
+                || integer(audio,"duration_ts")? != frames * samples_per_frame(rate) {
+                return Err("unqualified camera-original stereo PCM clock or layout".into());
+            }
+        }
         if duration_ts % frames != 0 {
             return Err("MOV timescale cannot represent one constant frame".into());
         }
@@ -436,10 +491,15 @@ pub(crate) fn probe(
             frames,
             tagged_rec709,
             quicktime_timecode,
+            avid_source_timecode,
             h264,
             aac,
+            pcm,
         }
     } else {
+        if avid_source_timecode.is_some() {
+            return Err("Avid camera-original timecode requires a MOV binding".into());
+        }
         let channels = integer(stream, "channels")?;
         let bits = match stream["codec_name"].as_str() {
             Some("pcm_s16le") => 16,
@@ -464,9 +524,12 @@ pub(crate) fn probe(
             channels,
         }
     };
-    let modified_micros = fs::metadata(&path)?
-        .modified()?
-        .duration_since(UNIX_EPOCH)?
+    let timestamp = fs::metadata(&path)?;
+    let modified = match &profile {
+        Profile::Mov { pcm: Some(_), .. } => timestamp.created().or_else(|_| timestamp.modified())?,
+        _ => timestamp.modified()?,
+    };
+    let modified_micros = modified.duration_since(UNIX_EPOCH)?
         .as_micros()
         .try_into()?;
     let binding = Media {
@@ -476,6 +539,7 @@ pub(crate) fn probe(
         profile,
         modified_micros,
         digest,
+        proxy,
     };
     binding.recheck()?;
     Ok((binding, time_base, duration_ts))
@@ -483,6 +547,61 @@ pub(crate) fn probe(
 
 fn supported_rate(rate: Rational) -> bool {
     matches!((rate.num(), rate.den()), (24, 1) | (24000, 1001))
+}
+
+// The Avid adapter already checked the physical PCM layout, clock and decoded
+// channel content. Bind exactly those pinned files to their saved graph package.
+fn prepare_proxy_audio(
+    input: &avid_reader::source::SourceInput,
+    expected_package: &str,
+    bin: usize,
+    frames: i64,
+    bits: i64,
+    start: i64,
+) -> Result<(Media, u64)> {
+    let path = fs::canonicalize(&input.path)?;
+    let name = checked_name(path.file_name().and_then(|name| name.to_str())
+        .ok_or("invalid Avid audio sibling filename")?)?;
+    if path.extension().and_then(|ext| ext.to_str()) != Some("mxf") {
+        return Err("expected a verified Avid mono MXF".into());
+    }
+    let id = avid_reader::mxf::read_identity(&path)?;
+    let [package] = id.file_packages.as_slice() else {
+        return Err("expected one MXF file package".into());
+    };
+    let [material] = id.material_packages.as_slice() else {
+        return Err("expected one MXF material package".into());
+    };
+    if package != expected_package || package == material {
+        return Err("verified MXF disagrees with the saved audio sibling package".into());
+    }
+    let umid = |value: &str| -> Result<[u8; 32]> {
+        let bytes = hex::decode(value)?.try_into().map_err(|_| "invalid MXF package")?;
+        if bytes == [0; 32] {
+            return Err("empty MXF package identity".into());
+        }
+        Ok(bytes)
+    };
+    let metadata = fs::metadata(&path)?;
+    let modified_micros = metadata.created().or_else(|_| metadata.modified())?
+        .duration_since(UNIX_EPOCH)?.as_micros().try_into()?;
+    let media = Media {
+        name,
+        bin,
+        path,
+        profile: Profile::MonoAtom {
+            frames,
+            bits,
+            start,
+            package: umid(package)?,
+            material: umid(material)?,
+        },
+        modified_micros,
+        digest: hex::decode(&input.revision)?.try_into().map_err(|_| "invalid MXF digest")?,
+        proxy: None,
+    };
+    media.recheck()?;
+    Ok((media, metadata.len()))
 }
 
 pub(crate) fn check_stream(
@@ -494,21 +613,21 @@ pub(crate) fn check_stream(
 ) -> Result<()> {
     let (index, time_base, duration_ts) = match (&media.profile, source.kind) {
         (
-            Profile::Mov {
-                aac: true, frames, ..
-            },
+            Profile::Mov { aac, pcm, rate, frames, .. },
             StreamKind::Audio,
-        ) => (1, Rational::new(1, 48000).unwrap(), frames * 2000),
+        ) if *aac || pcm.is_some() => (1, Rational::new(1, 48000).unwrap(), frames * samples_per_frame(*rate)),
         _ => (0, time_base, duration_ts),
     };
     let valid = match &media.profile {
-        Profile::Mov { .. } if index == 1 => {
+        Profile::Mov { pcm, .. } if index == 1 => {
             selector
                 .channel
                 .is_some_and(|c| c < 2 && source.stream.is_some())
                 && source.sample_rate == Some(48000)
-                && source.bits.is_none()
-                && source.codec.as_deref() == Some("aac")
+                && source.bits == *pcm
+                && source.codec.as_deref() == Some(match pcm {
+                    Some(16) => "pcm_s16le", Some(24) => "pcm_s24le", _ => "aac",
+                })
         }
         Profile::Mov { rate, h264, .. } => {
             selector.channel.is_none()
@@ -531,13 +650,19 @@ pub(crate) fn check_stream(
                 && source.sample_rate == Some(48000)
                 && source.bits == Some(*bits)
         }
-        Profile::Atom(_) => false,
+        Profile::Atom(_) | Profile::MonoAtom { .. } => false,
     };
     let path_agrees = source.locations.iter().any(|s| Path::new(s) == media.path);
+    let origin_agrees = match &media.profile {
+        Profile::Mov { avid_source_timecode: Some(start), rate, .. } if source.kind == StreamKind::Video => {
+            source.start == Rational::new(i128::from(*start) * i128::from(rate.den()), rate.num().into())
+        }
+        _ => source.start.is_none_or(|v| v == Rational::ZERO),
+    };
     if selector.index != index
         || !valid
         || !path_agrees
-        || source.start.is_some_and(|v| v != Rational::ZERO)
+        || !origin_agrees
         || source.duration != extent(duration_ts, time_base)?
     {
         return Err("graph media facts disagree with verified linked file".into());
@@ -651,6 +776,7 @@ pub(crate) fn prepare_project(
     let mut media = Vec::new();
     let mut media_bytes = 0u64;
     let mut selected = HashMap::new();
+    let mut independent_audio = HashMap::new();
     for binding in &spec.media {
         let item_id = binding.item_id.as_str();
         if selected.contains_key(item_id) {
@@ -677,25 +803,42 @@ pub(crate) fn prepare_project(
         {
             return Err(format!("unqualified routing or stream count for {item_id}").into());
         }
-        let (verified, tb, duration_ts) = probe(
+        let mut avid_source_timecode = None;
+        for link in &item.media {
+            let source = streams[link.media.as_str()];
+            if let Some(clock) = source.clock.as_ref().filter(|clock|
+                clock.provenance.route == graph::source::AVID_SOURCE_COLUMNS_TIMECODE)
+            {
+                if avid_source_timecode.is_some() || source.kind != StreamKind::Video
+                    || !supported_rate(clock.rate) || clock.drop || clock.display_base != 24
+                {
+                    return Err(format!("{item_id}: unsupported camera-original timecode").into());
+                }
+                avid_source_timecode = Some(i64::try_from(clock.effective_count)?);
+            }
+        }
+        let (verified, tb, duration_ts) = probe_with_avid_clock(
             binding,
             ffprobe,
             checked_name(&item.name)?,
             bin_ids[bin.id.as_str()],
+            avid_source_timecode,
+            avid_adapter::proxy::Attachment::from_graph(graph,item_id)?,
         )
         .map_err(|e| format!("{item_id}: {e}"))?;
         let mut by_label = HashMap::new();
         let mut seen = HashSet::new();
         let expected = match &verified.profile {
-            Profile::Mov { aac, .. } => {
-                if *aac {
+            Profile::Mov { aac, pcm, .. } => {
+                if *aac || pcm.is_some() {
                     3
                 } else {
                     1
                 }
             }
             Profile::Wav { channels, .. } => *channels as usize,
-            Profile::Atom(_) => return Err("unexpected split MXF in MOV/WAV probe".into()),
+            Profile::Atom(_) | Profile::MonoAtom { .. } =>
+                return Err("unexpected split MXF in MOV/WAV probe".into()),
         };
         if binding.streams.len() != expected {
             return Err(format!("{item_id}: incomplete physical selector set").into());
@@ -722,8 +865,40 @@ pub(crate) fn prepare_project(
                 return Err(format!("{item_id}: duplicate logical source stream label").into());
             }
         }
+        if media.len() == 256 {
+            return Err("selected media exceed the Resolve project limit".into());
+        }
         selected.insert(item_id, (media.len(), by_label));
         media.push(verified);
+        if let Some(siblings) = spec.proxy_audio.get(item_id) {
+            let Profile::Mov { frames, pcm: Some(bits), avid_source_timecode: Some(start), .. } =
+                media.last().ok_or("missing verified proxy picture")?.profile
+            else {
+                return Err(format!("{item_id}: independent proxy audio requires a verified stereo proxy").into());
+            };
+            if siblings[0].path == siblings[1].path || media.len() + 2 > 256 {
+                return Err(format!("{item_id}: duplicate audio sibling or Resolve media item limit").into());
+            }
+            for (channel, sibling) in siblings.iter().enumerate() {
+                let source = binding.streams.iter().find(|selector| selector.channel == Some(channel))
+                    .ok_or("missing original channel for verified Avid sibling")?;
+                let package = graph.sidecar("avid.source", &source.media_id)
+                    .and_then(|data| match data.get("file_package") {
+                        Some(Value::Str(id)) => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .ok_or("missing Avid audio sibling file package")?;
+                let (verified, size) = prepare_proxy_audio(
+                    sibling, package, bin_ids[bin.id.as_str()], frames, bits, start,
+                ).map_err(|e| format!("{item_id} A{}: {e}", channel+1))?;
+                media_bytes = media_bytes.checked_add(size).ok_or("linked media size overflows")?;
+                if media_bytes > 8u64 << 30 {
+                    return Err("linked project media exceeds the 8 GiB research budget".into());
+                }
+                independent_audio.insert((item_id, channel), media.len());
+                media.push(verified);
+            }
+        }
     }
     let mut atom_ids = Vec::new();
     for row in spec.atom_media {
@@ -755,6 +930,9 @@ pub(crate) fn prepare_project(
         let item =
             check_binding(graph, &verified).map_err(|error| format!("{item_id}: {error}"))?;
         selected.insert(item.id.as_str(), (media.len(), HashMap::new()));
+        if media.len() == 256 {
+            return Err("selected media exceed the Resolve project limit".into());
+        }
         media.push(Media {
             name: checked_name(&item.name)?,
             bin: bin_ids[bin.id.as_str()],
@@ -762,6 +940,7 @@ pub(crate) fn prepare_project(
             modified_micros: verified.modified_micros,
             digest: verified.digest,
             profile: Profile::Atom(Arc::new(verified)),
+            proxy: None,
         });
         atom_ids.push(item_id);
     }
@@ -1015,9 +1194,9 @@ pub(crate) fn prepare_project(
                         [lane @ (1 | 2)],
                         [label],
                         Profile::Mov {
-                            rate, aac: true, ..
+                            rate, aac, pcm, ..
                         },
-                    ) if *rate == sequence.rate => (
+                    ) if *rate == sequence.rate && (*aac || pcm.is_some()) => (
                         *lane as usize,
                         selectors.get(&Some(*label)).copied().flatten(),
                     ),
@@ -1033,6 +1212,12 @@ pub(crate) fn prepare_project(
                         )
                     }
                 };
+                let (media_index, channel) = match channel.and_then(|ch| {
+                    independent_audio.get(&(edit.item.as_str(), ch))
+                }) {
+                    Some(index) => (*index, Some(0)),
+                    None => (*media_index, channel),
+                };
                 if (matches!(lane, 1 | 2 | 4) && channel.is_none()) || lanes[lane].len() == MAX_EDITS_PER_LANE {
                     return Err(format!(
                         "{}: unresolved physical channel or edit count limit",
@@ -1041,7 +1226,7 @@ pub(crate) fn prepare_project(
                     .into());
                 }
                 let premiere_fades = clip_envelopes.check_premiere_fades(
-                    edit, lane, &media[*media_index].profile,
+                    edit, lane, &media[media_index].profile,
                 )?;
                 let mut start = frames_on(edit.record_start, sequence.rate)?;
                 let mut source_in = frames_on(edit.source_in, sequence.rate)?;
@@ -1061,8 +1246,8 @@ pub(crate) fn prepare_project(
                 let end = source_in
                     .checked_add(source_length)
                     .ok_or("source range overflow")?;
-                let available = match &media[*media_index].profile {
-                    Profile::Mov { frames, .. } => *frames,
+                let available = match &media[media_index].profile {
+                    Profile::Mov { frames, .. } | Profile::MonoAtom { frames, .. } => *frames,
                     Profile::Wav { samples, .. } => samples / samples_per_frame(sequence.rate),
                     Profile::Atom(binding) => binding.frames,
                 };
@@ -1072,7 +1257,7 @@ pub(crate) fn prepare_project(
                     );
                 }
                 let envelope = clip_envelopes.prepare(
-                    edit, lane, &media[*media_index].profile, source_in, length, premiere_fades,
+                    edit, lane, &media[media_index].profile, source_in, length, premiere_fades,
                 )?;
                 let video = crate::video::prepare(edit, sequence.rate, source_in, length, available)
                     .map_err(|e| format!("{}: {e}", edit.id))?;
@@ -1085,7 +1270,7 @@ pub(crate) fn prepare_project(
                     return Err("Resolve primary gain must belong to a V1 picture edit".into());
                 }
                 lanes[lane].push(Edit {
-                    media: *media_index,
+                    media: media_index,
                     channel,
                     start,
                     source_in,

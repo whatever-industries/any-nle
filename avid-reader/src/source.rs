@@ -161,6 +161,8 @@ pub struct SourceMaster {
     pub originals: Vec<Option<OriginalTrack>>,
     /// Saved direct file-to-physical timecode routes, in master track order.
     pub file_clocks: Vec<Option<SavedFileClock>>,
+    /// Saved routing for a master backed by a managed multi-descriptor file.
+    pub managed_multistream: Option<ManagedMultistream>,
     /// A saved import route. The original WAV bytes have not been verified.
     pub imported_audio: Option<Box<SavedPcmImport>>,
     /// Observed on the directly referenced picture file mob, in master track order.
@@ -169,6 +171,40 @@ pub struct SourceMaster {
     pub rendered_freeze: bool,
     /// Upstream precompute identity for a timeline-bound AudioSuite Gain master.
     pub rendered_gain: Option<crate::io::MobId>,
+}
+#[derive(Debug)]
+pub struct ManagedMultistream {
+    pub file_package: MobId,
+    pub tracks: Vec<ManagedMultistreamTrack>,
+    pub descriptors: Vec<ManagedMultistreamDescriptor>,
+}
+#[derive(Debug)]
+pub struct ManagedMultistreamTrack {
+    pub kind: i64,
+    pub master_label: i64,
+    pub file_label: i64,
+    pub physical_track_number: Option<u32>,
+    pub master_offset: Option<i64>,
+    pub file_source_package: Option<MobId>,
+    pub file_source_track: Option<i64>,
+    pub file_source_offset: Option<i64>,
+    pub file_source_length: Option<i64>,
+    pub file_source_rate: Option<Rate>,
+}
+#[derive(Debug)]
+pub struct ManagedMultistreamDescriptor {
+    pub class: [u8; 4],
+    pub length: Option<i64>,
+    pub edit_rate: Option<Rate>,
+    pub sample_rate: Option<Rate>,
+    pub bits: Option<i64>,
+    pub channels: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub frame_layout: Option<i64>,
+    pub display_aspect: Option<(i64, i64)>,
+    pub resolution_id: Option<i64>,
+    pub compression: Option<[u8; 4]>,
 }
 #[derive(Debug)]
 pub struct SavedPcmImport {
@@ -267,6 +303,8 @@ pub struct SourceEvent {
     pub picture_chain: Vec<PictureStage>,
     /// Saved phase for the bounded automatic adapter between 24 and 24000/1001.
     pub motion_adapter_phase: Option<i64>,
+    /// The enclosing PVOL has an unset pan flag and saves the center position.
+    pub motion_adapter_center_pan: bool,
     /// Visible source frame offsets from the qualified range start for a saved Timewarp map.
     pub saved_timewarp: Option<Vec<i64>>,
     /// Signed playback ratio established by the saved constant Speed and Position controls.
@@ -373,6 +411,8 @@ pub struct SourceTransition {
     pub effect: Option<String>,
     pub audio_curve_attribute: Option<i64>,
     pub audio_curve_parameter: Option<i64>,
+    /// Direct incoming filler span at the sequence rate.
+    pub incoming_filler: Option<i64>,
     pub outgoing: Binding,
     pub incoming: Binding,
 }
@@ -396,6 +436,7 @@ pub enum SourceIssueKind {
     RouteTiming,
     MatteKey { length: Option<i64> },
     ColorAdapter { length: Option<i64> },
+    LayeredSubmaster { length: Option<i64>, input_count: usize },
     DisabledClip { length: i64, backing_class: [u8; 4], plain_mono: bool, plain_stereo: bool, neutral_picture: Option<MobId> },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,6 +471,28 @@ pub struct MatteImport {
 }
 
 #[derive(Debug)]
+pub struct SubmasterInput {
+    pub track: Option<i64>,
+    pub component_class: Option<[u8; 4]>,
+    /// Direct component or the sole nonempty entry inside an input sequence.
+    pub segment_class: Option<[u8; 4]>,
+    pub segment_effect: Option<String>,
+    /// A direct picture reference with its position inside this saved input.
+    pub picture_source: Option<SubmasterPictureInput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmasterPictureInput {
+    pub mob: crate::io::MobId,
+    pub track: i64,
+    pub source_start: i64,
+    pub local_start: i64,
+    pub length: i64,
+    pub local_length: i64,
+    pub rate: Rate,
+}
+
+#[derive(Debug)]
 pub struct SourceIssue {
     pub owner: String,
     pub reason: String,
@@ -441,14 +504,27 @@ pub struct SourceIssue {
     pub track: i64,
     pub matte_inputs: Option<MatteInputs>,
     pub matte_import: Option<MatteImport>,
+    pub color_adapter: Option<SourceColorAdapter>,
+    pub submaster_inputs: Vec<SubmasterInput>,
     /// Saved control/route match only. Media identity and destination composition
     /// still require verification; a match does not remove the source loss.
     pub picture_profile: Option<SourcePictureProfile>,
+}
+/// An edit-side payload and its checked relationship to the direct picture source.
+#[derive(Debug)]
+pub struct SourceColorAdapter {
+    pub master: MobId,
+    pub master_track: i64,
+    pub source_in: i64,
+    pub picture_file: Observed<MobId>,
+    pub transform: String,
+    pub neutral_wrapper: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourcePictureProfile {
     ImportedPngMatte,
     EmptyColorAdapter,
+    PlainLayeredSubmaster,
 }
 #[derive(Debug)]
 pub struct SourceSequence {
@@ -544,6 +620,8 @@ pub enum SourceGroupPiece {
 #[derive(Debug)]
 pub struct SourceGroupUse {
     pub is_ganged: Option<bool>,
+    /// The exact selector is the full-span picture input to one qualified Warp.
+    pub warp_picture_input: bool,
     pub id: String,
     pub kind: i64,
     pub track: i64,

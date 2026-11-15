@@ -13,6 +13,7 @@ fn input() -> PreparedProjectInput {
         audio_mixers: Default::default(),
         track_states: Default::default(),
         picture_effects: Vec::new(),
+        source_luts: Vec::new(),
         edit_labels: Vec::new(),
         disabled_edits: Default::default(),
         direct_dnxhr_origins: Default::default(),
@@ -28,6 +29,7 @@ fn input() -> PreparedProjectInput {
         av_subclip_uses: vec![],
         constant_speeds: Vec::new(),
         picture_nests: vec![],
+        layered_submasters: vec![],
         png_mattes: Default::default(),
         sequences: vec![Sequence {
             name: "Caption and Text Control".into(),

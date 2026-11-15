@@ -18,6 +18,7 @@ use uuid::Uuid;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 mod group;
+mod proxy_cache;
 mod linked;
 mod markers;
 pub use group::publish_group;

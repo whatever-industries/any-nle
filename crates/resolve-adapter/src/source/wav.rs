@@ -1,4 +1,4 @@
-//! Standalone PCM cache and virtual routing, separate from embedded MXF audio.
+//! Standalone PCM cache and virtual routing for WAV and mono OP-Atom audio.
 use super::*;
 
 pub(super) fn samples_per_frame(rate: Rational) -> Result<i64> {
@@ -10,6 +10,14 @@ pub(super) fn samples_per_frame(rate: Rational) -> Result<i64> {
 }
 
 pub(super) fn integer_duration(text: &str) -> Result<i64> {
+    integer_frame(text, false)
+}
+
+pub(super) fn integer_atom_frame(text: &str) -> Result<i64> {
+    integer_frame(text, true)
+}
+
+fn integer_frame(text: &str, mono_atom: bool) -> Result<i64> {
     let Some((whole, fraction)) = text.split_once('|') else {
         return Ok(text.parse()?);
     };
@@ -20,7 +28,9 @@ pub(super) fn integer_duration(text: &str) -> Result<i64> {
     let fraction = f64::from_le_bytes(hex::decode(fraction)?.as_slice().try_into()?);
     // Resolve sometimes serializes binary64 noise beside an integral frame
     // count. Keep true fractional edits outside this frame-aligned profile.
-    if fraction.abs() > whole.unsigned_abs() as f64 * f64::EPSILON || !fraction.is_finite() {
+    // A nonzero MXF origin adds binary64 cancellation at the file clock scale.
+    let tolerance = if mono_atom { 1e-9 } else { whole.unsigned_abs() as f64 * f64::EPSILON };
+    if fraction.abs() > tolerance || !fraction.is_finite() {
         return Err("unqualified Resolve fractional audio edit".into());
     }
     Ok(whole)
@@ -67,7 +77,9 @@ pub(super) fn read(
     let node = entry.entry()?;
     expect(node, "BtAudioInfo")?;
     let (path, codec) = cache(node, blobs)?;
-    if codec != "Linear PCM" || !path.to_ascii_lowercase().ends_with(".wav") {
+    let suffix = path.rsplit_once('.').map(|(_, ext)| ext);
+    let atom = suffix.is_some_and(|ext| ext.eq_ignore_ascii_case("mxf"));
+    if codec != "Linear PCM" || !(atom || suffix.is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))) {
         return Ok(None);
     }
     let tracks = blobs.qt(node.get("TracksBA")?)?;
@@ -86,7 +98,7 @@ pub(super) fn read(
     if !matches!(channels, 1 | 2)
         || track.int("SampleRate")? != 48000
         || track.int("IdxTrack")? != 0
-        || track.real("StartTime")? != 0.0
+        || (!atom && track.real("StartTime")? != 0.0)
         || track.text("CodecName")? != Some("Linear PCM")
         || samples <= 0
     {
@@ -104,7 +116,29 @@ pub(super) fn read(
     let mut rate_bytes = [0; 16];
     rate_bytes[..8].copy_from_slice(value);
     let rate = rate(&rate_bytes)?;
-    let length = samples / samples_per_frame(rate)?;
+    let samples_per_frame = samples_per_frame(rate)?;
+    let length = samples / samples_per_frame;
+    let start_seconds = track.real("StartTime")?;
+    let start = if atom { frames(start_seconds, rate)? } else { 0 };
+    let mxf_packages = if atom {
+        if rate != crate::prepare::rate() || channels != 1 || samples % samples_per_frame != 0
+            || !(0..crate::DAY).contains(&start) || length <= 0
+        {
+            return Ok(None);
+        }
+        if !track.keys().any(|key| key == "MXFMetadata") {
+            return Ok(None);
+        }
+        let meta = qt(track.bytes("MXFMetadata")?)?;
+        let file: [u8; 32] = meta.bytes("sourceMobId")?.try_into()?;
+        let material: [u8; 32] = meta.bytes("masterMobId")?.try_into()?;
+        if file == [0; 32] || material == [0; 32] || file == material {
+            return Err("invalid standalone MXF package identity".into());
+        }
+        Some((hex::encode_upper(file), hex::encode_upper(material)))
+    } else {
+        None
+    };
     let outer = pb_bytes(&fields, 1)?.ok_or("missing standalone WAV pool metadata")?;
     let routes = qt(pb_bytes(outer, 5)?.ok_or("missing standalone WAV virtual routes")?)?;
 
@@ -114,7 +148,7 @@ pub(super) fn read(
         id: id.into(),
         name: clip.get("Name")?.into(),
         media: vec![],
-        umid: None,
+        umid: mxf_packages.as_ref().map(|(_, material)| material.clone()),
         tape: None,
         rate: None,
         color_rgb16: None,
@@ -130,16 +164,18 @@ pub(super) fn read(
         }
         let route = qt(routes.bytes(selector)?)?;
         let extent = route.bytes("MediaExtents")?;
-        let [start, length] = extent.as_chunks::<8>().0 else {
+        let [route_start, length] = extent.as_chunks::<8>().0 else {
             return Err("invalid standalone WAV virtual extent".into());
         };
+        let route_start = f64::from_le_bytes(*route_start);
+        let start_matches = if atom { close(route_start, start_seconds) } else { route_start == 0.0 };
         if extent.len() != 16
-            || f64::from_le_bytes(*start) != 0.0
+            || !start_matches
             || !close(f64::from_le_bytes(*length), samples as f64 / 48000.0)
             || route.int("BitDepth")? != depth
             || route.text("CodecName")? != Some("Linear PCM")
         {
-            return Err("standalone WAV virtual extent contradicts audio cache".into());
+            return Err("standalone PCM virtual extent contradicts audio cache".into());
         }
         let mapping = qt(route.bytes("ChannelVecBA")?)?;
         let grouped = mapping.keys().eq(["0", "1"]);
@@ -156,14 +192,14 @@ pub(super) fn read(
             if channel.text("MediaRef")? != Some(node.id()?)
                 || optional_int(&channel, "TrackIdx")? != 0
             {
-                return Err("standalone WAV virtual source contradicts audio cache".into());
+                return Err("standalone PCM virtual source contradicts audio cache".into());
             }
             let physical_channel = optional_int(&channel, "ChannelIdx")?;
             if !(0..channels).contains(&physical_channel)
                 || physical.insert(physical_channel, index).is_some()
                 || (grouped && key.parse::<i64>()? != physical_channel)
             {
-                return Err("ambiguous standalone WAV physical channel".into());
+                return Err("ambiguous standalone PCM physical channel".into());
             }
             if !grouped {
                 selectors.insert(index, physical_channel);
@@ -176,15 +212,15 @@ pub(super) fn read(
     for (channel, selector) in physical {
         let label = channel + 1;
         let stream_id = format!("{id}/audio/{label}");
-        receipt(
-            graph,
-            &stream_id,
-            vec![
-                ("saved_selector", Value::Int(selector)),
-                ("saved_cache_track", Value::Int(0)),
-                ("saved_channel", Value::Int(channel)),
-            ],
-        );
+        let mut fields = vec![
+            ("saved_selector", Value::Int(selector)),
+            ("saved_cache_track", Value::Int(0)),
+            ("saved_channel", Value::Int(channel)),
+        ];
+        if let Some((file, _)) = &mxf_packages {
+            fields.push(("saved_file_package", text(file)));
+        }
+        receipt(graph, &stream_id, fields);
         add_media(
             graph,
             &mut item,
@@ -198,7 +234,7 @@ pub(super) fn read(
                 sample_rate: Some(48000),
                 bits: Some(bits),
                 duration,
-                start: Some(Rational::ZERO),
+                start: Some(seconds(start, rate)?),
                 clock: None,
                 stream: Some(label),
                 online: None,
@@ -210,7 +246,7 @@ pub(super) fn read(
         graph,
         id,
         vec![
-            ("kind", text("standalone_wav")),
+            ("kind", text(if atom { "standalone_mono_atom" } else { "standalone_wav" })),
             ("cache_samples", Value::Int(samples)),
             ("audio_import_rate", text(&rate.to_string())),
         ],
@@ -221,11 +257,12 @@ pub(super) fn read(
     Ok(Some(Master {
         rate,
         length,
-        start: 0,
+        start,
         audio: selectors,
         path,
         size: (0, 0),
         wav_samples: Some(samples),
+        standalone_mono_atom: atom,
         stereo_pool_route: wav_stereo_pool_route,
         split_atom_audio: false,
     }))
@@ -241,7 +278,7 @@ fn optional_int(map: &encoding::Map, key: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::integer_duration;
+    use super::{integer_atom_frame, integer_duration};
 
     #[test]
     fn observed_binary64_residue_does_not_change_the_wav_edit() {
@@ -249,5 +286,13 @@ mod tests {
         assert!(integer_duration("48|000000000000e03f").is_err());
         assert!(integer_duration("48|000000000000f87f").is_err());
         assert!(integer_duration("48|00").is_err());
+    }
+
+    #[test]
+    fn nonzero_atom_clock_accepts_saved_float_residue_but_refuses_a_sample_offset() {
+        assert_eq!(integer_atom_frame("24|00000000007c953d").unwrap(), 24);
+        assert_eq!(integer_atom_frame("5|000000000076943d").unwrap(), 5);
+        let sample = hex::encode((1.0f64 / 2002.0).to_le_bytes());
+        assert!(integer_atom_frame(&format!("5|{sample}")).is_err());
     }
 }

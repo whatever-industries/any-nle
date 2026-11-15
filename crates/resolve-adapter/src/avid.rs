@@ -12,7 +12,7 @@ use graph::{
     StreamKind,
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -234,6 +234,17 @@ pub fn prepare_avid_turnover(
     options: &avid_adapter::original::OriginalOptions,
     project_root: Option<&Path>,
 ) -> Result<crate::turnover::Turnover> {
+    prepare_avid_turnover_with_policy(bins, media_roots, sequences, options, project_root, false)
+}
+
+pub(crate) fn prepare_avid_turnover_with_policy(
+    bins: &[PathBuf],
+    media_roots: &[PathBuf],
+    sequences: &[String],
+    options: &avid_adapter::original::OriginalOptions,
+    project_root: Option<&Path>,
+    require_camera_originals: bool,
+) -> Result<crate::turnover::Turnover> {
     use crate::linked::{GroupSpec, ProjectSpec, TimelineSpec};
     if !(1..=256).contains(&bins.len()) || !(1..=64).contains(&sequences.len()) {
         return Err("select 1–256 Avid bins and 1–64 sequences".into());
@@ -272,6 +283,7 @@ pub fn prepare_avid_turnover(
         timelines: Vec::new(),
         media: Vec::new(),
         atom_media: Vec::new(),
+        proxy_audio: Default::default(),
     };
     let mut required = Vec::new();
     let mut unique = HashSet::new();
@@ -323,6 +335,9 @@ pub fn prepare_avid_turnover(
             group,
         });
     }
+    if require_camera_originals {
+        check_camera_originals(graph, &spec.timelines)?;
+    }
     for id in required {
         let item = graph
             .items
@@ -373,6 +388,18 @@ pub fn prepare_avid_turnover(
                 },
             });
         } else {
+            if let Some(proxy) = avid_adapter::proxy::Attachment::from_graph(graph, &id)? {
+                if proxy.bits.is_some() {
+                    let binding = read.proxy_bindings.iter()
+                        .find(|binding| binding.path == proxy.path)
+                        .ok_or("missing verified Resolve proxy binding")?;
+                    let paths = binding.audio.as_ref().ok_or("verified proxy lacks mono audio siblings")?;
+                    let pin = |path: &Path| read.original_inputs.iter()
+                        .find(|input| input.path == path).cloned()
+                        .ok_or("verified proxy sibling lacks a source digest");
+                    spec.proxy_audio.insert(id.clone(), [pin(&paths[0])?, pin(&paths[1])?]);
+                }
+            }
             spec.media.push(crate::linked::original_media_spec(
                 item,
                 &owner.id,
@@ -384,7 +411,91 @@ pub fn prepare_avid_turnover(
     let mut notices = read.diagnostics;
     notices.extend(read.scan_issues);
     notices.extend(read.audio_group_issues);
+    let problem = notices.iter().find(|note|
+        note.contains(avid_adapter::original::SOURCE_MEDIA_UNAVAILABLE)).cloned();
+    let used: HashSet<_> = spec.media.iter().filter_map(|m|
+        read.graph.sidecar(avid_adapter::proxy::ADAPTER,&m.item_id)
+            .and_then(|v| match v.get("path") {Some(graph::Value::Str(s))=>Some(PathBuf::from(s)),_=>None}))
+        .collect();
+    let proxies: Vec<_> = read.proxy_bindings.into_iter().filter(|b| used.contains(&b.path)).collect();
+    if !proxies.is_empty() {
+        for input in read.original_inputs {
+            let digest = hex::decode(input.revision)?.try_into().map_err(|_| "invalid Avid media digest")?;
+            guards.push((input.path,digest));
+        }
+    }
     crate::turnover::Turnover::prepare(read.graph, spec, &options.ffprobe, guards, notices, vec![])
+        .map(|mut t| { t.proxies = proxies; t })
+        .map_err(|error| match problem {
+            Some(detail) => format!("{error}\n{detail}").into(),
+            None => error,
+        })
+}
+
+fn check_camera_originals(
+    graph: &SourceGraph,
+    timelines: &[crate::linked::TimelineSpec],
+) -> Result<()> {
+    let media: HashMap<_, _> = graph.media.iter().map(|m| (m.id.as_str(), m)).collect();
+    let items: HashMap<_, _> = graph.items.iter().map(|item| (item.id.as_str(), item)).collect();
+    let sequences: HashMap<_, _> = graph.sequences.iter().map(|s| (s.id.as_str(), s)).collect();
+    let is_original = |id: &str| {
+        let mut picture = items
+            .get(id)
+            .into_iter()
+            .flat_map(|item| &item.media)
+            .filter_map(|binding| media.get(binding.media.as_str()))
+            .filter(|stream| stream.kind == StreamKind::Video);
+        let Some(stream) = picture.next() else {
+            return false;
+        };
+        picture.next().is_none()
+            && stream.locations.len() == 1
+            && stream.online == Some(true)
+            && stream.original.is_some()
+    };
+    let name = |id: &str| items.get(id).map(|item| item.name.as_str());
+    let mut missing = Vec::new();
+    let mut count = 0;
+    let mut record_missing = |message| {
+        count += 1;
+        if missing.len() < 16 {
+            missing.push(message);
+        }
+    };
+    for timeline in timelines {
+        let sequence = sequences[timeline.id.as_str()];
+        for edit in &sequence.placements {
+            if let Some(track) = edit.video_track.filter(|_| !is_original(&edit.item)) {
+                let position = crate::prepare::frames_on(edit.record_start, sequence.rate)
+                    .map(|frame| format!("record frame {frame}"))
+                    .unwrap_or_else(|_| format!("record time {} s", edit.record_start));
+                record_missing(format!(
+                    "{} · V{track} · {position} · {}",
+                    sequence.name,
+                    name(&edit.item).unwrap_or(&edit.item)
+                ));
+            }
+        }
+        if let Some(group) = &timeline.group {
+            for camera in group.cameras.iter().filter(|camera| !is_original(camera)) {
+                record_missing(format!(
+                    "{} · Group camera {}",
+                    sequence.name,
+                    name(camera).unwrap_or(camera)
+                ));
+            }
+        }
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "Require camera originals blocked {count} picture binding(s). Check saved paths and path mappings. Showing {}:\n{}",
+        missing.len(),
+        missing.join("\n")
+    )
+    .into())
 }
 
 fn group_selection<'a>(

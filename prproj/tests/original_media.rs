@@ -37,6 +37,7 @@ fn original(shape: &str) -> OriginalClip {
         })
         .collect();
     OriginalClip {
+        proxy_path: None,
         metadata: ClipMetadata {
             id: "original".into(),
             name: "Synthetic original".into(),
@@ -65,6 +66,7 @@ fn original(shape: &str) -> OriginalClip {
             rate: Fraction::new(24, 1),
             duration: 2 * TICKS_PER_SECOND,
             stream_index: 0,
+            source_start: 0,
         }),
         audio: (!prores).then_some(OriginalAudio {
             source_start: 0,
@@ -101,6 +103,7 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         av_subclip_uses: Vec::new(),
         constant_speeds: Vec::new(),
         picture_nests: Vec::new(),
+        layered_submasters: Vec::new(),
         png_mattes: Default::default(),
         video_dissolves: Vec::new(),
         audio_edge_fades: Vec::new(),
@@ -109,6 +112,7 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         audio_mixers: Default::default(),
         track_states: Default::default(),
         picture_effects: Vec::new(),
+        source_luts: Vec::new(),
         edit_labels: Vec::new(),
         disabled_edits: Default::default(),
         direct_dnxhr_origins: Default::default(),
@@ -131,6 +135,38 @@ fn xml(p: &PathBuf) -> String {
         .unwrap();
     s
 }
+
+#[test]
+fn linked_picture_media_carries_its_saved_reel_and_clock() {
+    let scratch = Scratch::new();
+    let out = scratch.0.join("camera.prproj");
+    let mut clip = original("prores_hq");
+    clip.metadata.tape_name = Some("REEL_A_101".into());
+    let start = 36_001 * TICKS_PER_SECOND;
+    clip.video.as_mut().unwrap().source_start = start;
+    prepare_typed_project(
+        &input(clip),
+        &out,
+        &mut SeededUuids::new("camera reel"),
+        &[],
+        false,
+    )
+    .unwrap()
+    .publish()
+    .unwrap();
+
+    let saved = xml(&out);
+    let (_, media_and_after) = saved.split_once("<Media ObjectUID=").unwrap();
+    let (media, _) = media_and_after.split_once("</Media>").unwrap();
+    assert!(media.contains("<TapeName>REEL_A_101</TapeName>"));
+    assert!(media.contains("<AlternateTapeName>REEL_A_101</AlternateTapeName>"));
+    assert!(media.contains(&format!("<AlternateStart>{start}</AlternateStart>")));
+    let (_, log_and_after) = saved.split_once("<ClipLoggingInfo ").unwrap();
+    let (log, _) = log_and_after.split_once("</ClipLoggingInfo>").unwrap();
+    assert!(log.contains("<TapeName>REEL_A_101</TapeName>"));
+    assert!(log.contains(&format!("<MediaInPoint>{start}</MediaInPoint>")));
+}
+
 #[test]
 fn original_master_construction_matches_independent_python_and_sample_representation() {
     let scratch = Scratch::new();
@@ -248,6 +284,57 @@ fn sequence(events: Vec<Event>) -> Sequence {
         track_levels: vec![],
         audio_crossfades: vec![],
         start: 0,
+    }
+}
+
+#[test]
+fn linked_original_marker_conflicts_follow_the_selected_source_lane() {
+    let scratch = Scratch::new();
+    let when = TICKS_PER_SECOND / 4;
+    let source = Marker {
+        name: "Source audio note".into(),
+        comment: String::new(),
+        start: when,
+        duration: TICKS_PER_SECOND / 24,
+        user: String::new(),
+        color: "Red".into(),
+        track: Some("A1".into()),
+        owner: "sequence".into(),
+        event: None,
+        source: None,
+        inherited: false,
+    };
+    for (track, same_lane) in [("V1", false), ("A1", false), ("A2", true)] {
+        for winner in ["source", "edit"] {
+            let mut clip = original("dualmono");
+            clip.metadata.markers.push(source.clone());
+            let mut project = input(clip);
+            project.options.marker_conflict_winner = winner.into();
+            let mut edit = event();
+            edit.stereo.clear();
+            edit.audio_tracks = vec![1, 2];
+            // The A2 timeline lane plays the source's A1 channel.
+            edit.audio_channels = vec![2, 1];
+            let mut timeline = sequence(vec![edit]);
+            timeline.markers.push(Marker {
+                name: "Editorial note".into(),
+                track: Some(track.into()),
+                owner: "edit".into(),
+                event: Some(0),
+                source: Some(when),
+                ..source.clone()
+            });
+            project.sequences.push(timeline);
+            let out = scratch.0.join(format!("{track}-{winner}.prproj"));
+            prepare_typed_project(&project, &out, &mut SeededUuids::new("linked-marker-lanes"), &[], false)
+                .unwrap().publish().unwrap();
+            let doc = prproj::xml::parse_prproj(&out).unwrap();
+            let count = |name: &str| doc.tree.iter_tag(doc.root, "DVAMarker")
+                .filter(|&node| doc.tree.text(node).is_some_and(|text| text.contains(name)))
+                .count();
+            assert_eq!(count("Source audio note"), if same_lane && winner == "edit" { 1 } else { 2 }, "{track} {winner}");
+            assert_eq!(count("Editorial note"), if same_lane && winner == "source" { 0 } else { 1 }, "{track} {winner}");
+        }
     }
 }
 
@@ -423,6 +510,7 @@ fn left_aligned_dissolve_uses_only_incoming_preroll() {
     let frame = TICKS_PER_SECOND / 24;
     let mut project = input(original("prores_hq"));
     let mut outgoing = event();
+    outgoing.video_track = Some(5);
     outgoing.stereo.clear();
     outgoing.source_in = 24 * frame;
     let mut incoming = outgoing.clone();
@@ -442,6 +530,12 @@ fn left_aligned_dissolve_uses_only_incoming_preroll() {
     ] {
         assert_eq!(doc.tree.findtext(tr, field).unwrap(), Some(value.to_string()));
     }
+    let project_readback = prproj::model::Project::from_document(doc, &output).unwrap();
+    let tracks = project_readback.video_tracks(project_readback.sequences()[0]);
+    assert_eq!(tracks.len(), 5);
+    assert!(tracks[..4].iter().all(|&track| project_readback.track_transitions(track).is_empty()));
+    assert_eq!(project_readback.track_transitions(tracks[4]).len(), 1);
+    assert_eq!(project_readback.track_clips(tracks[4]).len(), 2);
     project.sequences[0].events[1].source_in = 7 * frame;
     let invalid = scratch.0.join("missing-handle.prproj");
     assert!(prepare_typed_project(&project, &invalid, &mut ids, &[], false).is_err());

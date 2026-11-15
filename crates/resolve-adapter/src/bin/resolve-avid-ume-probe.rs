@@ -13,6 +13,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let options = OriginalOptions {
         ffprobe: ffprobe.into(),
+        prefer_source_media: false,
         root_mappings: roots
             .chunks_exact(2)
             .map(|pair| RootMapping {
@@ -20,6 +21,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 current_root: (&pair[1]).into(),
             })
             .collect(),
+        ..Default::default()
     };
     let result = convert_avid_ume(
         Path::new(bin),

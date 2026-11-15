@@ -125,6 +125,7 @@ fn linked_original_and_sequence_only_sources_remain_under_the_import_root() {
     input.bins[0].clips.clear(); // Legacy clip is referenced only by the sequence.
     input.bins[1].clips = vec!["original".into()];
     input.clips.push(PreparedClip::Original(OriginalClip {
+        proxy_path: None,
         metadata: ClipMetadata {
             id: "original".into(),
             name: "Linked original".into(),

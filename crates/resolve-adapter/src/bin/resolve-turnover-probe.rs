@@ -56,6 +56,11 @@ impl TryFrom<LegacyProbeJob> for TurnoverJob {
                 avid_project_root: job.avid_project_root,
                 media_roots: job.media_roots,
                 mappings: job.mappings,
+                prefer_source_media: false,
+                require_camera_originals: false,
+                attach_avid_proxies: false,
+                proxy_rewrap_dir: None,
+                ffmpeg: None,
             },
         };
         Ok(Self {
@@ -107,8 +112,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .source_graph()
             .write_json(&mut std::io::stdout().lock())?;
     } else if review {
-        result.review(&job.templates, &job.output)?;
+        let review = result.review(&job.templates, &job.output)?;
         println!("Resolve review complete. Link to originals.");
+        if !review.new_proxy_paths.is_empty() {
+            println!("Creates new media.");
+            println!("Estimated proxy storage: {} bytes", review.estimated_proxy_bytes);
+            for path in review.new_proxy_paths {
+                println!("Proxy output: {}", path.display());
+            }
+        }
     } else {
         let published = result.publish(&job.templates, &job.output, accept)?;
         if let Some(warning) = published.cleanup_warning {

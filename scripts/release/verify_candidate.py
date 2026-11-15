@@ -51,7 +51,7 @@ def verify_launcher_icon(target, extracted, package):
             if not all(image in binary for image in images):
                 raise ValueError('Windows launcher icon mismatch: ' + path.name)
 
-def verify_package(target,directory,version):
+def verify_package(target,directory,version,*,receipt_path=pathlib.Path('candidate-verification.json')):
     version = release_version(version)
     directory=pathlib.Path(directory);suffix,extension=TARGETS[target];stem=f'Any.NLE_{suffix}_v{version}'
     package=directory/(stem+extension);stage=directory/(stem+'.stage')
@@ -105,7 +105,9 @@ def verify_package(target,directory,version):
             if any(f in result for f in ('--enable-gpl','--enable-version3','--enable-nonfree')):raise ValueError('packaged forbidden backend license')
         if 'apple' in target:subprocess.run(['codesign','--verify','--deep','--strict',str(temp/'Any NLE.app')],check=True)
     receipt={'schema':'anynle.candidate-verification/1','target':target,'version':version,'package':package.name,'sha256':sha(package),'extracted_bytes_match':True,'architecture_verified':True,'launcher_icon_verified':True,'cli_smoke':True,'backend_smoke':True}
-    pathlib.Path('candidate-verification.json').write_text(json.dumps(receipt,indent=2)+'\n');print(json.dumps(receipt));return receipt
+    pathlib.Path(receipt_path).write_text(json.dumps(receipt,indent=2)+'\n')
+    print(json.dumps(receipt))
+    return receipt
 
 def verify_all(directory,version,*,expected_binding=None):
     version = release_version(version)
@@ -134,9 +136,12 @@ def verify_all(directory,version,*,expected_binding=None):
     sums=directory/'SHA256SUMS';sums.write_text(''.join(sha(p)+'  '+p.name+'\n' for p in sorted(files,key=lambda p:p.name)))
     print(json.dumps({'schema':'anynle.six-platform-gate/1','targets':sorted(seen),'assets':len(files),'source_private_receipt_binding':binding}));return files+[sums]
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--target',choices=TARGETS);p.add_argument('--output');p.add_argument('--all');p.add_argument('--version');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--target',choices=TARGETS);p.add_argument('--output');p.add_argument('--all');p.add_argument('--version')
+    p.add_argument('--receipt',type=pathlib.Path,default=pathlib.Path('candidate-verification.json'),
+                   help='write the single-package verification receipt to this file')
+    a=p.parse_args()
     if a.all:
         expected = gate_binding(os.environ['GITHUB_SHA'], os.environ['PRIVATE_GATE']) if os.environ.get('GITHUB_ACTIONS') == 'true' else None
         verify_all(a.all,a.version,expected_binding=expected)
-    elif a.target and a.output:verify_package(a.target,a.output,a.version)
+    elif a.target and a.output:verify_package(a.target,a.output,a.version,receipt_path=a.receipt)
     else:p.error('use --all or --target and --output')

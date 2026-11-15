@@ -8,7 +8,7 @@ fn project(path: &Path, a: &Path, b: &Path) {
     let media = |id, path: &Path, reel, start| {
         format!(
             r#"<Media ObjectUID="item-{id}"><FilePath>{path}</FilePath>
-            <ActualMediaFilePath>{path}</ActualMediaFilePath><RelativePath>{file}</RelativePath>
+            <ActualMediaFilePath>{path}</ActualMediaFilePath><RelativePath>./{file}</RelativePath>
             <RelativePath>{file}</RelativePath><FileKey>key-{id}</FileKey>
             <ContentAndMetadataState>state-{id}</ContentAndMetadataState>
             <AlternateTapeName>{reel}</AlternateTapeName><UseAlternateStart>true</UseAlternateStart>
@@ -92,6 +92,63 @@ fn selective_relink_rebases_paths_without_opening_ffprobe_and_preserves_metadata
         .to_string();
     assert!(error.contains("SHA-256 mismatch"), "{error}");
     assert!(!refused.exists());
+}
+
+#[test]
+fn different_relative_locators_are_refused_before_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let input = root.join("source.prproj");
+    let output = root.join("refused.prproj");
+    let a = root.join("a.mov");
+    let b = root.join("b.mov");
+    project(&input, &a, &b);
+    let (xml, framing) = decompress_prproj(&fs::read(&input).unwrap()).unwrap();
+    let xml = String::from_utf8(xml)
+        .unwrap()
+        .replace(
+            "<RelativePath>./a.mov</RelativePath>",
+            "<RelativePath>./other/a.mov</RelativePath>",
+        );
+    fs::write(&input, compress_prproj(xml.as_bytes(), framing.as_ref())).unwrap();
+    let error = apply(
+        &input,
+        &[move_file(&a, &root.join("moved/a.mov"))],
+        &output,
+        &root.join("nonexistent-ffprobe"),
+        None,
+    )
+    .err()
+    .expect("contradictory paths must be refused");
+    assert!(error.to_string().contains("contradictory Premiere RelativePath"));
+    assert!(!output.exists());
+}
+
+#[test]
+fn separate_destination_paths_cannot_share_one_hard_linked_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let old_a = root.join("old/a.mov");
+    let old_b = root.join("old/b.mov");
+    let new_a = root.join("new/a.mov");
+    let new_b = root.join("new/b.mov");
+    let input = root.join("source.prproj");
+    let output = root.join("refused.prproj");
+    project(&input, &old_a, &old_b);
+    fs::create_dir(new_a.parent().unwrap()).unwrap();
+    fs::write(&new_a, b"one physical original").unwrap();
+    fs::hard_link(&new_a, &new_b).unwrap();
+    let moves = [move_file(&old_a, &new_a), move_file(&old_b, &new_b)];
+    let error = apply(&input, &moves, &output, &root.join("unused-ffprobe"), None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("different originals resolve to the same media file"), "{error}");
+    assert!(!output.exists());
+
+    fs::remove_file(&new_b).unwrap();
+    fs::copy(&new_a, &new_b).unwrap();
+    apply(&input, &moves, &output, &root.join("unused-ffprobe"), None).unwrap();
 }
 
 #[test]

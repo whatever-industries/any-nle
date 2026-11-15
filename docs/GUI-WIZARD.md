@@ -26,10 +26,18 @@ In source builds with the offline and proxy controls, **Separate files**,
 **Grouped**, and **Merged** offer the options below. Check the
 [release notes](../RELEASE_NOTES.md) for packaged support.
 **Allow offline media** lets qualified missing sources become relinkable items.
-**Prefer camera originals** tries Avid's saved source path and falls back to
-managed media if verification fails. **Attach Avid media as proxies** uses
-verified matches, with an optional new folder for a compatible stereo proxy
-rewrap. **Rewrap to native clips** requires the source media online.
+Under **Primary media**, choose **Use the media in the Avid edit** or
+**Prefer camera originals for picture**. When you prefer camera originals,
+Any NLE tries Avid's saved source path and falls back to qualified Avid media.
+To locate moved originals, enter a saved folder prefix and choose its current folder under
+**Saved-path mappings**.
+
+**Attach matching Avid media as proxies** checks the Avid media against the
+camera original. **Rewrap proxy for compatibility** uses an existing output
+folder for a verified stereo proxy and displays **Creates new media.**
+Review lists the matched camera file, channels used from that file, and the
+proxy path. **Rewrap to native clips** uses its own media folder and requires
+the source media online.
 [Verification and relink scope](VERIFIED-RELINK.md)
 
 On Review, **Run preflight** checks the job without creating outputs. The summary

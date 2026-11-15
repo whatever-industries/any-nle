@@ -26,7 +26,7 @@ impl ClipMode {
     pub fn explanation(self) -> (&'static str, &'static str) {
         match self {
             Self::Rewrap => (
-                "One native clip with the declared audio groups. Stream copy keeps the essence.",
+                "The rewrapped file is the main media for each native Premiere clip.",
                 "Creates new media. Qualified native sources only; needs additional space.",
             ),
             Self::Grouped => (
@@ -50,6 +50,10 @@ pub struct Choices {
     pub mode: ClipMode,
     #[serde(default)]
     pub allow_offline_media: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_source_media: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attach_avid_proxies: bool,
     pub include_dependencies: bool,
     pub include_trash_attic: bool,
     pub policy_json: String,
@@ -61,11 +65,22 @@ impl Default for Choices {
         Self {
             mode: ClipMode::Rewrap,
             allow_offline_media: false,
+            prefer_source_media: false,
+            attach_avid_proxies: false,
             include_dependencies: true,
             include_trash_attic: false,
             policy_json: AvidToPremiere::default().to_json_text(),
             effects: Vec::new(),
         }
+    }
+}
+impl Choices {
+    pub fn uses_camera_originals(&self) -> bool {
+        self.mode != ClipMode::Rewrap && self.prefer_source_media
+    }
+
+    pub fn attaches_avid_proxies(&self) -> bool {
+        self.uses_camera_originals() && self.attach_avid_proxies
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -157,6 +172,7 @@ pub struct Inputs {
     pub original_roots: Vec<PathBuf>,
     pub path_mappings: Vec<(PathBuf, PathBuf)>,
     pub new_media: Option<PathBuf>,
+    pub proxy_rewrap_dir: Option<PathBuf>,
 }
 #[derive(Clone, Copy)]
 pub enum RequiredInput {
@@ -329,6 +345,26 @@ mod tests {
         w.choices.mode = ClipMode::Grouped;
         assert!(w.changed_since(&offline));
         assert!(!w.can_convert());
+    }
+    #[test]
+    fn camera_original_choices_are_only_active_in_linked_modes() {
+        let mut w = Wizard::default();
+        w.choices.prefer_source_media = true;
+        w.choices.attach_avid_proxies = true;
+        assert!(!w.choices.uses_camera_originals());
+        assert!(!w.choices.attaches_avid_proxies());
+
+        for mode in [ClipMode::Separate, ClipMode::Grouped, ClipMode::Merged] {
+            w.choices.mode = mode;
+            assert!(w.choices.attaches_avid_proxies());
+            assert!(w.accept_review(w.revision()));
+            let before = w.snapshot();
+            w.choices.prefer_source_media = false;
+            assert!(!w.choices.attaches_avid_proxies());
+            assert!(w.changed_since(&before));
+            assert!(!w.can_convert());
+            w.choices.prefer_source_media = true;
+        }
     }
     #[test]
     fn bin_selection_is_deduplicated_case_insensitive_and_never_includes_locks() {

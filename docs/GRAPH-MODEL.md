@@ -124,11 +124,15 @@ These are shared model/1 rules, not a change to graph/1 or to Avid interpretatio
 adapter still validates its own scalar fields, codecs, effect semantics and supported shapes;
 these cross-object checks are not a complete substitute for adapter validation.
 
-## Known gaps (to do as they are needed)
+## Historical graph/1 gaps
 
-- Avid colour correction and AniMatte are `avid.*` effects. Making them neutral (colour
-  operations; masks in frame fractions, with feather in neutral units) needs the Avid render
-  calibrations (AVB-0015, AVID colour findings) and is per-effect work.
+The [main roadmap](ROADMAP.md#linked-media-conversion-parity) tracks current
+route work, and the [source graph guide](SOURCE-GRAPH-MIGRATION.md) covers
+graph/2.
+
+- Avid colour correction and AniMatte used `avid.*` effects. The
+  [current effect queue](ROADMAP.md#timeline-and-effects) tracks later
+  interpretation and destination work.
 - `time_display` (a Premiere TimeDisplay code the Avid reader chooses) sits in a `premiere`
   sidecar. Its neutral form is the item's display rate.
 - Tracks are listed only where model/1 has a level. A reader that knows all tracks (names,

@@ -1,6 +1,6 @@
 //! Existing media-preparation checks, retained across the module split.
 use super::backend::{bounded, integer, probe, run};
-use super::source::pcm_essence_bytes;
+use super::source::{essence_spans, pcm_essence_bytes};
 use super::validation::timecode;
 use super::{normalize_source_clocks, validate_bin_audio, Plan, R};
 use graph::json::{self, Value};
@@ -15,6 +15,29 @@ use std::time::SystemTime;
 use prproj::convert::model::{parse_model_str, Fraction};
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 struct Scratch(PathBuf);
+
+#[test]
+fn avid_dnx_clip_wrapped_picture_element_is_recognized() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("picture-elements.mxf");
+    let element = [
+        6, 14, 43, 52, 1, 2, 1, 1, 14, 4, 3, 1, 0x15, 1, 6, 1,
+    ];
+    let mut adjacent = element;
+    adjacent[15] = 2;
+    let mut data = Vec::from(element);
+    data.extend_from_slice(&[2, 0, 0]);
+    data.extend_from_slice(&adjacent);
+    data.extend_from_slice(&[2, 0, 0]);
+    fs::write(&path, data).unwrap();
+
+    let spans = essence_spans(&path).unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].kind, 0x15);
+    assert_eq!(spans[0].bytes, 2);
+    assert_eq!(spans[0].key, element);
+}
+
 impl Scratch {
     fn new() -> Self {
         let n = SystemTime::now()

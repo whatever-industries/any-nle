@@ -3,6 +3,8 @@ use super::*;
 use prproj::convert::prepared::{av_subclip_edit_fits, PreparedAvSubclip, PreparedAvSubclipUse, PreparedPictureSubclip};
 
 const RATE: &str = "24000/1001";
+const EXACT_24: &str = "24";
+const RATE_2997: &str = "30000/1001";
 
 pub(super) fn field_int(object: &Value, field: &str) -> Option<i64> {
     key(object, field).and_then(integer)
@@ -19,9 +21,9 @@ pub(super) fn urn(mob: &str) -> String {
     format!("urn:smpte:umid:{}", groups.join("."))
 }
 
-fn track_matches(track: &Value, kind: i64, label: i64, backing: i64, target: &str) -> bool {
+fn track_matches(track: &Value, rate: &str, kind: i64, label: i64, backing: i64, target: &str) -> bool {
     key(track, "component_class").and_then(str_value) == Some("SCLP")
-        && key(track, "rate").and_then(str_value) == Some(RATE)
+        && key(track, "rate").and_then(str_value) == Some(rate)
         && field_int(track, "kind") == Some(kind)
         && field_int(track, "label") == Some(label)
         && field_int(track, "target_track") == Some(label)
@@ -50,7 +52,9 @@ pub(super) fn prepare(
         return Ok(Vec::new());
     }
     let mut parents = HashMap::new();
+    let mut items_by_id = HashMap::new();
     for item in &graph.items {
+        items_by_id.insert(item.id.as_str(), item);
         if let Some(mob) = item.umid.as_deref() {
             parents.entry(mob).and_modify(|entry| *entry = None).or_insert(Some(item));
         }
@@ -64,6 +68,20 @@ pub(super) fn prepare(
     for (bin, owner) in graph.bins.iter().enumerate() {
         let Some(receipt) = side(sidecars, "avid.subclips", &owner.id) else { continue };
         let Value::Arr(rows) = receipt else { return Err(error("invalid Avid subclip receipt")) };
+        let mut bin_parents: HashMap<_, Option<&SourceItem>> = HashMap::new();
+        for item_id in &owner.items {
+            let Some(item) = items_by_id.get(item_id.as_str()).copied() else { continue };
+            if let Some(mob) = item.umid.as_deref() {
+                bin_parents
+                    .entry(mob)
+                    .and_modify(|entry| {
+                        if entry.is_some_and(|existing| existing.id != item.id) {
+                            *entry = None;
+                        }
+                    })
+                    .or_insert(Some(item));
+            }
+        }
         for row in rows {
             let id = key(row, "id").and_then(str_value).filter(|id| !id.is_empty())
                 .ok_or_else(|| error("Avid subclip receipt lacks occurrence identity"))?;
@@ -101,9 +119,9 @@ pub(super) fn prepare(
                         }
                     }
                 }
-                let (Some(Value::Arr(tracks)), Some(RATE)) = (
+                let (Some(Value::Arr(tracks)), Some(rate @ (RATE | EXACT_24 | RATE_2997))) = (
                     key(row, "tracks"), key(row, "rate").and_then(str_value),
-                ) else { return Err("reusable subclips require a saved 23.976 picture track") };
+                ) else { return Err("reusable subclips require a saved supported picture rate (23.976, 24, or 29.97 DF)") };
                 let track = tracks.iter().find(|t| field_int(t, "kind") == Some(1))
                     .ok_or("reusable subclips require picture")?;
                 let target = key(track, "target_mob").and_then(str_value)
@@ -111,7 +129,9 @@ pub(super) fn prepare(
                 if target == native_id {
                     return Err("backing master refers to the subclip itself");
                 }
-                let parent = parents.get(target).copied()
+                // A bin can retain its own copy of a native master and its markers.
+                // Prefer that occurrence when other selected bins also carry the mob.
+                let parent = bin_parents.get(target).or_else(|| parents.get(target)).copied()
                     .ok_or("backing master is unavailable in the selected bins")?
                     .ok_or("more than one selected master has the backing identity")?;
                 let parent_clip = clip_id(&parent.id);
@@ -120,7 +140,22 @@ pub(super) fn prepare(
                 };
                 let video = master.video.as_ref()
                     .ok_or("backing master has no prepared picture")?;
-                if video.rate != model::Fraction::new(24_000, 1001)
+                if rate == EXACT_24 {
+                    if clock != ClockProfile::LegacyImport
+                        || video.rate != model::Fraction::new(24, 1)
+                        || video.start != 0
+                        || !matches!(direct_opatom_clocks(parent, media, sidecars, true, true, false), Some((0, 0, _, _)))
+                    {
+                        return Err("24 fps A/V subclips require verified zero-origin DNxHD LB with two mono PCM16 siblings");
+                    }
+                } else if rate == RATE_2997 {
+                    if video.rate != model::Fraction::new(30_000, 1001)
+                        || master.time_display != Some(102)
+                        || input.direct_dnxhr_origins.get(&parent_clip) != Some(&video.start)
+                    {
+                        return Err("29.97 A/V subclips require verified drop-frame DNxHD LB with two mono PCM24 siblings");
+                    }
+                } else if video.rate != model::Fraction::new(24_000, 1001)
                     || !input.direct_dnxhr_origins.contains_key(&parent_clip)
                 {
                     return Err("backing picture requires a verified 23.976 DNxHR LB link");
@@ -134,19 +169,19 @@ pub(super) fn prepare(
                 if !(0 <= start && start < end && end <= backing) {
                     return Err("saved subclip In and Out fall outside the usable backing range");
                 }
-                if !track_matches(track, 1, 1, backing, target) {
+                if !track_matches(track, rate, 1, 1, backing, target) {
                     return Err("reusable subclips require a direct, same-rate V1 reference with zero backing offset");
                 }
                 if backing.checked_mul(unit).is_none_or(|length| length > video.duration) {
                     return Err("saved backing length disagrees with its track or exceeds the linked picture");
                 }
-                if tracks.len() == 1 && master.audio.iter().all(|a| a.bits == 24) {
+                if rate == RATE && tracks.len() == 1 && master.audio.iter().all(|a| a.bits == 24) {
                     return Ok((native_id, Subclip::Picture(PreparedPictureSubclip {
                         bin, parent_clip, name: name.into(), start: start * unit, end: end * unit,
                     })));
                 }
                 if tracks.len() != 3 || ![1, 2].iter().all(|&label| {
-                    tracks.iter().any(|t| track_matches(t, 2, label, backing, target))
+                    tracks.iter().any(|t| track_matches(t, rate, 2, label, backing, target))
                 }) {
                     return Err("A/V subclips require direct V1/A1/A2 references to one master with zero backing offsets");
                 }
@@ -156,13 +191,14 @@ pub(super) fn prepare(
                     media.get(reference.media.as_str()).is_some_and(|m| m.online == Some(true)))
                     || !uniform_pcm
                     || backing * unit != video.duration
-                    || !master.markers.is_empty()
                 {
-                    return Err("A/V subclips require an online 23.976 managed DNx master with two independent mono lanes of the same PCM16 or PCM24 depth, matching backing length and no source markers");
+                    return Err("A/V subclips require an online managed DNx master with two independent mono lanes of the same PCM16 or PCM24 depth and matching backing length");
                 }
-                Ok((native_id, Subclip::Av(PreparedAvSubclip {
+                let subclip = PreparedAvSubclip {
                     bin, parent_clip, name: name.into(), start: start * unit, end: end * unit,
-                })))
+                };
+                subclip.source_marker(master)?;
+                Ok((native_id, Subclip::Av(subclip)))
             };
             match admit() {
                 Ok((_, Subclip::Picture(subclip))) => input.picture_subclips.push(subclip),
@@ -181,6 +217,23 @@ pub(super) fn prepare(
         }
     }
     input.av_subclip_uses = bind_av_uses(graph, sidecars, ownership, &clips, &av_routes, input, losses);
+    let bound_edits: HashSet<_> = input.av_subclip_uses.iter()
+        .map(|u| (u.sequence, u.event)).collect();
+    for (si, (sequence, source)) in input.sequences.iter_mut().zip(&graph.sequences).enumerate() {
+        for marker in &mut sequence.markers {
+            let Some(event) = marker.event.and_then(|i| usize::try_from(i).ok()) else { continue };
+            if marker.owner != "edit" || marker.inherited || !bound_edits.contains(&(si, event)) {
+                continue;
+            }
+            loss(losses, &source.id, "marker_ownership", format!(
+                "marker {:?} on {} at {} ticks moved from the A/V subclip edit to the sequence",
+                marker.name, marker.track.as_deref().unwrap_or("unknown track"), marker.start,
+            ));
+            marker.owner = "sequence".into();
+            marker.event = None;
+            marker.source = None;
+        }
+    }
     Ok(autosyncs.into_iter().filter_map(|(mob, bin, sequence, has_clock, id)| {
         if duplicate_native_ids.contains(&mob) {
             loss(losses, id, "subclip_bin_item", "AutoSync native identity is ambiguous");
@@ -206,10 +259,14 @@ fn bind_av_uses(
         return Vec::new();
     }
     let multicam: HashSet<_> = input.multicam_uses.iter().map(|u| (u.sequence, u.event)).collect();
-    let marked: HashSet<_> = input.sequences.iter().enumerate().flat_map(|(si, s)| {
-        s.markers.iter().filter(|m| m.owner == "edit" && !m.inherited)
-            .filter_map(move |m| Some((si, usize::try_from(m.event?).ok()?)))
-    }).collect();
+    let mut marked: HashMap<_, Vec<_>> = HashMap::new();
+    for (si, sequence) in input.sequences.iter().enumerate() {
+        for marker in sequence.markers.iter().filter(|m| m.owner == "edit" && !m.inherited) {
+            if let Some(event) = marker.event.and_then(|event| usize::try_from(event).ok()) {
+                marked.entry((si, event)).or_default().push(marker.source);
+            }
+        }
+    }
     let mut parent_urns = HashMap::new();
     for item in &graph.items {
         if let Some(mob) = item.umid.as_deref().filter(|s| mob_id(s)) {
@@ -236,12 +293,28 @@ fn bind_av_uses(
             let PreparedClip::Legacy(parent) = clips.get(definition.parent_clip.as_str()).copied()? else {
                 return None;
             };
-            if multicam.contains(&(sequence, event)) || marked.contains(&(sequence, event))
+            let rate = match (seq.rate.num, seq.rate.den) {
+                (24, 1) => EXACT_24,
+                (24_000, 1001) => RATE,
+                (30_000, 1001) => RATE_2997,
+                _ => return None,
+            };
+            if multicam.contains(&(sequence, event))
                 || !av_subclip_edit_fits(seq, edit, parent, definition)
                 || key(second, "mob").and_then(str_value) != Some(parent_urns.get(p.item.as_str())?.as_str())
-                || [first, second].iter().any(|h| key(h, "rate").and_then(str_value) != Some(RATE))
+                || [first, second].iter().any(|h| key(h, "rate").and_then(str_value) != Some(rate))
             {
                 return None;
+            }
+            if let Some(edit_markers) = marked.get(&(sequence, event)) {
+                // Keep the regular edit path for a shared source frame or
+                // an unresolved edit marker position.
+                let source = definition.source_marker(parent).ok()?;
+                if let Some(source) = source {
+                    if edit_markers.iter().any(|start| start.is_none() || *start == Some(source.start)) {
+                        return None;
+                    }
+                }
             }
             let unit = model::ticks_per_unit(seq.rate);
             let saved = |v, field| key(v, field).and_then(|v| field_int(v, "value"));
@@ -276,12 +349,33 @@ fn bind_av_uses(
             None => loss(losses, &p.id, "subclip_timeline_source", UNBOUND),
         }
     }
-    uses.into_iter().filter_map(|(u, id)| {
-        if !ambiguous.contains(&(u.sequence, u.event, u.audio_track)) {
-            Some(u)
-        } else {
+    uses.retain(|(u, id)| {
+        if ambiguous.contains(&(u.sequence, u.event, u.audio_track)) {
             loss(losses, id, "subclip_timeline_source", UNBOUND);
-            None
+            return false;
         }
+        true
+    });
+    // Moving a marker off the edit is useful only when all its lanes can keep
+    // referencing the same reusable subclip. A partial binding keeps the normal marker path.
+    let mut marked_bindings = HashMap::new();
+    for (u, _) in &uses {
+        let owner = (u.sequence, u.event);
+        if marked.contains_key(&owner) {
+            let (subclip, count, consistent) = marked_bindings.entry(owner).or_insert((u.subclip, 0, true));
+            *count += 1;
+            *consistent &= *subclip == u.subclip;
+        }
+    }
+    uses.into_iter().filter_map(|(u, id)| {
+        let owner = (u.sequence, u.event);
+        if let Some(&(_, count, consistent)) = marked_bindings.get(&owner) {
+            let event = &input.sequences[u.sequence].events[u.event];
+            if !consistent || count != usize::from(event.video_track.is_some()) + event.audio_tracks.len() {
+                loss(losses, id, "subclip_timeline_source", UNBOUND);
+                return None;
+            }
+        }
+        Some(u)
     }).collect()
 }

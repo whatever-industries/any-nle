@@ -9,8 +9,10 @@ use std::fmt::Write as _;
 use std::mem::size_of;
 use std::rc::Rc;
 mod groups;
+mod managed_multistream;
 mod imported_audio;
 mod matte;
+mod source_color;
 mod timewarp;
 pub(super) use timewarp::{direct_input as timewarp_input, is_sampled_effect, uses_editable_position};
 
@@ -158,25 +160,31 @@ fn borrowed_attrs<'a>(ctx: &Ctx<'a>, node: &Node) -> &'a [(String, Value)] {
         _ => &[],
     }
 }
-fn saved_input_transform(ctx: &Ctx<'_>, file: &Node, budget: &SharedBudget) -> Option<Observed<String>> {
-    const MAX_TRANSFORM_BYTES: usize = 16 * 1024;
+const MAX_INPUT_TRANSFORM_BYTES: usize = 16 * 1024;
+fn input_transform_text<'a>(ctx: &Ctx<'a>, file: &Node) -> Option<Result<&'a str, &'static str>> {
     if int(file, "mob_type_id") != Some(MOB_SOURCE) {
         return None;
     }
     let mut values = borrowed_attrs(ctx, file).iter()
         .filter(|(key, _)| key == "_COLOR_INPUT_TRANSFORMATION");
     let (_, value) = values.next()?;
-    let reason = if values.next().is_some() {
-        "duplicate Avid source color transformation attributes"
+    Some(if values.next().is_some() {
+        Err("duplicate Avid source color transformation attributes")
     } else if let Some(text) = value.as_str() {
-        if !text.is_empty() && text.len() <= MAX_TRANSFORM_BYTES {
-            return Some(Observed::Known(copy_text(budget, text)));
+        if !text.is_empty() && text.len() <= MAX_INPUT_TRANSFORM_BYTES {
+            Ok(text)
+        } else {
+            Err("empty or oversized Avid source color transformation")
         }
-        "empty or oversized Avid source color transformation"
     } else {
-        "Avid source color transformation is not saved as text"
-    };
-    Some(Observed::Unresolved(copy_text(budget, reason)))
+        Err("Avid source color transformation is not saved as text")
+    })
+}
+fn saved_input_transform(ctx: &Ctx<'_>, file: &Node, budget: &SharedBudget) -> Option<Observed<String>> {
+    Some(match input_transform_text(ctx, file)? {
+        Ok(text) => Observed::Known(copy_text(budget, text)),
+        Err(reason) => Observed::Unresolved(copy_text(budget, reason)),
+    })
 }
 fn each_marker<'a>(ctx: &Ctx<'a>, node: &Node, mut action: impl FnMut(&'a Node)) {
     for (key, value) in borrowed_attrs(ctx, node) {
@@ -363,6 +371,7 @@ pub(super) struct MasterMeta {
     pub(super) marker_witnesses: Vec<MasterMarkerWitness>,
     pub(super) originals: Vec<Option<OriginalTrack>>,
     pub(super) file_clocks: Vec<Option<SavedFileClock>>,
+    pub(super) managed_multistream: Option<ManagedMultistream>,
     pub(super) imported_audio: Option<Box<SavedPcmImport>>,
     pub(super) input_transforms: Vec<SourceInputTransform>,
     pub(super) rendered_freeze: bool,
@@ -593,6 +602,9 @@ impl InputContext {
             }
         }
         let imported_still = self.imported_still(ctx, mob, &id, ambiguous);
+        let managed_multistream = master.and_then(|master| {
+            managed_multistream::capture(ctx, mob, master, ambiguous, &self.budget)
+        });
         let imported_audio = master.and_then(|master| {
             imported_audio::capture(ctx, mob, master, &offsets, &file_clocks, ambiguous, &self.budget)
         });
@@ -605,6 +617,7 @@ impl InputContext {
             originals,
             imported_audio,
             file_clocks,
+            managed_multistream,
             input_transforms,
             imported_still,
         }
@@ -777,6 +790,7 @@ struct Scope {
     record_length: Option<i64>,
     children: usize,
     group_path: bool,
+    group_warp_input: bool,
 }
 struct MarkerFact {
     id: String,
@@ -1038,7 +1052,8 @@ impl Capture {
         let known = parent.map_or(self.rate.is_some(), |s| s.position_known)
             && rate == self.rate
             && track > 0;
-        let group_path = parent.is_none_or(|s| s.group_path && s.class == *b"SEQU");
+        let group_path = parent.is_none_or(|s| s.group_path
+            && (s.class == *b"SEQU" || s.group_warp_input));
         if let Some(i) = self.stack.last() {
             self.scopes[*i].children += 1;
         } else {
@@ -1061,6 +1076,7 @@ impl Capture {
             record_length: int(node, "length"),
             children: 0,
             group_path,
+            group_warp_input: false,
         });
         self.stack.push(index);
         groups::capture_use(self, ctx, node, index, kind, track, position, rate);
@@ -1356,6 +1372,48 @@ impl Capture {
             t.incoming = owner;
         }
     }
+    /// A verified Warp picture input keeps the enclosing record clock and full span.
+    pub(super) fn bind_group_warp_input(&mut self, ctx: &Ctx<'_>, input: &Node) {
+        let Some((&index, parents)) = self.stack.split_last() else { return };
+        let scope = &self.scopes[index];
+        let Some(length) = scope.record_length.filter(|&n| n > 0) else { return };
+        if !scope.group_path || !scope.position_known || scope.retimed
+            || parents.iter().any(|&i| self.scopes[i].group_warp_input)
+            || float(input, "edit_rate").and_then(Rate::from_avid) != scope.rate
+        {
+            return;
+        }
+        let select = if input.class == *b"SEQU" {
+            let Some(Value::RefList(children)) = input.get("components") else { return };
+            let mut candidate = None;
+            for child in children {
+                let Some(node) = ctx.deref(Some(child)) else { return };
+                if node.class == *b"FILL" && int(node, "length") == Some(0) {
+                    continue;
+                }
+                if candidate.replace(node).is_some() { return; }
+            }
+            let Some(candidate) = candidate else { return };
+            candidate
+        } else {
+            input
+        };
+        if select.class != *b"SLCT" || int(select, "length") != Some(length)
+            || float(select, "edit_rate").and_then(Rate::from_avid) != scope.rate
+        {
+            return;
+        }
+        let tracks = ctx.tracks(select);
+        if tracks.len() >= 2 && tracks.iter().all(|track| {
+            ctx.deref(track.get("component")).is_some_and(|leaf| {
+                leaf.class == *b"SCLP" && mob_id(leaf).is_some_and(|id| {
+                    ctx.mobs.get(&id).is_some_and(|m| int(m, "usage_code") == Some(5))
+                })
+            })
+        }) {
+            self.scopes[index].group_warp_input = true;
+        }
+    }
     pub(super) fn query(&mut self, op: usize, node: &Node, motion: Option<(i64, i64)>, motion_adapter_phase: Option<i64>) {
         self.query_with_timewarp(op, node, motion, motion_adapter_phase, None, false);
     }
@@ -1581,6 +1639,59 @@ impl Capture {
     pub(super) fn unresolved_motion_adapter(&mut self, record: i64, kind: i64, track: i64) {
         self.unresolved_motion(record, kind, track, "Avid Motion Adapter timing is not supported");
     }
+    pub(super) fn layered_submaster(&mut self, ctx: &Ctx<'_>, effect: &Node, tracks: &[&Node], record: i64, track: i64) -> bool {
+        const MAX_INPUTS: usize = 32;
+        let Some(scope) = self.stack.last().map(|i| &self.scopes[*i]) else {
+            return false;
+        };
+        let direct = self.stack.iter().rev().skip(1).all(|&i| self.scopes[i].class == *b"SEQU");
+        let position_known = direct && scope.position_known && !scope.retimed;
+        let length = scope.record_length.filter(|len| position_known && *len > 0);
+        let input_count = tracks.len();
+        let mut inputs = Vec::new();
+        if !reserve(&self.budget, &mut inputs, input_count.min(MAX_INPUTS)) {
+            return false;
+        }
+        for input in tracks.iter().take(MAX_INPUTS) {
+            let component = ctx.deref(input.get("component"));
+            let segment = component.and_then(|node| {
+                if node.class == *b"SEQU" { sole_picture_segment(ctx, node) } else { Some(node) }
+            });
+            let segment_effect = segment.and_then(|node| node.get("effect_id").and_then(Value::as_str))
+                .filter(|id| !id.is_empty() && id.len() <= 64)
+                .map(|id| copy_text(&self.budget, id));
+            inputs.push(SubmasterInput {
+                track: int(input, "index"),
+                component_class: component.map(|node| node.class),
+                segment_class: segment.map(|node| node.class),
+                segment_effect,
+                picture_source: component.and_then(|node| submaster::picture_source(ctx, effect, node)),
+            });
+        }
+        let plain_layers = self.rate.is_some_and(|rate| {
+            (Some(rate) == Rate::new(24, 1) || Some(rate) == Rate::new(24_000, 1001))
+                && length.is_some_and(|length| plain_layered_submaster(ctx, effect, tracks, &inputs, length, rate))
+        });
+        let index = self.adapter_issues.len();
+        add_classified_issue(
+            &IssueContext {
+                owner: &scope.id, record, position_known, rate: self.rate,
+                kind: KIND_PICTURE, track,
+            },
+            SourceIssueKind::LayeredSubmaster { length, input_count },
+            "Avid layered Submaster omitted. Its picture inputs need an editable composite.",
+            Vec::new(),
+            &self.budget,
+            &mut self.adapter_issues,
+        );
+        if let Some(issue) = self.adapter_issues.get_mut(index) {
+            issue.submaster_inputs = inputs;
+            if plain_layers {
+                issue.picture_profile = Some(SourcePictureProfile::PlainLayeredSubmaster);
+            }
+        }
+        plain_layers
+    }
     pub(super) fn unsupported_picture_effect<'a>(
         &mut self, ctx: &Ctx<'a>, node: &'a Node, record: i64, kind: i64, track: i64, effect: &str,
         ambiguous: &HashSet<MobId>,
@@ -1636,9 +1747,11 @@ impl Capture {
                     }
                 }
             }
-        } else if let (Some(_), Some(issue)) = (length, self.adapter_issues.get_mut(index)) {
+        } else if let (Some(span), Some(issue)) = (length, self.adapter_issues.get_mut(index)) {
             if matte::empty_color_adapter(ctx, node).is_some() {
                 issue.picture_profile = Some(SourcePictureProfile::EmptyColorAdapter);
+            } else if self.rate == Rate::new(24, 1) {
+                issue.color_adapter = source_color::capture_adapter(ctx, node, span, ambiguous, &self.budget);
             }
         }
     }
@@ -1687,7 +1800,7 @@ impl Capture {
             self.scopes.push(Scope {
                 id: owner, class: *b"SCLP", from: op_index, to: op_index,
                 rate: self.rate, position_known: true, retimed: false,
-                record_length: Some(span), children: 0, group_path: false,
+                record_length: Some(span), children: 0, group_path: false, group_warp_input: false,
             });
         }
     }
@@ -1895,6 +2008,8 @@ fn add_classified_issue(
         track: context.track,
         matte_inputs: None,
         matte_import: None,
+        color_adapter: None,
+        submaster_inputs: Vec::new(),
         picture_profile: None,
     });
 }
@@ -1956,6 +2071,72 @@ fn sole_picture_segment<'a>(ctx: &Ctx<'a>, node: &Node) -> Option<&'a Node> {
         }
     }
     sole
+}
+
+fn plain_layered_submaster(
+    ctx: &Ctx<'_>, effect: &Node, tracks: &[&Node], inputs: &[SubmasterInput], length: i64,
+    rate: Rate,
+) -> bool {
+    let [background, lower, upper] = inputs else { return false };
+    let (Some(lower_picture), Some(upper_picture)) = (lower.picture_source, upper.picture_source) else {
+        return false;
+    };
+    let node_rate = |node: &Node| float(node, "edit_rate").and_then(Rate::from_avid);
+    if !submaster::neutral_controls(ctx, effect, length)
+        || node_rate(effect) != Some(rate)
+        || [background.track, lower.track, upper.track] != [Some(1), Some(2), Some(3)]
+        || lower_picture.track != 1 || upper_picture.track != 1
+        || lower_picture.local_start != 0 || lower_picture.length != length
+    {
+        return false;
+    }
+    let no_controls = |node: &Node| ["effect_id", "left_bob", "right_bob", "session_attrs", "precomputed", "param_list"]
+        .iter().all(|key| matches!(node.get(key), None | Some(Value::Null | Value::Ref(0))));
+    let no_attrs = |node: &Node| matches!(node.get("attributes"), None | Some(Value::Null | Value::Ref(0)));
+    // The two verified DNx sources are opaque 16:9 pictures. This saved
+    // override centers the same full-frame bounds in every rectangle.
+    const BOUNDS: &str = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\" ?><Bounds>",
+        "  <Framing>-1600/1 -900/1 3200/1 1800/1</Framing>",
+        "  <Valid>-1600/1 -900/1 3200/1 1800/1</Valid>",
+        "  <Essence>-1600/1 -900/1 3200/1 1800/1</Essence>",
+        "  <Source>-1600/1 -900/1 3200/1 1800/1</Source></Bounds>",
+    );
+    tracks.iter().enumerate().all(|(index, track)| {
+        if int(track, "lock_number") != Some(0) {
+            return false;
+        }
+        let Some(proxy) = ctx.deref(track.get("filler_proxy")) else { return false };
+        if proxy.class != *b"TRKR" || int(proxy, "media_kind_id") != Some(KIND_PICTURE)
+            || int(proxy, "relative_scope") != Some(i64::from(index == 0))
+            || int(proxy, "relative_track") != Some(-1) || int(proxy, "length") != Some(i64::from(i32::MAX))
+            || !no_controls(proxy) || !no_attrs(proxy)
+        {
+            return false;
+        }
+        let Some(sequence) = ctx.deref(track.get("component")) else { return false };
+        if sequence.class != *b"SEQU" || node_rate(sequence) != Some(rate)
+            || int(sequence, "media_kind_id") != Some(KIND_PICTURE)
+            || !no_controls(sequence) || !no_attrs(sequence)
+        {
+            return false;
+        }
+        let Some(Value::RefList(children)) = sequence.get("components") else { return false };
+        let fill = |reference: &Value| ctx.deref(Some(reference)).filter(|node| {
+            node.class == *b"FILL" && node_rate(node) == Some(rate)
+                && int(node, "media_kind_id") == Some(KIND_PICTURE) && no_controls(node) && no_attrs(node)
+        });
+        if index == 0 {
+            return matches!(children.as_slice(), [only] if fill(only).and_then(|n| int(n, "length")) == Some(length));
+        }
+        let [lead, clip, tail] = children.as_slice() else { return false };
+        let Some(clip) = ctx.deref(Some(clip)) else { return false };
+        let attrs = borrowed_attrs(ctx, clip);
+        fill(lead).is_some() && fill(tail).is_some() && clip.class == *b"SCLP" && no_controls(clip)
+            && attrs.len() == 2
+            && unique_attribute(attrs, "_IMAGE_BOUNDS_OVERRIDE").and_then(Value::as_str) == Some(BOUNDS)
+            && unique_attribute(attrs, "_BOUNDS_REFORMATTING_OPTION").and_then(Value::as_int) == Some(1)
+    })
 }
 
 fn matte_import(
@@ -2596,6 +2777,7 @@ fn finish_source(
                         picture_extension: None,
                         picture_chain: Vec::new(),
                         motion_adapter_phase: fact.motion_adapter_phase,
+                        motion_adapter_center_pan: false,
                         saved_timewarp: fact.saved_timewarp.take(),
                         constant_speed: fact.constant_speed,
                         plain_submaster: false,
@@ -2620,11 +2802,14 @@ fn finish_source(
                     ));
                 }
             }
-            Op::PanVolume { before, gain, pans, mut automation, mut pan_automation } => {
+            Op::PanVolume { before, gain, pans, saved_center_pan, mut automation, mut pan_automation } => {
                 let produced = &mut events[starts[before]..];
                 let single = produced.len() == 1;
                 let has_pan = pan_automation.is_some();
                 for e in produced {
+                    if single && e.motion_adapter_phase.is_some() {
+                        e.motion_adapter_center_pan = saved_center_pan;
+                    }
                     e.event.edit_gain_db = gain;
                     e.event.edit_pan = if matches!(e.event.combined, Some((_, 1))) {
                         pans[1]
@@ -2757,6 +2942,11 @@ fn finish_source(
             effect: t.effect,
             audio_curve_attribute: t.audio_curve_attribute,
             audio_curve_parameter: t.audio_curve_parameter,
+            incoming_filler: t.incoming.as_deref().and_then(|owner| {
+                capture.scopes.iter().find(|scope| scope.id == owner)
+            }).filter(|scope| scope.class == *b"FILL" && scope.group_path
+                && scope.position_known && scope.rate == t.rate)
+                .and_then(|scope| scope.record_length).filter(|&n| n > 0),
             outgoing: binding(
                 t.outgoing.as_deref(),
                 &capture.scopes,
@@ -2994,6 +3184,7 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
                                 marker_witnesses: meta.marker_witnesses,
                                 originals: meta.originals,
                                 file_clocks: meta.file_clocks,
+                                managed_multistream: meta.managed_multistream,
                                 imported_audio: meta.imported_audio,
                                 input_transforms: meta.input_transforms,
                                 rendered_freeze: meta.rendered_freeze,

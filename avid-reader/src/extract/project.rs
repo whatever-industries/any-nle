@@ -377,6 +377,7 @@ enum Op {
     Problem { position: i64, kind: i64, track: i64, message: String },
     PanVolume {
         before: usize, gain: Option<f64>, pans: [Option<f64>; 2],
+        saved_center_pan: bool,
         automation: Option<volume::Capture<crate::source::VolumePoint>>,
         pan_automation: Option<volume::Capture<crate::source::PanPoint>>,
     },
@@ -833,6 +834,8 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                             before,
                             gain,
                             pans: [pan1, pan2],
+                            saved_center_pan: c.get("pan_set") == Some(&Value::Bool(false))
+                                && int(c, "pan") == Some(16_384),
                             automation,
                             pan_automation,
                         });
@@ -906,6 +909,11 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                             })
                             .clone();
                         let before = self.ops.len();
+                        if kind == PictureKind::Warp {
+                            if let Some(source) = &mut self.source {
+                                source.bind_group_warp_input(ctx, input);
+                            }
+                        }
                         self.component(input, position, via, depth + 1);
                         self.push_op(Op::Picture { before, value: fx });
                         if self.source.is_some() {
@@ -972,7 +980,7 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                 match inputs.as_slice() {
                     [input] => {
                         let plain_submaster = effect == submaster::EFFECT
-                            && self.kind == KIND_PICTURE && self.track == 1
+                            && self.kind == KIND_PICTURE && self.track > 0
                             && self.source.as_ref().is_some_and(|source| source.direct_submaster())
                             && submaster::plain_input(ctx, c, length);
                         let before = self.ops.len();
@@ -992,7 +1000,17 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                         }
                     }
                     [] => self.problem(position, format!("effect {} with no input clip ({} frames) not converted", effect, length)),
-                    many => self.problem(position, format!("effect {} with {} inputs not converted", effect, many.len())),
+                    many => {
+                        if effect == submaster::EFFECT && self.kind == KIND_PICTURE {
+                            if self.source.as_mut().is_some_and(|source| {
+                                source.layered_submaster(ctx, c, &tracks, position, self.track)
+                            }) {
+                                // The source receipt reports anything the destination cannot place.
+                                return;
+                            }
+                        }
+                        self.problem(position, format!("effect {} with {} inputs not converted", effect, many.len()));
+                    }
                 }
             }
             other => {
@@ -1370,6 +1388,7 @@ mod tests {
             before: 0,
             gain: Some(-6.0),
             pans: [Some(-100.0), Some(25.0)],
+            saved_center_pan: false,
             automation: None,
             pan_automation: None,
         });
@@ -1449,6 +1468,7 @@ mod tests {
             before: 0,
             gain: Some(-6.0),
             pans: [None, None],
+            saved_center_pan: false,
             automation: None,
             pan_automation: None,
         });
@@ -2275,6 +2295,50 @@ mod tests {
         mob(&mut f,id(3),"Unqualified span",MOB_COMPOSITION,0,&[(1,effect)]);mob(&mut f,id(1),"Master",MOB_MASTER,0,&[]);
         let out=source_project(&[f]);assert!(out.sequences[0].events.is_empty());
         assert!(out.sequences[0].unresolved.iter().any(|i|i.reason.contains("enclosing component span")));
+    }
+
+    #[test]
+    fn submaster_picture_reference_requires_a_complete_same_rate_layer() {
+        let mut f = file();
+        let fill = |f: &mut AvbFile, length| {
+            let mut filler = node(*b"FILL", "Filler");
+            filler.put("media_kind_id", Value::Int(KIND_PICTURE));
+            filler.put("edit_rate", Value::Float(24.0));
+            filler.put("length", Value::Int(length));
+            add(f, filler)
+        };
+        let before = fill(&mut f, 3);
+        let after = fill(&mut f, 2);
+        let leaf = source(&mut f, id(1), KIND_PICTURE, 1, 17, 7);
+        let layer = segments(&mut f, KIND_PICTURE, &[before, leaf, after]);
+        let multiple = segments(&mut f, KIND_PICTURE, &[leaf, leaf]);
+        let mixed = source(&mut f, id(2), KIND_PICTURE, 1, 33, 7);
+        let mixed_layer = segments(&mut f, KIND_PICTURE, &[before, mixed, after]);
+        let broken = segments(&mut f, KIND_PICTURE, &[before, leaf, after]);
+        for index in [leaf, layer, multiple, mixed_layer, broken] {
+            let Some(Object::Decoded(n)) = f.objects[index as usize].as_mut() else { unreachable!() };
+            n.put("edit_rate", Value::Float(24.0));
+        }
+        let Some(Object::Decoded(n)) = f.objects[mixed as usize].as_mut() else { unreachable!() };
+        n.put("edit_rate", Value::Float(25.0));
+        let Some(Object::Decoded(n)) = f.objects[broken as usize].as_mut() else { unreachable!() };
+        n.fields.iter_mut().find(|(key, _)| *key == "components").unwrap().1 =
+            Value::RefList(vec![Value::Ref(before), Value::Ref(50_000), Value::Ref(after)]);
+
+        let mut effect = node(*b"TKFX", "Submaster");
+        effect.put("edit_rate", Value::Float(24.0));
+        effect.put("length", Value::Int(12));
+        let ctx = Ctx { file: &f, mobs: HashMap::new() };
+        let saved = submaster::picture_source(&ctx, &effect, f.node(layer).unwrap()).unwrap();
+        assert_eq!((saved.mob, saved.track, saved.source_start), (id(1), 1, 17));
+        assert_eq!((saved.local_start, saved.length, saved.local_length), (3, 7, 12));
+        assert_eq!(saved.rate, crate::source::Rate::new(24, 1).unwrap());
+        for index in [multiple, mixed_layer, broken, leaf, before] {
+            assert!(submaster::picture_source(&ctx, &effect, f.node(index).unwrap()).is_none(), "{index}");
+        }
+        effect.fields.iter_mut().find(|(key, _)| *key == "length").unwrap().1 = Value::Int(7);
+        assert!(submaster::picture_source(&ctx, &effect, f.node(layer).unwrap()).is_none());
+        assert_eq!(submaster::picture_source(&ctx, &effect, f.node(leaf).unwrap()).unwrap().local_start, 0);
     }
 
     #[test]

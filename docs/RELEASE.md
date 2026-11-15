@@ -44,6 +44,8 @@ The package records its observed host SONAMEs in `linux-runtime.json`.
    `scripts/release/package.py` with target, binaries, backend, notices and output.
    Run `verify_candidate.py` against the actual package, and audit the staged files
    plus compressed provenance before publication.
+   For local replays, pass `--receipt PATH` to keep the verification receipt with
+   the replay outputs.
 
 Scripts use Python 3.13 in CI. Native packaging uses macOS ditto/codesign, NSIS 3.11
 on Windows, using the zlib compressor and retained NSIS notices, and

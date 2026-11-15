@@ -1,12 +1,20 @@
 //! Ordinary file-backed original masters. Physical streams and channels are explicit.
-use super::model::{ticks_per_unit, Fraction};
+use super::model::{ticks_per_unit, Event, Fraction};
 use super::prepared::*;
 use crate::build::media as m;
 use crate::error::{Error, Result};
 use crate::ids::UuidSource;
 use crate::model::project::resolve_path;
 use crate::model::{ItemId, Project};
-use crate::xml::mutations::append_leaf;
+use crate::xml::mutations::{append_child, append_leaf};
+
+pub(super) fn mono_source_channel(clip: &OriginalClip, event: &Event, slot: usize) -> Option<i64> {
+    if event.audio_channels.is_empty() {
+        clip.channels.get(slot).map(|channel| channel.avid_track)
+    } else {
+        event.audio_channels.get(slot).copied()
+    }
+}
 
 pub fn add_item(
     project: &mut Project,
@@ -34,6 +42,7 @@ pub fn add_item(
         .as_ref()
         .map(|v| ticks_per_unit(v.rate))
         .unwrap_or_else(|| ticks_per_unit(Fraction::new(c.audio.as_ref().unwrap().sample_rate, 1)));
+    let source_start = c.video.as_ref().map_or(0, |v| v.source_start);
     let label = if c.video.is_some() {
         if c.audio.is_some() {
             (m::AV_LABEL_INDEX, m::AV_LABEL_COLOR)
@@ -84,7 +93,7 @@ pub fn add_item(
             c.audio
                 .as_ref()
                 .map(|a| ticks_per_unit(Fraction::new(a.sample_rate, 1))),
-            0,
+            source_start,
         )
     } else {
         let a = c.audio.as_ref().unwrap();
@@ -103,8 +112,75 @@ pub fn add_item(
             0,
         )
     };
+    let reel = c
+        .metadata
+        .tape_name
+        .as_deref()
+        .filter(|value| c.video.is_some() && !value.is_empty());
+    if let Some(reel) = reel {
+        append_leaf(&mut project.doc.tree, e, "AlternateTapeName", reel);
+        append_leaf(&mut project.doc.tree, e, "TapeName", reel);
+    }
     let media = project.register_uid(e, &uid)?;
     project.imported_media.push(media);
+    let proxy = if let Some(path) = &c.proxy_path {
+        let v = c.video.as_ref().expect("validated proxy video");
+        let e = m::new_movie_video_stream(
+            &mut project.doc.tree,
+            v.width,
+            v.height,
+            ticks_per_unit(v.rate),
+            v.duration,
+            if c.audio.is_some() { "mov" } else { "mxf" },
+            "AVdn",
+            0,
+        )?;
+        append_leaf(&mut project.doc.tree, e, "IsFrameRectOverridden", "true");
+        append_leaf(
+            &mut project.doc.tree,
+            e,
+            "OverriddenFrameRect",
+            &format!("0,0,{},{}", v.width, v.height),
+        );
+        let vid = project.register(e)?;
+        let audio = c
+            .audio
+            .as_ref()
+            .map(|a| {
+                let e = m::new_audio_stream(
+                    &mut project.doc.tree,
+                    ticks_per_unit(Fraction::new(a.sample_rate, 1)),
+                    &m::audio_channel_layout(a.channels as u32),
+                    a.duration,
+                    (a.representation == SampleRepresentation::Pcm16).then_some("3"),
+                );
+                project.register(e)
+            })
+            .transpose()?;
+        let proxy_uid = ids.uuid4().to_string();
+        let state = ids.uuid4().to_string();
+        let e = m::new_movie_media(
+            &mut project.doc.tree,
+            ids,
+            &proxy_uid,
+            &vid,
+            path,
+            &dir,
+            &state,
+            audio.as_deref(),
+            c.audio
+                .as_ref()
+                .map(|a| ticks_per_unit(Fraction::new(a.sample_rate, 1))),
+            source_start,
+        );
+        append_leaf(&mut project.doc.tree, e, "IsProxy", "true");
+        append_leaf(&mut project.doc.tree, e, "AlternateStart", "0");
+        let node = project.register_uid(e, &proxy_uid)?;
+        project.imported_media.push(node);
+        Some(proxy_uid)
+    } else {
+        None
+    };
     let e = m::new_markers_collection(&mut project.doc.tree, &state);
     let markers = project.register(e)?;
     let format = if let Some(v) = &c.video {
@@ -127,15 +203,30 @@ pub fn add_item(
             None
         },
         &format,
-        0,
+        source_start,
         "",
     );
+    if let Some(reel) = reel {
+        append_leaf(&mut project.doc.tree, e, "TapeName", reel);
+    }
     let logging = project.register(e)?;
     let mut clips = Vec::new();
     let mut chains = Vec::new();
     let mut vectors = Vec::new();
     if let Some(v) = &c.video {
         let e = m::new_movie_media_source(&mut project.doc.tree, &uid, v.duration);
+        if let Some(uid) = &proxy {
+            let content = project
+                .doc
+                .tree
+                .find1(e, "MediaSource/Content")
+                .expect("video content");
+            let reference = project
+                .doc
+                .tree
+                .new_element_with("ProxyMedia", &[("ObjectURef", uid)]);
+            append_child(&mut project.doc.tree, content, reference, None);
+        }
         let source = project.register(e)?;
         let e = m::new_movie_template_clip(
             &mut project.doc.tree,
@@ -148,8 +239,41 @@ pub fn add_item(
         clips.push(project.register(e)?);
     }
     if let Some(a) = &c.audio {
-        let e = m::new_audio_media_source(&mut project.doc.tree, &uid, a.duration);
-        let source = project.register(e)?;
+        let source_node = m::new_audio_media_source(&mut project.doc.tree, &uid, a.duration);
+        let source = project.register(source_node)?;
+        let mut proxy_refs = Vec::new();
+        if let Some(uid) = &proxy {
+            for channel in 0..a.channels {
+                let e = crate::build::top(
+                    &mut project.doc.tree,
+                    "AudioProxy",
+                    "56e9cdb3-7244-44ff-98a3-f1932ebf202d",
+                    "1",
+                    None,
+                );
+                let tree = &mut project.doc.tree;
+                let r = tree.new_element_with("ProxyMedia", &[("ObjectURef", uid)]);
+                append_child(tree, e, r, None);
+                append_leaf(tree, e, "ProxyStreamIndex", &channel.to_string());
+                append_leaf(tree, e, "OriginalSecondaryIndex", &channel.to_string());
+                proxy_refs.push(project.register(e)?);
+            }
+        }
+        if !proxy_refs.is_empty() {
+            let tree = &mut project.doc.tree;
+            let content = tree
+                .find1(source_node, "MediaSource/Content")
+                .expect("audio content");
+            let proxies = tree.new_element_with("AudioProxies", &[("Version", "1")]);
+            append_child(tree, content, proxies, None);
+            for (index, id) in proxy_refs.iter().enumerate() {
+                let r = tree.new_element_with(
+                    "AudioProxyItem",
+                    &[("Index", &index.to_string()), ("ObjectRef", id)],
+                );
+                append_child(tree, proxies, r, None);
+            }
+        }
         for (group, g) in c.groups.iter().enumerate() {
             let mut secondary = Vec::new();
             for n in 0..a.channels {

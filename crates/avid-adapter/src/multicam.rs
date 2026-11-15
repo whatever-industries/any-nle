@@ -76,21 +76,6 @@ fn uncertainty(s: &str, b: &mut Budget) -> Result<Option<String>, String> {
     b.charge(size_of::<String>() + s.len())?;
     Ok(Some(s.into()))
 }
-fn member<'a>(
-    mob: MobId,
-    bin: usize,
-    copies: &HashMap<MobId, Vec<(usize, usize)>>,
-    out: &'a ReadResult,
-) -> Option<&'a SourceItem> {
-    let all = copies.get(&mob)?;
-    let mut local = all.iter().filter(|(b, _)| *b == bin);
-    let index = match (local.next(), local.next()) {
-        (Some((_, i)), None) => *i,
-        (None, None) if all.len() == 1 => all[0].1,
-        _ => return None,
-    };
-    out.graph.items.get(index)
-}
 pub(super) fn append<'a>(
     groups: &'a [av::SourceGroup],
     copies: &HashMap<MobId, Vec<(usize, usize)>>,
@@ -163,7 +148,7 @@ pub(super) fn append<'a>(
                             source_in,
                             rate: source_rate,
                         } => {
-                            let Some(item) = member(*master, g.bin, copies, out) else {
+                            let Some(item) = source_master_copy(*master, g.bin, copies, &out.graph.items) else {
                                 alt.reason=uncertainty("group member is missing, unsupported or ambiguous in its source bin",budget)?;
                                 break;
                             };
@@ -494,6 +479,10 @@ impl Index<'_> {
             } else {
                 reason
             };
+            if u.warp_picture_input && reason.is_none() && binding.reason.is_none() {
+                sidecar(out, budget, "avid.group_use", &u.id,
+                    obj(vec![("warp_picture_input", Value::Bool(true))]))?;
+            }
             out.graph.multicam_uses.push(MulticamUse {
                 id: u.id.clone(),
                 sequence: seq.id.clone(),

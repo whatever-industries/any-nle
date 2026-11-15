@@ -67,6 +67,62 @@ impl Project {
     /// bag-less audio chain, and past channel 0 a `SecondaryIndex` plus the SubClip's
     /// `OrigChGrp`.
     pub fn narrow_merged_channel(&mut self, placed: TrackItemId, channel: i64) -> Result<()> {
+        self.narrow_mono_channel(placed, channel, channel)
+    }
+
+    /// A multicam's logical mono group can select a different physical bus channel.
+    pub(crate) fn narrow_multicam_audio(
+        &mut self,
+        placed: TrackItemId,
+        source: ItemId,
+        group: usize,
+    ) -> Result<()> {
+        let Some(master) = self.item(source).master else {
+            return value("multicam audio master missing");
+        };
+        let Some(reference) = self.doc.tree.child_by_tag(master, "AudioClipChannelGroups") else {
+            return value("multicam audio channel groups missing");
+        };
+        let groups = self.doc.resolve(reference)?;
+        let vectors = self.doc.tree.findall(groups, "ClipChannelVectors/ClipChannelVectorItem")?;
+        let Some(&vector) = vectors.get(group) else {
+            return value("multicam logical audio group missing");
+        };
+        let vector = self.doc.resolve(vector)?;
+        let members = self.doc.tree.findall(vector, "ClipChannels/ClipChannelItem")?;
+        let [member] = members.as_slice() else {
+            return value("multicam audio group must be mono");
+        };
+        let serializer = self.doc.resolve(*member)?;
+        if self.doc.tree.findtext(serializer, "SourceClipIndex")?.as_deref() != Some("0") {
+            return value("multicam audio group must select the source sequence audio clip");
+        }
+        let Some(channel) = self
+            .doc
+            .tree
+            .findtext(serializer, "mSourceChannelIndex")?
+            .and_then(|text| text.parse::<i64>().ok())
+            .filter(|&channel| channel >= 0)
+        else {
+            return value("multicam physical audio channel missing or invalid");
+        };
+
+        let clip = self.track_item(placed).clip;
+        let mut matches = 0;
+        for entry in self.doc.tree.findall(clip, "SecondaryContents/SecondaryContentItem")? {
+            let content = self.doc.resolve(entry)?;
+            let index = self.doc.tree.findtext(content, "ChannelIndex")?.unwrap_or_else(|| "0".into());
+            if py_int(&index)? == channel {
+                matches += 1;
+            }
+        }
+        if matches != 1 {
+            return value("multicam physical audio channel must match one secondary content");
+        }
+        self.narrow_mono_channel(placed, group as i64, channel)
+    }
+
+    fn narrow_mono_channel(&mut self, placed: TrackItemId, group: i64, channel: i64) -> Result<()> {
         let data = self.track_item(placed).clone();
         let clip = data.clip;
         if let Some(layout) = self.doc.tree.child_by_tag(clip, "AudioChannelLayout") {
@@ -104,10 +160,10 @@ impl Project {
                 }
             }
         }
-        if channel != 0 {
-            append_leaf(&mut self.doc.tree, clip, "SecondaryIndex", &channel.to_string());
+        if group != 0 {
+            append_leaf(&mut self.doc.tree, clip, "SecondaryIndex", &group.to_string());
             if let Some(orig) = self.doc.tree.child_by_tag(data.subclip, "OrigChGrp") {
-                self.doc.tree.set_text(orig, Some(channel.to_string()));
+                self.doc.tree.set_text(orig, Some(group.to_string()));
             }
         }
         Ok(())
@@ -193,6 +249,47 @@ impl Project {
 mod tests {
     use crate::model::project::{py_int, py_path};
     use crate::model::track_item::{py_div_trunc, py_round};
+
+    #[test]
+    fn multicam_audio_preserves_logical_group_and_physical_output() {
+        use crate::build::{multicam::build_multicam_mono_audio_with_outputs, time::Time};
+        use crate::convert::multicam::FRAME;
+        use crate::model::{ItemData, ItemType, Project};
+        use crate::SeededUuids;
+
+        let mut ids = SeededUuids::new("multicam-sparse-output");
+        let mut project = Project::new(&mut ids).unwrap();
+        let timeline = project.add_sequence("Edit", "1080p23976", None, &mut ids).unwrap();
+        let fragment = build_multicam_mono_audio_with_outputs(
+            &mut project.doc.tree, &mut ids, "Group", FRAME, 1920, 1080, 110, 30 * FRAME, 2, 3,
+            [0, 1, 3].into_iter(),
+        ).unwrap();
+        let objects = project.splice(fragment, &mut ids).unwrap();
+        let master = objects.get("MasterClip").unwrap();
+        let groups_ref = project.doc.tree.find1(master, "AudioClipChannelGroups").unwrap();
+        let groups = project.doc.resolve(groups_ref).unwrap();
+        let vectors = project.resolve_all(groups, "ClipChannelVectors/ClipChannelVectorItem").unwrap();
+        let members = project.resolve_all(vectors[2], "ClipChannels/ClipChannelItem").unwrap();
+        let selector = project.doc.tree.find1(members[0], "mSourceChannelIndex").unwrap();
+        assert_eq!(project.doc.tree.text(selector), Some("3"));
+        let mut data = ItemData::new(objects.get("ClipProjectItem").unwrap(), ItemType::Clip);
+        data.master = Some(master);
+        let source = project.push_item(data);
+        let track = project.audio_tracks(timeline)[0];
+        let placed = project.add_clip(track, source, Time::new(0), &mut ids).unwrap();
+
+        assert!(project.narrow_multicam_audio(placed, source, 3).is_err());
+        project.doc.tree.set_text(selector, Some("32"));
+        assert!(project.narrow_multicam_audio(placed, source, 2).is_err());
+        project.doc.tree.set_text(selector, Some("3"));
+        project.narrow_multicam_audio(placed, source, 2).unwrap();
+        let placed = project.track_item(placed);
+        assert_eq!(project.doc.tree.findtext(placed.subclip, "OrigChGrp").unwrap().as_deref(), Some("2"));
+        assert_eq!(project.doc.tree.findtext(placed.clip, "SecondaryIndex").unwrap().as_deref(), Some("2"));
+        let contents = project.resolve_all(placed.clip, "SecondaryContents/SecondaryContentItem").unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(project.doc.tree.findtext(contents[0], "ChannelIndex").unwrap().as_deref(), Some("3"));
+    }
 
     #[test]
     fn int_follows_python() {

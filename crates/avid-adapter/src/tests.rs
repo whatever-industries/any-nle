@@ -19,6 +19,50 @@ fn mob(n: u32) -> MobId {
 }
 
 #[test]
+fn master_start_keeps_drop_frame_logging_separate_from_media_clock() {
+    let (mut facts, index) = fixture(1);
+    for (frames, fps, drop, expected) in [
+        (1799, 30, true, Some("00:00:59;29")),
+        (1800, 30, true, Some("00:01:00;02")),
+        (215784, 30, true, Some("02:00:00;00")),
+        (35964, 60, true, Some("00:10:00;00")),
+        (215784, 30, false, Some("01:59:52:24")),
+        (1800, 24, true, None),
+    ] {
+        facts.masters[0].master.start = Some(extract::Timecode { frames, fps, drop });
+        let result = build(&facts, &index, "Synthetic", &["Bin".into()]).unwrap();
+        let graph = SourceGraph::from_json_text(&result.graph.to_json_text().unwrap()).unwrap();
+        let item = &graph.items[0];
+        assert_eq!(
+            graph.sidecar("avid", &item.id).unwrap().get("start_timecode"),
+            Some(&expected.map(s).unwrap_or(Value::Null)),
+        );
+        assert_eq!(graph.media[0].clock, None);
+    }
+}
+
+#[test]
+fn distinguishes_selected_ambiguous_packages_from_other_scan_diagnostics() {
+    let (facts, mut index) = fixture(1);
+    let selected = facts.masters[0].master.tracks[0].file_mob.umid_hex();
+    let unrelated = mob(999).umid_hex();
+    index.files.remove(&selected);
+    index.ambiguous = vec![selected.clone(), unrelated.clone()];
+    let result = build(&facts, &index, "Synthetic", &["Bin".into()]).unwrap();
+    assert_eq!(
+        result.ambiguous_managed_packages,
+        [format!("ambiguous MXF file package {selected}")]
+    );
+    assert_eq!(
+        result.scan_issues,
+        [
+            format!("ambiguous MXF file package {selected}"),
+            format!("ambiguous MXF file package {unrelated}"),
+        ]
+    );
+}
+
+#[test]
 fn graph_keeps_same_named_subclip_receipts_on_their_bin() {
     let (mut facts, index) = fixture(1);
     for (number, start) in [(2, 11), (3, 41)] {
@@ -125,6 +169,7 @@ fn fixture(channels: i64) -> (av::SourceProject, index::MediaIndex) {
         marker_witnesses: vec![],
         originals: vec![],
         file_clocks: vec![],
+        managed_multistream: None,
         imported_audio: None,
         input_transforms: vec![],
         rendered_freeze: false,
@@ -160,6 +205,7 @@ fn event(
         picture_extension: None,
         picture_chain: Vec::new(),
         motion_adapter_phase: None,
+        motion_adapter_center_pan: false,
         saved_timewarp: None,
         constant_speed: None,
         plain_submaster: false,
@@ -241,6 +287,8 @@ fn matte_key_loss_is_locatable_after_graph_reload() {
             invert_alpha: None,
             locators: vec!["/Synthetic/alpha.png".into()],
         }),
+        color_adapter: None,
+        submaster_inputs: Vec::new(),
         picture_profile: None,
     });
     facts.sequences.push(source);
@@ -266,6 +314,132 @@ fn matte_key_loss_is_locatable_after_graph_reload() {
     assert_eq!(import.get("ignore_alpha"), Some(&Value::Bool(false)));
     assert_eq!(import.get("invert_alpha"), Some(&Value::Null));
     assert_eq!(import.get("saved_locators"), Some(&Value::Arr(vec![s("/Synthetic/alpha.png")])));
+}
+
+#[test]
+fn color_adapter_receipt_binds_only_the_owned_picture_placement() {
+    let (mut facts, mut index) = fixture(1);
+    let track = &mut facts.masters[0].master.tracks[0];
+    track.kind = KIND_PICTURE;
+    track.edit_rate = 24.0;
+    track.length = 48;
+    track.essence = Some(Essence::Picture {
+        compression: "AVHD".into(),
+        resolution_id: 0,
+        width: 1920,
+        height: 1080,
+        display_aspect: Some((16, 9)),
+    });
+    let file_mob = track.file_mob;
+    index.identities.values_mut().next().unwrap().file_tracks = vec![(24, 1, 48)];
+    let mut picture = event("picture", 1, 1, 0, 24, None);
+    picture.event.kind = KIND_PICTURE;
+    let mut source = sequence(vec![picture]);
+    source.unresolved.push(av::SourceIssue {
+        owner: "sequence/component/1".into(),
+        reason: "Avid Color Adapter omitted".into(),
+        issue_kind: av::SourceIssueKind::ColorAdapter { length: Some(24) },
+        route: vec![],
+        record_start: Observed::Known(0),
+        record_rate: Rate::new(24, 1),
+        kind: KIND_PICTURE,
+        track: 1,
+        matte_inputs: None,
+        matte_import: None,
+        color_adapter: Some(av::SourceColorAdapter {
+            master: mob(1),
+            master_track: 1,
+            source_in: 0,
+            picture_file: Observed::Known(file_mob),
+            transform: "<ColorTransformationList/>".into(),
+            neutral_wrapper: true,
+        }),
+        submaster_inputs: vec![],
+        picture_profile: None,
+    });
+    facts.sequences.push(source);
+    for (owner, expected) in [
+        ("sequence/component/1/component/0", Some("picture")),
+        ("sequence/component/10/component/0", None),
+    ] {
+        facts.sequences[0].events[0].owner = owner.into();
+        let built = run(&facts, &index).graph;
+        let graph = SourceGraph::from_json_text(&built.to_json_text().unwrap()).unwrap();
+        let sidecar = graph.sidecar("avid.source", "revision/seq").unwrap();
+        let Some(Value::Arr(issues)) = sidecar.get("unresolved") else { panic!("expected issues") };
+        let adapter = issues[0].get("color_adapter").unwrap();
+        assert_eq!(adapter.get("placement"), Some(&expected.map(s).unwrap_or(Value::Null)));
+        assert_eq!(adapter.get("picture_file"), Some(&s(file_mob.urn())));
+        assert_eq!(adapter.get("neutral_wrapper"), Some(&Value::Bool(true)));
+        assert!(graph.losses.iter().any(|loss| loss.aspect == "source_color_adapter"
+            && loss.object == expected.unwrap_or("revision/seq")));
+    }
+}
+
+#[test]
+fn layered_submaster_keeps_ordered_input_facts_without_placing_a_composite() {
+    let (mut facts, index) = fixture(1);
+    let mut source = sequence(vec![event("unchanged-audio", 1, 1, 0, 24, None)]);
+    source.unresolved.push(av::SourceIssue {
+        owner: "revision/seq/component/0".into(),
+        reason: "Avid layered Submaster omitted".into(),
+        issue_kind: av::SourceIssueKind::LayeredSubmaster { length: Some(48), input_count: 3 },
+        route: Vec::new(),
+        record_start: Observed::Known(0),
+        record_rate: Rate::new(24, 1),
+        kind: KIND_PICTURE,
+        track: 1,
+        matte_inputs: None,
+        matte_import: None,
+        color_adapter: None,
+        submaster_inputs: [b"FILL", b"SCLP", b"TKFX"].into_iter().enumerate().map(|(i, tag)| {
+            av::SubmasterInput {
+                track: Some(i as i64 + 1),
+                component_class: Some(*b"SEQU"),
+                segment_class: Some(*tag),
+                segment_effect: (tag == b"TKFX").then(|| "EFF2_BLEND_PIP".into()),
+                picture_source: (tag == b"SCLP").then(|| av::SubmasterPictureInput {
+                    mob: mob(10),
+                    track: 1,
+                    source_start: 17,
+                    local_start: 4,
+                    length: 40,
+                    local_length: 48,
+                    rate: Rate::new(24, 1).unwrap(),
+                }),
+            }
+        }).collect(),
+        picture_profile: None,
+    });
+    facts.sequences.push(source);
+    let built = run(&facts, &index).graph;
+    let graph = SourceGraph::from_json_text(&built.to_json_text().unwrap()).unwrap();
+    let [edit] = graph.sequences[0].placements.as_slice() else { panic!("expected one audio edit") };
+    assert_eq!(edit.id, "unchanged-audio");
+    assert!(graph.losses.iter().any(|l| l.aspect == "picture_effect"
+        && l.reason.contains("V1 at record frame 0 for 48 frames (24 fps)")));
+    let receipt = graph.sidecar("avid.source", "revision/seq").unwrap();
+    let Some(Value::Arr(issues)) = receipt.get("unresolved") else { panic!("expected issues") };
+    assert_eq!(issues[0].get("effect_id"), Some(&s("EFF_SUBMASTER")));
+    assert_eq!(issues[0].get("input_count"), Some(&Value::Int(3)));
+    assert_eq!(issues[0].get("record_length"), Some(&Value::Int(48)));
+    let Some(Value::Arr(inputs)) = issues[0].get("submaster_inputs") else { panic!("expected layers") };
+    assert_eq!(inputs.len(), 3);
+    for (i, (input, class)) in inputs.iter().zip(["FILL", "SCLP", "TKFX"]).enumerate() {
+        assert_eq!(input.get("track"), Some(&Value::Int(i as i64 + 1)));
+        assert_eq!(input.get("component_class"), Some(&s("SEQU")));
+        assert_eq!(input.get("segment_class"), Some(&s(class)));
+    }
+    assert_eq!(inputs[2].get("segment_effect"), Some(&s("EFF2_BLEND_PIP")));
+    assert!(inputs[0].get("picture_source").is_none() && inputs[2].get("picture_source").is_none());
+    let saved_picture = inputs[1].get("picture_source").unwrap();
+    assert_eq!(saved_picture.get("mob"), Some(&s(mob(10).urn())));
+    assert_eq!(saved_picture.get("track"), Some(&Value::Int(1)));
+    assert_eq!(saved_picture.get("source_start"), Some(&Value::Int(17)));
+    assert_eq!(saved_picture.get("local_start"), Some(&Value::Int(4)));
+    assert_eq!(saved_picture.get("length"), Some(&Value::Int(40)));
+    assert_eq!(saved_picture.get("local_length"), Some(&Value::Int(48)));
+    assert_eq!(saved_picture.get("rate"), Some(&s("24")));
 }
 
 #[test]
@@ -661,6 +835,7 @@ fn transition_endpoints_keep_native_identity() {
         effect: Some("DISSOLVE".into()),
         audio_curve_attribute: None,
         audio_curve_parameter: None,
+        incoming_filler: None,
         outgoing: av::Binding {
             placements: vec!["out".into()],
             reason: None,
@@ -984,10 +1159,52 @@ fn explicit_root_mappings_keep_same_named_originals_distinct() {
     assert_eq!(distinct.tracks[&("revision/master".into(), 0)].path, a.join("source.wav").canonicalize().unwrap());
     assert_eq!(distinct.tracks[&("revision/second".into(), 0)].path, b.join("source.wav").canonicalize().unwrap());
 
+    let mut repeated = fixture(1).0.masters.remove(0);
+    repeated.id = "revision/repeated".into();
+    repeated.master.mob_id = mob(3);
+    repeated.originals = facts.masters[0].originals.clone();
+    facts.masters.push(repeated);
+    let first = a.join("source.wav").canonicalize().unwrap();
+    let second = b.join("source.wav").canonicalize().unwrap();
+    let mut visited = Vec::new();
+    let interleaved = original::OriginalIndex::scan_with(&facts, &options, |path| {
+        visited.push(path.to_owned());
+        Ok(metadata.clone())
+    }).unwrap();
+    assert_eq!(visited, [first.clone(), second.clone()]);
+    assert_eq!(interleaved.original_inputs.len(), 2);
+    assert_eq!(interleaved.tracks[&("revision/repeated".into(), 0)].path, first);
+
+    let changed = original::OriginalIndex::scan_with(&facts, &options, |path| {
+        if path == second {
+            std::fs::write(&first, b"changed during the other file's probe").unwrap();
+        }
+        Ok(metadata.clone())
+    }).err().expect("an interleaved cache hit must not hide a file change");
+    assert!(changed.contains("changed before source read completed"));
+    std::fs::write(&first, a.as_os_str().as_encoded_bytes()).unwrap();
+    facts.masters.pop();
+
     options.root_mappings[1].current_root = a.clone();
     let error = scan(&facts, &options).err().expect("distinct paths must not collapse");
     assert!(error.contains("/saved/b/source.wav"));
     assert!(error.contains("root mappings resolve distinct saved originals"));
+
+    #[cfg(unix)]
+    {
+        // Equal bytes on separate files are valid. A hard link across two
+        // mapped folders is the same file and cannot stand for both originals.
+        let second_file = b.join("source.wav");
+        let first_file = a.join("source.wav");
+        options.root_mappings[1].current_root = b;
+        std::fs::copy(&first_file, &second_file).unwrap();
+        assert_eq!(scan(&facts, &options).unwrap().original_inputs.len(), 2);
+        std::fs::remove_file(&second_file).unwrap();
+        std::fs::hard_link(&first_file, &second_file).unwrap();
+        let error = scan(&facts, &options).err().expect("hard links must not collapse originals");
+        assert!(error.contains("/saved/b/source.wav"));
+        assert!(error.contains("root mappings resolve distinct saved originals"));
+    }
 
     // Separate bin items and even different mob IDs can legitimately reuse one locator.
     facts.masters[1].originals = facts.masters[0].originals.clone();
@@ -1011,7 +1228,7 @@ fn controlled_original_pcm_and_compressed_clocks_use_physical_streams_without_mx
         let probe=Value::Obj(vec![("streams".into(),Value::Arr(streams)),("format".into(),Value::Obj(vec![("format_name".into(),Value::Str(if compressed{"mov,mp4,m4a,3gp,3g2,mj2"}else{"wav"}.into()))]))]);
         let mut calls=0;let original=original::OriginalIndex::scan_with(&facts,&Default::default(),|_|{calls+=1;Ok(probe.clone())}).unwrap();assert_eq!(calls,1);
         assert_eq!(original.original_inputs.len(),1);assert_eq!(original.original_inputs[0].revision.len(),64);
-        let out=build_selected(&facts,&Default::default(),"Synthetic",&["Sources".into()],&original,&HashMap::new()).unwrap();assert_eq!(out.graph.media.len(),2);assert_eq!(out.original_inputs,original.original_inputs);
+        let out=build_selected(&facts,&Default::default(),"Synthetic",&["Sources".into()],&original,&MotionMxf::default()).unwrap();assert_eq!(out.graph.media.len(),2);assert_eq!(out.original_inputs,original.original_inputs);
         if compressed{assert_eq!(original.notes.len(),1);assert!(out.diagnostics.iter().any(|s|s.contains("default")&&s.contains("not observed source color")));}else{assert!(original.notes.is_empty());}
         for (channel,m) in out.graph.media.iter().enumerate(){assert_eq!(m.duration,Rational::integer(2));assert_eq!(m.sample_rate,Some(48000));assert_eq!(m.bits,if compressed{None}else{Some(bits)});let o=m.original.as_ref().unwrap();assert_eq!(o.channel_index,Some(channel as i64));assert_eq!(o.sample_representation.as_deref(),Some(representation));}
         let mut bad=probe.clone();if let Value::Obj(root)=&mut bad{if let Some((_,Value::Arr(rows)))=root.iter_mut().find(|(k,_)|k=="streams"){if let Value::Obj(row)=rows.last_mut().unwrap(){row.iter_mut().find(|(k,_)|k=="channels").unwrap().1=Value::Int(3);}}}
@@ -1068,7 +1285,7 @@ fn source_group(id:&str)->av::SourceGroup{
     av::SourceGroup{id:id.into(),bin:0,mob:Some(mob(20)),name:"Group A".into(),rate:Some(r),stored_rate:Some(24.0),length:Some(48),lanes:vec![av::SourceGroupLane{is_ganged:Some(true),kind:Some(KIND_SOUND),label:Some(1),rate:Some(r),length:Some(48),selected:Some(0),alternatives,reason:None}],marks:vec![],markers:vec![],reason:None}
 }
 fn group_use(g:&av::SourceGroup,selected:i64,bindings:&[&str])->av::SourceGroupUse{
-    av::SourceGroupUse{is_ganged:Some(true),id:"group-use".into(),kind:KIND_SOUND,track:1,position:Some(0),length:Some(12),rate:g.rate,selected:Some(selected),alternatives:g.lanes[0].alternatives.iter().map(|a|av::GroupEndpoint{length:Some(12),..a.endpoint}).collect(),binding:av::Binding{placements:bindings.iter().map(|s|s.to_string()).collect(),reason:None},reason:None}
+    av::SourceGroupUse{is_ganged:Some(true),warp_picture_input:false,id:"group-use".into(),kind:KIND_SOUND,track:1,position:Some(0),length:Some(12),rate:g.rate,selected:Some(selected),alternatives:g.lanes[0].alternatives.iter().map(|a|av::GroupEndpoint{length:Some(12),..a.endpoint}).collect(),binding:av::Binding{placements:bindings.iter().map(|s|s.to_string()).collect(),reason:None},reason:None}
 }
 #[test]
 fn group_layouts_keep_gaps_and_bind_exact_occurrences_instead_of_first_timestamp(){

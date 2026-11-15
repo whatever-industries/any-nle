@@ -2,7 +2,8 @@
 //!
 //! Class 1 columns (Comment) live in the project item's property bag; class 0 logging columns
 //! live on the master clip's `ClipLoggingInfo`. Premiere 27's linked AAF import
-//! uses `FilmCameraRoll` for Camroll. The media's own Tape Name is written separately.
+//! uses `FilmCameraRoll` for Camroll. `SoundRoll` is independent of both Tape Name and the
+//! rate of the sound timecode.
 
 use crate::convert::model::{py_str_repr, AvidInfo};
 use crate::error::{value, Result};
@@ -10,10 +11,15 @@ use crate::model::{ItemId, Project};
 use crate::xml::{NodeId, Tree};
 
 /// `LOGGING`: (Avid column, ClipLoggingInfo element).
-pub const LOGGING: [(&str, &str); 3] = [("Camroll", "FilmCameraRoll"), ("Scene", "Scene"), ("Take", "ShotTake")];
+pub const LOGGING: [(&str, &str); 4] = [
+    ("Camroll", "FilmCameraRoll"),
+    ("Scene", "Scene"),
+    ("Take", "ShotTake"),
+    ("Soundroll", "SoundRoll"),
+];
 /// `BAG`: (Avid column, property-bag key).
 pub const BAG: [(&str, &str); 1] = [("Comments", "Column.PropertyText.Comment")];
-pub const LOGGING_ORDER: [&str; 5] = ["ShotTake", "FilmCameraRoll", "Description", "Scene", "LogNote"];
+pub const LOGGING_ORDER: [&str; 6] = ["ShotTake", "FilmCameraRoll", "SoundRoll", "Description", "Scene", "LogNote"];
 /// Avid-internal or already-represented columns that are not copied as text.
 pub const SKIP: [&str; 2] = ["UNC Path", "Video"];
 

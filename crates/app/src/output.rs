@@ -1,5 +1,5 @@
 //! Shared CLI output checks. Snapshot creation also checks exclusively at write time.
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
@@ -57,8 +57,8 @@ pub fn preflight(project: &Path, graph: Option<&Path>) -> Result<(), String> {
 
 /// A preflight is not a reservation: another file can appear while bins are being read.
 /// create_new refuses it atomically, including any symbolic link at the snapshot path.
-pub fn write_snapshot(path: &Path, text: &str) -> Result<(), String> {
-    let mut file = OpenOptions::new()
+fn open_new_output(path: &Path) -> Result<File, String> {
+    OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
@@ -68,9 +68,25 @@ pub fn write_snapshot(path: &Path, text: &str) -> Result<(), String> {
             } else {
                 format!("{}: {e}", path.display())
             }
-        })?;
-    file.write_all(text.as_bytes())
+        })
+}
+
+pub fn write_snapshot(path: &Path, text: &str) -> Result<(), String> {
+    open_new_output(path)?
+        .write_all(text.as_bytes())
         .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+pub(crate) fn write_relink_report(
+    path: &Path,
+    text: &str,
+    retained: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut report = open_new_output(path)
+        .map_err(|e| format!("Offline relink report could not be created: {e}"))?;
+    retained.push(path.to_owned());
+    report.write_all(text.as_bytes())
+        .map_err(|e| format!("Partial offline relink report retained at {}: {e}", path.display()))
 }
 
 pub(crate) struct SnapshotWriteError {

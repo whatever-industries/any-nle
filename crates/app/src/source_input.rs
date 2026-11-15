@@ -1,37 +1,60 @@
 //! Revision pins are computed with bounded streaming I/O. The original bin stays in place.
 use avid_reader::source::SourceInput;
+use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OriginalStamp {
+    pub(crate) path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+}
+
+pub(crate) fn original_stamp(path: &Path) -> Result<OriginalStamp, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{}: original is not a file", path.display()));
+    }
+    Ok(OriginalStamp {
+        path: path.into(),
+        len: metadata.len(),
+        modified: metadata.modified().map_err(|e| e.to_string())?,
+    })
+}
+
+pub(crate) fn recheck_originals(originals: &[OriginalStamp]) -> Result<(), String> {
+    for old in originals {
+        if &original_stamp(&old.path)? != old {
+            return Err(format!("Original media changed after pre-flight: {}", old.path.display()));
+        }
+    }
+    Ok(())
+}
 
 fn revision(path: &Path) -> Result<String, String> {
-    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    prproj::hash::sha256_reader(BufReader::with_capacity(64 << 10, file))
-        .map(|h| prproj::hash::hex(&h))
-        .map_err(|e| format!("{}: {e}", path.display()))
+    checked_revision(path, &mut || Ok(()))
 }
 /// Streaming revision reads remain cancellable without buffering a whole media file.
 fn checked_revision(
     path: &Path,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<String, String> {
-    struct Checked<'a> {
-        file: BufReader<File>,
-        check: &'a mut dyn FnMut() -> Result<(), String>,
-    }
-    impl std::io::Read for Checked<'_> {
-        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-            (self.check)().map_err(std::io::Error::other)?;
-            std::io::Read::read(&mut self.file, b)
+    let io_error = |e| format!("{}: {e}", path.display());
+    let mut file = File::open(path).map_err(io_error)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 << 10];
+    loop {
+        check().map_err(|e| format!("{}: {e}", path.display()))?;
+        match file.read(&mut buffer) {
+            Ok(0) => return Ok(prproj::hash::hex(&hash.finalize())),
+            Ok(n) => hash.update(&buffer[..n]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(io_error(e)),
         }
     }
-    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    prproj::hash::sha256_reader(Checked {
-        file: BufReader::with_capacity(64 << 10, file),
-        check,
-    })
-    .map(|h| prproj::hash::hex(&h))
-    .map_err(|e| format!("{}: {e}", path.display()))
 }
 pub fn pin_checked(
     paths: &[PathBuf],
@@ -85,15 +108,40 @@ pub fn recheck(inputs: &[SourceInput]) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
-    fn changed_bin_refuses_and_original_is_not_written() {
-        let path = std::env::temp_dir().join(format!(
-            "anynle-source-pin-{}-{}",
+    fn revision_matches_existing_digest_and_can_cancel_between_chunks() {
+        let path = tempfile_path("streaming");
+        let data: Vec<u8> = (0..((64 << 10) + 33)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let expected = prproj::hash::hex(&prproj::hash::sha256(&data));
+        assert_eq!(revision(&path).unwrap(), expected);
+        let mut calls = 0;
+        let result = pin_checked(std::slice::from_ref(&path), &mut || {
+            calls += 1;
+            if calls == 2 {
+                Err("cancelled test".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.unwrap_err().contains("cancelled test"));
+        assert_eq!(calls, 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    fn tempfile_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "anynle-source-pin-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+    }
+
+    #[test]
+    fn changed_bin_refuses_and_original_is_not_written() {
+        let path = tempfile_path("changed-bin");
         std::fs::write(&path, b"first").unwrap();
         let inputs = pin(&[path.clone()]).unwrap();
         recheck(&inputs).unwrap();

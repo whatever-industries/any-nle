@@ -1,5 +1,10 @@
 # Shared effect contracts for Premiere and Resolve
 
+This is the initial cross-editor audit. The [timeline and effects roadmap](ROADMAP.md#timeline-and-effects)
+tracks later qualifications, including ordered chains. Use the
+[Resolve priorities](ROADMAP.md#general-conversion-priorities-from-the-pinned-references)
+for current destination work.
+
 This audit compares Avid source interpretation and Premiere output with the
 Resolve controls each mapping needs. Resolve's qualified static position,
 scale, crop, isolated reflections and bounded Linear motion are described in the

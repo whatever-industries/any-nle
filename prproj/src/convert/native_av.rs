@@ -416,7 +416,13 @@ fn add_av_master(
         set_subclip_bounds(project, e, boundaries)?;
         sources.push(project.register(e)?);
     }
-    let gs = groups(clip)?;
+    // Reusable A/V subclips have two saved mono lanes. The backing master
+    // can also have a stereo view for an unrelated edit in the same sequence.
+    let gs = if subclip.is_some() {
+        super::combined::combined_order(clip)?.into_iter().map(|i| vec![i]).collect()
+    } else {
+        groups(clip)?
+    };
     let ordinal = |i: usize| {
         clip.audio
             .iter()
@@ -609,7 +615,8 @@ pub fn place_audio(
         .doc
         .tree
         .findall(groups, "ClipChannelVectors/ClipChannelVectorItem")?;
-    let vector = project.doc.resolve(vectors[group])?;
+    let vector = project.doc.resolve(*vectors.get(group)
+        .ok_or_else(|| invalid("group outside master channel vectors"))?)?;
     let members = project
         .doc
         .tree

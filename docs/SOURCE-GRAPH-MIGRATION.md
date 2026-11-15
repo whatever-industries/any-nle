@@ -34,6 +34,23 @@ from a bounded native archive profile. Its saved Resolve clocks and channel
 selectors retain their own provenance. Product route qualification remains
 separate from the source adapter.
 
+## Avid source ColorAdapter ownership
+
+The physical picture source's saved input transform remains in the item's
+`avid.source.input_color_transforms` receipt. A top-level 24 fps
+`EFF2_LUTSFX` edit with one full-span picture input can carry a separate
+`color_adapter` record in the owning sequence's `avid.source.unresolved`
+receipt. It retains the exact edit-side text, input master and track, and
+saved source in-point. When that text matches the directly referenced
+picture source and the wrapper resolves to one placement over the same
+range, the record names the picture file package and that placement.
+A missing or contradictory source match retains its reason and a null
+placement. A plain edit of the same master has no ColorAdapter record.
+
+The source receipt leaves color-space and cube asset qualification to
+destination preparation. The conversion continues to report the omitted
+appearance. [Premiere comparison](ROADMAP.md#edit-fidelity-and-metadata)
+
 ## Avid timeline track declarations and names
 
 Graph/2 stores qualified Avid track names on `sequences[].tracks[]`, keyed
@@ -169,6 +186,44 @@ matched all 24 AAF picture frames. Under default center pan, A2 matched all
 48,048 samples and A1 differed by at most one PCM24 count per output
 channel. Separate files mode requires two siblings of the same bit depth.
 
+The direct CLI also uses the reusable subclip writer for saved subclips
+in Separate files mode when the media comes from `--media`. The retained
+unmarked and source-marked A/V controls produce the same projects as the
+previous explicit `--link-originals` command and the saved job.
+
+A backing marker wholly outside a reusable A/V subclip stays on the
+backing master. A range that ends at In or starts at Out is outside. A
+point at In is inside, and Out is exclusive. The writer can still copy
+one contained V1 marker, and a crossing range still triggers the reported
+fallback. An independently owned edit marker can use the sequence
+fallback while all three timeline lanes keep their shared subclip
+reference. This applies when the subclip has no source marker or all
+resolved edit marker starts differ from the copied source marker start.
+The two boundary-range AVBs are
+derived from the retained native control. Both CLI and saved-job
+projects preserve the trims, selectors, and marker ownership. Premiere
+27 converted both CLI projects to its native format and reopened them.
+The native saves retain all three references to the same reusable
+subclip and the exact range on the backing picture.
+CONV-0187
+
+The distinct-start control keeps the source marker at file frames
+[10, 13) and the independent edit marker at sequence frames [8, 11).
+Premiere 27 reopened the native copy with both ranges and one subclip
+referenced by V1, A1, and A2. The report identifies the marker moved to
+the sequence. The seeded control with matching source starts still
+uses the existing edit marker preference.
+CONV-0188
+
+When multiple selected bins contain the same native backing master,
+subclip preparation uses the unique matching occurrence in the
+subclip's own bin. This keeps that bin's marker and logging data.
+Without a local match, the backing identity must resolve uniquely
+across the selection. Two different matches within the same bin
+still produce a scoped loss. The five-bin macOS replay retained
+the marked subclip and all 13 other sequences after Premiere 27
+reopen. CONV-0189
+
 ## Trimmed Avid Submaster nests
 
 Avid Collapse saves the picture inputs inside the parent’s Submaster.
@@ -187,6 +242,10 @@ child’s display timecode separate from both trims. The native control
 timeline remains separate because the AVB does not link it to the inline
 Submaster.
 
+For managed Submasters, the direct CLI can use `--media` by itself. It
+preserves the same editable children as the explicit `--link-originals`
+command and saved jobs.
+
 After Save As and reopen in Premiere 27, the head-trimmed CLI and saved-job
 projects match all 29 linked AAF picture frames. The two isolated mono
 lanes cover 58,058 samples each. A2 matches exactly, and A1 differs by
@@ -195,6 +254,148 @@ the nest two frames into the sequence also retains its later child clock.
 The qualified profile covers same-rate online 1080p23.976 direct managed
 picture. Other Submaster shapes keep the existing conversion behavior and
 report a flattened boundary where the picture edit survives.
+
+A resolved V1 review marker can stay on the parent sequence while the
+Submaster stays editable. This also covers a saved edit marker that matches
+an inherited source marker. In the derived head-trimmed test, Premiere 27
+Save As and reopen retained the parent range at record frames [6, 10) and
+the source range at file frames [13, 17) on the picture inside the child.
+Both mono edits still link directly to their original MXFs. A graph
+round trip also preserves the editable Submaster when a marker with a
+confirmed picture owner moves to the parent because its source
+position falls between Premiere ticks. Its full record range must
+fit inside the prepared edit. A marker with unresolved ownership uses
+the flattening fallback.
+
+The parent can also place a plain Submaster above V1. In the derived
+V5 control, the parent uses one editable child over record frames [0, 28).
+The child reads file frames [7, 35) on its own V1. The lower picture and
+two mono edits remain on the parent for all 29 frames. The V5 review
+range stays on the parent at [6, 10), and the report identifies V5.
+The CLI and saved job agree, and the V1 control is byte-identical to
+the previous converter output. Premiere 27 reopened the V5 edit in
+the combined wizard project. All 29 picture frames match the flat
+control, including the last frame, where V5 has ended and V1 shows
+through. This profile uses one neutral picture input. See
+`CONV-0167` and `CONV-0182` in the evidence ledger.
+
+Separate files also prepares a plain Submaster at exact 24 fps from
+verified 1080p DNxHD LB picture with a zero file origin and two PCM16
+mono siblings. The saved parent TC1 must agree with the prepared
+sequence start. In the derived control, the parent places the child
+at [56, 84), the child starts at 01:00:02:08, and its picture uses
+file frames [21, 49). Only the parent picture reads from child frame
+zero. The coincident mono edits keep distinct source trims, [22, 50)
+on A1 and [21, 49) on A2. Both entry points and Premiere 27 build 88
+Save As and reopen agree on the parent, child, and audio edits. A
+render against the reopened flat Premiere control matches all 196
+picture frames. The full mix and isolated A1, A2, and A3 each match
+392,000 PCM24 samples per output channel under the same pan settings.
+See `CONV-0169` and `CONV-0184` in the evidence ledger.
+
+### Layered Submaster inputs
+
+Graph/2 retains the ordered input tracks of a layered Submaster.
+Its `avid.source` receipt records the
+timeline occurrence, qualified record span, input count, and up to
+32 input tracks. Each input keeps its saved track index, component
+class, and the class and effect ID of its direct or sole nonempty
+segment when available. A same-rate picture input with one saved source
+clip and optional filler also carries the referenced MOB and track,
+the saved source in-point, and the clip's offset and duration on the
+input's own clock. The capture verifies the full input length against
+the effect, including leading and trailing filler. For plain layers,
+the adapter also records the selected graph item. A unique copy in the
+sequence's bin takes precedence. If the bin has no copy, the adapter
+can use a unique copy from another selected bin. The Premiere writer
+checks the full MOB ID and qualifies the item's media before writing.
+An unresolved item or unsupported composite stays a reported omission.
+Older graph receipts without an item binding still require a unique
+master across the selected bins.
+
+The retained two-layer Collapse comparison saves three inputs in
+order. The first is filler, the second is a plain source, and the
+third is a Picture-in-Picture effect. Two of the saved occurrences
+retain a qualified 48-frame interval at 24 fps. In all three copies the
+plain layer reads saved source frames [48, 96) at local frames [0, 48).
+The variant wrapped inside another effect still has unresolved parent
+record timing. The original and collapsed Avid TIFFs match for the
+returned frame. The Picture-in-Picture composite remains unsupported.
+CONV-0186
+
+Separate files writes an editable Premiere nest for the bounded
+23.976 and exact 24 fps profiles with two plain 1080p picture layers, a full lower
+layer, a verified upper-layer range, and an exact parent clock. Each
+source must resolve to a verified managed DNx picture with the matching
+original media. The writer retains the child V1 and V2 ranges and
+keeps the parent's mono edits independent. Direct CLI and saved jobs
+produced the same structure from the derived 28-frame AVB. The lower
+picture occupies [0, 28) and the upper [4, 23). Other controls and
+uncertain media or picture overlaps stay outside the profile.
+
+The exact 24 fps profile uses the verified zero-origin DNxHD LB and
+PCM16 package. The saved sequence TC1 must match the converted parent
+origin. A derived 24 fps control recovered the V1 gap at record frames
+[56, 84) as an editable nest. Inside it, V1 covers [0, 28) from source
+[21, 49) and V2 covers [4, 23) from source [29, 48). The direct CLI and
+saved job agree on the parent and child display clocks and all 12
+parent audio placements, including the stereo combiner on A3. The
+saved source selection matches the flat control for all 196 frames.
+A different framing record stays a reported omission. Native
+playback and the linked AAF comparison remain pending.
+
+The two-bin control selects the same saved picture master under two
+different names. Both bin orders bind the layered edit to the item in
+its own bin. The direct CLI and saved job produce matching child tracks
+and source ranges. At 23.976, copies of a layered DNxHD LB/PCM24 source
+can share the direct link when the full master ID, complete picture
+and audio package, and verified file clocks agree.
+
+The writer evaluates each occurrence in the sequence independently.
+In the derived three-occurrence control, both CLI and saved jobs wrote
+the first two nests with distinct upper source trims and preserved the
+parent clocks and mono edits. The third occurrence stays a reported
+loss because its upper trim extends past the linked file. An overlap
+or an unresolved picture span on the same track blocks that placement.
+
+Known record ranges let a layered Submaster share a track with
+separate marked edits, graphics and dissolves. In a derived AVB, the
+28-frame nest stayed editable and the next cut kept its one-frame
+range as a clip marker in both the CLI and job outputs. The structural
+control also preserves a separate dissolve and title. When a title
+overlaps a nest on the same track, the converter reports the affected
+nest as an omission.
+
+An exact marker on the outer Submaster can travel with the nest when
+its saved local and record positions place its start inside the effect.
+Premiere keeps the full marker range, text and color on the parent
+sequence and reports the ownership change. In the derived 24 fps
+control, both entry points preserve the nest at frames [56,84) and the
+marker at [81,87), three frames into the next cut. A marker on an inner
+component or one that starts outside its saved owner still blocks the
+nest.
+
+The same ownership check covers a range continuing into a second
+qualified Submaster. A derived 23.976 AVB keeps nests over [0,28) and
+[29,57), the one-frame cut between them, and the full marker [25,33) on
+the parent. Neither the marker range nor the recovered first nest
+clears the separate source-overrun report for the third occurrence.
+
+Premiere 27.0.0 build 88 saved and reopened the derived 23.976 control.
+The parent kept the full blue range, both nests and the intervening cut.
+The saved child ranges, channel assignments and nine media paths match
+the generated project, and Premiere reported zero offline items.
+All 57 picture frames exported from the reopened timeline match the
+unmarked companion pixel for pixel, including both sides of the cut.
+This isolates the marker change; the flat picture reference, a native
+Avid Collapse and its linked AAF remain separate comparisons.
+
+For the native layered control, use two linked picture clips
+with different trims on V1 and V2. Leave a gap before and after V2 so
+both inputs are visible over the preserved span. Keep parent audio
+separate and use no inner effect. Verify both child tracks and render
+through the V2 coverage changes and after trimming the parent. This
+test isolates the child track layout before introducing PIP controls.
 
 ## Static Avid Corner Pin
 
@@ -395,7 +596,10 @@ origin-correction interface; a future slice needs its own qualification.
 Markers retain owner-local position/rate and occurrence bindings in the source.
 Only a qualified transform yields portable record time. Unsupported marker timing
 is a scoped loss. A known record marker whose edit ownership is removed by trimming
-moves to the sequence with an ownership-loss report. Master clip markers carry
+moves to the sequence with an ownership-loss report. The same fallback keeps the
+exact record range when the edit marker's source position cannot be expressed in
+Premiere ticks. A graph round trip verifies the written sequence range and loss
+report using a derived source time. Master clip markers carry
 their saved track. Older graph/2 files can recover the track from their native
 marker receipt. Inheritance requires matching duration, content and creation
 stamp on the same source track at the exact source time. Unqualified retimed

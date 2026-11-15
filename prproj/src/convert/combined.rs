@@ -118,6 +118,28 @@ fn tag_copy(project: &mut Project, copy: ItemId, merged_name: &str, bag: &[(&str
     Ok(())
 }
 
+pub(super) fn tag_merged_picture(
+    project: &mut Project,
+    picture: ItemId,
+    merged_name: &str,
+    original_name: &str,
+) -> Result<()> {
+    tag_copy(project, picture, merged_name, &[("MZ.MergeClipUtils.ComponentMasterClipOriginalName", original_name)])
+}
+
+pub(super) fn tag_merged_audio(
+    project: &mut Project,
+    audio: ItemId,
+    merged_name: &str,
+    original_name: &str,
+    index: usize,
+) -> Result<()> {
+    tag_copy(project, audio, merged_name, &[
+        ("MZ.MergeClipUtils.AudioTrackNumberFromOriginalMergedClip", &index.to_string()),
+        ("MZ.MergeClipUtils.ComponentMasterClipOriginalName", original_name),
+    ])
+}
+
 /// `create_merged`: `audio_items` must already be in combined order (see [`combined_order`]).
 /// Returns `(merged_item, video_copy, audio_copies)`: in a sequence, Premiere places a merged
 /// clip as its component copies, linked (PRPROJ-0011 placements).
@@ -154,19 +176,10 @@ pub fn create_merged(
     project.import_target = previous;
     let (video_copy, audio_copies) = copies?;
     let video_name = project.item_name(video_item);
-    tag_copy(project, video_copy, merged_name, &[("MZ.MergeClipUtils.ComponentMasterClipOriginalName", &video_name)])?;
+    tag_merged_picture(project, video_copy, merged_name, &video_name)?;
     for (index, (&source, &copy)) in audio_items.iter().zip(&audio_copies).enumerate() {
         let source_name = project.item_name(source);
-        let index = index.to_string();
-        tag_copy(
-            project,
-            copy,
-            merged_name,
-            &[
-                ("MZ.MergeClipUtils.AudioTrackNumberFromOriginalMergedClip", &index),
-                ("MZ.MergeClipUtils.ComponentMasterClipOriginalName", &source_name),
-            ],
-        )?;
+        tag_merged_audio(project, copy, merged_name, &source_name, index)?;
     }
     // Qualified direct parts already reference the same Media objects. Replacing
     // their state with hash references would erase the only copy of each payload.
@@ -258,6 +271,10 @@ pub fn create_merged(
     );
     let sequence_element = project.doc.attach_object(e)?;
     let sequence = project.parse_sequence(sequence_element)?;
+    // This hidden sequence owns the reusable bin item's displayed source clock.
+    if let Some(start) = media.direct_combined_display_start(&video.path) {
+        project.set_zero_point(sequence, Time::new(start))?;
+    }
 
     let video_track = project.video_tracks(sequence)[0];
     let video_placed = project.add_clip(video_track, video_copy, Time::new(0), ids)?;
@@ -452,6 +469,11 @@ pub(crate) fn create_grouped_with_media(
         return Err(other("KeyError: multicam template is missing its core objects"));
     };
     let sequence = project.parse_sequence(sequence_element)?;
+    if let Some(start) = clip.video.as_ref()
+        .and_then(|video| media?.direct_combined_display_start(&video.path))
+    {
+        project.set_zero_point(sequence, Time::new(start))?;
+    }
     if let Some(video_item) = video_item {
         let track = project.video_tracks(sequence)[0];
         let placed = project.add_clip(track, video_item, Time::new(0), ids)?;

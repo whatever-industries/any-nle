@@ -277,6 +277,28 @@ fn prefix_name(item: &mut String, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Saved QuickTime PCM caches include both an epoch and a calendar string.
+/// Store the calendar string in UTC to avoid locale-dependent output.
+fn resolve_file_stamp(seconds: u64) -> Result<String> {
+    if seconds > 253402300799 {
+        return Err("Resolve media timestamp outside the representable calendar".into());
+    }
+    let days = (seconds / 86400) as i64;
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let weekday = ["Thu","Fri","Sat","Sun","Mon","Tue","Wed"][days as usize % 7];
+    let month = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][(month-1) as usize];
+    Ok(format!("{weekday} {month} {day:2} {:02}:{:02}:{:02} {year:04}",
+        seconds / 3600 % 24, seconds / 60 % 60, seconds % 60))
+}
+
 fn clip_cache(media: &Media, codec: &[u8], video: bool) -> Result<String> {
     let folder = utf8_path(media.path.parent().ok_or("missing linked media parent")?)?;
     let file = media
@@ -287,13 +309,20 @@ fn clip_cache(media: &Media, codec: &[u8], video: bool) -> Result<String> {
     let mut data = Vec::new();
     pb_bytes(1, folder.as_bytes(), &mut data);
     pb_bytes(2, file.as_bytes(), &mut data);
+    let embedded_pcm = matches!(media.profile,Profile::Mov {pcm:Some(_),..});
+    let mono_atom = matches!(media.profile, Profile::MonoAtom { .. });
+    if embedded_pcm || mono_atom {
+        pb_bytes(3, resolve_file_stamp(media.modified_micros / 1_000_000)?.as_bytes(), &mut data);
+    }
     pb_bytes(5, codec, &mut data);
     if video {
         pb_bytes(6, file.as_bytes(), &mut data);
         pb_bytes(7, uid().as_bytes(), &mut data);
     }
     pb_int(13, media.modified_micros, &mut data);
-    if matches!(
+    if embedded_pcm && video {
+        pb_int(14, 244, &mut data);
+    } else if matches!(
         media.profile,
         Profile::Mov {
             quicktime_timecode: false,
@@ -307,7 +336,9 @@ fn clip_cache(media: &Media, codec: &[u8], video: bool) -> Result<String> {
     pb_int(16, 100, &mut data);
     pb_int(
         18,
-        if video || codec == b"AAC" {
+        if mono_atom {
+            16388
+        } else if video || codec == b"AAC" || embedded_pcm {
             16384
         } else {
             32768
@@ -317,27 +348,37 @@ fn clip_cache(media: &Media, codec: &[u8], video: bool) -> Result<String> {
     pack(&data)
 }
 
-fn embedded_aac(item: &mut String, source: &str, media: &Media, frames: i64) -> Result<()> {
+fn embedded_audio(item: &mut String, source: &str, media: &Media, frames: i64, rate: Rational, pcm: Option<i64>) -> Result<()> {
     let donor = named(source, "Sm2MpAudioClip", "Signals-24.wav")?;
     let base = block(&donor, "BtAudioInfo")?;
     let id = uid();
-    let samples = frames * 2000;
-    let track = qt(&[
-        ("UniqueId", Text(&uid())),
-        ("StartTime", Double(0.0)),
+    let samples = frames * samples_per_frame(rate);
+    let (codec, depth) = match pcm { Some(16) => ("Linear PCM",1), Some(24) => ("Linear PCM",2), _ => ("AAC",3) };
+    let start = match &media.profile {
+        Profile::Mov { avid_source_timecode: Some(start), .. } if pcm.is_some() => *start as f64 / fps(rate),
+        _ => 0.0,
+    };
+    let track_id = uid();
+    let mut track = vec![
+        ("UniqueId", Text(&track_id)),
+        ("StartTime", Double(start)),
         ("SampleRate", Uint(48000)),
         ("NumChannels", Int(2)),
         ("IdxTrack", Int(0)),
         ("Duration", Long(samples)),
         ("DbType", Text("BtAudioTrack")),
-        ("CodecName", Text("AAC")),
-        ("ChannelLayout", Int(2)),
-        ("BitDepth", Uint(3)),
-    ]);
+        ("CodecName", Text(codec)),
+        ("BitDepth", Uint(depth)),
+    ];
+    if pcm.is_none() {
+        // Preserve the established AVC/AAC field order.
+        track.insert(track.len()-1, ("ChannelLayout", Int(2)));
+    }
+    let track = qt(&track);
     let audio = bind_audio(
         &base,
         &id,
-        &clip_cache(media, b"AAC", false)?,
+        &clip_cache(media, codec.as_bytes(), false)?,
         &qt(&[("0", Bytes(&track))]),
     )?;
     container_field(
@@ -355,13 +396,17 @@ fn embedded_aac(item: &mut String, source: &str, media: &Media, frames: i64) -> 
     let left = qt(&[("MediaRef", Text(&id))]);
     let right = qt(&[("MediaRef", Text(&id)), ("ChannelIdx", Int(1))]);
     let channels = qt(&[("1", Bytes(&right)), ("0", Bytes(&left))]);
-    let range = extent(0.0, samples as f64 / 48000.0);
-    let route = qt(&[
+    let range = extent(start, samples as f64 / 48000.0);
+    let mut route = vec![
         ("Type", Uint(0)),
         ("MediaExtents", Bytes(&range)),
-        ("CodecName", Text("AAC")),
+        ("CodecName", Text(codec)),
         ("ChannelVecBA", Bytes(&channels)),
-    ]);
+    ];
+    if pcm.is_some() {
+        route.push(("BitDepth",Uint(depth)));
+    }
+    let route = qt(&route);
     let routes = qt(&[("0", Bytes(&route))]);
     replace_fields(item, |data| {
         replace_bytes(&data, 1, |a| {
@@ -416,6 +461,8 @@ fn pool_item(
             );
             named(source, "Sm2MpAudioClip", &name)?
         }
+        Profile::MonoAtom { bits, .. } =>
+            named(source, "Sm2MpAudioClip", &format!("Mono-{bits}.wav"))?,
         Profile::Atom(binding) => {
             let donor = atom_donor.ok_or("missing split MXF template")?;
             let id = uid();
@@ -438,6 +485,8 @@ fn pool_item(
             tagged_rec709,
             h264,
             aac,
+            pcm,
+            avid_source_timecode,
             ..
         } => {
             let old = block(&item, "BtVideoInfo")?;
@@ -447,14 +496,20 @@ fn pool_item(
                 "Clip",
                 &clip_cache(media, if *h264 { b"avc1" } else { b"apch" }, true)?,
             )?;
-            let timing = qt(&[
-                ("UniqueId", Text(&uid())),
+            let timing_id = uid();
+            let frame_rate = rate_bytes(*rate);
+            let mut timing = vec![
+                ("UniqueId", Text(&timing_id)),
                 ("StartFrame", Int(0)),
                 ("NumFrames", Int(i32::try_from(*frames)?)),
-                ("FrameRate", Bytes(&rate_bytes(*rate))),
-                ("DbType", Text("BtVideoTime")),
-            ]);
-            set(&mut video, "Time", &hex::encode(timing))?;
+                ("FrameRate", Bytes(&frame_rate)),
+            ];
+            let timecode = avid_source_timecode.map(crate::linked::non_drop_24);
+            if let Some(timecode) = &timecode {
+                timing.push(("Timecode", Text(timecode)));
+            }
+            timing.push(("DbType", Text("BtVideoTime")));
+            set(&mut video, "Time", &hex::encode(qt(&timing)))?;
             if *h264 {
                 let mut resolution = [0; 16];
                 resolution[..8].copy_from_slice(&1920u64.to_be_bytes());
@@ -484,76 +539,111 @@ fn pool_item(
             ]);
             set(&mut video, "VideoMetadata", &hex::encode(metadata))?;
             replace_once(&mut item, &old, &video)?;
-            if *aac {
-                embedded_aac(&mut item, source, media, *frames)?;
+            if *aac || pcm.is_some() {
+                embedded_audio(&mut item, source, media, *frames, *rate, *pcm)?;
+            }
+            if let Some(proxy) = &media.proxy {
+                let proxy_cache = super::proxy_cache::build(proxy)?;
+                replace_fields(&mut item, |data| crate::binary::rewrite_bytes(&data,2,|old| {
+                    if old.is_some() { return Err("unexpected proxy in Resolve media skeleton".into()); }
+                    Ok(Some(proxy_cache))
+                }))?;
             }
         }
         Profile::Wav {
             samples,
             bits,
             channels,
-        } => {
-            let old = block(&item, "BtAudioInfo")?;
-            let mut audio = old.clone();
-            let audio_id = dbid(&audio)?.to_owned();
-            let depth = if *bits == 16 { 1 } else { 2 };
-            set(
-                &mut audio,
-                "Clip",
-                &clip_cache(media, b"Linear PCM", false)?,
-            )?;
-            let mut track = vec![
-                ("UniqueId", Text(&audio_id)),
-                ("StartTime", Double(0.0)),
-                ("SampleRate", Uint(48000)),
-                ("NumChannels", Int(*channels as i32)),
-                ("IdxTrack", Int(0)),
-                ("Duration", Long(*samples)),
-                ("DbType", Text("BtAudioTrack")),
-                ("CodecName", Text("Linear PCM")),
-            ];
-            if depth == 2 {
-                track.push(("ChannelLayout", Int(*channels as i32)));
-            }
-            track.push(("BitDepth", Uint(depth)));
-            set(
-                &mut audio,
-                "TracksBA",
-                &hex::encode(qt(&[("0", Bytes(&qt(&track)))])),
-            )?;
-            replace_once(&mut item, &old, &audio)?;
-            let left = qt(&[("MediaRef", Text(&audio_id))]);
-            let right = qt(&[("MediaRef", Text(&audio_id)), ("ChannelIdx", Int(1))]);
-            let channels_map = if *channels == 2 {
-                qt(&[("1", Bytes(&right)), ("0", Bytes(&left))])
-            } else {
-                qt(&[("0", Bytes(&left))])
-            };
-            let bounds = extent(0.0, *samples as f64 / 48000.0);
-            let mut route = Vec::new();
-            if *channels == 2 {
-                route.push(("Type", Uint(0)));
-            }
-            route.extend([
-                ("MediaExtents", Bytes(&bounds)),
-                ("CodecName", Text("Linear PCM")),
-                ("ChannelVecBA", Bytes(&channels_map)),
-                ("BitDepth", Uint(depth)),
+        } => standalone_audio(&mut item, media, project_rate, *samples, *bits, *channels, None)?,
+        Profile::MonoAtom { frames, bits, start, package, material } => {
+            let identity = qt(&[
+                ("tapeMobId", Bytes(&[0; 32])),
+                ("sourceMobId", Bytes(package)),
+                ("masterMobId", Bytes(material)),
             ]);
-            let routes = qt(&[("0", Bytes(&qt(&route)))]);
-            replace_fields(&mut item, |data| {
-                let with_routes =
-                    replace_bytes(&data, 1, |outer| replace_bytes(outer, 5, |_| Ok(routes)))?;
-                replace_bytes(&with_routes, 2, |_| {
-                    let mut clock = vec![9];
-                    clock.extend_from_slice(&fps(project_rate).to_le_bytes());
-                    Ok(clock)
-                })
-            })?;
+            set(&mut item, "VirtualAudioTracksBA", "")?;
+            standalone_audio(
+                &mut item, media, project_rate, frames * samples_per_frame(project_rate),
+                *bits, 1, Some((seconds(*start), &identity)),
+            )?;
         }
         Profile::Atom(_) => return Err("unexpected split MXF template profile".into()),
     }
     Ok((id, item))
+}
+
+fn standalone_audio(
+    item: &mut String,
+    media: &Media,
+    project_rate: Rational,
+    samples: i64,
+    bits: i64,
+    channels: i64,
+    atom: Option<(f64, &[u8])>,
+) -> Result<()> {
+    let start = atom.map_or(0.0, |(start, _)| start);
+    let old = block(item, "BtAudioInfo")?;
+    let mut audio = old.clone();
+    let audio_id = dbid(&audio)?.to_owned();
+    let depth = if bits == 16 { 1 } else { 2 };
+    set(
+        &mut audio,
+        "Clip",
+        &clip_cache(media, b"Linear PCM", false)?,
+    )?;
+    let mut track = vec![
+        ("UniqueId", Text(&audio_id)),
+        ("StartTime", Double(start)),
+        ("SampleRate", Uint(48000)),
+        ("NumChannels", Int(channels as i32)),
+    ];
+    if let Some((_, identity)) = atom {
+        track.push(("MXFMetadata", Bytes(identity)));
+    }
+    track.extend([
+        ("IdxTrack", Int(0)),
+        ("Duration", Long(samples)),
+        ("DbType", Text("BtAudioTrack")),
+        ("CodecName", Text("Linear PCM")),
+    ]);
+    if depth == 2 && atom.is_none() {
+        track.push(("ChannelLayout", Int(channels as i32)));
+    }
+    track.push(("BitDepth", Uint(depth)));
+    set(
+        &mut audio,
+        "TracksBA",
+        &hex::encode(qt(&[("0", Bytes(&qt(&track)))])),
+    )?;
+    replace_once(item, &old, &audio)?;
+    let left = qt(&[("MediaRef", Text(&audio_id))]);
+    let right = qt(&[("MediaRef", Text(&audio_id)), ("ChannelIdx", Int(1))]);
+    let channels_map = if channels == 2 {
+        qt(&[("1", Bytes(&right)), ("0", Bytes(&left))])
+    } else {
+        qt(&[("0", Bytes(&left))])
+    };
+    let bounds = extent(start, samples as f64 / 48000.0);
+    let mut route = Vec::new();
+    if channels == 2 {
+        route.push(("Type", Uint(0)));
+    }
+    route.extend([
+        ("MediaExtents", Bytes(&bounds)),
+        ("CodecName", Text("Linear PCM")),
+        ("ChannelVecBA", Bytes(&channels_map)),
+        ("BitDepth", Uint(depth)),
+    ]);
+    let routes = qt(&[("0", Bytes(&qt(&route)))]);
+    replace_fields(item, |data| {
+        let with_routes =
+            replace_bytes(&data, 1, |outer| replace_bytes(outer, 5, |_| Ok(routes)))?;
+        replace_bytes(&with_routes, 2, |_| {
+            let mut clock = vec![9];
+            clock.extend_from_slice(&fps(project_rate).to_le_bytes());
+            Ok(clock)
+        })
+    })
 }
 
 fn sequence_fields(sequence: &str) -> Result<String> {
@@ -733,9 +823,18 @@ fn write_timeline(
                 _ => None,
             };
             let end = match &source.profile {
-                Profile::Mov { frames, .. } => (frames - 1) as f64 / fps(rate),
+                Profile::Mov { frames, avid_source_timecode, .. } => {
+                    if let Some(start) = avid_source_timecode {
+                        set(&mut clip, "MediaStartTime", &(*start as f64 / fps(rate)).to_string())?;
+                    }
+                    (frames - 1) as f64 / fps(rate)
+                }
                 Profile::Wav { samples, .. } => {
                     (samples - samples_per_frame(rate)) as f64 / 48000.0
+                }
+                Profile::MonoAtom { frames, start, .. } => {
+                    set(&mut clip, "MediaStartTime", &seconds(*start).to_string())?;
+                    seconds(frames - 1)
                 }
                 Profile::Atom(binding) => {
                     set(
@@ -1317,14 +1416,63 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
         }
     }
     for (media, id) in p.media.iter().zip(&ids.media) {
+        if let Profile::MonoAtom { frames, bits, start, package, material } = &media.profile {
+            let stream_id = format!("{id}/audio/1");
+            let item = graph.items.iter().find(|item| item.id == *id)
+                .ok_or("generated mono MXF item absent")?;
+            let stream = graph.media.iter().find(|stream| stream.id == stream_id)
+                .ok_or("generated mono MXF stream absent")?;
+            let saved = graph.sidecar("resolve.source", &stream_id)
+                .ok_or("generated mono MXF file receipt absent")?;
+            if item.umid.as_deref() != Some(&hex::encode_upper(material))
+                || item.media.len() != 1 || item.media[0].media != stream_id
+                || stream.locations.as_slice() != [utf8_path(&media.path)?]
+                || stream.sample_rate != Some(48000) || stream.bits != Some(*bits)
+                || stream.start != Rational::new(i128::from(*start) * 1001, 24000)
+                || Some(stream.duration) != Rational::new(i128::from(*frames) * 1001, 24000)
+                || saved.get("saved_file_package") != Some(&Value::Str(hex::encode_upper(package)))
+                || saved.get("saved_selector") != Some(&Value::Int(0))
+                || saved.get("saved_channel") != Some(&Value::Int(0))
+                || saved.get("saved_cache_track") != Some(&Value::Int(0))
+            {
+                return Err("generated Resolve mono MXF identity, clock or selector differs from preparation".into());
+            }
+        }
+        if let Some(proxy) = &media.proxy {
+            let saved = graph.sidecar("resolve.proxy",id).ok_or("generated proxy absent")?;
+            if saved.get("path") != Some(&Value::Str(utf8_path(&proxy.path)?.into()))
+                || saved.get("frames") != Some(&Value::Int(proxy.frames))
+                || saved.get("start") != Some(&Value::Int(proxy.start))
+                || saved.get("rate") != Some(&Value::Str(proxy.rate.to_string()))
+                || saved.get("audio_bits") != Some(&proxy.bits.map(Value::Int).unwrap_or(Value::Null))
+            {
+                return Err("generated Resolve proxy locator, extent or PCM assignment disagrees".into());
+            }
+        }
+        if let Profile::Mov { avid_source_timecode: Some(start), rate, frames, .. } = &media.profile {
+            let file = utf8_path(&media.path)?;
+            let source = graph.media.iter().find(|source| source.id == format!("{id}/video"))
+                .ok_or("generated camera-original video stream absent")?;
+            if source.locations.as_slice() != [file]
+                || source.codec.as_deref() != Some("apch")
+                || source.rate != Some(*rate)
+                || Some(source.duration) != Rational::new(i128::from(*frames) * i128::from(rate.den()), rate.num().into())
+                || source.start != Rational::new(i128::from(*start) * i128::from(rate.den()), rate.num().into())
+                || source.clock.as_ref().is_none_or(|clock| clock.effective_count != *start as u64)
+            {
+                return Err("generated camera-original locator, source timecode or extent differs from preparation".into());
+            }
+        }
         if let Profile::Mov {
-            h264: true,
+            h264,
             rate,
             frames,
             aac,
+            pcm,
             ..
         } = &media.profile
         {
+            if !*h264 && pcm.is_none() { continue; }
             let item = graph
                 .items
                 .iter()
@@ -1336,11 +1484,11 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             )
             .ok_or("generated AVC duration overflow")?;
             let file = utf8_path(&media.path)?;
-            let expected = if *aac {
-                [Some("avc1"), Some("aac"), Some("aac")]
-            } else {
-                [Some("avc1"), None, None]
+            let video_codec = if *h264 {"avc1"} else {"apch"};
+            let audio_codec = if *aac { Some("aac") } else {
+                match pcm {Some(16)=>Some("pcm_s16le"),Some(24)=>Some("pcm_s24le"),_=>None}
             };
+            let expected = [Some(video_codec),audio_codec,audio_codec];
             let mut streams = item.media.iter();
             for codec in expected.into_iter().flatten() {
                 let saved = streams

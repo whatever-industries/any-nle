@@ -408,9 +408,23 @@ fn verify_moves(
         .transpose()?;
     let mut stamps = BTreeMap::new();
     let mut basenames: HashMap<_, Vec<_>> = HashMap::new();
+    #[cfg(unix)]
+    let mut physical_files = BTreeMap::new();
     for (path, target) in &moves {
         let stamp = media_stamp(target)
             .map_err(|error| format!("could not verify media at {target}: {error}"))?;
+        #[cfg(unix)]
+        {
+            // Canonical paths distinguish symlinks but two hard links can
+            // still point at a single physical original.
+            let (device, inode, _, _) = stamp.identity;
+            if let Some(previous) = physical_files.insert((device, inode), target) {
+                return Err(format!(
+                    "different originals resolve to the same media file: {previous} and {target}"
+                )
+                .into());
+            }
+        }
         stamps.insert(target.clone(), stamp);
         basenames
             .entry(original_path(path)?.file_name().ok_or("missing basename")?)

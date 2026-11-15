@@ -6,6 +6,7 @@ mod multicam;
 pub use multicam::{Multicam, MulticamLane, MulticamAlternative, MulticamPiece, MulticamUse};
 
 pub const SCHEMA: &str = "anynle.graph/2";
+pub const AVID_SOURCE_COLUMNS_TIMECODE: &str = "avid_source_columns_verified_mov_timecode";
 
 /// Exact source timecode facts. Display base and physical counting rate are distinct.
 #[derive(Clone, Debug, PartialEq)]

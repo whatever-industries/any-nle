@@ -49,6 +49,14 @@ pub enum TurnoverSource {
         media_roots: Vec<PathBuf>,
         #[serde(default)]
         mappings: Vec<[PathBuf; 2]>,
+        #[serde(default)]
+        prefer_source_media: bool,
+        #[serde(default)]
+        require_camera_originals: bool,
+        #[serde(default)]
+        attach_avid_proxies: bool,
+        proxy_rewrap_dir: Option<PathBuf>,
+        ffmpeg: Option<PathBuf>,
     },
     PremiereToResolve {
         premiere: PathBuf,
@@ -66,9 +74,24 @@ impl TurnoverJob {
                 avid_project_root,
                 media_roots,
                 mappings,
+                prefer_source_media,
+                require_camera_originals,
+                attach_avid_proxies,
+                proxy_rewrap_dir,
+                ffmpeg,
             } => {
+                if proxy_rewrap_dir.is_some() && !attach_avid_proxies {
+                    return Err("proxy_rewrap_dir requires attach_avid_proxies; creates new media".into());
+                }
                 let options = OriginalOptions {
+                    link_managed_op1a: false,
                     ffprobe: self.ffprobe.clone(),
+                    prefer_source_media: *prefer_source_media
+                        || *require_camera_originals
+                        || *attach_avid_proxies,
+                    attach_avid_proxies: *attach_avid_proxies,
+                    proxy_rewrap_dir: proxy_rewrap_dir.clone(),
+                    ffmpeg: ffmpeg.clone().unwrap_or_else(|| "ffmpeg".into()),
                     root_mappings: mappings
                         .iter()
                         .map(|[saved_root, current_root]| RootMapping {
@@ -77,12 +100,13 @@ impl TurnoverJob {
                         })
                         .collect(),
                 };
-                crate::prepare_avid_turnover(
+                crate::avid::prepare_avid_turnover_with_policy(
                     bins,
                     media_roots,
                     sequences,
                     &options,
                     avid_project_root.as_deref(),
+                    *require_camera_originals,
                 )
             }
             TurnoverSource::PremiereToResolve { premiere, sequence } => {
@@ -99,6 +123,12 @@ pub struct Turnover {
     inputs: Vec<(PathBuf, [u8; 32])>,
     caption_omissions: Vec<graph::Loss>,
     selected_texts: HashSet<String>,
+    pub(crate) proxies: Vec<avid_adapter::proxy::Binding>,
+}
+
+pub struct TurnoverReview {
+    pub new_proxy_paths: Vec<PathBuf>,
+    pub estimated_proxy_bytes: u64,
 }
 
 impl Turnover {
@@ -125,6 +155,7 @@ impl Turnover {
             inputs,
             caption_omissions,
             selected_texts,
+            proxies: vec![],
         })
     }
 
@@ -146,8 +177,16 @@ impl Turnover {
     }
 
     /// Check the destination plan without staging or publishing any output.
-    pub fn review(&self, templates: &Templates, output: &Path) -> Result<()> {
-        review_turnover(&self.prepared, templates, output)
+    pub fn review(&self, templates: &Templates, output: &Path) -> Result<TurnoverReview> {
+        let estimated_proxy_bytes = avid_adapter::proxy::review(&self.proxies)?;
+        review_turnover(&self.prepared, templates, output)?;
+        let mut new_proxy_paths: Vec<_> = self.proxies.iter()
+            .filter(|binding| binding.audio.is_some())
+            .map(|binding| binding.path.clone())
+            .collect();
+        new_proxy_paths.sort_unstable();
+        new_proxy_paths.dedup();
+        Ok(TurnoverReview { new_proxy_paths, estimated_proxy_bytes })
     }
 
     pub fn publish(
@@ -165,11 +204,22 @@ impl Turnover {
                     .into(),
             );
         }
+        if self.proxies.iter().any(|p| p.audio.is_some()) {
+            self.review(templates, output)?;
+        }
         publish_turnover_checked(&self.prepared, templates, output, || {
-            for (path, revision) in &self.inputs {
-                if media_digest(path)? != *revision {
-                    return Err(format!("source project changed: {}", path.display()).into());
+            let verify = || -> Result<()> {
+                for (path, revision) in &self.inputs {
+                    if media_digest(path)? != *revision {
+                        return Err(format!("source project changed: {}", path.display()).into());
+                    }
                 }
+                Ok(())
+            };
+            verify()?;
+            avid_adapter::proxy::execute_all(&self.proxies)?;
+            if self.proxies.iter().any(|p|p.audio.is_some()) {
+                verify().map_err(|e|format!("{e}; verified proxy files retained"))?;
             }
             Ok(())
         })

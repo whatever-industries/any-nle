@@ -4,7 +4,7 @@
 //! Report notes go to a `&mut Vec<String>` (Python `report.notes`).
 
 use super::colors;
-use super::model::{py_str_repr, Marker, Options};
+use super::model::{py_str_repr, Event, Marker, Options};
 use crate::build::marker::{ensure_inner_list, set_color_index, MarkerSpec};
 use crate::build::time::Time;
 use crate::error::{value, Result};
@@ -13,6 +13,44 @@ use crate::model::item::{add_item_ref, child_items};
 use crate::model::{ItemData, ItemId, ItemType, Project, SequenceId, TrackItemId};
 
 pub const LABEL_PREFIX: &str = "BE.Prefs.LabelColors.";
+
+fn marker_track(marker: &Marker) -> Option<(&str, i64)> {
+    let (kind, index) = marker.track.as_deref()?.split_at_checked(1)?;
+    Some((kind, index.parse().ok()?))
+}
+
+/// Compare a clip marker with the source lane selected by the timeline edit.
+/// Keep the existing time-based preference when the lane cannot be resolved.
+pub(super) fn lanes_overlap(
+    event: &Event,
+    source: &Marker,
+    edit: &Marker,
+    has_picture: bool,
+    has_source_audio: impl FnOnce(i64) -> bool,
+    mono_source_channel: impl FnOnce(usize) -> Option<i64>,
+) -> bool {
+    let Some((kind, index)) = marker_track(source) else { return true };
+    let known = match kind {
+        "V" => index == 1 && has_picture,
+        "A" => has_source_audio(index),
+        _ => false,
+    };
+    if !known {
+        return true;
+    }
+    match marker_track(edit) {
+        Some(("V", track)) if event.video_track == Some(track) => kind == "V",
+        Some(("A", track)) => {
+            if let Some(slot) = event.audio_tracks.iter().position(|&placed| placed == track) {
+                return mono_source_channel(slot)
+                    .is_none_or(|channel| kind == "A" && channel == index);
+            }
+            event.stereo.iter().find(|group| group.audio_track == track)
+                .is_none_or(|group| kind == "A" && group.channels.contains(&index))
+        }
+        _ => true,
+    }
+}
 
 /// One adjustment layer as Premiere 26.3 saved it (py_premiere fixture 22_adjustment_layer):
 /// placeholders `{name}`, `{timebase}`, `{width}`, `{height}`, `{timecode_format}`,

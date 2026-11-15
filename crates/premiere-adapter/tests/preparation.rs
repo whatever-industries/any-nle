@@ -1,5 +1,5 @@
 use graph::source::*;
-use graph::{MarkerOwner, Rational as Q, Sidecar, StreamKind, Value};
+use graph::{Label, MarkerOwner, Rational as Q, Sidecar, StreamKind, TrackRef, Value};
 use premiere_adapter::{prepare, ClockProfile};
 use prproj::convert::model::{parse_model_str, Options};
 
@@ -164,32 +164,53 @@ fn fixture() -> SourceGraph {
 
 #[test]
 fn avid_source_color_transform_survives_graph_reload_and_reports_one_affected_clip() {
-    let mut graph = fixture();
+    let graph = fixture();
     let options = parse_model_str(include_str!("../../../examples/opatom_clip.model.json"))
         .unwrap().options;
     let baseline = prepare(&graph, &options, ClockProfile::LegacyImport).unwrap();
     let item_id = graph.items[0].id.clone();
-    let native = graph.sidecars.iter_mut()
-        .find(|s| s.adapter == "avid.source" && s.object == item_id).unwrap();
-    let Value::Obj(fields) = &mut native.data else { panic!("native facts must be an object") };
-    let text = "<ColorTransformationList><ColorTransformation/></ColorTransformationList>";
-    let transforms = Value::Arr(vec![v(vec![
-        ("track", Value::Int(1)),
-        ("owner_mob", Value::Str("source-mob".into())),
-        ("text", Value::Str(text.into())),
-    ])]);
-    fields.push(("input_color_transforms".into(), transforms.clone()));
-    let reloaded = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
-    assert_eq!(
-        reloaded.sidecar("avid.source", &item_id).unwrap().get("input_color_transforms"),
-        Some(&transforms),
-    );
-    let prepared = prepare(&reloaded, &options, ClockProfile::LegacyImport).unwrap();
-    assert_eq!(baseline.model, prepared.model);
-    let losses: Vec<_> = prepared.losses.iter()
-        .filter(|l| l.aspect == "source_color_transform").collect();
-    let [loss] = losses.as_slice() else { panic!("expected one loss for the affected clip") };
-    assert_eq!(loss.object, item_id);
+    let wrap = |operation: &str| {
+        format!("<ColorTransformationList><ColorTransformation>{operation}</ColorTransformation></ColorTransformationList>")
+    };
+    for (xml, expected) in [
+        (wrap(""), "retained in graph/2 only"),
+        (
+            wrap("<ExternalLut><LutFileName>Camera &amp; Chart.cube</LutFileName><LutDimension>3D</LutDimension><InhibitScaling/></ExternalLut>"),
+            "external source LUT \"Camera & Chart.cube\"",
+        ),
+        (
+            wrap("<ExternalLut><LutFileName>../other.cube</LutFileName><LutDimension>3D</LutDimension></ExternalLut>"),
+            "retained in graph/2 only",
+        ),
+        (
+            wrap("<ExternalLut><LutFileName>First.cube</LutFileName><LutFileName>Second.cube</LutFileName><LutDimension>3D</LutDimension></ExternalLut>"),
+            "retained in graph/2 only",
+        ),
+        ("<ColorTransformationList>".into(), "retained in graph/2 only"),
+    ] {
+        let mut variant = graph.clone();
+        let native = variant.sidecars.iter_mut()
+            .find(|s| s.adapter == "avid.source" && s.object == item_id).unwrap();
+        let Value::Obj(fields) = &mut native.data else { panic!("native facts must be an object") };
+        let transforms = Value::Arr(vec![v(vec![
+            ("track", Value::Int(1)),
+            ("owner_mob", Value::Str("source-mob".into())),
+            ("text", Value::Str(xml)),
+        ])]);
+        fields.push(("input_color_transforms".into(), transforms.clone()));
+        let reloaded = SourceGraph::from_json_text(&variant.to_json_text().unwrap()).unwrap();
+        assert_eq!(
+            reloaded.sidecar("avid.source", &item_id).unwrap().get("input_color_transforms"),
+            Some(&transforms),
+        );
+        let prepared = prepare(&reloaded, &options, ClockProfile::LegacyImport).unwrap();
+        assert_eq!(baseline.model, prepared.model);
+        let losses: Vec<_> = prepared.losses.iter()
+            .filter(|l| l.aspect == "source_color_transform").collect();
+        let [loss] = losses.as_slice() else { panic!("expected one loss for the affected clip") };
+        assert_eq!(loss.object, item_id);
+        assert!(loss.reason.contains(expected), "{}", loss.reason);
+    }
 }
 fn q(n: i64) -> Q {
     Q::integer(n)
@@ -271,6 +292,7 @@ fn direct_24_combined_preserves_media_state_and_discrete_audio() {
                 })
                 .collect();
             assert_eq!(pans, [Some("0"), None]);
+
         }
     }
 
@@ -535,26 +557,104 @@ fn direct_23976_dnxhd_pcm16_preserves_two_file_clocks_and_sample_types() {
     }
     let opts = Options { bin_mode: "separate".into(), ..options() };
     let g = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
-    let input = premiere_adapter::prepare_originals(&g, &opts, ClockProfile::LegacyImport).unwrap().input;
-    assert_eq!(input.sequences[0].start, ticks(86_400));
-    assert!(input.sequences[0].events.iter().all(|e| e.source_in == ticks(5)));
     let out = std::env::temp_dir().join(format!("anynle-direct-pcm16-{}-{}.prproj", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     let mut ids = prproj::SeededUuids::new("synthetic-direct-pcm16");
-    prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
-    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
-    std::fs::remove_file(&out).unwrap();
-    assert!(doc.tree.iter_tag(doc.root, "CodecType").any(|n| doc.tree.text(n) == Some("1096180846")));
-    assert!(doc.tree.iter_tag(doc.root, "TimecodeFormat").any(|n| doc.tree.text(n) == Some("110")));
-    assert_eq!(doc.tree.iter_tag(doc.root, "SampleType").filter(|&n| doc.tree.text(n) == Some("3")).count(), 2);
-    assert_eq!(doc.tree.iter_tag(doc.root, "Media").filter_map(|n| doc.tree.child_by_tag(n, "Start"))
-        .filter_map(|n| doc.tree.text(n).and_then(|s| s.parse::<i64>().ok())).collect::<Vec<_>>(), [ticks(172_800); 3]);
+    for mode in ["separate", "grouped", "merged"] {
+        let options = Options { bin_mode: mode.into(), ..opts.clone() };
+        let input = premiere_adapter::prepare_originals(&g, &options, ClockProfile::LegacyImport).unwrap().input;
+        assert_eq!(input.sequences[0].start, ticks(86_400));
+        assert!(input.sequences[0].events.iter().all(|e| e.source_in == ticks(5)));
+        prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+        let mut doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+        std::fs::remove_file(&out).unwrap();
+        assert!(doc.tree.iter_tag(doc.root, "CodecType").any(|n| doc.tree.text(n) == Some("1096180846")));
+        assert!(doc.tree.iter_tag(doc.root, "TimecodeFormat").any(|n| doc.tree.text(n) == Some("110")));
+        assert_eq!(doc.tree.iter_tag(doc.root, "SampleType").filter(|&n| doc.tree.text(n) == Some("3")).count(), 2);
+        assert_eq!(doc.tree.iter_tag(doc.root, "Media").filter_map(|n| doc.tree.child_by_tag(n, "Start"))
+            .filter_map(|n| doc.tree.text(n).and_then(|s| s.parse::<i64>().ok())).collect::<Vec<_>>(), [ticks(172_800); 3]);
+        let mut starts: Vec<_> = doc.tree.iter_tag(doc.root, "MZ.ZeroPoint")
+            .map(|n| doc.tree.text(n).unwrap().parse::<i64>().unwrap()).collect();
+        starts.sort_unstable();
+        let expected = if mode == "separate" {
+            vec![ticks(86_400)]
+        } else {
+            vec![ticks(86_400), ticks(172_800)]
+        };
+        assert_eq!(starts, expected);
+        let states: Vec<_> = doc.tree.iter_tag(doc.root, "Media")
+            .filter_map(|n| doc.tree.child_by_tag(n, "ModificationState"))
+            .collect();
+        assert_eq!(states.len(), 3);
+        for state in states {
+            assert!(doc.payload(state).unwrap().is_some_and(|bytes| !bytes.is_empty()));
+        }
+        if mode == "grouped" {
+            assert!(doc.tree.iter_tag(doc.root, "MonoToStereoPanProcessor").count() >= 2);
+
+            use prproj::convert::{model::Marker, prepared::PreparedClip};
+            let mut marked = input.clone();
+            let sequence = &mut marked.sequences[0];
+            let (index, edit) = sequence.events.iter().enumerate()
+                .find(|(_, e)| e.video_track == Some(1) && e.audio_tracks.contains(&1)).unwrap();
+            let name = sequence.name.clone();
+            for (label, track) in [("Picture range", "V1"), ("Mono range", "A1")] {
+                sequence.markers.push(Marker {
+                    name: label.into(), comment: "Review".into(), user: String::new(),
+                    color: "Red".into(), track: Some(track.into()), owner: "edit".into(),
+                    start: edit.record_start, duration: ticks(1),
+                    event: Some(index as i64), source: Some(edit.source_in), inherited: false,
+                });
+            }
+            let source_start = edit.source_in;
+            let PreparedClip::Legacy(source_clip) = &mut marked.clips[0] else {
+                panic!("expected a linked DNxHD master");
+            };
+            for (name, track) in [("Source A1 range", "A1"), ("Source A2 range", "A2")] {
+                source_clip.markers.push(Marker {
+                    name: name.into(), comment: "Source review".into(), user: String::new(),
+                    color: "Red".into(), track: Some(track.into()), owner: "sequence".into(),
+                    start: source_start, duration: ticks(1), event: None, source: None, inherited: false,
+                });
+            }
+            let out = std::env::temp_dir().join(format!("anynle-grouped-markers-{}-{}.prproj", std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let report = prproj::convert::writer::prepare_typed_project(&marked, &out, &mut ids, &[], false)
+                .unwrap().publish().unwrap();
+            let doc = prproj::xml::parse_prproj(&out).unwrap();
+            std::fs::remove_file(out).unwrap();
+            let tree = &doc.tree;
+            let sequence = tree.iter_tag(doc.root, "Sequence")
+                .find(|&node| tree.findtext(node, "Name").unwrap().as_deref() == Some(name.as_str())).unwrap();
+            let collection = doc.resolve(tree.find1(sequence, "MarkerOwner/Markers").unwrap()).unwrap();
+            let saved = doc.resolve(tree.find1(collection, "Markers/Marker/Second").unwrap()).unwrap();
+            let marker = tree.findtext(saved, "DVAMarker").unwrap().unwrap();
+            assert!(marker.contains("Picture range"));
+            let resolve = |node, path| tree.find1(node, path).map(|r| doc.resolve(r).unwrap());
+            let audio = tree.iter_tag(doc.root, "AudioClipTrackItem").filter_map(|item| {
+                let subclip = resolve(item, "ClipTrackItem/SubClip")?;
+                let clip = resolve(subclip, "Clip")?;
+                let collection = resolve(clip, "Clip/MarkerOwner/Markers")?;
+                let markers: Vec<_> = tree.findall(collection, "Markers/Marker/Second").unwrap().iter()
+                    .map(|&r| tree.findtext(doc.resolve(r).unwrap(), "DVAMarker").unwrap().unwrap())
+                    .collect();
+                markers.iter().any(|text| text.contains("Mono range")).then_some(markers)
+            }).next().unwrap();
+            assert!(audio.iter().any(|text| text.contains("Source A2 range")));
+            assert!(!audio.iter().any(|text| text.contains("Source A1 range")));
+            let [marker_move] = report.grouped_picture_marker_moves.as_slice() else {
+                panic!("expected a Grouped picture marker ownership change");
+            };
+            assert_eq!((marker_move.sequence, marker_move.record_ticks, marker_move.marker_name.as_str()),
+                (0, marked.sequences[0].events[index].record_start, "Picture range"));
+        }
+    }
 
     let mut mixed = g.clone();
     mixed.media.iter_mut().find(|m| m.kind == StreamKind::Audio).unwrap().bits = Some(24);
-    for (graph, mode) in [(&g, "grouped"), (&g, "merged"), (&mixed, "separate")] {
+    for mode in ["separate", "grouped", "merged"] {
         let options = Options { bin_mode: mode.into(), ..opts.clone() };
-        let input = premiere_adapter::prepare_originals(graph, &options, ClockProfile::LegacyImport).unwrap().input;
+        let input = premiere_adapter::prepare_originals(&mixed, &options, ClockProfile::LegacyImport).unwrap().input;
         assert!(input.direct_dnxhr_origins.is_empty());
         assert!(prepare_typed_project(&input, &out, &mut ids, &[], false).is_err());
         assert!(!out.exists());
@@ -613,6 +713,122 @@ fn direct_23976_dnxhd_pcm16_preserves_two_file_clocks_and_sample_types() {
         tree.child_by_tag(c, "MasterClip").is_some_and(|r| doc.resolve(r) == Ok(master))
     }).count(), 3);
 
+    let mut source_marked = ranged.clone();
+    let item = &mut source_marked.items[0];
+    item.markers.push(SourceMarker {
+        name: "Backing source range".into(),
+        comment: "Keep the source annotation".into(),
+        user: String::new(),
+        color: Some(Label { palette: "avid".into(), name: "Red".into() }),
+        start: Some(frame(10)),
+        duration: frame(3),
+        track: Some(TrackRef { kind: StreamKind::Video, index: 1 }),
+        owner: MarkerOwner::Sequence,
+        owner_occurrence: item.id.clone(),
+        owner_local: Some(frame(10)),
+        owner_rate: Some(rate),
+        binding: SourceBinding { placements: vec![], reason: None },
+        source: None,
+        inherited: false,
+    });
+    let source_input = prepare(&source_marked);
+    assert_eq!(source_input.input.av_subclip_uses, ready.input.av_subclip_uses);
+    prepare_typed_project(&source_input.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    assert_eq!(doc.tree.iter_tag(doc.root, "DVAMarker").count(), 2);
+
+    let mut two_bins = source_marked.clone();
+    let mut second_master = two_bins.items[0].clone();
+    second_master.id = "duplicate-backing-master".into();
+    second_master.markers.clear();
+    two_bins.bins.push(graph::Bin {
+        id: "other-backing-bin".into(),
+        name: "Other bin with the same backing mob".into(),
+        parent: None,
+        items: vec![second_master.id.clone()],
+    });
+    two_bins.items.push(second_master.clone());
+    let prepared = prepare(&two_bins);
+    assert_eq!(prepared.input.av_subclips, source_input.input.av_subclips);
+    assert_eq!(prepared.input.av_subclip_uses, source_input.input.av_subclip_uses);
+
+    let mut ambiguous_here = two_bins.clone();
+    ambiguous_here.bins[0].items.push(second_master.id);
+    let refused = prepare(&ambiguous_here);
+    assert!(refused.input.av_subclips.is_empty());
+    assert!(refused.losses.iter().any(|l| l.aspect == "subclip_bin_item"
+        && l.reason.contains("more than one selected master")));
+
+    let mut ambiguous_elsewhere = two_bins.clone();
+    let scoped_items = std::mem::take(&mut ambiguous_elsewhere.bins[0].items);
+    ambiguous_elsewhere.bins[1].items.extend(scoped_items);
+    let refused = prepare(&ambiguous_elsewhere);
+    assert!(refused.input.av_subclips.is_empty());
+    assert!(refused.losses.iter().any(|l| l.aspect == "subclip_bin_item"
+        && l.reason.contains("more than one selected master")));
+
+    let mut crossing = source_marked.clone();
+    crossing.items[0].markers[0].duration = frame(87);
+    let outside_subclip = prepare(&crossing);
+    assert!(outside_subclip.input.av_subclips.is_empty());
+    assert!(outside_subclip.losses.iter().any(|l| l.aspect == "subclip_bin_item"
+        && l.reason.contains("one V1 range contained in the subclip")));
+
+    let mut marked = ranged.clone();
+    let picture_id = marked.sequences[0].placements.iter()
+        .find(|p| p.video_track.is_some()).unwrap().id.clone();
+    marked.sequences[0].markers.push(SourceMarker {
+        name: "Subclip review".into(),
+        comment: "Keep this range".into(),
+        user: String::new(),
+        color: Some(Label { palette: "avid".into(), name: "Red".into() }),
+        start: Some(frame(2)),
+        duration: frame(3),
+        track: Some(TrackRef { kind: StreamKind::Video, index: 1 }),
+        owner: MarkerOwner::Edit,
+        owner_occurrence: "synthetic:subclip-marker".into(),
+        owner_local: Some(frame(2)),
+        owner_rate: Some(rate),
+        binding: SourceBinding { placements: vec![picture_id.clone()], reason: None },
+        source: None,
+        inherited: false,
+    });
+    let marked_input = prepare(&marked);
+    assert_eq!(marked_input.input.av_subclip_uses, ready.input.av_subclip_uses);
+    assert!(marked_input.losses.iter().any(|l| l.aspect == "marker_ownership"
+        && l.reason.contains("Subclip review")));
+    let marker = &marked_input.input.sequences[0].markers[0];
+    assert_eq!((marker.owner.as_str(), marker.start, marker.duration), ("sequence", ticks(2), ticks(3)));
+    prepare_typed_project(&marked_input.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    std::fs::remove_file(&out).unwrap();
+
+    let mut both = marked.clone();
+    both.items[0].markers = source_marked.items[0].markers.clone();
+    both.items[0].markers[0].start = Some(frame(7));
+    both.items[0].markers[0].owner_local = Some(frame(7));
+    let conflicting = prepare(&both);
+    assert_eq!(conflicting.input.av_subclips.len(), 1);
+    assert!(conflicting.input.av_subclip_uses.is_empty());
+    assert_eq!(conflicting.input.sequences[0].markers[0].owner, "edit");
+
+    let mut distinct = marked.clone();
+    distinct.items[0].markers = source_marked.items[0].markers.clone();
+    let distinct = prepare(&distinct);
+    assert_eq!(distinct.input.av_subclip_uses, ready.input.av_subclip_uses);
+    let marker = &distinct.input.sequences[0].markers[0];
+    assert_eq!((marker.owner.as_str(), marker.start, marker.duration), ("sequence", ticks(2), ticks(3)));
+    prepare_typed_project(&distinct.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&out).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    assert_eq!(doc.tree.iter_tag(doc.root, "DVAMarker").count(), 3);
+
+    let mut incomplete = marked.clone();
+    incomplete.sidecars.retain(|s| s.object != picture_id);
+    let incomplete = prepare(&incomplete);
+    assert!(incomplete.input.av_subclip_uses.is_empty());
+    assert_eq!(incomplete.input.sequences[0].markers[0].owner, "edit");
+
     let shorten = |graph: &mut SourceGraph, start, end| {
         let receipt = graph.sidecars.iter_mut().find(|s| s.adapter == "avid.subclips").unwrap();
         let Value::Arr(rows) = &mut receipt.data else { panic!("missing receipt rows") };
@@ -638,6 +854,54 @@ fn direct_23976_dnxhd_pcm16_preserves_two_file_clocks_and_sample_types() {
         assert_eq!(doc.tree.iter_tag(doc.root, tag)
             .filter(|&n| doc.tree.text(n) == Some(expected.as_str())).count(), 3);
     }
+
+    let mut outside_marked = marked.clone();
+    shorten(&mut outside_marked, 5, 29);
+    let template = &source_marked.items[0].markers[0];
+    for (name, start, duration) in [("Ends at In", 3, 2), ("Point at Out", 29, 0)] {
+        let start = frame(start);
+        outside_marked.items[0].markers.push(SourceMarker {
+            name: name.into(),
+            start: Some(start),
+            duration: frame(duration),
+            owner_local: Some(start),
+            ..template.clone()
+        });
+    }
+    let outside_graph = SourceGraph::from_json_text(&outside_marked.to_json_text().unwrap()).unwrap();
+    let outside = prepare(&outside_graph);
+    assert_eq!(outside.input.av_subclips, short.input.av_subclips);
+    assert_eq!(outside.input.av_subclip_uses, short.input.av_subclip_uses);
+    assert_eq!(outside.input.sequences[0].markers[0].owner, "sequence");
+    prepare_typed_project(&outside.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&out).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    assert_eq!(doc.tree.iter_tag(doc.root, "DVAMarker").count(), 3);
+
+    let mut at_in = outside_marked.clone();
+    at_in.items[0].markers.push(SourceMarker {
+        name: "Point at In".into(),
+        start: Some(frame(5)),
+        duration: Q::ZERO,
+        owner_local: Some(frame(5)),
+        ..template.clone()
+    });
+    let touching = prepare(&at_in);
+    assert_eq!(touching.input.av_subclips.len(), 1);
+    assert_eq!(touching.input.av_subclip_uses, short.input.av_subclip_uses);
+    assert_eq!(touching.input.sequences[0].markers[0].owner, "sequence");
+    prepare_typed_project(&touching.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&out).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    let markers: Vec<_> = doc.tree.iter_tag(doc.root, "DVAMarker")
+        .filter_map(|id| doc.tree.text(id)).collect();
+    assert_eq!(markers.len(), 5);
+    assert_eq!(markers.iter().filter(|marker| marker.contains("Point at In")).count(), 2);
+
+    outside_marked.items[0].markers[0].duration = frame(3);
+    let crossing_in = prepare(&outside_marked);
+    assert!(crossing_in.input.av_subclips.is_empty());
+    assert!(crossing_in.losses.iter().any(|l| l.aspect == "subclip_bin_item"));
 
     let mut pcm24 = shortened.clone();
     for m in &mut pcm24.media {
@@ -697,6 +961,101 @@ fn direct_23976_dnxhd_pcm16_preserves_two_file_clocks_and_sample_types() {
             && tree.findtext(n, "Clip/OutPoint").unwrap() == Some(ticks(24).to_string())
     }));
 
+    let mut marked_nest = nested.clone();
+    marked_nest.sequences[0].markers.push(SourceMarker {
+        name: "Marked Submaster".into(),
+        comment: "Retain this range on the parent".into(),
+        user: String::new(),
+        color: Some(Label { palette: "avid".into(), name: "Red".into() }),
+        start: Some(frame(10)),
+        duration: frame(3),
+        track: Some(TrackRef { kind: StreamKind::Video, index: 1 }),
+        owner: MarkerOwner::Edit,
+        owner_occurrence: "synthetic:marked-submaster".into(),
+        owner_local: Some(frame(2)),
+        owner_rate: Some(rate),
+        binding: SourceBinding { placements: vec![picture_id.clone()], reason: None },
+        source: None,
+        inherited: false,
+    });
+    let marked = prepare(&marked_nest);
+    let [marked_child] = marked.input.picture_nests.as_slice() else { panic!("marked nest was flattened") };
+    assert_eq!((marked_child.sequence, marked_child.event), (nest.sequence, nest.event));
+    let marker = &marked.input.sequences[marked_child.sequence].markers[0];
+    assert_eq!((marker.owner.as_str(), marker.start, marker.duration), ("sequence", ticks(10), ticks(3)));
+    assert!(marked.losses.iter().any(|l| l.aspect == "marker_ownership" && l.reason.contains("Marked Submaster")));
+    prepare_typed_project(&marked.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    std::fs::remove_file(&out).unwrap();
+
+    let mut record_only_nest = marked_nest.clone();
+    record_only_nest.sequences[0].markers[0].source = Some(Q::new(1, 11).unwrap());
+    let saved = SourceGraph::from_json_text(&record_only_nest.to_json_text().unwrap()).unwrap();
+    let record_only = prepare(&saved);
+    assert_eq!(record_only.input.picture_nests, marked.input.picture_nests);
+    let marker = &record_only.input.sequences[0].markers[0];
+    assert_eq!((marker.owner.as_str(), marker.start, marker.duration), ("sequence", ticks(10), ticks(3)));
+    assert_eq!(record_only.losses.iter().filter(|l| l.aspect == "marker_ownership").count(), 1);
+    prepare_typed_project(&record_only.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    std::fs::remove_file(&out).unwrap();
+
+    let mut outside_nest = record_only_nest.clone();
+    outside_nest.sequences[0].markers[0].duration = frame(40);
+    let outside = prepare(&outside_nest);
+    assert!(outside.input.picture_nests.is_empty());
+    assert_eq!(outside.input.sequences[0].markers[0].owner, "sequence");
+
+    let mut unresolved_record_only = record_only_nest;
+    unresolved_record_only.sequences[0].markers[0].binding.reason = Some("unknown native owner".into());
+    assert!(prepare(&unresolved_record_only).input.picture_nests.is_empty());
+
+    let mut upper = marked_nest.clone();
+    let sequence = &mut upper.sequences[0];
+    sequence.placements.iter_mut().find(|p| p.id == picture_id).unwrap().video_track = Some(5);
+    sequence.markers[0].track = Some(TrackRef { kind: StreamKind::Video, index: 5 });
+    let upper = prepare(&upper);
+    let [upper_child] = upper.input.picture_nests.as_slice() else { panic!("upper nest was flattened") };
+    let sequence = &upper.input.sequences[upper_child.sequence];
+    assert_eq!(sequence.events[upper_child.event].video_track, Some(5));
+    let marker = &sequence.markers[0];
+    assert_eq!((marker.owner.as_str(), marker.start, marker.duration), ("sequence", ticks(10), ticks(3)));
+    assert!(upper.losses.iter().any(|l| l.aspect == "marker_ownership" && l.reason.contains("on V5")));
+    prepare_typed_project(&upper.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    std::fs::remove_file(&out).unwrap();
+
+    let mut unresolved = marked_nest.clone();
+    unresolved.sequences[0].markers[0].binding.reason = Some("unknown native owner".into());
+    let unresolved = prepare(&unresolved);
+    assert!(unresolved.input.picture_nests.is_empty());
+    assert_eq!(unresolved.input.sequences[0].markers[0].owner, "sequence");
+
+    let mut inherited_nest = marked_nest.clone();
+    let mut source_marker = inherited_nest.sequences[0].markers[0].clone();
+    let edit = inherited_nest.sequences[0].placements.iter().find(|p| p.id == picture_id).unwrap();
+    source_marker.start = Some(edit.source_in.checked_add(frame(2)).unwrap());
+    source_marker.owner_local = source_marker.start;
+    source_marker.owner = MarkerOwner::Sequence;
+    source_marker.owner_occurrence = "synthetic:backing-picture".into();
+    source_marker.binding.placements.clear();
+    inherited_nest.items[0].markers.push(source_marker);
+    for id in [&inherited_nest.items[0].id, &inherited_nest.sequences[0].id] {
+        let sidecar = inherited_nest.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && &s.object == id).unwrap();
+        let Value::Obj(fields) = &mut sidecar.data else { panic!("missing Avid source fields") };
+        fields.push(("marker_native".into(), Value::Arr(vec![v(vec![
+            ("graph_index", Value::Int(0)), ("created", Value::Int(100)),
+        ])])));
+    }
+    let inherited = prepare(&inherited_nest);
+    assert_eq!(inherited.input.picture_nests.len(), 1);
+    let marker = &inherited.input.sequences[0].markers[0];
+    assert_eq!((marker.owner.as_str(), marker.start, marker.duration), ("sequence", ticks(10), ticks(3)));
+    assert!(!marker.inherited);
+    assert_eq!(inherited.losses.iter().filter(|l| l.aspect == "marker_ownership").count(), 1);
+
+    let mut mixed_rate_nest = make_nest.input.clone();
+    mixed_rate_nest.sequences[nest.sequence].rate = prproj::convert::model::Fraction::new(24, 1);
+    assert!(prepare_typed_project(&mixed_rate_nest, &out, &mut ids, &[], false).is_err());
+    assert!(!out.exists());
+
     let mut malformed_nest = make_nest.input;
     let mut outside = malformed_nest.picture_nests[0];
     outside.event = usize::MAX;
@@ -742,6 +1101,91 @@ fn direct_23976_dnxhd_pcm16_preserves_two_file_clocks_and_sample_types() {
     assert!(prepare_typed_project(&malformed, &out, &mut ids, &[], false).err().unwrap()
         .to_string().contains("unknown prepared A/V subclip"));
     assert!(!out.exists());
+}
+
+#[test]
+fn marked_constant_retime_preserves_picture_speed_and_the_full_record_marker() {
+    let mut graph = fixture();
+    let frame = |n| Q::new(n, 24).unwrap();
+    let rate = q(24);
+    graph.items[0].rate = Some(rate);
+    for (index, media) in graph.media.iter_mut().enumerate() {
+        let picture = media.kind == StreamKind::Video;
+        media.online = Some(true);
+        media.start = Some(Q::ZERO);
+        media.duration = frame(242);
+        if !picture {
+            media.bits = Some(16);
+        }
+        media.clock = Some(SourceClock {
+            effective_count: 0,
+            rate,
+            display_base: 24,
+            drop: false,
+            provenance: SourceClockProvenance {
+                origin_count: 0,
+                source_offset: 0,
+                source_rate: if picture { rate } else { q(48_000) },
+                source_package: format!("physical {index}"),
+                timecode_track: format!("TC {index}"),
+                route: "file_source_clip_to_physical_timecode_track".into(),
+            },
+        });
+        let facts = graph.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == media.id).unwrap();
+        let descriptor = if picture {
+            v(vec![("compression", Value::Str("AVHD".into())),
+                   ("resolution_id", Value::Int(1253)),
+                   ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)]))])
+        } else {
+            v(vec![("channels", Value::Int(1)), ("bits", Value::Int(16))])
+        };
+        facts.data = v(vec![
+            ("legacy_clock", clock(0, 24, false)),
+            ("descriptor", descriptor),
+            ("descriptor_length", Value::Int(if picture { 242 } else { 484_000 })),
+            ("file_package", Value::Str(format!("file {index}"))),
+            ("picture_coding", if picture { Value::Str("060E2B340401010A0401020271130000".into()) } else { Value::Null }),
+        ]);
+    }
+    let sequence = &mut graph.sequences[0];
+    let picture = sequence.placements.iter_mut().find(|p| p.video_track == Some(1)).unwrap();
+    picture.record_start = frame(50);
+    picture.source_in = frame(42);
+    picture.duration = frame(50);
+    picture.speed = Some(graph::Speed { ratio: (50, 99), source_duration: frame(99) });
+    let parent = picture.id.clone();
+    let marker = &mut sequence.markers[0];
+    marker.owner = MarkerOwner::Edit;
+    marker.track = Some(graph::TrackRef { kind: StreamKind::Video, index: 1 });
+    marker.start = Some(frame(56));
+    marker.source = Some(frame(54));
+    marker.duration = frame(3);
+    marker.binding.placements = vec![parent.clone()];
+    let mut unresolved = marker.clone();
+    unresolved.start = None;
+    sequence.markers.push(unresolved);
+    graph.sidecars.push(Sidecar {
+        adapter: "avid.source".into(),
+        object: parent,
+        data: v(vec![("constant_speed", Value::Arr(vec![Value::Int(2), Value::Int(1)]))]),
+    });
+    let graph = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    let options = Options { bin_mode: "separate".into(), ..options() };
+    let compat = prepare(&graph, &options, ClockProfile::LegacyImport).unwrap();
+    let typed = premiere_adapter::prepare_originals(&graph, &options, ClockProfile::LegacyImport).unwrap();
+    assert_eq!(compat.constant_speeds, typed.input.constant_speeds);
+    assert_eq!(compat.constant_speeds.len(), 1);
+    assert_eq!(compat.constant_speeds[0].ratio, (2, 1));
+    let [saved] = typed.input.sequences[0].markers.as_slice() else {
+        panic!("expected the one marker with qualified record time");
+    };
+    assert_eq!(saved.owner, "sequence");
+    assert_eq!(saved.start, frame(56).to_units(prproj::convert::model::TICKS_PER_SECOND).unwrap());
+    assert_eq!(saved.duration, frame(3).to_units(prproj::convert::model::TICKS_PER_SECOND).unwrap());
+    assert_eq!(saved.event, None);
+    assert_eq!(saved.source, None);
+    assert!(typed.losses.iter().any(|l| l.aspect == "marker_ownership" && l.reason.contains("corrected constant retime")));
+    assert!(typed.losses.iter().any(|l| l.aspect == "marker_timing"));
 }
 
 #[test]
@@ -817,14 +1261,33 @@ fn direct_dnxhd_drop_frame_requires_the_saved_profile_and_sequence_clock() {
     for mode in ["grouped", "merged"] {
         let options = Options { bin_mode: mode.into(), ..options() };
         let input = premiere_adapter::prepare_originals(&saved, &options, ClockProfile::LegacyImport).unwrap().input;
-        assert!(input.direct_dnxhr_origins.is_empty());
-        assert!(prepare_typed_project(&input, &out, &mut ids, &[], false).is_err());
-        assert!(!out.exists());
+        assert_eq!(input.direct_dnxhr_origins.values().copied().collect::<Vec<_>>(), [ticks(215_784)]);
+        assert_eq!(input.sequences[0].start, ticks(1795));
+        prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+        let mut doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+        std::fs::remove_file(&out).unwrap();
+        let displays: Vec<_> = doc.tree.iter_tag(doc.root, "MZ.Sequence.VideoTimeDisplayFormat")
+            .map(|n| doc.tree.text(n).unwrap()).collect();
+        assert_eq!(displays, ["102", "102"]);
+        // The reusable bin item and the editorial timeline have independent clocks.
+        let mut starts: Vec<_> = doc.tree.iter_tag(doc.root, "MZ.ZeroPoint")
+            .map(|n| doc.tree.text(n).unwrap().parse::<i64>().unwrap()).collect();
+        starts.sort_unstable();
+        assert_eq!(starts, [ticks(1795), ticks(215_784)]);
+        let states: Vec<_> = doc.tree.iter_tag(doc.root, "Media")
+            .filter_map(|n| doc.tree.child_by_tag(n, "ModificationState")).collect();
+        assert_eq!(states.len(), 3);
+        for state in states {
+            assert!(doc.payload(state).unwrap().is_some_and(|bytes| !bytes.is_empty()));
+        }
     }
     let mut unknown = saved.clone();
     unknown.sequences[0].clock = None;
-    assert!(premiere_adapter::prepare_originals(&unknown, &separate, ClockProfile::LegacyImport)
-        .err().unwrap().to_string().contains("direct_dnxhd_sequence_clock"));
+    for mode in ["separate", "grouped", "merged"] {
+        let options = Options { bin_mode: mode.into(), ..options() };
+        assert!(premiere_adapter::prepare_originals(&unknown, &options, ClockProfile::LegacyImport)
+            .err().unwrap().to_string().contains("direct_dnxhd_sequence_clock"));
+    }
     let mut wrong_coding = saved;
     let picture = wrong_coding.media.iter().find(|m| m.kind == StreamKind::Video).unwrap();
     let facts = wrong_coding.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == picture.id).unwrap();
@@ -1582,6 +2045,53 @@ fn off_clock_marker_duration_or_source_does_not_block_timeline() {
 }
 
 #[test]
+fn off_clock_edit_marker_source_keeps_its_exact_sequence_range() {
+    let mut g = coincident_marker_fixture();
+    let source = &mut g.sequences[0].markers[0];
+    source.source = Some(Q::new(1, 11).unwrap());
+    source.duration = Q::new(3, 24).unwrap();
+    source.inherited = true;
+    let saved = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let source = &saved.sequences[0].markers[0];
+
+    let prepared = premiere_adapter::prepare_originals(&saved, &options(), ClockProfile::LegacyImport)
+        .unwrap();
+    let sequence = &prepared.input.sequences[0];
+    assert_eq!(sequence.events.len(), 1);
+    let [marker] = sequence.markers.as_slice() else {
+        panic!("expected the exact edit marker range on the sequence");
+    };
+    let second = prproj::convert::model::TICKS_PER_SECOND;
+    assert_eq!(marker.start, source.start.unwrap().to_units(second).unwrap());
+    assert_eq!(marker.duration, 3 * (second / 24));
+    assert_eq!((&marker.name, &marker.comment), (&source.name, &source.comment));
+    assert_eq!(marker.track.as_deref(), Some("V1"));
+    assert_eq!(marker.owner, "sequence");
+    assert_eq!((marker.event, marker.source, marker.inherited), (None, None, false));
+    let marker_losses: Vec<_> = prepared.losses.iter().filter(|l| l.aspect.starts_with("marker_")).collect();
+    let [entry] = marker_losses.as_slice() else { panic!("expected one marker loss"); };
+    assert_eq!(entry.aspect, "marker_ownership");
+    assert!(entry.reason.starts_with(&format!("{}/marker/0:", saved.sequences[0].id)));
+    assert!(entry.reason.contains("marker source: 1/11 is not on the Premiere tick clock"));
+
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let out = std::env::temp_dir().join(format!("anynle-edit-marker-fallback-{}-{timestamp}.prproj", std::process::id()));
+    let mut ids = prproj::ids::SeededUuids::new("edit-marker-fallback");
+    prproj::convert::writer::prepare_typed_project(&prepared.input, &out, &mut ids, &[], false)
+        .unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&out).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    let project = prproj::model::Project::from_document(doc, &out).unwrap();
+    let [stored] = project.sequence_markers(project.sequences()[0]) else {
+        panic!("expected one saved sequence marker");
+    };
+    use prproj::model::marker::{marker_end, marker_name, marker_start};
+    assert_eq!(marker_name(&project.doc.tree, *stored).unwrap(), source.name);
+    assert_eq!(marker_start(&project.doc.tree, *stored).unwrap().ticks, marker.start);
+    assert_eq!(marker_end(&project.doc.tree, *stored).unwrap().ticks, marker.start + marker.duration);
+}
+
+#[test]
 fn resolve_sequence_marker_palette_survives_graph_reload() {
     let mut graph = fixture();
     let template = graph.sequences[0].markers[0].clone();
@@ -1751,8 +2261,7 @@ fn audio_source_subframes_remain_exact_but_unsupported_record_subframes_refuse()
         .contains("destination_record_grid"));
 }
 
-#[test]
-fn marker_inheritance_uses_exact_source_time_and_creation_content() {
+fn coincident_marker_fixture() -> SourceGraph {
     let mut g = fixture();
     let video = g.sequences[0].placements[0].id.clone();
     let mut source = g.sequences[0].markers[0].clone();
@@ -1788,6 +2297,12 @@ fn marker_inheritance_uses_exact_source_time_and_creation_content() {
             ));
         }
     }
+    g
+}
+
+#[test]
+fn marker_inheritance_uses_exact_source_time_and_creation_content() {
+    let mut g = coincident_marker_fixture();
     let r = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
     let m = &r.model.sequences[0].markers[0];
     assert_eq!(m.source, Some(3 * 254016000000));
@@ -1798,6 +2313,28 @@ fn marker_inheritance_uses_exact_source_time_and_creation_content() {
     assert_eq!(r.model.clips["clip-1"].markers[0].track.as_deref(), Some("V1"));
     assert!(r.model.sequences[0].markers[0].inherited);
     g.items[0].markers[0].track = Some(graph::TrackRef { kind: StreamKind::Video, index: 1 });
+
+    let mut undated = g.clone();
+    for object in [&undated.items[0].id, &undated.sequences[0].id] {
+        let sidecar = undated.sidecars.iter_mut()
+            .find(|s| s.adapter == "avid.source" && s.object == *object).unwrap();
+        let Value::Obj(fields) = &mut sidecar.data else { panic!("expected source receipt") };
+        let Value::Arr(rows) = &mut fields.iter_mut().find(|(k, _)| k == "marker_native").unwrap().1
+            else { panic!("expected native markers") };
+        let Value::Obj(fields) = &mut rows[0] else { panic!("expected native marker") };
+        fields.iter_mut().find(|(k, _)| k == "created").unwrap().1 = Value::Null;
+    }
+    let range = Q::new(1, 24).unwrap();
+    undated.items[0].markers[0].duration = range;
+    undated.sequences[0].markers[0].duration = range;
+    let undated = SourceGraph::from_json_text(&undated.to_json_text().unwrap()).unwrap();
+    let r = prepare(&undated, &options(), ClockProfile::LegacyImport).unwrap();
+    let marker = &r.model.sequences[0].markers[0];
+    assert_eq!(marker.owner, "edit");
+    assert_eq!(marker.source, Some(3 * 254016000000));
+    assert_eq!(marker.duration, 254016000000 / 24);
+    assert!(!marker.inherited);
+    assert_eq!(r.model.clips["clip-1"].markers[0].duration, marker.duration);
 
     // An edit-local range change must not be discarded as an inherited copy.
     g.sequences[0].markers[0].duration = Q::new(1, 24).unwrap();
@@ -1815,6 +2352,69 @@ fn marker_inheritance_uses_exact_source_time_and_creation_content() {
     g.items[0].markers[0].start = Some(Q::new(73, 24).unwrap());
     let r = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
     assert!(!r.model.sequences[0].markers[0].inherited);
+}
+
+#[test]
+fn ambiguous_coincident_markers_reach_the_conflict_preference() {
+    use prproj::convert::writer::prepare_typed_project;
+
+    let g = coincident_marker_fixture();
+    for duplicate_source in [true, false] {
+        let mut graph = g.clone();
+        let (object, markers) = if duplicate_source {
+            let item = &mut graph.items[0];
+            (&item.id, &mut item.markers)
+        } else {
+            let sequence = &mut graph.sequences[0];
+            (&sequence.id, &mut sequence.markers)
+        };
+        let mut second = markers[0].clone();
+        second.owner_occurrence.push_str("/second");
+        markers.push(second);
+        let receipt = graph.sidecars.iter_mut()
+            .find(|sidecar| sidecar.adapter == "avid.source" && &sidecar.object == object)
+            .unwrap();
+        let Value::Obj(fields) = &mut receipt.data else { panic!("expected source receipt") };
+        let Value::Arr(rows) = &mut fields.iter_mut().find(|(k, _)| k == "marker_native").unwrap().1
+            else { panic!("expected native markers") };
+        let mut second = rows[0].clone();
+        let Value::Obj(fields) = &mut second else { panic!("expected native marker") };
+        fields.iter_mut().find(|(k, _)| k == "graph_index").unwrap().1 = Value::Int(1);
+        rows.push(second);
+
+        let saved = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+        for winner in ["source", "edit"] {
+            let opts = Options {
+                marker_conflict_winner: winner.into(),
+                marker_conflict_loser_to_sequence: true,
+                ..options()
+            };
+            let prepared = prepare(&saved, &opts, ClockProfile::LegacyImport).unwrap();
+            let source = &prepared.model.clips["clip-1"].markers;
+            let edits = &prepared.model.sequences[0].markers;
+            assert_eq!(source.len(), if duplicate_source { 2 } else { 1 });
+            assert_eq!(edits.len(), if duplicate_source { 1 } else { 2 });
+            assert!(edits.iter().all(|marker| !marker.inherited), "duplicate source: {duplicate_source}");
+
+            let path = std::env::temp_dir().join(format!(
+                "anynle-ambiguous-markers-{duplicate_source}-{winner}-{}-{}.prproj",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            ));
+            let adapted = premiere_adapter::prepare_originals(&saved, &opts, ClockProfile::LegacyImport).unwrap();
+            let mut ids = prproj::SeededUuids::new("ambiguous-marker-conflict");
+            let report = prepare_typed_project(&adapted.input, &path, &mut ids, &[], false)
+                .unwrap().publish().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(report.notes.iter().any(|note| note.contains(&format!(
+                "the {winner} marker is kept, the other placed on the sequence"
+            ))));
+            let doc = prproj::PremiereDocument::from_bytes(&bytes).unwrap();
+            let named_markers = doc.tree.iter_tag(doc.root, "DVAMarker").count();
+            assert_eq!(named_markers, source.len() * 2 + edits.len());
+        }
+    }
 }
 
 #[test]
@@ -2081,6 +2681,67 @@ fn original_fixture() -> SourceGraph {
         m.original=Some(OriginalStream{saved_locators:vec!["/Saved/source.mp4".into()],container:"mov".into(),stream_index:if audio{1}else{0},channel_index:if audio{Some(m.stream.unwrap()-1)}else{None},channels:audio.then_some(2),time_base:Q::new(1,clock).unwrap(),start_pts:0,duration_ts:m.duration.to_units(clock as i64).unwrap(),sample_representation:audio.then_some("aac".into())});
     }
     g
+}
+
+#[test]
+fn linked_aac_origin_preserves_stereo_source_and_independent_audio_edits() {
+    use prproj::convert::prepared::PreparedClip;
+
+    let mut g = original_fixture();
+    g.items[0].stream_groups = vec![vec![1, 2]];
+    for m in g.media.iter().filter(|m| m.kind == StreamKind::Audio) {
+        let side = g.sidecars.iter_mut().find(|sc|
+            sc.adapter == "avid.source" && sc.object == m.id).unwrap();
+        let Value::Obj(fields) = &mut side.data else { panic!("expected receipt") };
+        fields.extend([
+            ("same_rate_aac_file_track_start".into(), Value::Int(1)),
+            ("verified_aac_priming_samples".into(), Value::Int(1024)),
+        ]);
+    }
+    let frame = Q::new(1, 24).unwrap();
+    let mut expected = Vec::new();
+    for p in &mut g.sequences[0].placements {
+        if let [channel] = p.audio_streams.as_slice() {
+            // Use different source trims on the two lanes to catch accidental
+            // recombination into one stereo edit using just one trim.
+            if *channel == 2 {
+                p.source_in = p.source_in.checked_add(frame).unwrap();
+            }
+            let source = p.source_in.checked_add(frame).unwrap();
+            expected.push((p.id.clone(), source, *channel));
+            g.sidecars.push(Sidecar {
+                adapter: "avid.same_rate_aac".into(),
+                object: p.id.clone(),
+                data: v(vec![
+                    ("file_track_start", Value::Int(1)),
+                    ("saved_source_in", Value::Str(p.source_in.to_string())),
+                ]),
+            });
+            p.source_in = source;
+        }
+    }
+    assert_eq!(expected.len(), 2);
+    let encoded = g.to_json_text().unwrap();
+    let mut g = SourceGraph::from_json_text(&encoded).unwrap();
+    let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let [PreparedClip::Original(mono), PreparedClip::Original(stereo)] = prepared.input.clips.as_slice()
+        else { panic!("expected two prepared views of one original") };
+    assert_eq!(mono.groups, [vec![1], vec![2]]);
+    assert_eq!(stereo.groups, [vec![1, 2]]);
+    assert_eq!(mono.path, stereo.path);
+    for (id, source, channel) in &expected {
+        let (s, e) = prepared.ownership[id];
+        let edit = &prepared.input.sequences[s].events[e];
+        assert_eq!(edit.clip, mono.metadata.id);
+        assert_eq!(edit.source_in, source.to_units(prproj::convert::model::TICKS_PER_SECOND).unwrap());
+        assert_eq!(edit.audio_channels, [*channel]);
+    }
+    assert!(prepared.losses.iter().any(|loss| loss.aspect == "original_audio_insertion"));
+    let receipt = g.sidecars.iter_mut().find(|sc| sc.object == expected[0].0
+        && sc.adapter == "avid.same_rate_aac").unwrap();
+    receipt.data = v(vec![("file_track_start", Value::Int(0))]);
+    assert!(premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport)
+        .err().unwrap().to_string().contains("verified one-frame offset"));
 }
 
 #[test]
@@ -2501,6 +3162,55 @@ fn editable_multicam_resolves_independent_audio_order_and_refuses_unsupported_us
     assert!(premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).err().unwrap().0.contains("two original mono PCM24 siblings"));
 }
 
+#[test]
+fn static_motion_on_multicam_requires_the_avid_warp_input_witness() {
+    let mut graph = fixed_audio_group();
+    let usage = graph.multicam_uses.iter().find(|usage| usage.kind == StreamKind::Video).unwrap();
+    let usage_id = usage.id.clone();
+    let placement = graph.sequences[0].placements.iter_mut()
+        .find(|placement| usage.binding.placements.contains(&placement.id)).unwrap();
+    placement.transform = Some(graph::Transform {
+        position: (0.0, 0.0),
+        scale: (63.0, 63.0),
+        rotation: 0.0,
+        anchor: (0.0, 0.0),
+        crop: [0.0; 4],
+    });
+    let prepare = |graph: &SourceGraph| {
+        premiere_adapter::prepare_originals(graph, &options(), ClockProfile::VerifiedRewrap)
+    };
+    assert!(prepare(&graph).is_err());
+    graph.sidecars.push(Sidecar {
+        adapter: "avid.group_use".into(),
+        object: usage_id,
+        data: v(vec![("warp_picture_input", Value::Bool(true))]),
+    });
+    let loaded = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    let prepared = prepare(&loaded).unwrap();
+    let video = prepared.input.multicam_uses.iter().find(|usage| usage.video.is_some()).unwrap();
+    assert!(video.warp_picture_input);
+    assert_eq!(video.video, Some(1));
+    assert!(prepared.input.sequences[video.sequence].events[video.event].transform.is_some());
+}
+
+#[test]
+fn one_mono_group_preserves_second_default_picture_and_first_camera_audio() {
+    use prproj::convert::multicam::PreparedGroupAudio::Group;
+    let mut graph = fixed_audio_group();
+    let lanes = &mut graph.multicams[0].lanes;
+    lanes[0].selected = Some(1);
+    lanes.retain(|lane| lane.kind != StreamKind::Audio || lane.index == 1);
+    graph.multicam_uses.retain(|usage| usage.kind != StreamKind::Audio || usage.track == 1);
+    graph.sequences[0].placements.retain(|edit| edit.audio_tracks != [2]);
+    let prepared = premiere_adapter::prepare_originals(&graph, &options(), ClockProfile::VerifiedRewrap)
+        .unwrap();
+    let [group] = prepared.input.multicams.as_slice() else { panic!("one native Group") };
+    assert_eq!(group.cameras[0].clip, "camera-b");
+    assert_eq!(group.audio_cameras, [1]);
+    assert!(prepared.input.multicam_uses.iter().any(|usage| usage.video == Some(0)));
+    assert!(prepared.input.multicam_uses.iter().any(|usage| usage.audio == [Group(0)]));
+}
+
 fn linked_group_camera_fixture() -> SourceGraph {
     let mut g = fixed_audio_group();
     let rate = Q::new(24000, 1001).unwrap();
@@ -2541,6 +3251,485 @@ fn linked_group_camera_fixture() -> SourceGraph {
         ]);
     }
     g
+}
+
+#[test]
+fn layered_submaster_preserves_two_source_ranges_and_declines_an_overlap() {
+    let rate_23976 = Q::new(24000, 1001).unwrap();
+    for (rate, dnxhd) in [(rate_23976, false), (rate_23976, true), (q(24), true)] {
+        check_layered_submaster(rate, dnxhd);
+    }
+}
+
+fn check_layered_submaster(rate: Q, dnxhd: bool) {
+    let mut graph = linked_group_camera_fixture();
+    graph.multicams.clear();
+    graph.multicam_uses.clear();
+    graph.bins[0].items.retain(|id| id != "synthetic-group");
+    let frame = |n: i128| Q::new(n * i128::from(rate.den()), i128::from(rate.num())).unwrap();
+    let exact_24 = rate == q(24);
+    if dnxhd {
+        let sample_count = if exact_24 { 120000 } else { 120120 };
+        let bits = if exact_24 { 16 } else { 24 };
+        for item in &mut graph.items {
+            item.rate = Some(rate);
+        }
+        for m in &mut graph.media {
+            let picture = m.kind == StreamKind::Video;
+            m.duration = frame(60);
+            let clock = m.clock.as_mut().unwrap();
+            clock.rate = rate;
+            let descriptor = if picture {
+                m.rate = Some(rate);
+                clock.provenance.source_rate = rate;
+                v(vec![
+                    ("compression", Value::Str("AVHD".into())),
+                    ("resolution_id", Value::Int(1253)),
+                    ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)])),
+                ])
+            } else {
+                m.bits = Some(bits);
+                v(vec![("channels", Value::Int(1)), ("bits", Value::Int(bits))])
+            };
+            let side = graph.sidecars.iter_mut().find(|s| s.object == m.id && s.adapter == "avid.source").unwrap();
+            let Value::Obj(fields) = &mut side.data else { unreachable!() };
+            for (key, value) in fields {
+                match key.as_str() {
+                    "descriptor" => *value = descriptor.clone(),
+                    "descriptor_length" if !picture => *value = Value::Int(sample_count),
+                    "picture_coding" if picture => *value = Value::Str("060E2B340401010A0401020271130000".into()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let sequence = &mut graph.sequences[0];
+    sequence.rate = rate;
+    for p in &mut sequence.placements {
+        p.duration = frame(10);
+        p.source_in = frame(if p.video_track.is_some() { 8 } else { 5 });
+    }
+    sequence.start = Some(frame(86_400));
+    sequence.clock = Some(SourceClock {
+        effective_count: 86_400,
+        rate,
+        display_base: 24,
+        drop: false,
+        provenance: SourceClockProvenance {
+            origin_count: 86_400,
+            source_offset: 0,
+            source_rate: rate,
+            source_package: sequence.id.clone(),
+            timecode_track: "TC1/1".into(),
+            route: "direct sequence TC1".into(),
+        },
+    });
+    let sequence_id = sequence.id.clone();
+    let saved_rate = rate.to_string();
+    let str_value = |s: &str| Value::Str(s.into());
+    let layer = |track, item: &graph::source::SourceItem, start, source_in, duration, bound_item: Option<Value>| {
+        let mob = item.umid.as_ref().unwrap();
+        let parts = mob.as_bytes().chunks(8).map(|b| std::str::from_utf8(b).unwrap()).collect::<Vec<_>>();
+        let mut source = vec![
+            ("mob", Value::Str(format!("urn:smpte:umid:{}", parts.join(".").to_ascii_lowercase()))),
+            ("track", Value::Int(1)),
+            ("local_length", Value::Int(20)),
+            ("local_start", Value::Int(start)),
+            ("source_start", Value::Int(source_in)),
+            ("length", Value::Int(duration)),
+            ("rate", str_value(&saved_rate)),
+        ];
+        if let Some(bound_item) = bound_item {
+            source.push(("item", bound_item));
+        }
+        v(vec![("track", Value::Int(track)), ("picture_source", v(source))])
+    };
+    let owner = |index| format!("{sequence_id}/component/{index}");
+    let issue = |at, index, upper_source, upper_item| v(vec![
+        ("effect_id", str_value("EFF_SUBMASTER")),
+        ("picture_profile", str_value("plain_layered_submaster")),
+        ("kind", Value::Int(1)), ("track", Value::Int(1)),
+        ("record_rate", str_value(&saved_rate)),
+        ("record_start", v(vec![("value", Value::Int(at))])),
+        ("record_length", Value::Int(20)), ("input_count", Value::Int(3)),
+        ("owner", Value::Str(owner(index))),
+        ("reason", str_value("Saved picture layers")),
+        ("submaster_inputs", Value::Arr(vec![
+            v(vec![("track", Value::Int(1)), ("segment_class", str_value("FILL"))]),
+            layer(2, &graph.items[0], 0, 5, 20, None),
+            layer(3, &graph.items[1], 4, upper_source, 9, upper_item),
+        ])),
+    ]);
+    let rows = |next, origin: &str, upper_item: Option<Value>| v(vec![
+        ("compatibility_start", str_value(origin)),
+        ("unresolved", Value::Arr(vec![
+            issue(12, 0, 31, upper_item.clone()), issue(next, 1, 35, upper_item.clone()),
+            issue(52, 2, 60, upper_item),
+            v(vec![("kind", Value::Int(2))]),
+        ])),
+    ]);
+    let candidate = rows(32, "3600", None);
+    let overlap = rows(31, "3600", None);
+    let wrong_origin = rows(32, "3599", None);
+    let substituted = rows(32, "3600", Some(str_value("clip:camera-b-copy")));
+    let wrong_mob = rows(32, "3600", Some(str_value(&graph.items[0].id)));
+    let unresolved_copy = rows(32, "3600", Some(Value::Null));
+    let loss_reasons: Vec<_> = (0..3).map(|index| format!("V1 at {}: Saved picture layers", owner(index))).collect();
+    graph.sidecars.retain(|s| s.adapter != "avid.source" || s.object != sequence_id);
+    graph.sidecars.push(Sidecar { adapter: "avid.source".into(), object: sequence_id.clone(), data: candidate });
+    graph.losses.extend(loss_reasons.iter().map(|reason| graph::Loss {
+        object: sequence_id.clone(), aspect: premiere_adapter::LAYERED_LOSS.into(), reason: reason.clone(),
+    }));
+    let sequence = &mut graph.sequences[0];
+    let video = sequence.placements.iter().find(|p| p.video_track == Some(1)).unwrap().clone();
+    sequence.markers.push(SourceMarker {
+        name: "Review preceding cut".into(),
+        comment: String::new(),
+        user: String::new(),
+        color: None,
+        start: Some(frame(2)),
+        duration: frame(1),
+        track: Some(TrackRef { kind: StreamKind::Video, index: 1 }),
+        owner: MarkerOwner::Edit,
+        owner_occurrence: "preceding-source-marker".into(),
+        owner_local: Some(frame(2)),
+        owner_rate: Some(rate),
+        binding: SourceBinding { placements: vec![video.id.clone()], reason: None },
+        source: Some(frame(10)),
+        inherited: false,
+    });
+    let mut outgoing = video.clone();
+    outgoing.id = "following-cut-a".into();
+    outgoing.record_start = frame(60);
+    outgoing.duration = frame(12);
+    let mut incoming = video;
+    incoming.id = "following-cut-b".into();
+    incoming.record_start = frame(68);
+    incoming.duration = frame(12);
+    sequence.transitions.push(SourceTransition {
+        id: "following-dissolve".into(),
+        kind: StreamKind::Video,
+        track: 1,
+        cut: frame(70),
+        duration: frame(4),
+        cut_offset: frame(2),
+        style: "avid.EFF2_BLEND_DISSOLVE".into(),
+        outgoing: SourceBinding { placements: vec![outgoing.id.clone()], reason: None },
+        incoming: SourceBinding { placements: vec![incoming.id.clone()], reason: None },
+    });
+    sequence.placements.extend([outgoing, incoming]);
+    sequence.texts.push(graph::source::SourceText {
+        id: "following-graphic".into(), kind: graph::source::TextKind::Graphic, track: 1,
+        content: Some("Following graphic".into()), record_start: Some(frame(80)),
+        duration: Some(frame(5)), reason: None,
+    });
+    let prepare = |graph| premiere_adapter::prepare_originals(graph, &options(), ClockProfile::LegacyImport)
+        .unwrap();
+    let reloaded = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    let prepared = prepare(&reloaded);
+    let [nest, next] = prepared.input.layered_submasters.as_slice() else { panic!("expected two layered Submasters") };
+    let ticks = |n| frame(n).to_units(prproj::convert::model::TICKS_PER_SECOND).unwrap();
+    assert_eq!((nest.start, nest.duration), (ticks(12), ticks(20)));
+    assert_eq!(nest.layers.each_ref().map(|l| (l.start, l.source_in, l.duration)),
+        [(0, ticks(5), ticks(20)), (ticks(4), ticks(31), ticks(9))]);
+    assert_ne!(nest.layers[0].clip, nest.layers[1].clip);
+    assert_eq!((next.start, next.layers[1].source_in), (ticks(32), ticks(35)));
+    let remaining = |losses: &[graph::Loss]| losses.iter().filter(|l| l.aspect == premiere_adapter::LAYERED_LOSS)
+        .map(|l| l.reason.clone()).collect::<Vec<_>>();
+    assert_eq!(remaining(&prepared.losses), loss_reasons[2..]);
+    assert_eq!(prepared.input.video_dissolves.len(), 1);
+    assert_eq!(prepared.input.texts[0].start, ticks(80));
+    let marker = &prepared.input.sequences[0].markers[0];
+    assert_eq!((marker.owner.as_str(), marker.start, marker.duration), ("edit", ticks(2), ticks(1)));
+    prepared.input.validate().unwrap();
+    let mut invalid = prepared.input;
+    invalid.layered_submasters[0].layers[1].source_in = ticks(60);
+    assert!(invalid.validate().is_err());
+    let mut marked = graph.clone();
+    marked.sequences[0].markers.push(SourceMarker {
+        name: "Review nested edit".into(),
+        comment: String::new(),
+        user: String::new(),
+        color: None,
+        start: Some(frame(19)),
+        duration: frame(6),
+        track: Some(TrackRef { kind: StreamKind::Video, index: 1 }),
+        owner: MarkerOwner::Edit,
+        owner_occurrence: format!("{sequence_id}/component/0"),
+        owner_local: Some(frame(7)),
+        owner_rate: Some(rate),
+        binding: SourceBinding {
+            placements: vec![],
+            reason: Some("native owner includes an unresolved source branch".into()),
+        },
+        source: None,
+        inherited: false,
+    });
+    let restored = premiere_adapter::prepare_originals(&marked, &options(), ClockProfile::LegacyImport)
+        .unwrap();
+    assert_eq!(restored.input.layered_submasters.len(), 2);
+    let record_marker = &restored.input.sequences[0].markers[1];
+    assert_eq!((record_marker.owner.as_str(), record_marker.start, record_marker.duration),
+        ("sequence", ticks(19), ticks(6)));
+    let mut shared_cut = marked.clone();
+    shared_cut.sequences[0].markers[1].start = Some(frame(30));
+    shared_cut.sequences[0].markers[1].owner_local = Some(frame(18));
+    let surviving = prepare(&shared_cut);
+    assert_eq!(remaining(&surviving.losses), loss_reasons[2..]);
+    assert_eq!(surviving.input.layered_submasters.len(), 2);
+    let marker = &surviving.input.sequences[0].markers[1];
+    assert_eq!((marker.owner.as_str(), marker.start, marker.duration),
+        ("sequence", ticks(30), ticks(6)));
+    let mut uncertain = shared_cut.clone();
+    uncertain.sequences[0].markers[1].owner_local = Some(frame(17));
+    let refused = prepare(&uncertain);
+    assert!(refused.input.layered_submasters.is_empty());
+    assert_eq!(remaining(&refused.losses), loss_reasons);
+    // A marker on an inner effect does not prove ownership of the nest.
+    marked.sequences[0].markers[1].owner_occurrence.push_str("/component/4");
+    let unresolved = premiere_adapter::prepare_originals(&marked, &options(), ClockProfile::LegacyImport)
+        .unwrap();
+    assert_eq!(unresolved.input.layered_submasters.len(), 1);
+    assert_eq!(unresolved.input.layered_submasters[0].start, ticks(32));
+    // The parent sequence can carry the full range even when its end
+    // exceeds the nest. Its start must still belong to the saved owner.
+    let range = &mut marked.sequences[0].markers[1];
+    range.owner_occurrence = format!("{sequence_id}/component/1");
+    range.start = Some(frame(49));
+    range.owner_local = Some(frame(17));
+    let spanning = prepare(&marked);
+    assert_eq!(spanning.input.layered_submasters.len(), 2);
+    assert_eq!(remaining(&spanning.losses), loss_reasons[2..]);
+    let marker = &spanning.input.sequences[0].markers[1];
+    assert_eq!((marker.owner.as_str(), marker.start, marker.duration),
+        ("sequence", ticks(49), ticks(6)));
+    let mut beyond_owner = marked.clone();
+    beyond_owner.sequences[0].markers[1].start = Some(frame(52));
+    beyond_owner.sequences[0].markers[1].owner_local = Some(frame(20));
+    let outside = prepare(&beyond_owner);
+    assert_eq!(outside.input.layered_submasters.len(), 1);
+    assert_eq!(outside.input.layered_submasters[0].start, ticks(12));
+    let mut with_copy = graph.clone();
+    let mut copy = graph.items[1].clone();
+    copy.id = "clip:camera-b-copy".into();
+    with_copy.bins.push(graph::Bin {
+        id: "other-bin".into(), name: "Other bin".into(), parent: None, items: vec![copy.id.clone()],
+    });
+    with_copy.items.push(copy);
+    let unbound = premiere_adapter::prepare_originals(&with_copy, &options(), ClockProfile::LegacyImport)
+        .unwrap();
+    assert!(unbound.input.layered_submasters.is_empty());
+    with_copy.sidecars.last_mut().unwrap().data = substituted;
+    let saved = SourceGraph::from_json_text(&with_copy.to_json_text().unwrap()).unwrap();
+    let restored = premiere_adapter::prepare_originals(&saved, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(restored.input.layered_submasters.len(), 2);
+    assert!(restored.input.layered_submasters.iter().all(|nest| nest.layers[1].clip == "camera-b-copy"));
+    if dnxhd && !exact_24 {
+        assert!(restored.input.direct_dnxhd_pcm24.contains("camera-b"));
+        assert!(restored.input.direct_dnxhd_pcm24.contains("camera-b-copy"));
+    }
+    assert_eq!(remaining(&restored.losses), loss_reasons[2..]);
+    for invalid in [wrong_mob, unresolved_copy] {
+        let mut with_wrong_item = graph.clone();
+        with_wrong_item.sidecars.last_mut().unwrap().data = invalid;
+        let declined = premiere_adapter::prepare_originals(&with_wrong_item, &options(), ClockProfile::LegacyImport)
+            .unwrap();
+        assert!(declined.input.layered_submasters.is_empty());
+        assert_eq!(remaining(&declined.losses), loss_reasons);
+    }
+    if exact_24 {
+        let mut disagreeing = graph.clone();
+        disagreeing.sidecars.last_mut().unwrap().data = wrong_origin;
+        let refused = premiere_adapter::prepare_originals(&disagreeing, &options(), ClockProfile::LegacyImport)
+            .unwrap();
+        assert!(refused.input.layered_submasters.is_empty());
+        assert_eq!(remaining(&refused.losses), loss_reasons);
+    }
+    let mut title_overlap = graph.clone();
+    title_overlap.sequences[0].texts[0].record_start = Some(frame(27));
+    let with_title = prepare(&title_overlap);
+    assert_eq!(with_title.input.layered_submasters.len(), 1);
+    assert_eq!(with_title.input.layered_submasters[0].start, ticks(32));
+    assert_eq!(remaining(&with_title.losses), [loss_reasons[0].clone(), loss_reasons[2].clone()]);
+    graph.sidecars.last_mut().unwrap().data = overlap;
+    let declined = prepare(&graph);
+    assert!(declined.input.layered_submasters.is_empty());
+    assert_eq!(remaining(&declined.losses), loss_reasons);
+}
+
+#[test]
+fn linked_three_mono_group_keeps_default_and_independent_third_lane() {
+    use prproj::convert::{multicam::{PreparedGroupAudio, FRAME}, writer::prepare_typed_project};
+
+    let mut graph = linked_group_camera_fixture();
+    for (i, media) in graph.media.iter().enumerate() {
+        let facts = graph.sidecars.iter_mut()
+            .find(|s| s.adapter == "avid.source" && s.object == media.id).unwrap();
+        let Value::Obj(fields) = &mut facts.data else { panic!("missing native facts") };
+        fields.iter_mut().find(|(key, _)| key == "file_package").unwrap().1 =
+            Value::Str(format!("{:064X}", i + 1));
+        if media.kind == StreamKind::Audio {
+            fields.iter_mut().find(|(key, _)| key == "descriptor").unwrap().1 =
+                v(vec![("channels", Value::Int(1)), ("bits", Value::Int(24))]);
+        }
+    }
+    let without_a3 = graph.clone();
+    for (i, item) in graph.items.iter_mut().enumerate() {
+        let mut binding = item.media.last().unwrap().clone();
+        let mut media = graph.media.iter()
+            .find(|m| m.id == binding.media).unwrap().clone();
+        media.id.push_str(":third");
+        media.locations[0].push_str(".third.mxf");
+        media.stream = Some(3);
+        let mut facts = graph.sidecars.iter()
+            .find(|s| s.adapter == "avid.source" && s.object == binding.media).unwrap().clone();
+        facts.object = media.id.clone();
+        let Value::Obj(fields) = &mut facts.data else { panic!("missing native facts") };
+        fields.iter_mut().find(|(key, _)| key == "file_package").unwrap().1 =
+            Value::Str(format!("{:064X}", i + 7));
+        graph.sidecars.push(facts);
+        binding.media = media.id.clone();
+        graph.media.push(media);
+        item.media.push(binding);
+    }
+    let group = &mut graph.multicams[0];
+    let mut lane = group.lanes[2].clone();
+    lane.index = 3;
+    lane.selected = Some(1);
+    for alternative in &mut lane.alternatives {
+        alternative.id.push_str(":third");
+        for piece in &mut alternative.pieces {
+            if piece.item.is_some() {
+                piece.stream = Some(3);
+            }
+        }
+    }
+    group.lanes.push(lane);
+
+    let sequence = &mut graph.sequences[0];
+    let audio = sequence.placements.iter().find(|p| p.audio_tracks == [2]).unwrap().clone();
+    let use_ = graph.multicam_uses.iter()
+        .find(|u| u.kind == StreamKind::Audio && u.track == 2).unwrap().clone();
+    let frame = |n: i128| Q::new(n * 1001, 24000).unwrap();
+    for (start, end, alternate) in [(0, 3, false), (3, 6, true), (6, 10, false)] {
+        let mut edit = audio.clone();
+        edit.id = format!("third:{start}");
+        edit.record_start = frame(start);
+        edit.source_in = frame(if alternate { 8 + start } else { 5 + start });
+        edit.duration = frame(end - start);
+        edit.audio_tracks = vec![3];
+        edit.audio_streams = vec![3];
+        let mut pick = use_.clone();
+        pick.id = format!("use:third:{start}");
+        pick.track = 3;
+        pick.lane = Some(3);
+        pick.selected = Some(if alternate { 0 } else { 1 });
+        pick.record_start = Some(edit.record_start);
+        pick.source_in = Some(frame(8 + start));
+        pick.duration = Some(edit.duration);
+        pick.binding.placements = vec![edit.id.clone()];
+        if alternate {
+            edit.item = without_a3.items[1].id.clone();
+        }
+        sequence.placements.push(edit);
+        graph.multicam_uses.push(pick);
+    }
+
+    let saved = graph.to_json_text().unwrap();
+    let loaded = SourceGraph::from_json_text(&saved).unwrap();
+    assert_eq!(loaded, graph);
+    let prepared = premiere_adapter::prepare_originals(&loaded, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(prepared.input.multicams[0].audio_cameras, [0, 0, 0]);
+    assert_eq!(prepared.input.multicams[0].cameras[0].audio_labels, [1, 2, 3]);
+    assert_eq!(prepared.input.multicam_uses.iter().filter(|u|
+        u.audio.contains(&PreparedGroupAudio::LinkedAlternate(2))).count(), 1);
+    assert!(premiere_adapter::prepare_originals(&loaded, &options(), ClockProfile::VerifiedRewrap).is_err());
+    let merged = Options { bin_mode: "merged".into(), ..options() };
+    let refused = premiere_adapter::prepare_originals(&loaded, &merged, ClockProfile::LegacyImport).err().unwrap();
+    assert!(refused.0.contains("Separate files"), "{refused:?}");
+
+    let mut offline = loaded.clone();
+    offline.media.iter_mut().find(|m| m.stream == Some(3)).unwrap().online = Some(false);
+    assert!(premiere_adapter::prepare_originals(&offline, &options(), ClockProfile::LegacyImport).is_err());
+    let mut duplicate = loaded.clone();
+    let second = duplicate.sidecars.iter()
+        .find(|side| side.object == duplicate.items[0].media[2].media && side.adapter == "avid.source").unwrap();
+    let Value::Obj(fields) = &second.data else { panic!("missing native facts") };
+    let package = fields.iter().find(|(key, _)| key == "file_package").unwrap().1.clone();
+    let third = duplicate.sidecars.iter_mut()
+        .find(|side| side.object == duplicate.items[0].media[3].media && side.adapter == "avid.source").unwrap();
+    let Value::Obj(fields) = &mut third.data else { panic!("missing native facts") };
+    fields.iter_mut().find(|(key, _)| key == "file_package").unwrap().1 = package;
+    let refused = premiere_adapter::prepare_originals(&duplicate, &options(), ClockProfile::LegacyImport).err().unwrap();
+    assert!(refused.0.contains("three original mono PCM24 siblings"), "{refused:?}");
+    let mut wrong = loaded.clone();
+    let middle = wrong.multicam_uses.iter_mut().find(|p| p.id == "use:third:3").unwrap();
+    middle.selected = Some(1);
+    let refused = premiere_adapter::prepare_originals(&wrong, &options(), ClockProfile::LegacyImport).err().unwrap();
+    assert!(refused.0.contains("audio choice contradicts"), "{refused:?}");
+
+    let dir = std::env::temp_dir().join(format!("anynle-three-mono-group-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir(&dir).unwrap();
+    let out = dir.join("Independent A3.prproj");
+    prepare_typed_project(&prepared.input, &out, &mut prproj::SeededUuids::new("three-mono-group"), &[], false)
+        .unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    let project = prproj::model::Project::from_document(doc, &out).unwrap();
+    let tree = &project.doc.tree;
+    assert_eq!(tree.iter_tag(project.doc.root, "CodecType").filter_map(|n| tree.text(n)).collect::<Vec<_>>(),
+        ["1096180840", "1096180840"]);
+    let group = project.sequences().into_iter().find(|&s| project.sequence_name(s) == "Synthetic Group").unwrap();
+    assert_eq!(project.sequence(group).audio_channel_count, Some(8));
+    let tracks = project.audio_tracks(group);
+    assert_eq!(tracks.iter().map(|&t| project.is_muted(t).unwrap()).collect::<Vec<_>>(),
+        [false, false, false, true, true, true]);
+    let third = project.track(tracks[2]).element;
+    let panner = project.doc.resolve(tree.find1(third, "AudioTrack/Panner").unwrap()).unwrap();
+    assert_eq!(tree.findtext(panner, "DirectPanProcessor/Matrix").unwrap().as_deref(), Some("[[0,[2]],[1,[3]]]"));
+    let timeline = project.sequences().into_iter().find(|&s| project.sequence_name(s) == loaded.sequences[0].name).unwrap();
+    let a3 = &project.track(project.audio_tracks(timeline)[2]).clips;
+    assert_eq!(a3.len(), 3);
+    for &edit in &[a3[0], a3[2]] {
+        let placed = project.track_item(edit);
+        assert_eq!(tree.findtext(placed.subclip, "OrigChGrp").unwrap().as_deref(), Some("2"));
+        let references = tree.findall(placed.clip, "SecondaryContents/SecondaryContentItem").unwrap();
+        let [reference] = references.as_slice() else { panic!("expected one mono content") };
+        let content = project.doc.resolve(*reference).unwrap();
+        assert_eq!(tree.findtext(content, "ChannelIndex").unwrap().as_deref(), Some("3"));
+    }
+    let middle_source = project.track_item_source(a3[1]).unwrap();
+    let camera_b = &loaded.items[1];
+    let third_b = loaded.media.iter().find(|m| m.id == camera_b.media[3].media).unwrap();
+    assert_eq!(project.item_media_path(middle_source), Some(third_b.locations[0].as_str()));
+    assert_eq!(project.start(a3[1]).unwrap().ticks, 3 * FRAME);
+    assert_eq!(project.in_point(a3[1]).unwrap().ticks, 11 * FRAME);
+    assert_eq!(loaded.to_json_text().unwrap(), saved);
+
+    // Avid's DNx LB preset can save DNxHD as well as DNxHR. The picture
+    // template must follow its saved coding label in the three-lane path.
+    let mut dnxhd = loaded.clone();
+    for picture in dnxhd.media.iter().filter(|m| m.kind == StreamKind::Video) {
+        let side = dnxhd.sidecars.iter_mut()
+            .find(|side| side.object == picture.id && side.adapter == "avid.source").unwrap();
+        let Value::Obj(fields) = &mut side.data else { panic!("missing native facts") };
+        fields.iter_mut().find(|(key, _)| key == "descriptor").unwrap().1 = v(vec![
+            ("compression", Value::Str("AVHD".into())),
+            ("resolution_id", Value::Int(1253)),
+            ("display_aspect", Value::Arr(vec![Value::Int(16), Value::Int(9)])),
+        ]);
+        fields.iter_mut().find(|(key, _)| key == "picture_coding").unwrap().1 =
+            Value::Str("060E2B340401010A0401020271130000".into());
+    }
+    let candidate = premiere_adapter::prepare_originals(&dnxhd, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(candidate.input.direct_dnxhd_pcm24.len(), 2);
+    let out = dir.join("Independent A3 DNxHD.prproj");
+    prepare_typed_project(&candidate.input, &out, &mut prproj::SeededUuids::new("three-mono-dnxhd"), &[], false)
+        .unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(doc.tree.iter_tag(doc.root, "CodecType").filter_map(|n| doc.tree.text(n)).collect::<Vec<_>>(),
+        ["1096180846", "1096180846"]);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -2613,7 +3802,9 @@ fn linked_editable_multicam_uses_the_six_original_streams() {
     let mut ids = prproj::SeededUuids::new("synthetic-linked-group");
     let ready = prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap();
     assert!(!out.exists());
-    ready.publish().unwrap();
+    let report = ready.publish().unwrap();
+    assert!(report.notes.iter().any(|note| note.contains("two default mono outputs from its first camera")));
+    assert!(!report.notes.iter().any(|note| note.contains("alternate Group audio timeline edit")));
     let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
     let project = prproj::model::Project::from_document(doc, &out).unwrap();
     let tree = &project.doc.tree;
@@ -2689,16 +3880,92 @@ fn linked_editable_multicam_uses_the_six_original_streams() {
         .find(|p| p.id == binding).unwrap();
     placement.item = "clip:camera-b".into();
     placement.source_in = Q::new(8 * 1001, 24000).unwrap();
+    let rate = switched.sequences[0].rate;
+    let marker_start = Q::new(2 * 1001, 24000).unwrap();
+    let marker_duration = Q::new(3 * 1001, 24000).unwrap();
+    let marker_source = Q::new(10 * 1001, 24000).unwrap();
+    let video_placement = switched.multicam_uses.iter().find(|u| u.kind == StreamKind::Video)
+        .unwrap().binding.placements[0].clone();
+    for (name, kind, placement) in [
+        ("Angle note", StreamKind::Video, video_placement),
+        ("Inherited audio note", StreamKind::Audio, binding.clone()),
+        ("Alternate audio note", StreamKind::Audio, binding),
+    ] {
+        switched.sequences[0].markers.push(SourceMarker {
+            name: name.into(),
+            comment: "Keep this review range".into(),
+            user: String::new(),
+            color: Some(Label { palette: "avid".into(), name: "Red".into() }),
+            start: Some(marker_start),
+            duration: marker_duration,
+            track: Some(TrackRef { kind, index: 1 }),
+            owner: MarkerOwner::Edit,
+            owner_occurrence: format!("marker:{name}"),
+            owner_local: Some(marker_start),
+            owner_rate: Some(rate),
+            binding: SourceBinding { placements: vec![placement], reason: None },
+            source: None,
+            inherited: false,
+        });
+    }
+    let native_marker = |i| v(vec![
+        ("graph_index", Value::Int(i)), ("created", Value::Int(100)),
+    ]);
+    let item = switched.items.iter_mut().find(|i| i.id == "clip:camera-b").unwrap();
+    for marker in &switched.sequences[0].markers[..2] {
+        let mut source = marker.clone();
+        source.start = Some(marker_source);
+        source.owner_local = source.start;
+        source.owner = MarkerOwner::Sequence;
+        source.binding.placements.clear();
+        source.owner_occurrence = format!("master:{}", source.name);
+        item.markers.push(source);
+    }
+    for object in [&item.id, &switched.sequences[0].id] {
+        let rows = Value::Arr(vec![native_marker(0), native_marker(1)]);
+        if let Some(sidecar) = switched.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && &s.object == object) {
+            let Value::Obj(fields) = &mut sidecar.data else { panic!("expected Avid source facts") };
+            fields.push(("marker_native".into(), rows));
+        } else {
+            switched.sidecars.push(Sidecar {
+                adapter: "avid.source".into(), object: object.clone(), data: v(vec![("marker_native", rows)]),
+            });
+        }
+    }
     let prepared = prepare_linked(&switched, &options()).unwrap();
     assert!(prepared.losses.iter().any(|l| l.object == occurrence && l.aspect == "group_audio_editability"));
     assert!(prepared.input.multicam_uses.iter().any(|u| u.audio.contains(&LinkedAlternate(0))));
     assert!(prepared.input.multicam_uses.iter().any(|u| u.audio.contains(&Group(1))));
     let out = dir.join("Alternate Audio.prproj");
-    prepare_typed_project(&prepared.input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let report = prepare_typed_project(&prepared.input, &out, &mut ids, &[], false)
+        .unwrap().publish().unwrap();
+    assert!(report.notes.iter().any(|note| note.starts_with("1 alternate Group audio timeline edit")));
     let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
     let project = prproj::model::Project::from_document(doc, &out).unwrap();
     let sequence = project.sequences().into_iter()
         .find(|&s| project.sequence_name(s) == switched.sequences[0].name).unwrap();
+    use prproj::model::marker::{
+        marker_color_index, marker_comments, marker_end, marker_name, marker_start as saved_start,
+    };
+    let tree = &project.doc.tree;
+    assert_eq!(tree.iter_tag(project.doc.root, "SelectedTrackIndex")
+        .map(|node| tree.text(node).unwrap()).collect::<Vec<_>>(), ["1"]);
+    let video = project.video_tracks(sequence)[0];
+    let v1 = project.track(video).clips[0];
+    assert_eq!(project.item_name(project.track_item_source(v1).unwrap()), "Synthetic Group");
+    let markers = project.sequence_markers(sequence);
+    assert_eq!(markers.len(), 2);
+    let mut names = Vec::new();
+    for &marker in markers {
+        names.push(marker_name(tree, marker).unwrap());
+        assert_eq!(saved_start(tree, marker).unwrap().ticks, 2 * FRAME);
+        assert_eq!(marker_end(tree, marker).unwrap().ticks, 5 * FRAME);
+        assert!(marker_comments(tree, marker).unwrap().contains("Keep this review range"));
+        assert_eq!(marker_color_index(tree, marker).unwrap(), Some(1));
+    }
+    names.sort_unstable();
+    assert_eq!(names, ["Alternate audio note", "Angle note"]);
+    assert_eq!(prepared.losses.iter().filter(|l| l.aspect == "marker_ownership").count(), 2);
     let audio = project.audio_tracks(sequence);
     let a1 = project.track(audio[0]).clips[0];
     let a2 = project.track(audio[1]).clips[0];
@@ -2710,11 +3977,48 @@ fn linked_editable_multicam_uses_the_six_original_streams() {
             && camera_b.media.iter().any(|binding| binding.media == media.id)
     }).unwrap().locations[0].as_str();
     assert_eq!(project.item_media_path(a1_source), Some(alternate_path));
+    let [marker] = project.item_markers(a1_source) else { panic!("expected the linked alternate's source marker") };
+    assert_eq!(marker_name(tree, *marker).unwrap(), "Inherited audio note");
+    assert_eq!(saved_start(tree, *marker).unwrap().ticks, 10 * FRAME);
+    assert_eq!(marker_end(tree, *marker).unwrap().ticks, 13 * FRAME);
     assert_eq!(project.item_name(a2_source), "Synthetic Group");
-    for item in [a1, a2] {
+    for item in [v1, a1, a2] {
         assert_eq!(project.in_point(item).unwrap().ticks, 8 * FRAME);
         assert_eq!(project.out_point(item).unwrap().ticks, 18 * FRAME);
     }
+
+    let mut split_default = g.clone();
+    let lane = split_default.multicams[0].lanes.iter_mut()
+        .find(|lane| lane.kind == StreamKind::Audio && lane.index == 1).unwrap();
+    // The fixture stores the second picture camera at audio alternative zero.
+    lane.selected = Some(0);
+    let mut input = prepare_linked(&split_default, &options()).unwrap().input;
+    assert_eq!(input.multicams[0].audio_cameras, [1, 0]);
+    let out = dir.join("Split Group Default.prproj");
+    prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap().publish().unwrap();
+    let doc = prproj::PremiereDocument::from_bytes(&std::fs::read(&out).unwrap()).unwrap();
+    let project = prproj::model::Project::from_document(doc, &out).unwrap();
+    let group = project.sequences().into_iter()
+        .find(|&s| project.sequence_name(s) == "Synthetic Group").unwrap();
+    let tracks = project.audio_tracks(group);
+    let mutes: Vec<_> = tracks.iter().map(|&t| project.is_muted(t).unwrap()).collect();
+    assert_eq!(mutes, [false, false, true, true]);
+    let source_path = |track| {
+        let item = project.track(track).clips[0];
+        project.item_media_path(project.track_item_source(item).unwrap()).unwrap()
+    };
+    assert_eq!(source_path(tracks[0]), alternate_path);
+    let camera_a = &split_default.items[0];
+    let right = split_default.media.iter().find(|media| {
+        media.kind == StreamKind::Audio && media.stream == Some(2)
+            && camera_a.media.iter().any(|binding| binding.media == media.id)
+    }).unwrap();
+    assert_eq!(source_path(tracks[1]), right.locations[0]);
+
+    input.multicams[0].audio_cameras[0] = 2;
+    let invalid = dir.join("Invalid Group Default.prproj");
+    assert!(prepare_typed_project(&input, &invalid, &mut ids, &[], false).is_err());
+    assert!(!invalid.exists());
 }
 
 #[test]

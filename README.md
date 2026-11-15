@@ -26,6 +26,11 @@ See the [release notes](RELEASE_NOTES.md) for installation and checksums.
 4. In Review, run preflight and check the media paths, blockers, and reported
    losses. Convert, then open the new project in Premiere.
 
+In current source builds, linked modes also let you prefer verified camera
+originals for picture and attach matching Avid media as proxies. Check the
+[wizard guide](docs/GUI-WIZARD.md) and release notes for
+the supported options in your build.
+
 Supported transfers include bin organization and logging metadata, trims and
 sequence timecode, markers and clip colors, and selected editable picture,
 audio, and text controls. Support depends on the saved controls, media

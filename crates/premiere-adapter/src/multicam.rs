@@ -60,11 +60,12 @@ pub(super) fn prepare(
         }
     }
     let mut audio_lanes = Vec::new();
+    let mut picture_order = Vec::new();
     for m in &g.multicams {
-        if m.reason.is_some() || m.rate.map(fraction) != Some(RATE) || m.lanes.len() != 3 {
+        if m.reason.is_some() || m.rate.map(fraction) != Some(RATE) {
             return Err(refusal(
                 &m.id,
-                "needs one resolved picture and two resolved mono lanes at 23.976 fps",
+                "needs one resolved picture lane and resolved mono lanes at 23.976 fps",
             ));
         }
         let mut audio: Vec<_> = m
@@ -72,18 +73,31 @@ pub(super) fn prepare(
             .iter()
             .filter(|l| l.kind == StreamKind::Audio)
             .collect();
+        if audio.len() > 2 && m.lanes.len() - audio.len() == 1 && (!direct || audio.len() > 3) {
+            return Err(refusal(
+                &m.id,
+                &format!(
+                    "saved Group {:?} has {} audio lanes. Separate files supports up to three independent mono lanes in the scoped 23.976 profile. Select bins without this Group and its dependent edits",
+                    m.name,
+                    audio.len(),
+                ),
+            ));
+        }
+        if m.lanes.len() != audio.len() + 1 || !matches!(audio.len(), 1..=3) {
+            return Err(refusal(
+                &m.id,
+                "needs one resolved picture lane and one to three resolved mono lanes at 23.976 fps",
+            ));
+        }
         audio.sort_by_key(|l| l.index);
-        let [a1, a2] = audio.as_slice() else {
-            return Err(refusal(&m.id, "needs exactly two audio lanes"));
-        };
         let video = m
             .lanes
             .iter()
             .find(|l| l.kind == StreamKind::Video)
             .ok_or_else(|| refusal(&m.id, "missing picture lane"))?;
-        if video.selected != Some(0)
-            || [video, *a1, *a2]
-                .iter()
+        let angles = if audio.len() == 1 && video.selected == Some(1) { [1, 0] } else { [0, 1] };
+        if video.selected != Some(angles[0] as i64)
+            || std::iter::once(video).chain(audio.iter().copied())
                 .any(|l| l.reason.is_some() || l.alternatives.len() != 2)
         {
             return Err(refusal(
@@ -92,8 +106,10 @@ pub(super) fn prepare(
             ));
         }
         let mut cameras = Vec::with_capacity(2);
-        let mut audio_alternatives = [[0; 2]; 2];
-        for (i, alt) in video.alternatives.iter().enumerate() {
+        let mut audio_alternatives = vec![[0; 2]; audio.len()];
+        let mut audio_cameras = vec![None; audio.len()];
+        for (i, &angle) in angles.iter().enumerate() {
+            let alt = &video.alternatives[angle];
             let picture = real_piece(alt, &m.id)?;
             if picture.stream != Some(1) {
                 return Err(refusal(
@@ -101,8 +117,8 @@ pub(super) fn prepare(
                     "camera picture does not resolve to the leaf's single video stream",
                 ));
             }
-            let mut labels = [0; 2];
-            for (j, lane) in [*a1, *a2].into_iter().enumerate() {
+            let mut labels = Vec::with_capacity(audio.len());
+            for (j, lane) in audio.iter().enumerate() {
                 let mut matching = None;
                 for (index, candidate) in lane.alternatives.iter().enumerate() {
                     let p = real_piece(candidate, &m.id)?;
@@ -128,19 +144,17 @@ pub(super) fn prepare(
                         "audio alternatives do not cover the corresponding picture extent",
                     ));
                 };
-                if (lane.selected == Some(index)) != (i == 0) {
-                    return Err(refusal(
-                        &m.id,
-                        "both default audio lanes must resolve to the first camera",
-                    ));
+                if lane.selected == Some(index) {
+                    audio_cameras[j] = Some(i);
                 }
-                labels[j] = label;
+                labels.push(label);
                 audio_alternatives[j][i] = index;
             }
             let clip = clip_id(picture.item.as_deref().unwrap());
             if direct && !pcm24_direct.contains(clip.as_str()) {
+                let width = if audio.len() == 3 { "three" } else { "two" };
                 return Err(refusal(&m.id, &format!(
-                    "linked camera {} requires qualified DNx LB and two original mono PCM24 siblings",
+                    "linked camera {} requires qualified DNx LB and {width} original mono PCM24 siblings",
                     i + 1
                 )));
             }
@@ -157,6 +171,11 @@ pub(super) fn prepare(
                 audio_labels: labels,
             });
         }
+        let audio_cameras = audio_cameras.into_iter().collect::<Option<Vec<_>>>()
+            .ok_or_else(|| refusal(&m.id, "default audio lanes need exact saved camera selections"))?;
+        if !direct && audio_cameras.iter().any(|&camera| camera != 0) && audio.len() != 1 {
+            return Err(refusal(&m.id, "both default audio lanes must resolve to the first camera"));
+        }
         let bin = *bin_indices
             .get(m.id.as_str())
             .ok_or_else(|| refusal(&m.id, "group has no owning bin"))?;
@@ -166,12 +185,18 @@ pub(super) fn prepare(
             "group duration",
         )?;
         indices.insert(m.id.as_str(), input.multicams.len());
-        audio_lanes.push([(a1.index, audio_alternatives[0]), (a2.index, audio_alternatives[1])]);
+        audio_lanes.push(audio.iter().map(|lane| lane.index).zip(audio_alternatives).collect::<Vec<_>>());
+        picture_order.push(angles);
+        if angles == [1, 0] {
+            loss(losses, &m.id, "group_angle_order",
+                "The saved default picture is first in Premiere's angle order. Existing selections follow the original camera identity.");
+        }
         input.multicams.push(PreparedMulticam {
             id: m.id.clone(),
             name: m.name.clone(),
             bin,
             duration,
+            audio_cameras,
             cameras: cameras
                 .try_into()
                 .map_err(|_| refusal(&m.id, "wrong camera count"))?,
@@ -185,6 +210,9 @@ pub(super) fn prepare(
         .collect();
     let mut by_event = HashMap::new();
     let mut reported_clocks = HashSet::new();
+    let warp_uses: HashSet<_> = g.sidecars.iter().filter(|s| s.adapter == "avid.group_use"
+        && key(&s.data, "warp_picture_input").and_then(boolean) == Some(true))
+        .map(|s| s.object.as_str()).collect();
     for u in &g.multicam_uses {
         let [id] = u.candidates.as_slice() else {
             return Err(refusal(
@@ -238,6 +266,7 @@ pub(super) fn prepare(
                 group,
                 source_in,
                 video: None,
+                warp_picture_input: false,
                 audio: vec![PreparedGroupAudio::Group(usize::MAX); e.audio_tracks.len()],
             });
             i
@@ -254,24 +283,27 @@ pub(super) fn prepare(
             .ok_or_else(|| refusal(&u.id, "selection unresolved"))?;
         match u.kind {
             StreamKind::Video => {
+                let target = picture_order[group].iter().position(|&angle| angle as i64 == selected)
+                    .ok_or_else(|| refusal(&u.id, "picture choice does not name a saved angle"))?;
                 if u.lane.is_none()
                     || e.video_track != Some(u.track)
-                    || !(0..2).contains(&selected)
-                    || use_.video.replace(selected as usize).is_some()
+                    || use_.video.replace(target).is_some()
                 {
                     return Err(refusal(
                         &u.id,
                         "picture selection is not a unique prepared event lane",
                     ));
                 }
+                use_.warp_picture_input = warp_uses.contains(u.id.as_str());
             }
             StreamKind::Audio => {
                 let (channel, (_, alternatives)) = audio_lanes[group].iter().enumerate()
                     .find(|(_, (lane, _))| u.lane == Some(*lane))
                     .ok_or_else(|| refusal(&u.id, "audio selection has no exact Group lane"))?;
-                let choice = if selected == alternatives[0] {
+                let default = input.multicams[group].audio_cameras[channel];
+                let choice = if selected == alternatives[default] {
                     PreparedGroupAudio::Group(channel)
-                } else if direct && selected == alternatives[1] {
+                } else if direct && selected == alternatives[1 - default] {
                     loss(losses, &u.id, "group_audio_editability",
                         "alternate Group audio is a direct mono clip in Premiere; the picture angle remains editable");
                     PreparedGroupAudio::LinkedAlternate(channel)
@@ -287,6 +319,38 @@ pub(super) fn prepare(
                     return Err(refusal(&u.id, "duplicate group audio binding"));
                 }
             }
+        }
+    }
+    for (si, (sequence, source)) in input.sequences.iter_mut().zip(&g.sequences).enumerate() {
+        for marker in &mut sequence.markers {
+            let Some(event) = marker.event.and_then(|index| usize::try_from(index).ok()) else {
+                continue;
+            };
+            let Some(&use_index) = by_event.get(&(si, event)) else {
+                continue;
+            };
+            if marker.owner != "edit" {
+                continue;
+            }
+            let use_ = &input.multicam_uses[use_index];
+            let direct_audio = marker.track.as_deref().and_then(|track| track.strip_prefix('A'))
+                .and_then(|track| track.parse::<i64>().ok())
+                .is_some_and(|track| sequence.events[event].audio_tracks.iter().zip(&use_.audio)
+                    .any(|(&lane, choice)| lane == track && matches!(choice, PreparedGroupAudio::LinkedAlternate(_))));
+            if marker.inherited && direct_audio {
+                // The independently linked mono clip already carries its source markers.
+                continue;
+            }
+            // Each use must keep its shared multicam source. Leaf markers inside that
+            // source cannot provide a marker on the enclosing timeline edit.
+            loss(losses, &source.id, "marker_ownership", format!(
+                "marker {:?} on {} at {} ticks moved from the Group edit to the sequence",
+                marker.name, marker.track.as_deref().unwrap_or("unknown track"), marker.start,
+            ));
+            marker.owner = "sequence".into();
+            marker.event = None;
+            marker.source = None;
+            marker.inherited = false;
         }
     }
     for (b, source) in input.bins.iter_mut().zip(&g.bins) {

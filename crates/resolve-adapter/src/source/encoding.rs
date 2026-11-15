@@ -86,6 +86,7 @@ enum Qt {
     Real(f64),
     Text(String),
     Bytes(Vec<u8>),
+    ByteList(Vec<Vec<u8>>),
     Unused,
 }
 pub(super) struct Map(BTreeMap<String, Qt>);
@@ -120,6 +121,13 @@ impl Map {
         }
     }
 
+    pub fn byte_list(&self, key: &str) -> Result<Option<&[Vec<u8>]>> {
+        match self.0.get(key) {
+            None => Ok(None),
+            Some(Qt::ByteList(rows)) => Ok(Some(rows)),
+            _ => Err(format!("invalid Resolve byte list {key}").into()),
+        }
+    }
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.0.keys().map(String::as_str)
     }
@@ -151,6 +159,18 @@ pub(super) fn qt(mut data: &[u8]) -> Result<Map> {
                 Qt::Unused
             }
             6 => Qt::Real(f64::from_be_bytes(number(&mut data)?)),
+            9 => {
+                let count = u32::from_be_bytes(number(&mut data)?);
+                if count > 256 { return Err("Resolve list exceeds entry limit".into()); }
+                let mut rows = Vec::new();
+                for _ in 0..count {
+                    if u32::from_be_bytes(number(&mut data)?) != 12 || take(&mut data,1)?[0] != 0 {
+                        return Err("unsupported Resolve list entry".into());
+                    }
+                    rows.push(sized(&mut data)?.to_vec());
+                }
+                Qt::ByteList(rows)
+            }
             10 => Qt::Text(utf16(sized(&mut data)?)?),
             12 => Qt::Bytes(sized(&mut data)?.to_vec()),
             38 => {

@@ -612,11 +612,10 @@ pub fn build_multicam_mono_audio(
     video_tracks: usize,
     audio_tracks: usize,
 ) -> Result<NodeId> {
-    build_multicam_mono_audio_with_outputs(tree, uuids, name, frame_rate, width, height, time_display, duration_ticks, video_tracks, audio_tracks, audio_tracks)
+    build_multicam_mono_audio_with_outputs(tree, uuids, name, frame_rate, width, height, time_display, duration_ticks, video_tracks, audio_tracks, 0..audio_tracks)
 }
 
-/// The fixed-audio source keeps both cameras' audio tracks but only publishes
-/// the two active mono output channels as source-item channel groups.
+/// Expose physical bus channels as consecutive source-item mono groups.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_multicam_mono_audio_with_outputs(
     tree: &mut Tree,
@@ -629,13 +628,22 @@ pub(crate) fn build_multicam_mono_audio_with_outputs(
     duration_ticks: i64,
     video_tracks: usize,
     audio_tracks: usize,
-    outputs: usize,
+    outputs: impl ExactSizeIterator<Item = usize> + Clone,
 ) -> Result<NodeId> {
     if audio_tracks < 1 {
         return value("audio_tracks must be at least 1");
     }
-    if outputs == 0 || outputs > audio_tracks {
+    if outputs.len() == 0 || outputs.len() > audio_tracks || outputs.len() > BUS_CHANNELS {
         return value("invalid multicam output group count");
+    }
+    let mut seen = [false; BUS_CHANNELS];
+    for channel in outputs.clone() {
+        let Some(used) = seen.get_mut(channel) else {
+            return value("multicam output is outside the audio bus");
+        };
+        if std::mem::replace(used, true) {
+            return value("duplicate multicam physical output");
+        }
     }
     let root = build_multicam(tree, uuids, name, frame_rate, width, height, time_display, duration_ticks, video_tracks, false)?;
     let mut by_id: HashMap<String, NodeId> = HashMap::new();
@@ -708,7 +716,7 @@ pub(crate) fn build_multicam_mono_audio_with_outputs(
         tree.remove(chains, reference);
     }
     let mut chain_ids = Vec::new();
-    for _ in 0..outputs {
+    for _ in 0..outputs.len() {
         let id = take_id(&mut next_id);
         let chain = object(tree, root, "AudioComponentChain", Some(&id), None);
         build_leaf(tree, chain, "DefaultVol", "true");
@@ -733,7 +741,7 @@ pub(crate) fn build_multicam_mono_audio_with_outputs(
         tree.remove(vectors, reference);
     }
     let mut vector_ids = Vec::new();
-    for channel in 0..outputs {
+    for channel in outputs {
         let serializer_id = take_id(&mut next_id);
         let serializer = object(tree, root, "ClipChannelSerializer", Some(&serializer_id), None);
         build_leaf(tree, serializer, "SourceClipIndex", "0");

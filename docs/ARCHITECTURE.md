@@ -89,8 +89,8 @@ adopting Codex's proposal in AVB-PORT-COORDINATION.md. Details: [GRAPH-MODEL.md]
      read-back.
 - **Every pair is direct.** Interchange formats (FCPXML, AAF, OTIO, EDL) are offered as extra
   exports, never as the intermediate between two programs; the graph is the only intermediate.
-- **Open:** retiring the Python oracle; routing the Avid reader straight into the graph (needs
-  Codex's agreement).
+- The normal Avid path reads directly into graph/2. ADR-0005 describes
+  preparation and the retained Python comparison oracle.
 
 ### Selected-bin extraction foundation (2026-10-31)
 
@@ -128,10 +128,9 @@ See validation and capped runs.
 5. **Read-back.** The User opens the result in the real program, a few checks at a time. Parser
    round trips are not read-back.
 6. **Record it.**
-   - A row and column in [FEATURE-MATRIX.md](FEATURE-MATRIX.md).
+   - Update the direction in the [main roadmap](ROADMAP.md#linked-media-conversion-parity).
    - CONV pins in `research-dependencies.json`.
    - DECISIONS-EXPLAINED entries.
-   - A ROADMAP section.
 
 
 ## ADR-0005: Qualified source graph and explicit destination preparation (2026-11-05)

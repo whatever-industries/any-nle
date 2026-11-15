@@ -149,12 +149,13 @@ found)**, does the same for audio.
 
 ## Conversion decisions (automatic)
 
-### Names and metadata [PRPROJ-0015, CONV-0014, CONV-0129]
+### Names and metadata [PRPROJ-0015, CONV-0014, CONV-0129, CONV-0165]
 
 Clip names come from the Avid bin's Name. Camroll maps to Camera Roll, Take
 to Shot, Comments to Comment, Source File to Description, and Scene to
-Scene. The linked media keeps its own Tape Name. Other copied fields go
-into one Log Note line as labelled values so multiple fields stay legible.
+Scene. The exact Soundroll column maps to Sound Roll. Soundroll TC Rate
+stays in Log Note. The linked media keeps its own Tape Name. Other copied
+fields share one Log Note line with labels.
 
 ### Timecode [PRPROJ-0016, PRPROJ-0017; CONV-0015, CONV-0016]
 

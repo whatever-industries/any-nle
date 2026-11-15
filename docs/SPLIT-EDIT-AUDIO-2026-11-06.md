@@ -198,6 +198,66 @@ agree, and the updated output retains all four file paths and their saved
 physical timecodes after reopen. This comparison covers saved fields and
 links. Source LUT metadata remains a separate check. CONV-0129
 
+Two retained gain-and-pan linked AAFs carry `Soundroll TC Rate` with
+value `25` and no `Soundroll` comment. Premiere 27 reopened both
+imports with `25` in `ClipLoggingInfo/SoundRoll`. Any NLE now writes
+that field only from a populated exact `Soundroll` column. It keeps
+`Soundroll TC Rate` as labelled text in Log Note. Premiere 27 Save As
+and reopen of a derived linked WAV project retained the exact accented
+roll on its own master. The second master kept an empty Sound Roll, and
+both masters kept the rate in Log Note.
+CONV-0165 and CONV-0176
+
+### External source LUT and linked AAF
+
+Media Composer 25.12.0 build 58863 applied a project-scoped external 3D
+LUT to the source master and refreshed the 24 fps sequence's color adapter.
+The picture source mob saved `_COLOR_INPUT_TRANSFORMATION` with an
+`ExternalLut` entry containing the LUT name, relative `.cube` filename, and
+dimension. The linked AAF preserved the same XML on the picture source
+mob and in the 87-frame ColorAdapter operation for V1. The native project
+held the actual `.cube` as a separate file.
+
+Premiere 27.0.0 build 88 retained two frame-zero Unknown Effect markers
+for ColorAdapter after Save As, close, and reopen. All 87 decoded picture
+frames matched the reopened Any NLE project. The two projects pointed to
+different filenames for byte-identical picture MXFs. The initial
+comparison covered linked picture and saved metadata.
+
+Graph/2 retained the exact LUT XML and owner. Both direct conversion
+and saved jobs reported the clip's source transform and the affected
+V1 span. With the same seed and project name, the prepared Premiere
+project matched the neutral control after normalizing the bin name.
+
+The follow-up measured the LUT and neutral outputs directly in Avid.
+Separate files now uses the selected bin's Avid project `LUTs` folder.
+The converter checks the sibling XML against the saved edit-side
+ExternalLut, verifies the linked Rec.709 DNxHD picture package, and
+embeds the qualified affine transform in an editable Lumetri Look on the
+bound V1 edit. Avid's saved reference identifies the LUT by name and
+settings. The verification pins the current cube and XML until publication.
+A missing cube, conflicting descriptor, or unsupported stack leaves an
+edit-specific report.
+
+After Save As and reopen in Premiere 27, direct conversion and saved
+jobs kept one original picture reference, exact trims, and both mono
+media assignments. In the adjacent-use control, each project rendered
+87 neutral frames matching linked AAF and 87 processed frames matching
+the retained placed-LUT control. The processed frames measure 48.34 dB
+RGB PSNR against Avid's LUT render. Audio was checked structurally for
+this picture-only comparison.
+
+The source cube can have 2–65 samples per axis. Each saved value must
+agree with a single affine transform to within one millionth per RGB
+component, including interior samples. The writer embeds the eight
+corners. The derived 33- and 65-point versions of the tested channel
+swap produced the same seeded project and graph as the size-two cube.
+Premiere 27 reopened the derived 33-point case with the same original,
+trims, and effect placement, and rendered all 174 frames identically.
+A change to one interior value, with all corners unchanged, still
+produces an occurrence-specific loss, as do truncated and oversized grids.
+CONV-0175
+
 ### Timeline track names
 
 The retained Phase 23 Avid bin records its two custom audio track names
@@ -253,10 +313,50 @@ and display code 102. After reopen, Premiere retains the picture file origin
 and all three logging starts but rewrites each audio `Media/Start` from
 1,828,913,371,084,800 to 1,830,744,115,200,000 ticks. This rewrite did not
 change the saved edit ranges or PCM in the test.
+The saved Avid master TC1 also has count 215,784 with the drop-frame flag.
+Graph/2 retains the formatted `02:00:00;00` label and the Premiere Log Note
+shows that Avid Start. The linked AAF import keeps the numeric picture
+source clock and format 102, with no Avid Start note. The note is separate
+from the media's numeric start and the editorial clock.
 This is distinct from the qualified 23.976 DNxHR `AVdh`/110 profile.
 The result covers same-rate drop-frame edits with a qualified TC1, zero
-source offset, and matching discrete PCM24 siblings. It does not qualify
-29.97 DNxHR, non-drop, or Grouped and Merged output at this rate.
+source offset, and matching discrete PCM24 siblings.
+
+Grouped and Merged now use those same verified sources. Direct CLI and
+saved jobs retain the linked AAF's record and source ranges. Premiere 27
+build 88 kept the two mono routes and the qualified drop-frame sequence
+origin after Save As, close, and reopen. Frame stepping showed
+`00:00:59;29` followed by `00:01:00;02` in both projects. The media and
+component logging values follow the same pattern as the Separate control.
+The combined source sequence owns the reusable bin item's displayed source
+clock. With its start set to the verified picture origin, Premiere 27 shows
+`02:00:00;00` through `02:00:04;29` for both modes. Changing only the Merged
+wrapper's logging range did not fix the display. The production outputs
+retain the corrected source clock after Save As and reopen. The editorial
+clock and both file-relative trims are unchanged.
+
+Fresh insertion from the corrected bin items saved V1 and two independent
+mono lanes over the full 150-frame range. Grouped referenced the source
+sequence with channels 0 and 1; Merged used the original picture and each
+mono MXF directly. Premiere 27 exported all 15 frames from each reopened
+editorial timeline as PNG. Grouped and Merged have identical decoded
+RGB pixels. Frame matching against the Separate and linked AAF renders
+identifies the same numbered frames (10–14 and 45–54). The comparison
+across PNG and ProRes checks frame selection.
+
+Premiere 27's **Render Audio** produces a 150-frame Grouped source
+preview. The saved `AudioSequenceSource` links the preview to the combined
+source sequence. Both preview channels match all 240,240 decoded samples of
+their respective PCM24 mono MXFs. On the editorial timeline, Grouped selects
+channels 0 and 1 of that source, and Merged selects channel 0 of each mono
+MXF. Both saved projects select file sample spans `[16016, 24024)` and
+`[72072, 88088)` on each lane. Reconstructing those slices matches all
+24,024 samples per lane in Avid Direct Out and the retained Separate render.
+Swapping the lane or slipping the file ranges by one sample fails the
+comparison. After Save As and reopen in Premiere 27, both modes exported
+A1 and A2 independently as 48 kHz stereo PCM24 WAV. Each intended channel
+matched all 24,024 samples of Avid Direct Out, with digital silence on the
+opposite channel. 29.97 DNxHR and non-drop require separate qualification.
 CONV-0130
 
 ## 23.976 direct DNxHD with PCM16
@@ -276,10 +376,44 @@ pan** enabled, Any NLE matched all 96,096 expected samples on each discrete
 output, with the other output silent for each isolated render. Fresh insertion
 preserved the three original MXFs and the full 96-frame extent after reopen.
 
-This profile is online, non-drop, and Separate only. It requires the observed
-DNxHD coding, matching 16-bit mono siblings, matching clocks and extents, and
-zero source offsets. It does not establish DNxHR with PCM16, offline links,
-Grouped/Merged, or editable Groups. CONV-0136
+This profile requires online originals, the observed non-drop DNxHD coding,
+matching 16-bit mono siblings, matching clocks and extents, and zero source
+offsets. DNxHR with PCM16, offline media, and editable Avid Groups require
+separate qualification. CONV-0136
+
+The same native fixture now writes in Grouped and Merged as well. Grouped
+sends the two mono siblings to their own channels in the source sequence.
+Merged shares each physical media record between its original and component
+masters. Both direct CLI and saved jobs retain the same three MXF references,
+source and sequence clocks, and two trims on each lane. Premiere 27.0.0
+build 88 accepted both generated projects through Save As, close and reopen.
+The saved Grouped project's outer A1 and A2 select channels 0 and 1 of the
+source sequence, whose own lanes bind the original A1 and A2 MXFs. The saved
+Merged project binds each timeline lane to its original mono MXF directly.
+The retained linked AAF establishes the same file-relative trims. A wrong
+mono sibling was refused without a project. Direct CLI and saved jobs both
+identify the duplicate candidate by the selected MXF package ID. Both
+reusable bin items initially displayed zero. The writer now sets the
+hidden source sequence to the verified `02:00:00:00` source start and
+keeps the editorial origin at `01:00:00:00`. After Save As and reopen,
+fresh insertion from those clock-corrected items retained all 96 frames
+on V1, A1, and A2. Grouped used channels 0 and 1 of the source sequence;
+Merged retained the assigned mono MXFs directly. After reopen, Premiere
+27 rendered two 24-frame ProRes LT picture previews for each mode. The
+saved sequence identifies their record intervals as [0,24) and [24,48).
+The 48 decoded frames match exactly between Grouped and Merged. The
+numbered chart selects the same source frames as the retained Separate
+and linked AAF ProRes HQ exports. The Grouped audio preview also
+contains both decoded source lanes, each matching 192,192 source samples.
+Following the saved Grouped and Merged edit references and mono selectors
+reconstructs 96,096 samples per lane, identical to the corresponding
+discrete channel of the reopened Separate export. The saved clip pans
+are fully left and right. A one-sample slip and swapped channels both
+fail the comparison. After Save As and reopen in Premiere 27, both modes
+exported A1 and A2 independently as 48 kHz stereo PCM24 WAV. Each intended
+channel matched all 96,096 samples of the corresponding Separate render
+after converting the PCM16 reference to PCM24. The opposite channel was
+digitally silent.
 
 ### Linear audio dissolve against linked AAF
 
@@ -391,6 +525,73 @@ CONV-0131
 
 ## Coincident source and edit markers
 
+An inheritance match uses a saved creation timestamp along with the exact
+source lane, position, duration, and marker content. If both timestamps
+are missing, the edit marker reaches the ordinary conflict preference.
+With **Keep the other marker as a sequence marker** enabled, both
+occurrences can survive. A graph/2 save-and-reload control covers the
+undated range. The native Avid marker-copy lifecycle remains open.
+
+The match also needs exactly one source marker and exactly one matching
+edit marker on the prepared edit lane. Multiple matching occurrences
+reach the conflict preference. A synthetic graph/2 round trip verifies
+that both preferences retain all occurrences in the written project
+when sequence fallback is enabled. Native duplicate-copy behavior is
+still open.
+
+For linked file-backed masters, equal source time triggers the marker
+preference only when the source and edit lanes overlap or the lane is
+unresolved. Picture and verified independent audio channels can keep
+separate markers at the same file position on the edit copy. Audio
+uses the source channel the edit selects, including when it is routed
+to a different timeline track.
+
+Premiere 27 build 88 retained both ranges after Save As and reopen on
+the linked H.264/AAC control. The source A1 marker started at file
+frame 3 and lasted two frames. The V1 edit marker fell at the same
+file frame and lasted three frames. Both preferences produced the
+same project with both markers on the picture edit copy. Premiere's
+linked clip collection also carries the original source marker on
+the audio components.
+
+Moving the two-frame source marker to V1 made the ranges conflict.
+With sequence fallback enabled, each preference kept its chosen
+range on the edit and moved the other to record frame 1 with its
+duration, color and comment. The CLI, saved job and reopened project
+agree on all nine edits and two originals. All 36 decoded pictures
+matched. Both same-lane PCM exports matched the repeat cross-lane
+export across 72,000 samples per channel. The first cross-lane export
+differed by up to 256 PCM24 counts in the last cut. The repeat from
+the same saved project reproduced the other two renders. (CONV-0183)
+
+In the verified same-rate direct DNxHD Grouped profile, a picture-only
+marker collection can be shared with the picture clip. When a V1 edit
+has both picture and audio markers in the collection, the writer applies
+the picture conflict preference separately and keeps surviving V1 edit
+ranges on the sequence at their exact record positions. The audio
+markers stay in the Grouped clip collection. The CLI report, saved-job
+receipt, and Review identify the V1 ownership change at the marker's
+record timecode or its exact frame from sequence start.
+
+Premiere 27 build 88 reopened the retained same-rate 23.976 mixed-lane
+control. It kept the green picture marker on the sequence at record
+frames `[2,5)`, and the red audio marker at source frames `[7,11)` with
+both comments intact. Premiere moved the red marker into the shared
+Grouped sequence collection during its save. The reopened picture and
+both audio components reference that one collection, so the red marker
+is no longer exclusive to audio. All edit ranges, media paths and
+channel assignments stayed the same. The marked and unmarked sequences
+match across all 48 decoded pictures and 96,096 stereo PCM16 sample
+frames. This verifies range retention for the existing fallback;
+Grouped does not guarantee lane-exclusive markers. (CONV-0180)
+
+For the same direct DNxHD Grouped profile, the conflict check compares
+the edit's selected audio source track. In the mixed-marker control, the
+A1 edit conflicts with the source A1 marker at the same frame. The
+source A2 range stays in the Grouped collection under both preferences.
+When sequence fallback is enabled, the other A1 marker retains its range
+at the corresponding record position.
+
 The Avid reader already captured the source track in the master marker
 witness. The graph now carries that track through to the corresponding
 Premiere bin item. Premiere preparation can also read the track from an
@@ -406,6 +607,59 @@ on its V1 occurrence and the source marker on the sequence. The bin
 master also retains the original source marker. All three retain their
 own duration, text and palette. The Avid export comparison remains
 open after a derived test sequence failed to load in Media Composer.
+CONV-0132
+
+The same direct DNxHD control exposed a Grouped writer gap. The shared
+marker collection was on the audio template, so the picture edit lacked
+the winning range. The writer now also links that collection to the
+picture template for verified online direct DNxHD groups with a nonzero
+source clock and V1 markers. Direct CLI and saved jobs keep the
+winning range on V1 and the other on the sequence under either
+preference. Premiere 27 Save As and reopen confirm the edit-preferred
+case at the original trims and with the two existing mono selectors.
+Merged keeps source V1 markers on the shared picture component. For
+same-rate, unretimed V1 edits on the verified direct DNxHD profile with
+a nonzero source clock, a marked edit uses its own picture component.
+That component follows the same preference and sequence fallback as
+Separate and Grouped. Both preferences passed CLI and saved-job checks.
+The 29.97 DF edit-preferred Premiere 27 Save As and reopen kept both
+markers at the same positions, with the two mono edits and original
+media links intact. Other Merged edit-marker cases retain the sequence
+fallback. Opening the reusable Merged bin item after reopen also showed
+the original two-frame source marker with its saved comment in the
+Source Monitor at `02:00:00;12`. This verifies display for picture-only
+marker collections in the direct 29.97 DF DNxHD profile with a nonzero
+source origin. Other Merged source-marker collections retain the
+unverified-timebase diagnostic.
+
+For the direct 23.976 DNxHD LB profile with two PCM16 mono siblings and
+a nonzero source origin, each uniquely selected mono file can also carry
+its own Merged edit markers. On the derived mixed-lane control, either
+A1 preference keeps the chosen marker at source frame 7 and puts the
+other on the sequence at record frame 2. The source range lasts two
+frames and the edit range lasts four. The independent V1 and A2 ranges
+keep their original times, comments, colors and component ownership.
+Both preferences passed CLI and saved-job read-back and Premiere 27
+Save As and reopen, with the six edits and three original links intact.
+Both renders match the linked AAF on all 48 picture frames. Their
+96,096 stereo PCM16 sample frames match the unmarked Merged control.
+The 29.97 DF and unmarked 23.976 seeded projects are byte-identical to
+the previous writer. This test used a derived marked AVB and the
+retained unmarked picture AAF.
+
+The Premiere 27 Source Monitor shows the reusable Merged item's origin
+at `02:00:00:00` and both two-frame audio ranges from `02:00:00:07`
+to `02:00:00:09`. It lists each range twice. A test project with the
+markers on only the individual mono components acquired both additional
+entries when Premiere saved it. The converter reports this display
+behavior for the verified audio-only range profile.
+
+A fresh native edit from the reusable item placed V1, A1 and A2 with
+source and record frames `[5,29)`. After Save As and reopen, each mono
+component kept one source range and its original MXF. Premiere's export
+covered the 24 occupied frames, which match the first cut in the linked
+AAF. The isolated 48,048-sample renders match their respective mono
+files under Premiere's center pan within one PCM16 count.
 CONV-0132
 
 ### Native coincident point markers and linked AAF
@@ -449,9 +703,92 @@ and reopen. The Premiere bridge and the saved project independently
 show a start of 24 frames and a duration of 22 frames on the
 24 fps sequence with its original 01-hour start. Normal conversion
 of the retained timeline still refuses its unqualified mixed-rate
-Motion Adapter. This check establishes marker placement and the scope
-of this offline AAF export. Keep online AAF behavior, native coincident
-source/edit ranges, and inherited-copy behavior open separately.
+Motion Adapter.
+
+An online control copies the saved span into an isolated same-rate
+87-frame sequence with verified DNxHD LB and two PCM16 siblings.
+Media Composer's linked Edit Protocol AAF carries the span in a
+24 fps TimelineMobSlot named `Segmentation`. A 24-frame filler precedes
+the 22-frame DescriptiveMarker, whose green color and length are
+explicit. The AAF's three media locators resolve to matching MXFs.
+Premiere 27 build 88 imports the sequence with zero markers and
+reopens it with zero. Both Any NLE entry points write the exact green
+range, and it survives Premiere Save As and reopen. The exports match
+all 87 decoded frames and differ by at most one PCM16 count across
+174,000 stereo sample frames under center pan. (CONV-0172)
+
+The online control changes the containing sequence and media state
+together. It establishes that Premiere dropped this saved span despite
+its presence in a linked, playable AAF. Native source ranges and copied
+range ownership remain separate checks.
+
+### Derived source span and edit copy
+
+Two derived 24 fps controls place a red marker at file frames `[100,122)`
+and save a V1 marker at record frames `[24,46)`. The edit begins at
+file frame 76. Names, comments, colors, and lengths agree. In one
+sequence the creation timestamps match, and in the other they differ
+by one second.
+
+Media Composer's linked AAFs contain a MasterMob marker and a
+CompositionMob marker, each with Length 22 and Position zero in its
+event slot. Premiere 27 build 88 reopens each AAF with one generic green
+point at record frame zero. The text of the comment survives.
+
+With **Keep the other marker as a sequence marker** enabled, the
+reopened Any NLE project retains one red V1 marker for the matching copy.
+For the independent pair it retains the V1 marker and a red sequence
+marker at `[24,46)`. The CLI and saved job agree. The independent-range
+render matches all 87 picture frames and remains within one PCM16
+count across 174,000 stereo sample frames compared with its AAF.
+The following native edit tests the copy operation. (CONV-0173)
+
+### Native source range and point copy
+
+Media Composer 25.12 saved two online 24 fps overwrites with **Copy
+Source Markers** enabled. The disposable source was seeded with the
+retained 22-frame range at file frames [100, 122). The first overwrite
+uses that exact span. In the second, a 30-frame source selection fully
+encloses the range and also contains a point marker at file frame 98.
+
+In both saved AVBs the range remains on the source. In the paired
+control, Avid saves the point as an edit-owned copy with its original
+creation timestamp and a two-frame offset into the new cut. Any NLE
+projects the source range into each picture edit. The paired control's
+project has one point per placement, including the placement with the
+saved copy, and no duplicate sequence marker with the keep-both
+setting. This test seeded the range before loading the bin in Avid.
+In a separate direct-authoring attempt, the mapped Composer marker
+button opened a one-frame marker with a 12-frame source selection
+active. The dialog was cancelled. Direct source range authoring remains
+open.
+
+Media Composer exported the exact paired sequence as a linked AAF Edit
+Protocol file with all tracks, marks off, and effects rendering off. The
+AAF contained zero embedded essence and two point events, one on the
+source at file frame 98 and one on the composition at record frame 89.
+After Save As, close, and reopen in Premiere 27 build 88, the AAF import
+had the copied point at record frame 89 as a green sequence marker with
+the original comment and a generic name. It had no saved source range
+or source point marker. Premiere also added an Unknown Effect marker
+for the Color Adapter at record frame 87.
+
+The direct CLI and saved-job projects agree on the saved edit and
+marker facts. After the CLI project reopened in Premiere 27, the
+picture edits still showed the red points at record frames 22 and 89
+and the red ranges at [24, 46) and [91, 113), with their saved names
+and comments. Both reopened projects retained the 01:00:00:00 start,
+the two picture edits and four mono audio edits, and their exact source
+and record ranges. Any NLE reports the Color Adapter against the edit
+that starts at frame 87. This paired comparison checked saved edit and
+marker data.
+
+The combined macOS package replay includes the first native overwrite.
+After Save As and reopen in Premiere 27 build 88, the two occurrences
+retain the 22-frame red range at record frames [24, 46) and [87, 109),
+with the same name and comment. All 109 decoded frames match the
+expected same-source positions. The report identifies the Color Adapter
+saved on the appended picture edit as an appearance loss.
 
 ## Disabled clip occurrences
 
@@ -661,6 +998,126 @@ masters and codecs outside the current picture-led DNx/PCM rewrap scope. Never f
 back silently to a known-unqualified direct route after a rewrap refusal. Held areas
 remain held. User listening, exact fade equivalence, broader native cohorts and
 corrected absolute clocks remain separate qualification tasks.
+
+## Mirrored PVOL volume ramps
+
+The retained 24 fps mono control uses the same WAV and a two-second edit
+trimmed two seconds into the source. Its four editable volume keys are
+at edit-relative frames 0, 12, 24 and 47, at −12, 0, 0 and −12 dB.
+Graph/2, the direct CLI, the saved job, and the retained linked AAF
+reopened in Premiere 27 agree at those four positions and levels.
+The separate subframe control retains its second key at 12.53613 frames
+in the converter output, compared with frame 12 in the reopened AAF.
+
+Gain measurements use 48-sample windows against each editor's own
+unprocessed reference. On the −12 dB control, the first Avid Direct Out
+ramp fits a straight line in dB within 0.001 dB RMS. The final ramp has
+two fitted slopes, approximately −0.34 and −0.63 dB per frame, which
+intersect about 65,530 samples from the start of the edit. The
+opposite-direction −6 dB ramp has a fitted intersection near sample
+65,525. The whole-frame and subframe versions of that control differ
+at the second key and have identical PCM from the third key onward.
+Four window widths from 24 to 192 samples reproduce both intersection
+estimates to within one sample. Their proximity to sample 65,536 gives
+the next test a fixed sample position to check. The linked AAF render of the
+−12 dB control differs from Avid by 0.40 dB RMS over the full edit.
+The −12 dB endpoints match, while the saved −6 dB control reaches
+−6.10 dB in Avid and −6.00 dB in the AAF render.
+
+An independent search across the final ramp found intersections at about
+65,528 and 65,533 samples for the rising and falling Avid controls. The
+search used the source-energy centroid of each window and supplied no
+candidate break position. Across four window widths, both Avid controls
+fit two lines within 0.000002 dB RMS. At 48 samples per window the linked
+AAF renders still had residuals of 0.015 and 0.060 dB RMS after the same
+two-line fit. The saved keys alone therefore cannot serve as a render
+reference for these controls.
+
+The follow-up keeps the same source trim, clip duration, and −12 dB
+endpoints, and moves the last two keys from frames 24 and 47 to 17 and
+44. Media Composer 25.12.0 build 58863 exported the dry and both ramp
+controls as mono PCM24 Direct Out. The measured final-ramp slope change
+stayed near sample 65,533 for both key arrangements. Across four window
+widths, the shifted control's estimates differ by less than one sample
+and are thousands of samples away from the tested key-relative predictions.
+
+A second control moved only the source trim by seven frames. Its dry
+render matched the new source samples and the measured gain envelope kept
+the same slopes and slope change. Moving the edit eight frames later on
+the sequence, with the original trim and the same keys, changed both
+ramps. After the 16,000 samples of leading silence, its dry render
+matched the original dry PCM. The processed render has slope changes at
+approximately 32,766, 65,534, and 98,301 samples from sequence start,
+close to successive multiples of 32,768. This establishes a timeline
+position dependency for the control. The calculation of the boundaries
+and behavior at other rates remain open.
+
+A prediction from the saved keys explains most of the remaining render
+difference in the retained controls. At each sequence-relative multiple
+of 32,768 samples, interpolate the neighboring saved gains in linear
+amplitude. Convert those intermediate gains and the saved gains to dB,
+round down to a tenth, then interpolate in dB between those values.
+For example, the original and shifted final ramps predict −3.0 and
+−5.0 dB at sample 65,536. The moved edit predicts −2.3, −2.2 and
+−9.7 dB at its three interior boundaries. These predictions use the
+saved edit position and source-relative key times without fitting
+parameters to individual renders.
+
+Across the six retained 24 fps mono PCM24 Direct Out controls, this
+prediction has 0.00043–0.00088 dB RMS error in 48-sample windows,
+compared with 0.169–0.869 dB for a straight line in dB between saved
+keys. The same pattern holds with
+24- and 96-sample windows. Rounding only the intermediate gains misses
+the −6.1 dB plateau in both the whole-frame and subframe controls.
+The saved amplitude in those controls is slightly below −6 dB. The
+exact sample boundaries, behavior at other rates, and a destination
+mapping that preserves editable intent still need separate checks.
+CONV-0185
+
+The staged 23.976 control uses a verified 48 kHz managed mono source.
+The two sequences share the same 40-frame trim, placed eight frames
+into the sequence. One is dry and the other has a short volume ramp
+that ends at sequence sample 65,568. On a fixed sample grid, the
+65,536-sample boundary falls inside the ramp. On a grid scaled by the
+edit rate, the boundary lands near sample 65,601.536, after the last
+key of that ramp. With the decoded source PCM, simulated renders
+separate those predictions by about 0.59 dB RMS in the boundary window.
+Both converter entry points preserve all five editable keys at their
+exact sample times and keep the dry edit unchanged.
+
+Media Composer 25.12.0 build 58863 exported both controls as mono PCM24
+Direct Out after managed relink. The dry export matches all 96,096
+expected samples, including the silent head. The relinked copies kept
+the trims and saved volume points. Four measurement windows place the
+first rising ramp's slope change at samples 32,766.43–32,766.57, close
+to the 32,768-sample boundary predicted from the 24 fps tests. The short
+fall crosses the next boundary without the predicted −9.4 dB knot. In
+the boundary window the fixed-grid prediction errs by 0.70 dB RMS,
+compared with 0.11 dB for a straight dB ramp between the saved points.
+The fixed grid describes the first ramp in this test. The second ramp
+shows that the 24 fps prediction still needs a rule for short key spans.
+
+The linked AAF contains all five gain points. Premiere 27 build 88 kept
+the A1 trim and clock after Save As and reopen, but saved four keys.
+It collapsed the two close subframe points at samples 65,296 and
+65,568 into a unity key at 64,064. The reopened Any NLE project retained
+all five Linear keys and their exact times. The stereo PCM24 exports
+contained the 80,080 active samples on each channel. Over that interval,
+relative to the dry control, the Any NLE volume envelope differs from Avid
+by 0.432 dB RMS per channel and the AAF import by 4.156 dB RMS. Across the
+short ramp the corresponding errors are 0.912 and 7.168 dB RMS.
+The converter keeps the exact editable keys and continues to report the
+interpolation difference. CONV-0185
+
+In the earlier shifted-key 24 fps test, linked AAF and Any NLE retained
+the same four editable keys and the original WAV trim after Save As,
+close and reopen in Premiere 27 build 88.
+Their dry and shifted stereo PCM24 exports agree within one count per
+sample on both channels. Normalizing each shifted export against its own
+dry reference gives about 0.506 dB RMS error and 1.087 dB peak error
+against Avid Direct Out over the two-second edit. The current converter
+keeps the editable keys and reports the interpolation difference.
+CONV-0177
 
 ## Editable managed mono clip pan
 

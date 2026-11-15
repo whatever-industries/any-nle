@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::io::{Error, Result};
 
+mod managed;
+pub use managed::{read_managed_direct_out, ManagedDirectOut, ManagedEssenceTrack};
+
 /// Header metadata is normally tens of kilobytes; Avid pads it with KAG fill. Never read more.
 pub const MAX_HEADER_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -55,6 +58,11 @@ pub const PRORES_422_HQ_CODING: [u8; 16] = [
 /// FFmpeg n8.1's VC-3 codec-UL family corroborates this label; RI00 alone is generic.
 pub const DNXHR_LB_CODING: [u8; 16] = [
     0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0D,
+    0x04, 0x01, 0x02, 0x02, 0x71, 0x28, 0x00, 0x00,
+];
+/// DNxHR LB as labelled in Resolve-exported Avid OP-Atom media.
+pub const DNXHR_LB_CODING_0A: [u8; 16] = [
+    0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A,
     0x04, 0x01, 0x02, 0x02, 0x71, 0x28, 0x00, 0x00,
 ];
 
@@ -207,6 +215,13 @@ fn hex32(b: &[u8]) -> String {
 }
 
 pub fn parse_identity(data: &[u8]) -> Result<MxfIdentity> {
+    parse_header(data, None)
+}
+
+fn parse_header(
+    data: &[u8],
+    managed: Option<&mut Option<ManagedDirectOut>>,
+) -> Result<MxfIdentity> {
     // The header partition pack must come first (no run-in support).
     let (key, start, end) = klv(data, 0)?;
     if key[..13] != PARTITION || key[13] != 0x02 {
@@ -237,6 +252,9 @@ pub fn parse_identity(data: &[u8]) -> Result<MxfIdentity> {
         // Avid audio headers also carry private sets keyed by non-SMPTE UUIDs (KB IDENTITY-0006);
         // only framing matters for those, so any 16-byte key is accepted and skipped.
         let (key, vstart, vend) = klv(data, pos)?;
+        if managed.is_some() && header_end.is_some_and(|limit| vend > limit) {
+            return Err(Error::new("managed OP1a item crosses the header extent", pos));
+        }
         let is_fill = key[..4] == UL_PREFIX && key[4] == 0x01 && key[8..13] == [0x03, 0x01, 0x02, 0x10, 0x01];
         let is_primer = key[..13] == PARTITION && key[13] == 0x05 && key[14] == 0x01;
         if header_end.is_none() && !is_fill {
@@ -386,6 +404,11 @@ pub fn parse_identity(data: &[u8]) -> Result<MxfIdentity> {
     }
     id.file_origins_zero = id.file_essence_tracks > 0 && origins.len() == id.file_essence_tracks
         && origins.iter().all(|n| *n == 0);
+    if let Some(witness) = managed {
+        *witness = Some(managed::inspect(
+            data, &sets, start, end, &id, ambiguous_instance_ids,
+        )?);
+    }
     Ok(id)
 }
 

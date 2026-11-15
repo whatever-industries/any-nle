@@ -217,6 +217,7 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         }],
         media: vec![],
         atom_media: vec![],
+        proxy_audio: Default::default(),
     };
     for (kind, tracks, expected) in [
         (StreamKind::Video, &data.video_tracks, 1),

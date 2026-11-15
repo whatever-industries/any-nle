@@ -227,7 +227,7 @@ fn effect_controls(
             .is_some_and(|fx| neutral_keys(fx, level))
 }
 
-fn neutral_keys(fx: &Node, level: i64) -> bool {
+pub(super) fn neutral_keys(fx: &Node, level: i64) -> bool {
     if fx.class != *b"FXPS"
         || int(fx, "orig_length") != Some(-1)
         || int(fx, "window_offset") != Some(0)

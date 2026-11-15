@@ -581,6 +581,7 @@ struct Master {
     path: String,
     size: (i64, i64),
     wav_samples: Option<i64>,
+    standalone_mono_atom: bool,
     stereo_pool_route: bool,
     split_atom_audio: bool,
 }
@@ -639,6 +640,10 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
             original: None,
         },
     );
+    let proxy = proxy_observation(clip, blobs).unwrap_or_default();
+    let pcm = proxy.as_ref().and_then(|v| match v.get("audio_bits") {
+        Some(Value::Int(bits)) => Some(*bits), _ => None,
+    });
     let mut audio = BTreeMap::new();
     let mut split_atom_audio = false;
     let mut stereo_pool_route = false;
@@ -656,8 +661,16 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
                     && rate == Rational::integer(24)
                     && start == 0
                 {
-                    read_avc_stereo(clip, node, &path, length, blobs, graph, &mut item)?;
+                    read_embedded_stereo(clip, node, &path, length, rate, 0, None, blobs, graph, &mut item)?;
                     audio = BTreeMap::from([(0, 0), (1, 1)]);
+                    stereo_pool_route = true;
+                } else if codec == "apch" && audio_codec == "Linear PCM" && size == (1920,1080)
+                    && rate == Rational::new(24000,1001).unwrap()
+                    && saved_timecode.is_some()
+                    && pcm.is_some()
+                {
+                    read_embedded_stereo(clip, node, &path, length, rate, start, pcm, blobs, graph, &mut item)?;
+                    audio = BTreeMap::from([(0,0),(1,1)]);
                     stereo_pool_route = true;
                 } else {
                     audio = audio_media(
@@ -708,6 +721,9 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
         ],
     );
     metadata::capture(clip, video, saved_timecode, blobs, graph)?;
+    if let Some(proxy) = proxy {
+        graph.sidecars.push(graph::Sidecar { adapter:"resolve.proxy".into(),object:id.into(),data:proxy });
+    }
     graph.items.push(item);
     Ok(Master {
         rate,
@@ -717,6 +733,7 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
         path,
         size,
         wav_samples: None,
+        standalone_mono_atom: false,
         stereo_pool_route,
         split_atom_audio,
     })
@@ -769,11 +786,55 @@ fn audio_routes(clip: &Node, blobs: &mut Blobs) -> Result<encoding::Map> {
     qt(pb_bytes(nested, 5)?.ok_or("missing Resolve virtual audio routes")?)
 }
 
-fn read_avc_stereo(
+fn proxy_observation(clip: &Node, blobs: &mut Blobs) -> Result<Option<Value>> {
+    let Some(encoded) = clip.maybe("FieldsBlob")?.filter(|v|!v.is_empty()) else { return Ok(None); };
+    let fields = blobs.envelope(encoded)?;
+    let Some(bytes) = pb_bytes(&fields,2)? else { return Ok(None); };
+    // Preserve older unrelated fields: only the observed attached-proxy cache is interpreted.
+    let Ok(top) = qt(bytes) else { return Ok(None); };
+    let Ok(video) = top.bytes("VIDEO_INFO").and_then(qt) else { return Ok(None); };
+    let packed = blobs.envelope(&hex::encode(video.bytes("Clip")?))?;
+    let get = |key| -> Result<&str> {
+        Ok(std::str::from_utf8(pb_bytes(&packed,key)?.ok_or("missing proxy locator field")?)?)
+    };
+    let folder = get(1)?;
+    let file = get(2)?;
+    if folder.is_empty() || file.is_empty() || file.contains(['/', '\\','\0']) || matches!(file,"."|"..") {
+        return Err("invalid Resolve proxy locator".into());
+    }
+    let path = Path::new(folder).join(file);
+    let timing = qt(video.bytes("Time")?)?;
+    let audio_bits = match top.byte_list("AUDIO_INFO_VEC")? {
+        Some([row]) => {
+            let audio = qt(row)?;
+            let tracks = qt(audio.bytes("TracksBA")?)?;
+            let track = qt(tracks.bytes("0")?)?;
+            let packed_audio = blobs.envelope(&hex::encode(audio.bytes("Clip")?))?;
+            if track.text("CodecName")? == Some("Linear PCM") && track.int("NumChannels")? == 2
+                && pb_bytes(&packed_audio,1)? == Some(folder.as_bytes()) && pb_bytes(&packed_audio,2)? == Some(file.as_bytes())
+            {
+                match track.int("BitDepth")? {1=>Value::Int(16),2=>Value::Int(24),_=>Value::Null}
+            } else { Value::Null }
+        }
+        _ => Value::Null,
+    };
+    Ok(Some(Value::Obj(vec![
+        ("path",text(path.to_str().ok_or("invalid proxy path")?)),
+        ("frames",Value::Int(timing.int("NumFrames")?)),
+        ("start", Value::Int(timecode(timing.text("Timecode")?.ok_or("missing proxy timecode")?,24)?)),
+        ("rate", text(&rate(timing.bytes("FrameRate")?)?.to_string())),
+        ("audio_bits",audio_bits),
+    ].into_iter().map(|(k,v)|(k.into(),v)).collect())))
+}
+
+fn read_embedded_stereo(
     clip: &Node,
     node: &Node,
     path: &str,
     length: i64,
+    rate: Rational,
+    start: i64,
+    pcm: Option<i64>,
     blobs: &mut Blobs,
     graph: &mut SourceGraph,
     item: &mut SourceItem,
@@ -781,28 +842,30 @@ fn read_avc_stereo(
     let tracks = blobs.qt(node.get("TracksBA")?)?;
     let routes = audio_routes(clip, blobs)?;
     if !tracks.keys().eq(["0"]) || !routes.keys().eq(["0"]) {
-        return Err("expected one embedded AVC audio track and stereo route".into());
+        return Err("expected one embedded movie audio track and stereo route".into());
     }
     let track = qt(tracks.bytes("0")?)?;
     let route = qt(routes.bytes("0")?)?;
-    let duration = seconds(length, Rational::integer(24))?;
+    let duration = seconds(length, rate)?;
+    let (codec, depth) = match pcm {Some(16)=>("Linear PCM",1),Some(24)=>("Linear PCM",2),_=>("AAC",3)};
     if track.int("NumChannels")? != 2
         || track.int("IdxTrack")? != 0
         || track.int("SampleRate")? != 48000
-        || track.int("ChannelLayout")? != 2
-        || track.int("BitDepth")? != 3
-        || track.text("CodecName")? != Some("AAC")
-        || track.real("StartTime")? != 0.0
-        || Some(track.int("Duration")?) != length.checked_mul(2000)
+        || (pcm.is_none() && track.int("ChannelLayout")? != 2)
+        || track.int("BitDepth")? != depth
+        || track.text("CodecName")? != Some(codec)
+        || frames(track.real("StartTime")?,rate)? != start
+        || Some(track.int("Duration")?) != length.checked_mul(crate::linked::samples_per_frame(rate))
         || route.int("Type")? != 0
-        || route.text("CodecName")? != Some("AAC")
-        || extent(route.bytes("MediaExtents")?, Rational::integer(24))? != (0, length)
+        || route.text("CodecName")? != Some(codec)
+        || (pcm.is_some() && route.int("BitDepth")? != depth)
+        || extent(route.bytes("MediaExtents")?, rate)? != (start, length)
     {
-        return Err("unqualified embedded AVC stereo sample clock or format".into());
+        return Err("unqualified embedded stereo sample clock or format".into());
     }
     let channels = qt(route.bytes("ChannelVecBA")?)?;
     if !channels.keys().eq(["0", "1"]) {
-        return Err("incomplete AVC stereo channel routing".into());
+        return Err("incomplete embedded stereo channel routing".into());
     }
     for (channel, key) in ["0", "1"].into_iter().enumerate() {
         let row = qt(channels.bytes(key)?)?;
@@ -812,7 +875,7 @@ fn read_avc_stereo(
             0
         };
         if row.text("MediaRef")? != Some(node.id()?) || saved != channel as i64 {
-            return Err("AVC stereo selector contradicts its cache".into());
+            return Err("embedded stereo selector contradicts its cache".into());
         }
         let label = channel as i64 + 1;
         add_media(
@@ -822,11 +885,11 @@ fn read_avc_stereo(
                 id: format!("{}/audio/{label}", clip.id()?),
                 kind: StreamKind::Audio,
                 locations: vec![path.into()],
-                codec: Some("aac".into()),
+                codec: Some(pcm.map_or_else(||"aac".into(),|bits|format!("pcm_s{bits}le"))),
                 frame_size: None,
                 rate: None,
                 sample_rate: Some(48000),
-                bits: None,
+                bits: pcm,
                 duration,
                 start: Some(Rational::ZERO),
                 clock: None,
@@ -1002,18 +1065,25 @@ impl Grid {
     }
 
     fn edit(self, node: &Node, wav: bool) -> Result<Edit> {
+        self.audio_edit(node, wav, false)
+    }
+
+    fn audio_edit(self, node: &Node, wav: bool, standalone_mono_atom: bool) -> Result<Edit> {
         let start: i64 = node.get("Start")?.parse()?;
         let start = start
             .checked_sub(self.origin)
             .ok_or("Resolve record start overflow")?;
         let duration = node.get("Duration")?;
-        let length = if wav {
+        let length = if standalone_mono_atom {
+            wav::integer_atom_frame(duration)?
+        } else if wav {
             wav::integer_duration(duration)?
         } else {
             duration.parse()?
         };
         let source_in = match node.get("In")? {
             "" => 0, // Native serialization of default zero.
+            text if standalone_mono_atom => wav::integer_atom_frame(text)?,
             text => text.parse::<i64>()?,
         };
         if start < 0
@@ -1436,9 +1506,10 @@ fn read_tracks<'a>(
                     )?;
                     continue;
                 }
-                let edit = grid.edit(
+                let edit = grid.audio_edit(
                     node,
                     kind == StreamKind::Audio && master.wav_samples.is_some(),
+                    kind == StreamKind::Audio && master.standalone_mono_atom,
                 )?;
                 if context.inspect_drt
                     && kind == StreamKind::Audio

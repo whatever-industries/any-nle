@@ -513,6 +513,13 @@ fn bin_items(file: &AvbFile) -> Vec<&Node> {
 pub(crate) mod project;
 pub use project::{extract_project, extract_project_paths, ProjectReadError};
 
+fn source_directory(locator: &str) -> Option<&str> {
+    let windows = locator.starts_with(r"\\")
+        || matches!(locator.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic());
+    let separator = locator.rfind(|ch| ch == '/' || (windows && ch == '\\'))?;
+    Some(&locator[..=separator])
+}
+
 fn master(ctx: &Ctx, mob: &Node) -> Result<MasterClip, String> {
     let name = mob.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     let id = mob_id(mob).ok_or("master clip has no mob ID")?;
@@ -675,7 +682,7 @@ fn master(ctx: &Ctx, mob: &Node) -> Result<MasterClip, String> {
         }
     }
     if let Some((_, unc)) = columns.iter().find(|(k, _)| k == "UNC Path") {
-        source_path = unc.rfind('/').map(|i| unc[..=i].to_string());
+        source_path = source_directory(unc).map(str::to_owned);
     }
 
     Ok(MasterClip {
@@ -756,6 +763,18 @@ pub fn format_timecode(frames: i64, fps: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_directory_preserves_saved_path_conventions() {
+        assert_eq!(source_directory(r"R:\Card A\COUNTER.mov"), Some(r"R:\Card A\"));
+        assert_eq!(
+            source_directory(r"\\server\Camera Share\Card B\COUNTER.mov"),
+            Some(r"\\server\Camera Share\Card B\")
+        );
+        assert_eq!(source_directory("R:/Card A/COUNTER.mov"), Some("R:/Card A/"));
+        assert_eq!(source_directory(r"/Card B/left\right.mov"), Some("/Card B/"));
+        assert_eq!(source_directory("COUNTER.mov"), None);
+    }
 
     #[test]
     fn timecode_formatting() {

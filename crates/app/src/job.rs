@@ -51,6 +51,12 @@ pub struct JobSpec {
     pub mode: ClipMode,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub allow_offline_media: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_source_media: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub attach_avid_proxies: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_rewrap_dir: Option<PathBuf>,
     pub new_media: Option<PathBuf>,
     pub policy_json: String,
     pub effects: Vec<EffectChoice>,
@@ -73,6 +79,9 @@ impl Default for JobSpec {
             project_name: None,
             mode: ClipMode::RewrapNative,
             allow_offline_media: false,
+            prefer_source_media: false,
+            attach_avid_proxies: false,
+            proxy_rewrap_dir: None,
             new_media: None,
             policy_json: String::new(),
             effects: vec![],
@@ -115,10 +124,19 @@ pub struct Review {
     pub inventory: Inventory,
     pub estimated_bytes: Option<u64>,
     pub available_bytes: Option<u64>,
+    pub camera_originals: Vec<CameraOriginalLink>,
     pub notes: Vec<ReportNote>,
     /// Display names keyed by the diagnostic's stable source object ID.
     pub subjects: std::collections::HashMap<String, String>,
     pub cli_equivalent: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraOriginalLink {
+    pub name: String,
+    pub picture: PathBuf,
+    /// Saved mono track and one-based physical channel in the camera file.
+    pub audio_channels: Vec<(i64, i64)>,
+    pub proxy: Option<PathBuf>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockerKind {
@@ -129,9 +147,11 @@ pub enum BlockerKind {
     OriginalLocator,
     OriginalMedia,
     NewMedia,
+    ProxyMedia,
     MediaTools,
     Effects,
     Rewrap,
+    GroupClipMode,
     SourceContent,
     SequenceTiming,
     Retry,
@@ -147,7 +167,9 @@ impl ReviewBlocker {
         Self { kind, message: message.into(), affected: Vec::new() }
     }
     pub(crate) fn cli_summary(self) -> String {
-        if self.kind == BlockerKind::SequenceTiming && !self.affected.is_empty() {
+        if matches!(self.kind, BlockerKind::SequenceTiming | BlockerKind::OriginalLocator)
+            && !self.affected.is_empty()
+        {
             format!("{}: {}", self.message, self.affected.join("; "))
         } else {
             self.message

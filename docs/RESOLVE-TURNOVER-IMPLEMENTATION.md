@@ -47,6 +47,49 @@ the source document. Reviewable omissions require
 failures still block publication. Each input project and media binding is
 checked again before exclusive publication.
 
+### Camera picture with independent editorial audio
+
+An internal Avid job can prefer camera originals from verified Avid source
+columns. With a verified 23.976 stereo proxy rewrap, Resolve links the camera
+picture and attaches the rewrapped MOV as its proxy. The edited mono audio
+uses the verified Avid MXF siblings. Review reports **Creates new media.**,
+the planned proxy paths, and the estimated bytes when it plans a rewrap.
+Picture-only proxy attachment uses the existing MXF in place.
+
+A derived 23.976 bin combines two camera picture cuts, both managed PCM24
+siblings, and a linked stereo WAV on the second A2 edit. Archive read-back
+retains the exact `01:00:00:00` timeline and `02:00:00:00` camera starts and
+all six edit ranges. A1 uses its own MXF for both edits. A2 uses its own MXF
+for the first edit and the WAV's right channel for the second. The proxy
+contains all 96 verified compressed picture frames. Each audio channel matches
+its original mono MXF sample for sample. An occupied proxy path blocks review.
+
+Resolve Studio 21.2.0.6 imported, saved, closed, and reopened the combined
+project with the originals online. A fresh DRP export kept all six file
+identities, trims, clocks, audio channel selectors, and the proxy attachment.
+Resolve matched all 48 decoded picture frames and 96,096 PCM24 samples per
+mono lane against a timeline assembled directly in Resolve using the same
+source files and ranges. The audio also matched the selected source samples
+within one PCM24 step after accounting for the stereo bus pan and the
+72-sample clip-edge ramps.
+
+### Require camera originals
+
+Set `source.require_camera_originals` to `true` in an internal Avid job/2
+to require a single verified original for every selected picture edit and
+every camera in a selected editable Group. The option defaults to off.
+With it enabled, preparation also looks for originals using the saved Avid
+source columns and any supplied path mappings. Verified existing UME
+picture links qualify. Managed editorial audio, linked WAV audio, and
+explicit proxy attachment keep their respective media policies.
+
+If picture would fall back to managed media, preparation reports the
+affected timelines, tracks, and record positions or camera names. The
+report counts all failed bindings and shows up to 16. It fails before
+writing a DRP or proxy. The internal probe has exercised the strict gate
+on the mixed editorial audio control and a picture-only camera original.
+The wizard and saved-path navigation remain pending.
+
 ## Premiere sequence markers
 
 On qualified Premiere → Resolve timelines, a Comment marker on the

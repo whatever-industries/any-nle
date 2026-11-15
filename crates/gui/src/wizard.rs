@@ -29,8 +29,9 @@ enum Pick {
     Project,
     Output,
     Media,
-
+    MappedOriginalFolder,
     NewMedia,
+    ProxyMedia,
     LoadPreset,
     SavePreset,
     SaveJob,
@@ -57,7 +58,7 @@ enum ReviewAction {
     Step(Page),
     Choose(Pick),
     Media(MediaJump),
-    SwitchToOffline,
+    SwitchToSeparate { enable_offline_media: bool },
 }
 #[derive(Default)]
 struct Tree {
@@ -204,7 +205,7 @@ pub struct App {
     preset_name: String,
     show_colors: bool,
     mapping_saved: String,
-    mapping_actual: String,
+    mapping_actual: PathBuf,
     ffmpeg: Option<PathBuf>,
     ffprobe: Option<PathBuf>,
     close_after_cancel: bool,
@@ -246,7 +247,7 @@ impl App {
             preset_name: "My preset".into(),
             show_colors: false,
             mapping_saved: String::new(),
-            mapping_actual: String::new(),
+            mapping_actual: PathBuf::new(),
             ffmpeg: None,
             ffprobe: None,
             close_after_cancel: false,
@@ -330,6 +331,11 @@ impl App {
                 ClipMode::Separate => job::ClipMode::Separate,
             },
             allow_offline_media: c.mode != ClipMode::Rewrap && c.allow_offline_media,
+            prefer_source_media: c.uses_camera_originals(),
+            attach_avid_proxies: c.attaches_avid_proxies(),
+            proxy_rewrap_dir: if c.attaches_avid_proxies() {
+                i.proxy_rewrap_dir.clone()
+            } else { None },
             new_media: if c.mode == ClipMode::Rewrap {
                 i.new_media.clone()
             } else {
@@ -469,12 +475,19 @@ impl App {
                     .set_title("Choose a folder")
                     .pick_folder()
                     .map(|p| vec![p]),
+                Pick::MappedOriginalFolder => d
+                    .set_title("Choose the current folder for the saved path")
+                    .pick_folder()
+                    .map(|p| vec![p]),
                 Pick::Output => d
                     .set_title("New Premiere project")
                     .add_filter("Premiere project", &["prproj"])
                     .set_file_name("Converted.prproj")
                     .save_file()
                     .map(|p| vec![p]),
+                Pick::ProxyMedia => d
+                    .set_title("Choose a folder for rewrapped proxies")
+                    .pick_folder().map(|p| vec![p]),
                 Pick::NewMedia => d
                     .set_title("Choose a parent for NEW media folder")
                     .pick_folder()
@@ -533,6 +546,7 @@ impl App {
                         .map(|m| (m.saved_prefix, m.actual_root))
                         .collect(),
                     new_media: s.new_media,
+                    proxy_rewrap_dir: s.proxy_rewrap_dir,
                 };
                 self.wizard.choices = Choices {
                     mode: match s.mode {
@@ -542,6 +556,8 @@ impl App {
                         job::ClipMode::Separate => ClipMode::Separate,
                     },
                     allow_offline_media: s.allow_offline_media,
+                    prefer_source_media: s.prefer_source_media || s.attach_avid_proxies,
+                    attach_avid_proxies: s.attach_avid_proxies,
                     include_dependencies: s.include_dependencies,
                     include_trash_attic: s.include_trash_attic,
                     policy_json: if s.policy_json.is_empty() {
@@ -653,6 +669,8 @@ impl App {
                                         self.wizard.inputs.media_roots.push(path.clone());
                                     }
                                 }
+                                Pick::MappedOriginalFolder => self.mapping_actual = path.clone(),
+                                Pick::ProxyMedia => self.wizard.inputs.proxy_rewrap_dir = Some(path.clone()),
                                 Pick::NewMedia => {
                                     self.wizard.inputs.new_media = Some(path.join(new_media_name()))
                                 }
@@ -887,6 +905,43 @@ impl App {
             ui.small("Existing destination files and media folders are never replaced.");
         });
     }
+    fn saved_path_mappings(&mut self, ui: &mut egui::Ui) {
+        ui.small("Enter the folder prefix saved by the source editor, then choose its current folder.");
+        ui.add(egui::TextEdit::singleline(&mut self.mapping_saved).hint_text("Saved folder prefix"));
+        path_edit(ui, &mut self.mapping_actual, "Current folder");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Browse current folder…").clicked() {
+                self.pick(Pick::MappedOriginalFolder, ui.ctx());
+            }
+            let saved = self.mapping_saved.trim();
+            if ui.add_enabled(!saved.is_empty() && self.mapping_actual.is_absolute(), egui::Button::new("Add mapping")).clicked() {
+                let paths = &mut self.wizard.inputs.path_mappings;
+                let prefix = PathBuf::from(saved);
+                let current = std::mem::take(&mut self.mapping_actual);
+                if let Some((_, root)) = paths.iter_mut().find(|(old, _)| *old == prefix) {
+                    *root = current;
+                } else {
+                    paths.push((prefix, current));
+                }
+                self.mapping_saved.clear();
+            }
+        });
+        let mut remove = None;
+        for (i, (saved, current)) in self.wizard.inputs.path_mappings.iter().enumerate() {
+            ui.push_id(i, |ui| {
+                ui.separator();
+                review_path(ui, "Saved prefix", saved);
+                review_path(ui, "Current folder", current);
+                if ui.small_button("Remove mapping").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.wizard.inputs.path_mappings.remove(i);
+        }
+    }
+
     fn clips(&mut self, ui: &mut egui::Ui) {
         let jump = self.media_jump.take();
         Self::title(
@@ -952,6 +1007,32 @@ impl App {
                     }
                 });
         }
+        if self.wizard.choices.mode != ClipMode::Rewrap {
+            Self::card(ui, |ui| {
+                ui.strong("Primary media");
+                ui.radio_value(&mut self.wizard.choices.prefer_source_media, false, "Use the media in the Avid edit");
+                ui.radio_value(&mut self.wizard.choices.prefer_source_media, true, "Prefer camera originals for picture");
+                if self.wizard.choices.uses_camera_originals() {
+                    ui.small("Try the saved camera path or a saved-path mapping. Keep the Avid media when the match cannot be verified.");
+                    ui.checkbox(&mut self.wizard.choices.attach_avid_proxies, "Attach matching Avid media as proxies");
+                }
+                if self.wizard.choices.attaches_avid_proxies() {
+                    ui.small("Verified picture-only DNxHD can attach in place. A matching stereo original can use a rewrapped proxy after both audio channels are verified.");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Rewrap proxy for compatibility…").on_hover_text("Creates new media.").clicked() {
+                            self.pick(Pick::ProxyMedia, ui.ctx());
+                        }
+                        if self.wizard.inputs.proxy_rewrap_dir.is_some() && ui.button("Link existing proxies only").clicked() {
+                            self.wizard.inputs.proxy_rewrap_dir = None;
+                        }
+                    });
+                    if let Some(path) = &self.wizard.inputs.proxy_rewrap_dir {
+                        ui.colored_label(AMBER, "Creates new media.");
+                        review_path(ui, "Proxy folder", path);
+                    }
+                }
+            });
+        }
         ui.horizontal(|ui| {
             ui.small(
                 "Avid MultiGroups and qualified linked originals follow their supported routes.",
@@ -990,12 +1071,9 @@ impl App {
             ui.horizontal(|ui|{if ui.button("Add Avid media folder…").clicked(){self.pick(Pick::Media,ui.ctx());}if ui.button("Refresh source references").clicked(){self.scan(ui.ctx());}});
             path_list(ui,"Avid media",&mut self.wizard.inputs.media_roots);
             if let Some(inv)=&self.inventory {ui.colored_label(if inv.found_media==inv.total_media{GOOD}else{AMBER},media_status(inv));}
-            ui.small("Originals are selected only by their exact saved paths or explicit saved-path mappings. Proxy attachment and audio-to-source relinking have no additional supported setting in this release.");
             let mappings = egui::CollapsingHeader::new("Saved-path mappings")
                 .open((jump == Some(MediaJump::OriginalMappings)).then_some(true)).show(ui,|ui|{
-                ui.label("Map an original saved path prefix to its current root; filenames alone never establish identity.");
-                ui.horizontal(|ui|{ui.add(egui::TextEdit::singleline(&mut self.mapping_saved).hint_text("Saved prefix").desired_width(220.));ui.label(">");ui.add(egui::TextEdit::singleline(&mut self.mapping_actual).hint_text("Current root").desired_width(220.));if ui.button("Add").clicked(){if !self.mapping_saved.trim().is_empty()&&!self.mapping_actual.trim().is_empty(){self.wizard.inputs.path_mappings.push((PathBuf::from(self.mapping_saved.trim()),PathBuf::from(self.mapping_actual.trim())));self.mapping_saved.clear();self.mapping_actual.clear();}}});
-                let mut remove=None;for(i,(a,b))in self.wizard.inputs.path_mappings.iter().enumerate(){ui.horizontal(|ui|{ui.label(format!("{} > {}",a.display(),b.display()));if ui.small_button("Remove").clicked(){remove=Some(i);}});}if let Some(i)=remove{self.wizard.inputs.path_mappings.remove(i);}
+                self.saved_path_mappings(ui);
             });
             if jump == Some(MediaJump::OriginalMappings) {
                 mappings.header_response.scroll_to_me(Some(egui::Align::TOP));
@@ -1212,6 +1290,11 @@ impl App {
                 "Choose a parent folder with room for the new media, then check again.",
                 Some(("Choose media parent…", ReviewAction::Choose(Pick::NewMedia))),
             ),
+            ProxyMedia => (
+                "Check the proxy output folder",
+                "Choose an existing folder with space for the rewrapped proxies, or use the existing proxies only.",
+                Some(("Choose proxy folder…", ReviewAction::Choose(Pick::ProxyMedia))),
+            ),
             MediaTools => (
                 "Check the media tools",
                 "Review the FFmpeg and ffprobe paths, or reset them to the bundled tools. Then return to Review.",
@@ -1226,6 +1309,11 @@ impl App {
                 "Media preparation blocked",
                 "Check the reason below. Review the clip mode and new media folder, or change the selected bins if the source is unsupported.",
                 Some(("Go to Clips & media", ReviewAction::Step(Page::Clips))),
+            ),
+            GroupClipMode => (
+                "Use Separate files for editable Avid Groups",
+                "Switch clip mode, then return to Review to check the Group and its original media.",
+                Some(("Switch to Separate files", ReviewAction::SwitchToSeparate { enable_offline_media: false })),
             ),
             SourceContent => (
                 "Selected content could not be converted",
@@ -1255,7 +1343,7 @@ impl App {
                     }
                 }
                 if issue.kind == RewrapMissingMedia && ui.button("Switch to Separate files").clicked() {
-                    action = Some(ReviewAction::SwitchToOffline);
+                    action = Some(ReviewAction::SwitchToSeparate { enable_offline_media: true });
                 }
                 if ui.link("Copy details").clicked() {
                     let mut details = vec![issue.message.as_str()];
@@ -1275,9 +1363,11 @@ impl App {
         match action {
             ReviewAction::Step(page) => self.wizard.page = page,
             ReviewAction::Choose(pick) => self.pick(pick, ctx),
-            ReviewAction::SwitchToOffline => {
+            ReviewAction::SwitchToSeparate { enable_offline_media } => {
                 self.wizard.choices.mode = ClipMode::Separate;
-                self.wizard.choices.allow_offline_media = true;
+                if enable_offline_media {
+                    self.wizard.choices.allow_offline_media = true;
+                }
                 self.invalidate();
                 self.wizard.page = Page::Clips;
             }
@@ -1335,8 +1425,7 @@ impl App {
         let i = &self.wizard.inputs;
         let choices = &self.wizard.choices;
         let rewrap = choices.mode == ClipMode::Rewrap;
-        let creates_media = rewrap
-            && self.review.as_ref().is_some_and(|review| review.estimated_bytes.is_some());
+        let creates_media = self.review.as_ref().is_some_and(|review| review.estimated_bytes.is_some());
 
         Self::card(ui, |ui| {
             ui.strong("Output");
@@ -1356,10 +1445,24 @@ impl App {
                     counted(i.bins.len(), "bin", "bins")
                 });
             });
+            if !rewrap {
+                ui.label(if choices.uses_camera_originals() {
+                    "Primary media · Prefer camera originals for picture"
+                } else {
+                    "Primary media · Use the media in the Avid edit"
+                });
+                if choices.attaches_avid_proxies() {
+                    ui.label(if i.proxy_rewrap_dir.is_some() {
+                        "Proxies · Attach matching Avid media and allow stereo rewrap"
+                    } else {
+                        "Proxies · Link matching Avid media in place"
+                    });
+                }
+            }
             if creates_media {
                 ui.colored_label(AMBER, RichText::new("Creates new media.").strong());
-                if let Some(path) = &i.new_media {
-                    review_path(ui, "Media folder", path);
+                if let Some(path) = if rewrap { &i.new_media } else { &i.proxy_rewrap_dir } {
+                    review_path(ui, if rewrap { "Media folder" } else { "Proxy folder" }, path);
                 }
             } else if rewrap && self.review.is_none() {
                 ui.label(RichText::new("A new media folder is needed for native OP-Atom rewraps.").color(MUTED));
@@ -1388,11 +1491,11 @@ impl App {
                         if inv.ume_originals == 0 {
                             String::new()
                         } else {
-                            format!(" · {}", counted(inv.ume_originals, "qualified UME original", "qualified UME originals"))
+                            format!(" · {}", counted(inv.ume_originals, "qualified original", "qualified originals"))
                         }
                     ));
                     if inv.ume_originals > 0 && inv.native_media == 0 {
-                        ui.label("Links to originals in place.");
+                        ui.label("Links to available originals in place.");
                     }
                     if creates_media {
                         ui.horizontal_wrapped(|ui| {
@@ -1402,6 +1505,29 @@ impl App {
                             ui.label(RichText::new("Available").color(MUTED));
                             ui.label(bytes(review.available_bytes));
                         });
+                    }
+                    if choices.uses_camera_originals() {
+                        if review.camera_originals.is_empty() {
+                            ui.label("No camera-original matches. Using the media in the Avid edits.");
+                        } else {
+                            let count = review.camera_originals.len();
+                            egui::CollapsingHeader::new(format!("Camera-original matches · {count}")).show(ui, |ui| {
+                                for link in &review.camera_originals {
+                                    ui.strong(&link.name);
+                                    review_path(ui, "Picture", &link.picture);
+                                    if !link.audio_channels.is_empty() {
+                                        let routes = link.audio_channels.iter()
+                                            .map(|(track, channel)| format!("A{track} → channel {channel}"))
+                                            .collect::<Vec<_>>().join(" · ");
+                                        ui.small(format!("Audio from camera file · {routes}"));
+                                    }
+                                    if let Some(proxy) = &link.proxy {
+                                        review_path(ui, "Proxy", proxy);
+                                    }
+                                    ui.separator();
+                                }
+                            });
+                        }
                     }
                     if changes > 0 {
                         ui.separator();
@@ -1416,7 +1542,7 @@ impl App {
                             for note in &inv.notes {
                                 ui.label(RichText::new(note).color(MUTED));
                             }
-                            Self::report(ui, &review.notes, &mut self.report_search, &mut self.why);
+                            Self::report(ui, &review.notes, Some(&review.subjects), &mut self.report_search, &mut self.why);
                         });
                 } else {
                     ui.strong(if self.busy { "Preflight in progress" } else { "Preflight" });
@@ -1461,6 +1587,7 @@ impl App {
     fn report(
         ui: &mut egui::Ui,
         notes: &[job::ReportNote],
+        subjects: Option<&std::collections::HashMap<String, String>>,
         search: &mut String,
         why: &mut Option<String>,
     ) {
@@ -1475,7 +1602,8 @@ impl App {
         let query = search.to_lowercase();
         let mut visible = 0;
         for n in notes {
-            if !format!("{} {} {}", n.severity, n.object, n.message)
+            let subject = subjects.and_then(|names| names.get(&n.object)).map(String::as_str);
+            if !format!("{} {} {} {}", n.severity, n.object, n.message, subject.unwrap_or(""))
                 .to_lowercase()
                 .contains(&query)
             {
@@ -1491,7 +1619,7 @@ impl App {
                             _ => MUTED,
                         },
                     ));
-                    ui.strong(&n.object);
+                    ui.strong(subject.unwrap_or(&n.object)).on_hover_text(&n.object);
                     if ui.link("Why?").clicked() {
                         *why = Some(if n.why.is_empty() {
                             n.message.clone()
@@ -1582,7 +1710,8 @@ impl App {
             "Conversion report · {}",
             counted(c.report.len(), "note", "notes")
         ))
-        .show(ui, |ui| Self::report(ui, &c.report, &mut self.report_search, &mut self.why));
+        .show(ui, |ui| Self::report(ui, &c.report, self.review.as_ref().map(|review| &review.subjects),
+            &mut self.report_search, &mut self.why));
         if ui.button("Convert another project").clicked() {
             self.completion = None;
             self.review = None;

@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 .DS_Store
 /avid-reader/target/
+/candidate-verification.json
 
 # agent worktrees
 .claude/worktrees/
