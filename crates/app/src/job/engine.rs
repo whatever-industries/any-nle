@@ -13,6 +13,10 @@ use std::{
 };
 
 const MAX_JOB_BYTES: usize = 1 << 20;
+const PREFLIGHT_REPORT_SCHEMA: &str = "anynle.preflight-report/1";
+const RECEIPT_SUFFIX: &str = ".anynle-report.json";
+const REPLAY_SUFFIX: &str = ".anynle-job.json";
+const DEBUG_SUFFIX: &str = ".anynle-debug.jsonl";
 use base64::Engine;
 pub fn load_encoded(encoded: &str) -> Result<JobSpec, String> {
     if encoded.len() > ((MAX_JOB_BYTES + 2) / 3) * 4 {
@@ -79,6 +83,67 @@ fn path_key(path: &Path) -> Result<String, String> {
         .to_string_lossy()
         .to_lowercase())
 }
+fn check_preflight_report_path<'a>(
+    path: &Path,
+    reserved: impl IntoIterator<Item = &'a Path>,
+) -> Result<(), String> {
+    if path
+        .extension()
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("json"))
+    {
+        return Err("Choose a .json path for the preflight report".into());
+    }
+    let key = path_key(path)?;
+    for output in reserved {
+        // A blocked job can have missing output parents. The report's parent
+        // exists, so paths with unresolved parents cannot alias its location.
+        if path_key(output).is_ok_and(|output_key| key == output_key) {
+            return Err(format!(
+                "Choose a different report path. {} is reserved for conversion.",
+                output.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Save the diagnostic for the stage that stopped preflight.
+pub fn save_blocked_preflight_report(
+    spec: &JobSpec,
+    blocker: &ReviewBlocker,
+    path: &Path,
+) -> Result<(), String> {
+    let sidecars: Vec<_> = [
+        RECEIPT_SUFFIX,
+        REPLAY_SUFFIX,
+        crate::offline::RELINK_SUFFIX,
+        DEBUG_SUFFIX,
+    ]
+    .into_iter()
+    .filter_map(|suffix| sidecar(&spec.output, suffix).ok())
+    .collect();
+    check_preflight_report_path(
+        path,
+        std::iter::once(spec.output.as_path())
+            .chain(sidecars.iter().map(PathBuf::as_path))
+            .chain(spec.new_media.as_deref()),
+    )?;
+    #[derive(serde::Serialize)]
+    struct BlockedReport<'a> {
+        schema: &'static str,
+        status: &'static str,
+        project_output: &'a Path,
+        blocker: &'a ReviewBlocker,
+    }
+    let report = BlockedReport {
+        schema: PREFLIGHT_REPORT_SCHEMA,
+        status: "blocked",
+        project_output: &spec.output,
+        blocker,
+    };
+    write_json(path, &report, &mut Vec::new())
+}
+
 fn check_project_paths(spec: &JobSpec, receipt: &Path, replay: &Path) -> Result<(), String> {
     output::preflight(&spec.output, Some(receipt))?;
     output::preflight(&spec.output, Some(replay))?;
@@ -127,6 +192,57 @@ impl PreparedJob {
         &self.review
     }
 
+    /// Export all findings from this preflight without consuming the prepared job.
+    pub fn save_preflight_report(&self, path: &Path) -> Result<(), String> {
+        let reserved = [
+            Some(self.spec.output.as_path()),
+            Some(self.receipt.as_path()),
+            Some(self.replay.as_path()),
+            self.media.as_ref().map(rewrap::Plan::directory),
+            self.offline_relink.as_ref().map(|(path, _)| path.as_path()),
+            self.graph_debug.as_ref().map(|(path, _)| path.as_path()),
+        ];
+        let proxy_outputs = self
+            .proxy_bindings
+            .iter()
+            .filter(|binding| binding.audio.is_some())
+            .map(|binding| binding.path.as_path());
+        check_preflight_report_path(path, reserved.into_iter().flatten().chain(proxy_outputs))?;
+        self.document
+            .check_reserved_output(path)
+            .map_err(|error| error.to_string())?;
+
+        #[derive(serde::Serialize)]
+        struct PreflightReport<'a> {
+            schema: &'static str,
+            status: &'static str,
+            project_output: &'a Path,
+            bins_checked: usize,
+            found_media: usize,
+            total_media: usize,
+            inventory_notes: &'a [String],
+            subjects: std::collections::BTreeMap<&'a str, &'a str>,
+            report: &'a [ReportNote],
+        }
+        let review = &self.review;
+        let report = PreflightReport {
+            schema: PREFLIGHT_REPORT_SCHEMA,
+            status: "ready",
+            project_output: &self.spec.output,
+            bins_checked: review.inventory.bins.len(),
+            found_media: review.inventory.found_media,
+            total_media: review.inventory.total_media,
+            inventory_notes: &review.inventory.notes,
+            subjects: review
+                .subjects
+                .iter()
+                .map(|(id, name)| (id.as_str(), name.as_str()))
+                .collect(),
+            report: &review.notes,
+        };
+        write_json(path, &report, &mut Vec::new())
+    }
+
     /// Move the display names to a client that will browse the completion report.
     pub fn take_review_subjects(&mut self) -> HashMap<String, String> {
         std::mem::take(&mut self.review.subjects)
@@ -152,35 +268,115 @@ pub fn prepare(
     cancel: &CancelToken,
     cb: &mut dyn FnMut(Progress),
 ) -> Result<PreparedJob, String> {
-    prepare_for_review(spec, cancel, cb).map_err(ReviewBlocker::cli_summary)
+    prepare_job(spec, false, cancel, cb).map_err(ReviewBlocker::cli_summary)
 }
 
 fn blocker(kind: BlockerKind) -> impl FnOnce(String) -> ReviewBlocker {
     move |message| ReviewBlocker::new(kind, message)
 }
 
-fn unresolved_masters(source: &graph::source::SourceGraph) -> Vec<String> {
-    let mut masters = source
-        .sidecars
-        .iter()
-        .filter(|s| s.adapter == "avid.source")
-        .filter_map(|s| match s.data.get("unresolved_masters") {
-            Some(graph::Value::Arr(masters)) => Some(masters),
-            _ => None,
-        })
-        .flatten();
+fn source_read_blocker(
+    issue: avid_adapter::SourceReadIssue,
+    linked: bool,
+    inputs: &[SourceInput],
+) -> ReviewBlocker {
+    use avid_adapter::{OriginalLocatorKind, SourceReadIssue};
+    use BlockerKind::*;
+
+    let in_bin = |kind, message, bin: usize| {
+        let mut blocker = ReviewBlocker::new(kind, message);
+        if let Some(input) = inputs.get(bin) {
+            blocker.affected.push(format!("Avid bin {}", input.path.display()));
+        }
+        blocker
+    };
+    match issue {
+        SourceReadIssue::OriginalLocator(issue) => {
+            let kind = match issue.kind {
+                OriginalLocatorKind::LegacyMxfPackage => LegacyMxfPackage,
+                OriginalLocatorKind::MissingOriginal if !linked => RewrapMissingOriginal,
+                _ => OriginalLocator,
+            };
+            let mut blocker = in_bin(kind, issue.message, issue.bin);
+            blocker.affected.extend(issue.additional.into_iter().map(|(bin, mut detail)| {
+                if let Some(input) = inputs.get(bin) {
+                    detail.push_str(&format!(" · {}", input.path.display()));
+                }
+                detail
+            }));
+            if issue.details_truncated {
+                blocker.message.push_str("\nAdditional locator checks reached the diagnostic size limit.");
+            }
+            blocker
+        }
+        SourceReadIssue::Bin(message) => ReviewBlocker::new(ProjectSource, message),
+        SourceReadIssue::OriginalMedia(message) => ReviewBlocker::new(OriginalMedia, message),
+        SourceReadIssue::MediaScan(message) => ReviewBlocker::new(AvidMedia, message),
+        SourceReadIssue::SourceFacts(message) => ReviewBlocker::new(SourceContent, message),
+    }
+}
+
+fn unresolved_masters(
+    source: &graph::source::SourceGraph,
+    inputs: &[SourceInput],
+    matte: &crate::png_mattes::Plan,
+) -> Vec<String> {
+    use graph::Value;
+
     let mut details = Vec::new();
-    for master in masters.by_ref().take(8) {
-        if let (Some(graph::Value::Str(name)), Some(graph::Value::Str(reason))) =
-            (master.get("name"), master.get("reason"))
-        {
-            details.push(format!("{name}: {reason}"));
+    for sidecar in source.sidecars.iter().filter(|s| s.adapter == "avid.source") {
+        let Some(Value::Arr(masters)) = sidecar.data.get("unresolved_masters") else {
+            continue;
+        };
+        let bin = sidecar
+            .object
+            .strip_prefix("bin:")
+            .and_then(|index| index.parse::<usize>().ok())
+            .and_then(|index| inputs.get(index));
+        for master in masters {
+            let (Some(Value::Str(name)), Some(Value::Str(reason))) =
+                (master.get("name"), master.get("reason"))
+            else {
+                continue;
+            };
+            let mut detail = format!("{name}: {reason}");
+            if let Some(Value::Str(occurrence)) = master.get("occurrence") {
+                if !matte.keeps_unresolved_master(&sidecar.object, occurrence, reason) {
+                    continue;
+                }
+                detail.push_str(&format!(" · {occurrence}"));
+            }
+            if let Some(bin) = bin {
+                detail.push_str(&format!(" · {}", bin.path.display()));
+            }
+            details.push(detail);
         }
     }
-    if masters.next().is_some() {
-        details.push("More clips are affected in the selected bins.".into());
-    }
     details
+}
+
+fn media_scan_blocker(
+    scan_issues: &[String],
+    audio_group_issues: &[String],
+    for_review: bool,
+) -> ReviewBlocker {
+    let kind = if scan_issues.is_empty() {
+        BlockerKind::SourceContent
+    } else {
+        BlockerKind::AvidMedia
+    };
+    let summary = "Media scan or channel routing needs resolution";
+    if for_review {
+        ReviewBlocker::new(kind, summary)
+    } else {
+        let details = scan_issues
+            .iter()
+            .chain(audio_group_issues)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        ReviewBlocker::new(kind, format!("{summary}: {details}"))
+    }
 }
 
 pub(crate) fn sequence_timing_blocker(source: &graph::source::SourceGraph) -> Option<ReviewBlocker> {
@@ -202,10 +398,6 @@ pub(crate) fn sequence_timing_blocker(source: &graph::source::SourceGraph) -> Op
     let mut seen = HashSet::new();
     for loss in blocked {
         if seen.insert((loss.object.as_str(), loss.reason.as_str())) {
-            if issue.affected.len() == 8 {
-                issue.affected.push("More edits are affected in the selected bins.".into());
-                break;
-            }
             let name = names.get(loss.object.as_str()).copied().unwrap_or("Selected sequence");
             issue.affected.push(format!("{name} · {}", loss.reason));
         }
@@ -226,12 +418,9 @@ fn group_clip_mode_blocker(
         BlockerKind::GroupClipMode,
         "Linked editable Groups require Separate files",
     );
-    issue.affected.extend(source.multicams.iter().take(8).map(|group| {
+    issue.affected.extend(source.multicams.iter().map(|group| {
         if group.name.is_empty() { group.id.clone() } else { group.name.clone() }
     }));
-    if source.multicams.len() > 8 {
-        issue.affected.push("More Groups are affected in the selected bins.".into());
-    }
     Some(issue)
 }
 
@@ -371,6 +560,15 @@ pub fn prepare_for_review(
     cancel: &CancelToken,
     cb: &mut dyn FnMut(Progress),
 ) -> Result<PreparedJob, ReviewBlocker> {
+    prepare_job(spec, true, cancel, cb)
+}
+
+fn prepare_job(
+    spec: JobSpec,
+    for_review: bool,
+    cancel: &CancelToken,
+    cb: &mut dyn FnMut(Progress),
+) -> Result<PreparedJob, ReviewBlocker> {
     use BlockerKind::*;
     let look_up_camera_originals = spec.prefer_source_media || spec.attach_avid_proxies;
     if spec.allow_offline_media && spec.mode == ClipMode::RewrapNative {
@@ -409,8 +607,8 @@ pub fn prepare_for_review(
     {
         return Err(ReviewBlocker::new(ProjectOutput, "Choose a .prproj project output"));
     }
-    let receipt = sidecar(&spec.output, ".anynle-report.json").map_err(blocker(ProjectOutput))?;
-    let replay = sidecar(&spec.output, ".anynle-job.json").map_err(blocker(ProjectOutput))?;
+    let receipt = sidecar(&spec.output, RECEIPT_SUFFIX).map_err(blocker(ProjectOutput))?;
+    let replay = sidecar(&spec.output, REPLAY_SUFFIX).map_err(blocker(ProjectOutput))?;
     check_project_paths(&spec, &receipt, &replay).map_err(blocker(ProjectOutput))?;
     check_new_media_paths(&spec, &receipt, &replay).map_err(blocker(NewMedia))?;
     let mut inv = super::inventory(&spec, cancel, cb).map_err(blocker(ProjectSource))?;
@@ -502,6 +700,7 @@ pub fn prepare_for_review(
                 proxy_rewrap_dir: spec.proxy_rewrap_dir.clone(),
                 ffmpeg: tools.ffmpeg.clone(),
                 allow_media_gaps: linked,
+                collect_blocked_locators: for_review,
             },
             spec.allow_offline_media,
             linked,
@@ -535,26 +734,7 @@ pub fn prepare_for_review(
             },
             &mut || cancel.check(),
         )
-        .map_err(|issue| {
-            use avid_adapter::SourceReadIssue;
-            let (kind, message, bin) = match issue {
-                SourceReadIssue::Bin(m) => (ProjectSource, m, None),
-                SourceReadIssue::MissingOriginal { message, bin } if spec.mode == ClipMode::RewrapNative => {
-                    (RewrapMissingMedia, message, Some(bin))
-                }
-                SourceReadIssue::OriginalLocator { message, bin } | SourceReadIssue::MissingOriginal { message, bin } => {
-                    (OriginalLocator, message, Some(bin))
-                }
-                SourceReadIssue::OriginalMedia(m) => (OriginalMedia, m, None),
-                SourceReadIssue::MediaScan(m) => (AvidMedia, m, None),
-                SourceReadIssue::SourceFacts(m) => (SourceContent, m, None),
-            };
-            let mut blocker = ReviewBlocker::new(kind, message);
-            if let Some(input) = bin.and_then(|index| inputs.get(index)) {
-                blocker.affected.push(format!("Avid bin {}", input.path.display()));
-            }
-            blocker
-        })
+        .map_err(|issue| source_read_blocker(issue, linked, &inputs))
     };
     let mut read = read_source(cb)?;
     if let Some(issue) = group_clip_mode_blocker(&read.graph, spec.mode) {
@@ -636,37 +816,27 @@ pub fn prepare_for_review(
             }
         }
     }
-    for text in read
-        .diagnostics
-        .iter()
-        .chain(&read.scan_issues)
-        .chain(&read.audio_group_issues)
-        .filter(|text| matte.keeps_reader_note(text))
-    {
-        notes.push(note(
-            "warning",
-            "source",
-            text,
-            "Review the affected object before using the result.",
-        ));
-    }
-    if spec.mode == ClipMode::RewrapNative
+    // A blocking master keeps priority, but Review also shows the scan and routing findings.
+    let source_issue = if spec.mode == ClipMode::RewrapNative
         && (read.missing_native_picture || !read.missing_managed_audio.is_empty()) {
         let mut issue = ReviewBlocker::new(RewrapMissingMedia, "Rewrap requires all source media");
-        issue.affected = unresolved_masters(&read.graph);
-        issue.affected.extend(read.missing_managed_audio);
-        return Err(issue);
-    }
-    // An unresolved master must not vanish from a successful wizard conversion.
-    if read
+        issue.affected = unresolved_masters(&read.graph, &inputs, &matte);
+        issue.affected.append(&mut read.missing_managed_audio);
+        Some(issue)
+    } else if read
         .graph
         .losses
         .iter()
         .any(|l| l.aspect == "source_master" && matte.keeps_loss(l))
     {
-        let kind = if read.missing_native_picture { AvidMedia } else { SourceContent };
+        let kind = if read.missing_native_picture || !read.package_conflict_details.is_empty()
+            || (for_review && !read.scan_issues.is_empty()) {
+            AvidMedia
+        } else {
+            SourceContent
+        };
         let mut issue = ReviewBlocker::new(kind, "Selected content contains unresolved masters; exclude those bins or resolve their media before conversion");
-        issue.affected = unresolved_masters(&read.graph);
+        issue.affected = unresolved_masters(&read.graph, &inputs, &matte);
         if let Some(reason) = &read.unused_proof_issue {
             issue.affected.insert(0, reason.clone());
         }
@@ -678,19 +848,27 @@ pub fn prepare_for_review(
                 issue.affected.extend(candidates.cloned());
             }
         }
+        Some(issue)
+    } else if !read.scan_issues.is_empty() || !read.audio_group_issues.is_empty() {
+        Some(media_scan_blocker(&read.scan_issues, &read.audio_group_issues, for_review))
+    } else {
+        None
+    };
+    if let Some(mut issue) = source_issue {
+        issue.affected.append(&mut read.package_conflict_details);
+        if for_review {
+            issue.affected.append(&mut read.scan_issues);
+            issue.affected.append(&mut read.audio_group_issues);
+        }
         return Err(issue);
     }
-    if !read.scan_issues.is_empty() || !read.audio_group_issues.is_empty() {
-        let kind = if read.scan_issues.is_empty() { SourceContent } else { AvidMedia };
-        return Err(ReviewBlocker::new(kind, format!(
-            "Media scan or channel routing needs resolution: {}",
-            read.scan_issues
-                .iter()
-                .chain(&read.audio_group_issues)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("; ")
-        )));
+    for text in read.diagnostics.iter().filter(|text| matte.keeps_reader_note(text)) {
+        notes.push(note(
+            "warning",
+            "source",
+            text,
+            "Review the affected object before using the result.",
+        ));
     }
     if !linked {
         if let Some(issue) = sequence_timing_blocker(&read.graph) {
@@ -924,7 +1102,7 @@ pub fn prepare_for_review(
         document.check_reserved_output(path).map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
     }
     let graph_debug = if spool_stats.is_some_and(|(records, _, _)| records > 0) {
-        let path = sidecar(&spec.output, ".anynle-debug.jsonl").map_err(blocker(ProjectOutput))?;
+        let path = sidecar(&spec.output, DEBUG_SUFFIX).map_err(blocker(ProjectOutput))?;
         output::preflight(&spec.output, Some(&path)).map_err(blocker(ProjectOutput))?;
         document.check_reserved_output(&path).map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
         let file = read.take_receipt_spool().map_err(blocker(SourceContent))?
@@ -1395,9 +1573,107 @@ mod tests {
         assert_eq!(issue.affected.len(), 9);
         assert_eq!(issue.affected[0], "Group 1");
         assert_eq!(issue.affected[7], "Group 8");
-        assert_eq!(issue.affected[8], "More Groups are affected in the selected bins.");
+        assert_eq!(issue.affected[8], "Group 9");
         assert!(group_clip_mode_blocker(&source, ClipMode::Separate).is_none());
         assert!(group_clip_mode_blocker(&source, ClipMode::RewrapNative).is_none());
+    }
+
+    #[test]
+    fn rewrap_locator_blocker_keeps_diagnostics_with_their_own_bins() {
+        use avid_adapter::{OriginalLocatorIssue, OriginalLocatorKind, SourceReadIssue};
+
+        let inputs = [
+            SourceInput { path: "First.avb".into(), revision: String::new() },
+            SourceInput { path: "Second.avb".into(), revision: String::new() },
+        ];
+        for (kind, linked, expected, cli_names_bin) in [
+            (OriginalLocatorKind::MissingOriginal, false, BlockerKind::RewrapMissingOriginal, false),
+            (OriginalLocatorKind::MissingOriginal, true, BlockerKind::OriginalLocator, true),
+            (OriginalLocatorKind::SavedPath, false, BlockerKind::OriginalLocator, true),
+            (OriginalLocatorKind::LegacyMxfPackage, false, BlockerKind::LegacyMxfPackage, true),
+            (OriginalLocatorKind::LegacyMxfPackage, true, BlockerKind::LegacyMxfPackage, true),
+        ] {
+            let issue = source_read_blocker(
+                SourceReadIssue::OriginalLocator(OriginalLocatorIssue {
+                    message: "Cannot resolve the first original".into(),
+                    bin: 0,
+                    kind,
+                    additional: vec![(1, "Second locator unavailable".into())],
+                    details_truncated: true,
+                }),
+                linked,
+                &inputs,
+            );
+            assert_eq!(issue.kind, expected);
+            assert_eq!(
+                issue.affected,
+                ["Avid bin First.avb", "Second locator unavailable · Second.avb"]
+            );
+            assert!(issue.message.contains("diagnostic size limit"));
+            assert_eq!(issue.cli_summary().contains("Avid bin First.avb"), cli_names_bin);
+        }
+    }
+
+    #[test]
+    fn blocked_preflight_exports_all_collected_details_without_publishing() {
+        let scratch = Scratch::new();
+        let spec = JobSpec {
+            output: scratch.0.join("New.prproj"),
+            ..JobSpec::default()
+        };
+        let mut source = graph::source::SourceGraph {
+            project: graph::Project { name: "Synthetic project".into() },
+            media: vec![],
+            items: vec![],
+            bins: vec![],
+            sequences: vec![],
+            losses: (1..=10).map(|index| graph::Loss {
+                object: "sequence:0".into(),
+                aspect: avid_adapter::UNQUALIFIED_ROUTE_TIMING.into(),
+                reason: format!("Unsupported edit {index}"),
+            }).collect(),
+            sidecars: vec![],
+            multicams: vec![],
+            multicam_uses: vec![],
+        };
+        source.losses.push(source.losses[0].clone());
+        let issue = sequence_timing_blocker(&source).unwrap();
+        assert_eq!(issue.affected.len(), 10);
+        let summary = issue.clone().cli_summary();
+        assert!(summary.ends_with(
+            "Selected sequence · Unsupported edit 8; More edits are affected in the selected bins."
+        ));
+        assert!(!summary.contains("Unsupported edit 9"));
+        assert!(std::fs::read_dir(&scratch.0).unwrap().next().is_none());
+
+        let reserved = scratch.0.join("NEW.prproj.ANYNLE-RELINK.JSON");
+        assert!(save_blocked_preflight_report(&spec, &issue, &reserved)
+            .unwrap_err()
+            .contains("reserved"));
+        let path = scratch.0.join("Blocked.json");
+        save_blocked_preflight_report(&spec, &issue, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["schema"], "anynle.preflight-report/1");
+        assert_eq!(report["status"], "blocked");
+        assert_eq!(report["blocker"]["kind"], "sequence_timing");
+        assert_eq!(report["blocker"]["message"], issue.message);
+        assert_eq!(report["blocker"]["affected"], serde_json::json!(issue.affected));
+        assert!(save_blocked_preflight_report(&spec, &issue, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+
+        let broken_output = JobSpec {
+            output: scratch.0.join("missing parent").join("New.prproj"),
+            ..JobSpec::default()
+        };
+        let Err(path_issue) = prepare_for_review(broken_output.clone(), &CancelToken::default(), &mut |_| {}) else {
+            panic!("expected a missing output parent to block");
+        };
+        assert_eq!(path_issue.kind, BlockerKind::ProjectOutput);
+        save_blocked_preflight_report(&broken_output, &path_issue, &scratch.0.join("Output Blocked.json"))
+            .unwrap();
+        assert!(!broken_output.output.parent().unwrap().exists());
     }
 
     struct Scratch(PathBuf);
@@ -1463,6 +1739,66 @@ mod tests {
             graph_debug: None,
             aux_outputs: vec![],
         }
+    }
+
+    #[test]
+    fn preflight_report_saves_every_finding_and_leaves_job_ready() {
+        let scratch = Scratch::new();
+        let mut job = prepared(&scratch.0);
+        job.review.inventory.found_media = 1;
+        job.review.inventory.total_media = 2;
+        job.review.inventory.notes.push("Inventory finding".into());
+        job.review
+            .subjects
+            .insert("edit:1".into(), "Same display name".into());
+        job.review
+            .subjects
+            .insert("edit:2".into(), "Same display name".into());
+        for index in 0..51 {
+            let (severity, object) = if index % 2 == 0 {
+                ("warning", "edit:1")
+            } else {
+                ("loss", "edit:2")
+            };
+            job.review
+                .notes
+                .push(note(severity, object, format!("Finding {index}"), "Saved reason"));
+        }
+
+        let reserved = scratch.0.join("NEW.prproj.ANYNLE-JOB.JSON");
+        assert!(job
+            .save_preflight_report(&reserved)
+            .unwrap_err()
+            .contains("reserved"));
+        assert!(!reserved.exists());
+
+        let report_path = scratch.0.join("Preflight.json");
+        job.save_preflight_report(&report_path).unwrap();
+        let bytes = std::fs::read(&report_path).unwrap();
+        assert!(job.save_preflight_report(&report_path).is_err());
+        assert_eq!(std::fs::read(&report_path).unwrap(), bytes);
+        let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["schema"], "anynle.preflight-report/1");
+        assert_eq!(report["status"], "ready");
+        assert_eq!(report["project_output"], job.spec.output.to_str().unwrap());
+        assert_eq!(report["found_media"], 1);
+        assert_eq!(report["total_media"], 2);
+        assert_eq!(
+            report["inventory_notes"],
+            serde_json::json!(["Inventory finding"])
+        );
+        assert_eq!(report["subjects"]["edit:1"], "Same display name");
+        assert_eq!(report["subjects"]["edit:2"], "Same display name");
+        assert_eq!(
+            report["report"],
+            serde_json::to_value(&job.review.notes).unwrap()
+        );
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
+
+        let completion = execute(job, &CancelToken::default(), &mut |_| {});
+        assert_eq!(completion.status, CompletionStatus::Complete);
+        assert!(scratch.0.join("new.prproj").is_file());
+        assert_eq!(std::fs::read(&report_path).unwrap(), bytes);
     }
 
     #[test]

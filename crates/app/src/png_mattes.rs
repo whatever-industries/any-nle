@@ -65,6 +65,13 @@ impl Plan {
             .is_some_and(|messages| messages.contains(&loss.reason))
     }
 
+    pub fn keeps_unresolved_master(&self, bin: &str, occurrence: &str, reason: &str) -> bool {
+        self.replaced
+            .get(bin)
+            .and_then(|by_aspect| by_aspect.get("source_master"))
+            .is_none_or(|messages| !messages.contains(&unresolved_master_reason(occurrence, reason)))
+    }
+
     fn replace_loss(&mut self, owner: &str, aspect: &'static str, message: String) {
         self.replaced
             .entry(owner.into())
@@ -77,6 +84,10 @@ impl Plan {
     pub fn keeps_reader_note(&self, note: &str) -> bool {
         !self.recovered_reader_notes.contains(note.trim())
     }
+}
+
+fn unresolved_master_reason(occurrence: &str, reason: &str) -> String {
+    format!("{occurrence}: {reason}; native master facts retained on bin")
 }
 
 fn text<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
@@ -494,7 +505,7 @@ fn prepare_sequence<'a>(
                 builder.plan.replace_loss(
                     bin_id,
                     "source_master",
-                    format!("{occurrence}: {reason}; native master facts retained on bin"),
+                    unresolved_master_reason(&occurrence, reason),
                 );
                 builder
                     .plan

@@ -101,6 +101,11 @@ impl References {
     pub(super) fn incomplete(&self) -> Option<&str> {
         self.incomplete.as_deref()
     }
+
+    /// Package references from the full saved dependency walk.
+    pub(super) fn complete_target_packages(&self) -> Option<impl Iterator<Item = String> + '_> {
+        self.incomplete.is_none().then(|| self.targets.iter().map(MobId::umid_hex))
+    }
 }
 
 #[cfg(test)]
@@ -126,12 +131,14 @@ mod tests {
         ], &mut || Ok(())).unwrap();
         assert!(refs.targets.contains(&id));
         assert!(refs.incomplete().is_none());
+        assert_eq!(refs.complete_target_packages().unwrap().collect::<Vec<_>>(), [id.umid_hex()]);
         refs.observe_objects(&[
             None,
             object(*b"CMPO", vec![("components", Value::Ref(2))]),
             Some(Object::Unsupported { class: *b"TEST", size: 4 }),
         ], &mut || Ok(())).unwrap();
         assert!(refs.incomplete().unwrap().contains("opaque TEST"));
+        assert!(refs.complete_target_packages().is_none());
     }
 }
 

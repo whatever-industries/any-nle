@@ -1,12 +1,14 @@
 //! Exact saved-locator/root-map lookup and bounded read-only physical-stream probes.
-use crate::SourceReadIssue;
+use crate::{OriginalLocatorIssue, OriginalLocatorKind, SelectedMediaIndex, SourceReadIssue};
 use avid_reader::source as av;
 use graph::{source::OriginalStream, Rational, StreamKind, Value};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
-    io::Read,
+    io::{BufRead, BufReader, Read},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::{ChildStdout, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 mod still;
 mod source_media;
@@ -33,6 +35,8 @@ pub struct OriginalOptions {
     pub proxy_rewrap_dir: Option<PathBuf>,
     pub ffmpeg: PathBuf,
     pub allow_media_gaps: bool,
+    /// Collect saved-path and MXF package details for Review blockers.
+    pub collect_blocked_locators: bool,
 }
 impl Default for OriginalOptions {
     fn default() -> Self {
@@ -46,6 +50,7 @@ impl Default for OriginalOptions {
             proxy_rewrap_dir: None,
             ffmpeg: "ffmpeg".into(),
             allow_media_gaps: false,
+            collect_blocked_locators: false,
         }
     }
 }
@@ -465,47 +470,64 @@ fn qualify_avc_high(video: &Value, level: i64) -> Result<(), String> {
     Ok(())
 }
 
-fn qualify_wide_avc_pcm24(
-    media: &Value, streams: &[Value], path: &Path, master: &av::SourceMaster,
+fn is_avc_pcm_movie(streams: &[Value]) -> bool {
+    matches!(streams, [video, audio] if text(video, "codec_name").as_deref() == Some("h264")
+        && matches!(text(audio, "codec_name").as_deref(),
+            Some("pcm_s16le" | "pcm_s24le" | "pcm_s24be"))
+        && number(audio, "channels") == Some(2))
+}
+
+fn qualify_avc_pcm(
+    streams: &[Value], path: &Path, master: &av::SourceMaster,
 ) -> Result<bool, String> {
     let [video, audio] = streams else {
-        return Err("wide AVC MOV requires one picture and one stereo PCM24 stream".into());
+        return Err("AVC PCM requires one picture and one stereo PCM stream".into());
     };
-    if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
-        || media.get("format").and_then(|f| f.get("tags")).and_then(|t| text(t, "major_brand")).as_deref() != Some("qt  ")
-        || shared_saved_locator(master).is_none()
-        || master.master.edit_rate != 24.0
-        || master.master.tracks.len() != 3
-        || master.offsets.len() != 3
-        || !master.offsets.iter().all(|offset| offset == &av::Observed::Known(0))
+    let mp4 = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
+    let mov = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
+    if !(mp4 || mov) || shared_saved_locator(master).is_none()
+        || master.master.tracks.len() != 3 || master.originals.len() != 3 || master.offsets.len() != 3
+        || !master.offsets.iter().all(|offset| *offset == av::Observed::Known(0))
     {
-        return Err("wide AVC MOV requires one saved 24 fps master with a shared MOV locator and zero offsets".into());
+        return Err("AVC PCM requires a shared MOV/MP4 locator and three tracks with saved zero offsets".into());
     }
-    qualify_avc_profile(video)?;
-    let defaulted = qualify_movie_geometry(video, (2048, 858), false)?;
-    if number(video, "index") != Some(0)
-        || number(audio, "index") != Some(1)
-        || text(audio, "codec_name").as_deref() != Some("pcm_s24le")
-        || text(audio, "codec_tag_string").as_deref() != Some("in24")
+    let rate = master.rate.filter(|rate| matches!((rate.num, rate.den),
+        (24, 1) | (24_000, 1001) | (25, 1) | (30_000, 1001)))
+        .ok_or("AVC PCM master edit rate is unqualified")?;
+    let rate_exact = crate::rational(rate);
+    let raster = number(video, "width").zip(number(video, "height"))
+        .filter(|(w, h)| (16..=16_384).contains(w) && (16..=16_384).contains(h))
+        .ok_or("AVC PCM raster is missing or out of range")?;
+    let level = number(video, "level").filter(|level| matches!(level, 40 | 51))
+        .ok_or("AVC PCM requires H.264 High level 4.0 or 5.1")?;
+    qualify_avc_high(video, level)?;
+    let defaulted = qualify_movie_geometry_at_rate(video, raster, rate_exact)?;
+    let bits = match (mp4, text(audio, "codec_name").as_deref(), text(audio, "codec_tag_string").as_deref()) {
+        (true, Some("pcm_s16le"), Some("ipcm")) | (false, Some("pcm_s16le"), Some("sowt")) => 16,
+        (true, Some("pcm_s24le"), Some("ipcm")) | (false, Some("pcm_s24le" | "pcm_s24be"), Some("in24")) => 24,
+        _ => return Err("AVC PCM audio representation does not match its container".into()),
+    };
+    let frames = number(video, "nb_frames").filter(|n| *n > 0)
+        .ok_or("AVC PCM picture count is unresolved")?;
+    let samples = same_rate_movie::frame_audio_extent(frames, rate, false)
+        .ok_or("AVC PCM audio extent overflows")?;
+    if number(video, "index") != Some(0) || number(audio, "index") != Some(1)
         || text(audio, "channel_layout").as_deref() != Some("stereo")
-        || number(audio, "channels") != Some(2)
-        || number(audio, "sample_rate") != Some(48_000)
-        || number(audio, "bits_per_sample") != Some(24)
+        || number(audio, "channels") != Some(2) || number(audio, "sample_rate") != Some(48_000)
+        || number(audio, "bits_per_sample") != Some(bits)
+        || number(audio, "duration_ts") != Some(samples)
     {
-        return Err("wide AVC MOV requires picture stream 0 and stereo in24 PCM24/48 kHz on stream 1".into());
+        return Err("AVC PCM requires picture stream 0 and full-span stereo PCM16/24 at 48 kHz on stream 1".into());
     }
-    check_saved_avc_pcm(master, video, (2048, 858), Rational::integer(24), 24, 2000)?;
+    check_saved_avc_pcm(master, frames, raster, rate_exact, bits, samples)?;
     Ok(defaulted)
 }
 
 fn check_saved_avc_pcm(
-    master: &av::SourceMaster, video: &Value, raster: (i64, i64), rate: Rational,
-    bits: i64, samples_per_frame: i64,
+    master: &av::SourceMaster, frames: i64, raster: (i64, i64), rate: Rational,
+    bits: i64, samples: i64,
 ) -> Result<(), String> {
     use avid_reader::extract::{KIND_PICTURE, KIND_SOUND};
-    let frames = number(video, "nb_frames").filter(|n| *n > 0)
-        .ok_or("AVC PCM picture count is unresolved")?;
-    let samples = frames.checked_mul(samples_per_frame).ok_or("AVC PCM audio extent overflows")?;
     let mut lanes = HashSet::new();
     let mut channels = HashSet::new();
     for (track, raw) in master.master.tracks.iter().zip(&master.originals) {
@@ -533,39 +555,6 @@ fn check_saved_avc_pcm(
     Ok(())
 }
 
-fn qualify_uhd_avc_pcm(streams: &[Value], master: &av::SourceMaster) -> Result<bool, String> {
-    let rate = Rational::new(24_000, 1001).unwrap();
-    let [video, audio] = streams else {
-        return Err("UHD AVC MP4 requires one picture and one stereo PCM stream".into());
-    };
-    if av::Rate::from_avid(master.master.edit_rate).map(crate::rational) != Some(rate)
-        || shared_saved_locator(master).is_none()
-        || master.master.tracks.len() != 3 || master.originals.len() != 3 || master.offsets.len() != 3
-        || !master.offsets.iter().all(|offset| offset == &av::Observed::Known(0))
-        || ratio(video, "avg_frame_rate") != Some(rate)
-    {
-        return Err("UHD AVC MP4 requires one saved 23.976 master with a shared MP4 locator and zero offsets".into());
-    }
-    qualify_avc_high(video, 51)?;
-    let defaulted = qualify_movie_geometry(video, (3840, 2160), true)?;
-    let bits = match (text(audio, "codec_name").as_deref(), number(audio, "bits_per_sample")) {
-        (Some("pcm_s16le"), Some(16)) => 16,
-        (Some("pcm_s24le"), Some(24)) => 24,
-        _ => return Err("UHD AVC MP4 requires signed little-endian PCM16 or PCM24".into()),
-    };
-    if number(video, "index") != Some(0) || number(audio, "index") != Some(1)
-        || text(audio, "codec_tag_string").as_deref() != Some("ipcm")
-        || text(audio, "channel_layout").as_deref() != Some("stereo")
-        || number(audio, "channels") != Some(2) || number(audio, "sample_rate") != Some(48_000)
-        || number(video, "nb_frames").and_then(|frames| frames.checked_mul(2002))
-            != number(audio, "duration_ts")
-    {
-        return Err("UHD AVC MP4 requires a full-span stereo ipcm PCM16/24 stream at 48 kHz and exact 23.976 picture".into());
-    }
-    check_saved_avc_pcm(master, video, (3840, 2160), rate, bits, 2002)?;
-    Ok(defaulted)
-}
-
 fn qualify_prores_hq(path: &Path, probe: &Value, streams: &[Value]) -> Result<bool, String> {
     qualify_prores_hq_timecode(path, probe, streams, Rational::integer(24), "00:00:00:00")
 }
@@ -576,7 +565,8 @@ fn qualify_prores_hq_timecode(
     let [video, timecode] = streams else {
         return Err("linked ProRes HQ requires one picture stream and one timecode track".into());
     };
-    qualify_prores_hq_parts(path, probe, video, timecode, 1, rate, expected)
+    verify_prores_hq_timecode_track(path, probe, video, timecode, 1, rate, expected)?;
+    qualify_movie_geometry_at_rate(video, (1920, 1080), rate)
 }
 
 fn embedded_avc_mov_timecode(
@@ -632,9 +622,9 @@ fn embedded_avc_mov_timecode(
     })
 }
 
-fn qualify_prores_hq_parts(
+fn verify_prores_hq_timecode_track(
     path: &Path, probe: &Value, video: &Value, timecode: &Value, index: i64, rate: Rational, expected: &str,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let brand = probe.get("format").and_then(|f| f.get("tags"))
         .and_then(|tags| text(tags, "major_brand"));
     if !path.extension().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("mov"))
@@ -669,7 +659,7 @@ fn qualify_prores_hq_parts(
     {
         return Err(format!("linked ProRes HQ requires one matching {rate} fps non-drop timecode track at {expected}"));
     }
-    qualify_movie_geometry_at_rate(video, (1920, 1080), rate)
+    Ok(())
 }
 
 /// Saved path syntax is parsed independently of the current OS. Only an explicit
@@ -772,11 +762,82 @@ fn missing_locator() -> String {
     "original locator resolution has 0 exact candidates; an explicit unambiguous root mapping is required".into()
 }
 
+#[derive(Default)]
+struct LocatorDetails {
+    rows: Vec<(usize, String)>,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl LocatorDetails {
+    fn push(&mut self, bin: usize, detail: String) -> bool {
+        self.bytes += detail.capacity() + std::mem::size_of::<(usize, String)>();
+        if self.bytes > crate::index::REVIEW_DETAIL_BUDGET {
+            self.truncated = true;
+            return false;
+        }
+        self.rows.push((bin, detail));
+        true
+    }
+}
+
+fn blocked_locator_details(
+    remaining: &[av::SourceMaster],
+    first_track: usize,
+    mappings: &[RootMapping],
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<LocatorDetails, SourceReadIssue> {
+    let mut details = LocatorDetails::default();
+    // A bad mapping applies to the whole job. Keep that primary diagnostic
+    // without repeating the same settings error for every saved path.
+    let Ok(mappings) = check_root_mappings(mappings) else {
+        return Ok(details);
+    };
+    for (index, master) in remaining.iter().enumerate() {
+        check()?;
+        // Managed and mixed routes have different addressing rules. Only
+        // examine masters that would enter the normal original-path loop.
+        if master.pcm_prefix.is_some()
+            || master.originals.len() != master.master.tracks.len()
+            || master.originals.iter().any(Option::is_none)
+            || legacy_mxf::saved_sibling_directory(master).is_some()
+        {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        let start = if index == 0 { first_track } else { 0 };
+        for (track, raw) in master.originals.iter().enumerate().skip(start) {
+            check()?;
+            let raw = raw.as_ref().expect("original descriptor route checked");
+            if !seen.insert(raw.locators.as_slice()) || (index == 0 && track == first_track) {
+                continue;
+            }
+            let reason = match resolve_with_checked_mappings(&raw.locators, &mappings) {
+                Ok(Some(_)) => continue,
+                Ok(None) => missing_locator(),
+                Err(error) => error,
+            };
+            let saved = raw.locators.first().map_or("no saved path", String::as_str);
+            let detail = format!("{:?} · {saved}: {reason} · {}", master.master.name, master.id);
+            if !details.push(master.master.bin, detail) {
+                return Ok(details);
+            }
+        }
+    }
+    Ok(details)
+}
+
 fn resolve_with_claim(
     locators: &[String],
     mappings: &[RootMapping],
 ) -> Result<Option<(PathBuf, LocatorClaim)>, String> {
-    let mappings = mappings
+    resolve_with_checked_mappings(locators, &check_root_mappings(mappings)?)
+}
+
+type CheckedRootMapping<'a> = ((String, Vec<String>), &'a Path);
+
+fn check_root_mappings(mappings: &[RootMapping]) -> Result<Vec<CheckedRootMapping<'_>>, String> {
+    mappings
         .iter()
         .map(|m| {
             if !m.current_root.is_absolute()
@@ -792,9 +853,15 @@ fn resolve_with_claim(
                 .saved_root
                 .to_str()
                 .ok_or("saved root mapping is not UTF-8")?;
-            Ok((saved_parts(saved)?, &m.current_root))
+            Ok((saved_parts(saved)?, m.current_root.as_path()))
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect()
+}
+
+fn resolve_with_checked_mappings(
+    locators: &[String],
+    mappings: &[CheckedRootMapping<'_>],
+) -> Result<Option<(PathBuf, LocatorClaim)>, String> {
     let mut paths = HashMap::<PathBuf, LocatorClaim>::new();
     for raw in locators {
         let (root, parts) = saved_parts(raw)?;
@@ -803,9 +870,9 @@ fn resolve_with_claim(
         if path.is_absolute() {
             candidates.push((path.to_owned(), false));
         }
-        for ((saved_root, saved), current) in &mappings {
+        for ((saved_root, saved), current) in mappings {
             if root == *saved_root && parts.starts_with(saved) {
-                let mut mapped = (*current).clone();
+                let mut mapped = current.to_path_buf();
                 for part in &parts[saved.len()..] {
                     let mut components = Path::new(part).components();
                     if !matches!(
@@ -857,8 +924,37 @@ fn resolve_with_claim(
     Ok(paths.into_iter().next())
 }
 
-pub(crate) fn bounded_probe(mut command: Command, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
-    use std::{sync::mpsc, time::Instant};
+pub(crate) fn bounded_probe(command: Command, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
+    run_probe(command, ProbeDeadline::Total(timeout), &mut || Ok(()), |stdout, _| {
+        let mut bytes = Vec::new();
+        stdout.take((1 << 20) + 1).read_to_end(&mut bytes)
+            .map_err(|e| format!("stdout read failed: {e}"))?;
+        if bytes.len() > 1 << 20 {
+            return Err("stdout exceeds 1 MiB".into());
+        }
+        Ok(bytes)
+    })
+}
+
+enum ProbeDeadline {
+    Total(Duration),
+    Idle(Duration),
+}
+
+const PICTURE_PACKET_IDLE_LIMIT: ProbeDeadline = ProbeDeadline::Idle(Duration::from_secs(30));
+
+fn run_probe<T: Send + 'static>(
+    mut command: Command,
+    deadline: ProbeDeadline,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    read: impl FnOnce(ChildStdout, &AtomicU64) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    use std::{sync::{mpsc, Arc}, time::Instant};
+    let (timeout, track_progress) = match deadline {
+        ProbeDeadline::Total(timeout) => (timeout, false),
+        ProbeDeadline::Idle(timeout) => (timeout, true),
+    };
+    check()?;
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -870,23 +966,23 @@ pub(crate) fn bounded_probe(mut command: Command, timeout: std::time::Duration) 
         return Err("stdout pipe unavailable".into());
     };
     let (tx, rx) = mpsc::sync_channel(1);
+    let progress = Arc::new(AtomicU64::new(0));
+    let worker_progress = Arc::clone(&progress);
     std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout
-            .take((1 << 20) + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes);
-        let _ = tx.send(result);
+        let _ = tx.send(read(stdout, &worker_progress));
     });
-    let deadline = Instant::now() + timeout;
+    let mut last_activity = Instant::now();
+    let mut verified = 0;
     let mut output = None;
     let mut status = None;
     let failure = loop {
+        if let Err(reason) = check() {
+            break reason;
+        }
         if output.is_none() {
             match rx.try_recv() {
-                Ok(Ok(bytes)) if bytes.len() <= 1 << 20 => output = Some(bytes),
-                Ok(Ok(_)) => break "stdout exceeds 1 MiB".to_string(),
-                Ok(Err(e)) => break format!("stdout read failed: {e}"),
+                Ok(Ok(value)) => output = Some(value),
+                Ok(Err(reason)) => break reason,
                 Err(mpsc::TryRecvError::Disconnected) => break "stdout reader disconnected".into(),
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -898,15 +994,23 @@ pub(crate) fn bounded_probe(mut command: Command, timeout: std::time::Duration) 
             }
         }
         if let Some(status) = status {
-            if let Some(bytes) = output.take() {
+            if let Some(value) = output.take() {
                 if status.success() {
-                    return Ok(bytes);
+                    return Ok(value);
                 }
                 break format!("process refused the file ({status})");
             }
         }
-        if Instant::now() >= deadline {
-            break format!("timed out after {} ms", timeout.as_millis());
+        if track_progress {
+            let current = progress.load(Ordering::Relaxed);
+            if current != verified {
+                verified = current;
+                last_activity = Instant::now();
+            }
+        }
+        if last_activity.elapsed() >= timeout {
+            let detail = if track_progress { " without a verified picture packet" } else { "" };
+            break format!("timed out after {} ms{detail}", timeout.as_millis());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
@@ -949,11 +1053,32 @@ pub(super) fn square_1080p_mxf(path: &Path, tool: &Path) -> Option<Option<(Ratio
         })
 }
 
-const MAX_PRORES_PICTURE_PACKETS: i64 = 16_384;
+fn read_picture_packet_row<'a>(
+    packets: &mut impl BufRead, bytes: &'a mut Vec<u8>,
+) -> Result<Option<&'a str>, String> {
+    const MAX_PACKET_ROW: u64 = 128;
+    bytes.clear();
+    let length = packets.take(MAX_PACKET_ROW + 1)
+        .read_until(b'\n', bytes)
+        .map_err(|err| format!("stdout read failed: {err}"))?;
+    if length == 0 {
+        return Ok(None);
+    }
+    if length as u64 > MAX_PACKET_ROW {
+        return Err(format!("row exceeds {MAX_PACKET_ROW} bytes"));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| "packet report is not UTF-8")?;
+    Ok(Some(text.lines().next().unwrap_or("")))
+}
 
-fn verify_prores_packets(packets: &str, count: i64, ticks_per_frame: i128) -> Result<(), String> {
+fn verify_prores_packets(
+    mut packets: impl BufRead, count: i64, ticks_per_frame: i128, mut mark_verified: impl FnMut(),
+) -> Result<(), String> {
+    let mut bytes = Vec::new();
     let mut seen = 0;
-    for row in packets.lines() {
+    while let Some(row) = read_picture_packet_row(&mut packets, &mut bytes)
+        .map_err(|why| format!("linked ProRes HQ packet {seen}: {why}"))?
+    {
         let expected = i128::from(seen) * ticks_per_frame;
         let mut fields = row.split(',').map(str::parse::<i128>);
         let valid = matches!(
@@ -969,6 +1094,7 @@ fn verify_prores_packets(packets: &str, count: i64, ticks_per_frame: i128) -> Re
             ));
         }
         seen += 1;
+        mark_verified();
     }
     if seen != count {
         return Err(
@@ -978,19 +1104,26 @@ fn verify_prores_packets(packets: &str, count: i64, ticks_per_frame: i128) -> Re
     Ok(())
 }
 
-fn prove_prores_cadence(path: &Path, tool: &Path, video: &Value, rate: Rational) -> Result<(), String> {
+fn prove_prores_cadence(
+    path: &Path, tool: &Path, video: &Value, rate: Rational,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
     let count = number(video, "nb_frames")
-        .filter(|count| (1..=MAX_PRORES_PICTURE_PACKETS).contains(count))
-        .ok_or("linked ProRes HQ requires a declared picture count within the 16,384-packet proof limit")?;
+        .filter(|&count| count > 0)
+        .ok_or("linked ProRes HQ requires a positive declared picture count")?;
     let base = ratio(video, "time_base")
         .filter(|base| base.num() > 0)
         .ok_or("linked ProRes HQ picture time base is missing")?;
     let numerator = i128::from(base.den()) * i128::from(rate.den());
     let denominator = i128::from(base.num()) * i128::from(rate.num());
+    if denominator <= 0 {
+        return Err("linked ProRes HQ picture rate is invalid".into());
+    }
     let ticks_per_frame = numerator / denominator;
     if ticks_per_frame == 0
         || numerator % denominator != 0
-        || number(video, "duration_ts").map(i128::from) != Some(i128::from(count) * ticks_per_frame)
+        || number(video, "duration_ts").filter(|&duration| duration > 0).map(i128::from)
+            .is_none_or(|duration| i128::from(count).checked_mul(ticks_per_frame) != Some(duration))
     {
         return Err(format!("linked ProRes HQ picture extent does not fit its exact {rate} fps clock"));
     }
@@ -1004,11 +1137,11 @@ fn prove_prores_cadence(path: &Path, tool: &Path, video: &Value, rate: Rational)
         .arg(path);
     // Read through EOF so an extra or uneven packet after the metadata probe's
     // initial sixteen packets cannot enter the fixed-rate destination route.
-    let bytes = bounded_probe(command, std::time::Duration::from_secs(30))
-        .map_err(|why| format!("linked ProRes HQ complete picture packet probe failed: {why}"))?;
-    let packets = std::str::from_utf8(&bytes)
-        .map_err(|_| "linked ProRes HQ packet probe output is not UTF-8")?;
-    verify_prores_packets(packets, count, ticks_per_frame)
+    run_probe(command, PICTURE_PACKET_IDLE_LIMIT, check, move |stdout, progress| {
+        verify_prores_packets(BufReader::new(stdout), count, ticks_per_frame, || {
+            progress.fetch_add(1, Ordering::Relaxed);
+        })
+    }).map_err(|why| format!("linked ProRes HQ complete picture packet probe failed: {why}"))
 }
 
 struct OriginalProbe {
@@ -1019,14 +1152,20 @@ struct OriginalProbe {
     still_decoded: Option<(i64, i64)>,
 }
 
-fn probe(path: &Path, tool: &Path) -> Result<OriginalProbe, String> {
+fn probe(
+    path: &Path, tool: &Path, check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<OriginalProbe, String> {
     let metadata = probe_metadata(path, tool)?;
+    if let Some(rate) = same_rate_movie::avc_picture_only_rate(path, &metadata) {
+        same_rate_movie::prove_avc_picture_cadence(path, tool, &metadata, rate, check)?;
+    }
     let prores_color_defaulted = match metadata.get("streams") {
         Some(Value::Arr(streams)) if streams.first().is_some_and(|s|
             text(s, "codec_name").as_deref() == Some("prores")
-                && same_rate_movie::is_25_or_2997(ratio(s, "avg_frame_rate"))) =>
+                && (same_rate_movie::is_25_or_2997(ratio(s, "avg_frame_rate"))
+                    || same_rate_movie::custom_prores_raster(s))) =>
         {
-            prove_prores_cadence(path, tool, &streams[0], ratio(&streams[0], "avg_frame_rate").unwrap())?;
+            prove_prores_cadence(path, tool, &streams[0], ratio(&streams[0], "avg_frame_rate").unwrap(), check)?;
             None
         }
         Some(Value::Arr(streams))
@@ -1034,7 +1173,7 @@ fn probe(path: &Path, tool: &Path) -> Result<OriginalProbe, String> {
         {
             qualify_container(path, &metadata)?;
             let defaulted = qualify_prores_hq(path, &metadata, streams)?;
-            prove_prores_cadence(path, tool, &streams[0], Rational::integer(24))?;
+            prove_prores_cadence(path, tool, &streams[0], Rational::integer(24), check)?;
             Some(defaulted)
         }
         _ => None,
@@ -1085,7 +1224,7 @@ fn probe_metadata(path: &Path, tool: &Path) -> Result<Value, String> {
 pub fn verify_offline_original(
     path: &Path, tool: &Path, container: &str, expected: &[(&OriginalStream, StreamKind, Rational, Option<i64>)],
 ) -> Result<(), String> {
-    let inspected = probe(path, tool)?;
+    let inspected = probe(path, tool, &mut || Ok(()))?;
     let value = &inspected.metadata;
     if qualify_container(path, value)? != container {
         return Err("candidate container does not match the saved original".into());
@@ -1413,7 +1552,7 @@ impl OriginalIndex {
         Self::scan_with_control(
             facts, false, None,
             options,
-            |path| {
+            |path, _| {
                 inspect(path).map(|metadata| OriginalProbe {
                     metadata,
                     prores_color_defaulted: None,
@@ -1438,37 +1577,91 @@ impl OriginalIndex {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, SourceReadIssue> {
         let mut originals = Self::scan_for_review_with_policy(facts, options, false, None, check)?;
-        originals.resolve_legacy_mxf(facts, &Default::default(), options, check)?;
+        let index = Default::default();
+        let selected_media = SelectedMediaIndex::new(facts, &originals, &index, check)?;
+        originals.resolve_legacy_mxf(facts, &selected_media, options, check)?;
         Ok(originals)
     }
 
     pub(super) fn resolve_legacy_mxf(
-        &mut self, facts: &av::SourceProject, index: &crate::index::MediaIndex,
+        &mut self, facts: &av::SourceProject, selected_media: &SelectedMediaIndex<'_>,
         options: &OriginalOptions, check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), SourceReadIssue> {
         if self.legacy_mxf.is_empty() { return Ok(()); }
+        let index = selected_media.index;
+        let permits_missing_media_fallbacks = selected_media.permits_missing_media_fallbacks();
+        let collect_blocked = options.collect_blocked_locators
+            && !self.allow_offline
+            && !options.allow_media_gaps
+            && self.references.is_none();
         let mut used = 0;
-        for master in &facts.masters {
+        for (ordinal, master) in facts.masters.iter().enumerate() {
             let Some(directory) = self.legacy_mxf.get(&master.id) else { continue };
-            let issue = |message| SourceReadIssue::OriginalLocator {
-                message: format!("{:?} · {directory}: {message}", master.master.name),
-                bin: master.master.bin,
+            let issue = |message| OriginalLocatorIssue::new(
+                OriginalLocatorKind::LegacyMxfPackage,
+                format!("{:?} · {directory}: {message}", master.master.name),
+                master.master.bin,
+            );
+            let (reason, primary_track) = match legacy_mxf::missing_siblings(master, index, check,
+                &mut |path| probe_offline_atom(path, &options.ffprobe)) {
+                Ok(missing) if missing.is_empty() => continue,
+                Ok(missing) => {
+                    let reason = format!("Legacy MXF locators require the saved file packages in a selected media root. Missing: {}.", missing.join(", "));
+                    if permits_missing_media_fallbacks {
+                        if self.references.as_ref().is_some_and(|refs| refs.can_omit(master)) {
+                            self.omit_unused(master, reason, &mut used)?;
+                            continue;
+                        }
+                        if options.allow_media_gaps {
+                            self.omit_media(master, reason, &mut used)?;
+                            continue;
+                        }
+                    }
+                    (reason, None)
+                }
+                Err(legacy_mxf::SiblingIssue::Package { track, message }) => (message, Some(track)),
+                Err(legacy_mxf::SiblingIssue::Check(reason)) => {
+                    return Err(SourceReadIssue::OriginalLocator(issue(reason)));
+                }
             };
-            let missing = legacy_mxf::missing_siblings(master, index, check,
-                &mut |path| probe_offline_atom(path, &options.ffprobe)).map_err(issue)?;
-            if missing.is_empty() { continue; }
-            let reason = format!("Legacy MXF locators require the saved file packages in a selected media root. Missing: {}.", missing.join(", "));
-            if self.references.as_ref().is_some_and(|refs| refs.can_omit(master))
-                && index.ambiguous.is_empty() && index.unreadable.is_empty()
-            {
-                self.omit_unused(master, reason, &mut used)?;
-                continue;
+            let mut issue = issue(reason);
+            if collect_blocked {
+                let mut details = LocatorDetails::default();
+                let conflicts = index.package_conflicts(check)?;
+                let mut reported_conflicts = HashSet::new();
+                // A missing-package summary already lists every absent lane in
+                // its clip. A refusal on one lane can leave other lanes unlisted.
+                let start = if primary_track.is_some() { ordinal } else { ordinal + 1 };
+                'affected: for (offset, later) in facts.masters[start..].iter().enumerate() {
+                    check()?;
+                    let Some(directory) = self.legacy_mxf.get(&later.id) else { continue };
+                    let exclude = if offset == 0 { primary_track } else { None };
+                    let findings = legacy_mxf::package_index_findings(later, index, exclude);
+                    if !findings.is_empty() {
+                        let detail = format!("{:?} · {directory}: {} · {}", later.master.name,
+                            findings.join("; "), later.id);
+                        if !details.push(later.master.bin, detail) {
+                            break;
+                        }
+                    }
+                    for track in &later.master.tracks {
+                        let package = track.file_mob.umid_hex();
+                        let Some((&package, conflict)) = conflicts.get_key_value(package.as_str()) else {
+                            continue;
+                        };
+                        if !reported_conflicts.insert(package) {
+                            continue;
+                        }
+                        let Some(detail) = conflict.detail(package) else { continue };
+                        if !details.push(later.master.bin, detail) {
+                            break 'affected;
+                        }
+                    }
+                }
+                issue.additional = details.rows;
+                issue.details_truncated = details.truncated;
             }
-            if options.allow_media_gaps && index.ambiguous.is_empty() && index.unreadable.is_empty() {
-                self.omit_media(master, reason, &mut used)?;
-                continue;
-            }
-            return Err(issue(reason));
+            return Err(SourceReadIssue::OriginalLocator(issue));
         }
         Ok(())
     }
@@ -1478,14 +1671,14 @@ impl OriginalIndex {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, SourceReadIssue> {
         Self::scan_with_control(facts, allow_offline, references, options,
-            |path| probe(path, &options.ffprobe), check)
+            |path, check| probe(path, &options.ffprobe, check), check)
     }
     fn scan_with_control(
         facts: &av::SourceProject,
         allow_offline: bool,
         references: Option<&crate::unused::References>,
         options: &OriginalOptions,
-        mut inspect: impl FnMut(&Path) -> Result<OriginalProbe, String>,
+        mut inspect: impl FnMut(&Path, &mut dyn FnMut() -> Result<(), String>) -> Result<OriginalProbe, String>,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, SourceReadIssue> {
         let mut out = Self { allow_offline, allow_media_gaps: options.allow_media_gaps, ..Self::default() };
@@ -1496,12 +1689,16 @@ impl OriginalIndex {
         let mut used = 0usize;
         let mut pinned = HashMap::<PathBuf, String>::new();
         let mut locator_claims = HashMap::<LocatorClaimKey, LocatorClaim>::new();
+        let collect_blocked = options.collect_blocked_locators
+            && !allow_offline
+            && !options.allow_media_gaps
+            && references.is_none();
         let adapter_masters: std::collections::HashSet<_> = facts.sequences.iter()
             .flat_map(|s| &s.events)
             .filter(|e| e.motion_adapter_phase.is_some())
             .map(|e| e.event.master)
             .collect();
-        'master: for m in &facts.masters {
+        'master: for (master_index, m) in facts.masters.iter().enumerate() {
             check()?;
             if m.pcm_prefix.is_some() || m.originals.iter().all(Option::is_none) {
                 continue;
@@ -1524,14 +1721,28 @@ impl OriginalIndex {
                 check()?;
                 let raw = raw.as_ref().unwrap();
                 let t = &m.master.tracks[i];
-                let locator_error = |why| {
+                let locator_issue = |kind, why| {
                     let saved = raw.locators.first().map_or("no saved path", String::as_str);
-                    SourceReadIssue::OriginalLocator {
-                        message: format!("{:?} · {saved}: {why}", m.master.name),
-                        bin: m.master.bin,
-                    }
+                    OriginalLocatorIssue::new(kind, format!("{:?} · {saved}: {why}", m.master.name), m.master.bin)
                 };
-                let found = resolve_with_claim(&raw.locators, &options.root_mappings).map_err(locator_error)?;
+                let locator_error = |why| {
+                    SourceReadIssue::OriginalLocator(locator_issue(OriginalLocatorKind::SavedPath, why))
+                };
+                let blocked = |kind, why, check: &mut dyn FnMut() -> Result<(), String>| {
+                    let mut issue = locator_issue(kind, why);
+                    if collect_blocked {
+                        let details = blocked_locator_details(
+                            &facts.masters[master_index..], i, &options.root_mappings, check,
+                        )?;
+                        issue.additional = details.rows;
+                        issue.details_truncated = details.truncated;
+                    }
+                    Ok::<_, SourceReadIssue>(SourceReadIssue::OriginalLocator(issue))
+                };
+                let found = match resolve_with_claim(&raw.locators, &options.root_mappings) {
+                    Ok(found) => found,
+                    Err(why) => return Err(blocked(OriginalLocatorKind::SavedPath, why, check)?),
+                };
                 let Some((path, claim)) = found else {
                     if let Some(path) = unused_path.filter(|_| i == 0) {
                         let offline_profile_unavailable = allow_offline && {
@@ -1573,11 +1784,7 @@ impl OriginalIndex {
                         }
                     }
                     if !allow_offline {
-                        let saved = raw.locators.first().map_or("no saved path", String::as_str);
-                        return Err(SourceReadIssue::MissingOriginal {
-                            message: format!("{:?} · {saved}: {}", m.master.name, missing_locator()),
-                            bin: m.master.bin,
-                        });
+                        return Err(blocked(OriginalLocatorKind::MissingOriginal, missing_locator(), check)?);
                     }
                     let selected = offline_original(m, i)
                         .and_then(|selected| selected.ok_or_else(|| format!(
@@ -1639,7 +1846,7 @@ impl OriginalIndex {
                     if pinned.get(&path).is_some_and(|old| old != &before) {
                         return Err("original content changed between source selections".into());
                     }
-                    let observed = inspect(&path).map_err(describe)?;
+                    let observed = inspect(&path, check).map_err(describe)?;
                     let after = crate::revision::file_revision_checked(&path, check)
                         .map_err(|e| format!("original revision recheck failed: {e}"))?;
                     if before != after {
@@ -1748,9 +1955,7 @@ impl OriginalIndex {
                     return Err("original stream selection is ambiguous/unqualified".into());
                 }
                 let mut picture_codec = "avc1";
-                let wide_avc_pcm24 = physical_container == "mov"
-                    && videos.first().is_some_and(|picture|
-                        number(picture, "width") == Some(2048) && number(picture, "height") == Some(858))
+                let avc_pcm = physical_container == "mov" && is_avc_pcm_movie(streams)
                     && !adapter_masters.contains(&m.master.mob_id);
                 let uhd_avc_mp4 = physical_container == "mov"
                     && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
@@ -1758,8 +1963,6 @@ impl OriginalIndex {
                         number(picture, "width") == Some(3840) && number(picture, "height") == Some(2160)
                             && text(picture, "codec_name").as_deref() == Some("h264"))
                     && !adapter_masters.contains(&m.master.mob_id);
-                let uhd_avc_pcm = uhd_avc_mp4 && audios.first().is_some_and(|audio|
-                    text(audio, "codec_tag_string").as_deref() == Some("ipcm"));
                 let uhd_avc_aac = uhd_avc_mp4 && audios.first().is_some_and(|audio|
                     text(audio, "codec_tag_string").as_deref() == Some("mp4a"));
                 if physical_container == "mov" {
@@ -1782,10 +1985,8 @@ impl OriginalIndex {
                         }
                         physical.prores_color_defaulted
                             .ok_or_else(|| "linked ProRes HQ has no complete verified picture packet clock".into())
-                    } else if wide_avc_pcm24 {
-                        qualify_wide_avc_pcm24(v, streams, &path, m)
-                    } else if uhd_avc_pcm {
-                        qualify_uhd_avc_pcm(streams, m)
+                    } else if avc_pcm {
+                        qualify_avc_pcm(streams, &path, m)
                     } else if uhd_avc_aac {
                         qualify_uhd_avc_aac(v, streams, m)
                     } else {
@@ -1851,10 +2052,10 @@ impl OriginalIndex {
                         ("mov", "aac", StreamKind::Audio) if videos.len() == 1 => {
                             ("mov", Some("aac"), None)
                         }
-                        ("mov", "pcm_s16le", StreamKind::Audio) if uhd_avc_pcm => {
+                        ("mov", "pcm_s16le", StreamKind::Audio) if avc_pcm => {
                             ("mov", Some("pcm16"), Some(16))
                         }
-                        ("mov", "pcm_s24le", StreamKind::Audio) if wide_avc_pcm24 || uhd_avc_pcm => {
+                        ("mov", "pcm_s24le" | "pcm_s24be", StreamKind::Audio) if avc_pcm => {
                             ("mov", Some("pcm24"), Some(24))
                         }
                         ("wav", "pcm_s16le", StreamKind::Audio) if videos.is_empty() => {
@@ -2271,22 +2472,34 @@ mod tests {
     }
     #[test]
     fn linked_prores_hq_checks_every_picture_packet() {
-        let count = 240;
-        let ticks_per_frame = 512;
-        let mut rows: Vec<_> = (0..count)
-            .map(|i| format!("{0},{0},{ticks_per_frame}", i128::from(i) * ticks_per_frame))
-            .collect();
-        assert!(verify_prores_packets(&rows.join("\n"), count, ticks_per_frame).is_ok());
-        assert!(verify_prores_packets(&rows[..239].join("\n"), count, ticks_per_frame).is_err());
-        rows.push("122880,122880,512".into());
-        assert!(verify_prores_packets(&rows.join("\n"), count, ticks_per_frame).is_err());
-        rows.pop();
+        use std::fmt::Write;
+        let count = 50_000;
+        let ticks_per_frame = 10_000;
+        let late_frame = 49_990;
+        let mut rows = String::new();
+        let mut late = 0;
+        let mut last = 0;
+        for frame in 0..count {
+            let pts = i128::from(frame) * ticks_per_frame;
+            if frame == late_frame { late = rows.len(); }
+            if frame == count - 1 { last = rows.len(); }
+            writeln!(rows, "{pts},{pts},{ticks_per_frame}").unwrap();
+        }
+        assert!(rows.len() > 1 << 20);
+        let verify = |bytes: &[u8]| verify_prores_packets(bytes, count, ticks_per_frame, || {});
+        verify(rows.as_bytes()).unwrap();
+        assert!(verify(&rows.as_bytes()[..last]).unwrap_err().contains("packet count"));
+        assert!(verify(&rows.as_bytes()[..rows.len() - 1]).is_ok());
+        let mut extra = rows.clone();
+        extra.push_str("500000000,500000000,10000\n");
+        assert!(verify(extra.as_bytes()).unwrap_err().contains("packet 50000"));
         // Two late packets keep the exact overall duration and average rate.
-        rows[200] = "102400,102400,528".into();
-        rows[201] = "102928,102928,496".into();
-        assert!(verify_prores_packets(&rows.join("\n"), count, ticks_per_frame)
-            .unwrap_err()
-            .contains("packet 200"));
+        let mut uneven = rows;
+        let later = uneven[late..].splitn(3, '\n').take(2).map(|r| r.len() + 1).sum::<usize>();
+        uneven.replace_range(late..late + later, "499900000,499900000,10001\n499910001,499910001,9999\n");
+        assert!(verify(uneven.as_bytes()).unwrap_err().contains("packet 49990"));
+        let oversized = [b'1'; 129];
+        assert!(verify(&oversized).unwrap_err().contains("row exceeds 128 bytes"));
     }
     #[cfg(unix)]
     #[test]
@@ -2315,6 +2528,37 @@ mod tests {
         assert!(bounded_probe(command, Duration::from_secs(1))
             .unwrap_err()
             .contains("refused"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn packet_probe_tracks_verified_progress_and_cancels_stalls() {
+        use std::time::Instant;
+        let read = |out, progress: &AtomicU64| {
+            verify_prores_packets(BufReader::new(out), 5, 1, || {
+                progress.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "for i in 0 1 2 3 4; do printf '%s,%s,1\n' \"$i\" \"$i\"; sleep 0.25; done"]);
+        let start = Instant::now();
+        run_probe(command, ProbeDeadline::Idle(Duration::from_millis(800)),
+            &mut || Ok(()), read).unwrap();
+        assert!(start.elapsed() > Duration::from_millis(800));
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '0,0,1\n'; exec sleep 5"]);
+        let error = run_probe(command, ProbeDeadline::Idle(Duration::from_millis(80)),
+            &mut || Ok(()), read).unwrap_err();
+        assert!(error.contains("without a verified picture packet"));
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '0,0,1\n'; exec sleep 5"]);
+        let start = Instant::now();
+        let error = run_probe(command, ProbeDeadline::Idle(Duration::from_secs(30)), &mut || {
+            if start.elapsed() >= Duration::from_millis(80) { Err("cancelled".into()) } else { Ok(()) }
+        }, read).unwrap_err();
+        assert_eq!(error, "cancelled");
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
     #[test]
     fn foreign_saved_paths_require_explicit_component_mappings() {

@@ -171,7 +171,7 @@ fn linked_dual_mono_mov_writes_two_physical_audio_media_nodes() {
 }
 
 #[test]
-fn linked_uhd_avc_pcm_mp4_admits_both_depths_at_the_exact_movie_clock() {
+fn linked_avc_pcm_mp4_accepts_nonstandard_rasters_and_checks_the_pcm_extent() {
     for depth in [SampleRepresentation::Pcm16, SampleRepresentation::Pcm24] {
         let mut clip = original("movie");
         let video = clip.video.as_mut().unwrap();
@@ -184,9 +184,13 @@ fn linked_uhd_avc_pcm_mp4_admits_both_depths_at_the_exact_movie_clock() {
         audio.representation = depth;
         validate_original(&clip).unwrap();
 
-        let mut wrong_raster = clip.clone();
-        wrong_raster.video.as_mut().unwrap().height = 1080;
-        assert!(validate_original(&wrong_raster).is_err());
+        let mut wide = clip.clone();
+        let video = wide.video.as_mut().unwrap();
+        video.width = 1600;
+        video.height = 900;
+        validate_original(&wide).unwrap();
+        wide.video.as_mut().unwrap().width = 0;
+        assert!(validate_original(&wide).is_err());
         clip.audio.as_mut().unwrap().duration -= ticks_per_unit(Fraction::new(48_000, 1));
         assert!(validate_original(&clip).is_err());
     }
@@ -850,7 +854,9 @@ fn original_refusals_are_atomic_and_legacy_model_remains_strict() {
     };
     variants.push(mutate(|c| c.channels[1].channel_index = 0));
     variants.push(mutate(|c| {
-        c.audio.as_mut().unwrap().representation = SampleRepresentation::Pcm16
+        let audio = c.audio.as_mut().unwrap();
+        audio.representation = SampleRepresentation::Pcm16;
+        audio.duration -= ticks_per_unit(Fraction::new(48_000, 1));
     }));
     variants.push(mutate(|c| c.video.as_mut().unwrap().stream_index = 2));
     variants.push(mutate(|c| c.groups = vec![vec![1]]));

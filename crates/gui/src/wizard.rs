@@ -24,6 +24,7 @@ const PRIMARY: Color32 = Color32::from_rgb(48, 77, 112);
 const GOOD: Color32 = Color32::from_rgb(133, 222, 190);
 const AMBER: Color32 = Color32::from_rgb(244, 199, 137);
 const CONVERTING: &str = "Converting project";
+const SAVING_PREFLIGHT: &str = "Saving preflight report";
 const WHY: &str = include_str!("../../../docs/DECISIONS-EXPLAINED.md");
 #[derive(Clone, Copy)]
 enum Pick {
@@ -37,6 +38,7 @@ enum Pick {
     LoadPreset,
     SavePreset,
     SaveJob,
+    SavePreflightReport,
     LoadJob,
     Ffmpeg,
     Ffprobe,
@@ -45,9 +47,14 @@ enum Event {
     Progress(Progress),
     Inventory(u64, Result<Inventory, String>),
     Prepared(u64, Result<Box<PreparedJob>, ReviewBlocker>),
+    PreflightReportSaved(PreflightReportSource, PathBuf, Result<(), String>),
     Finished(Completion),
     Picked(Pick, Option<Vec<PathBuf>>),
     WorkerFailed(String),
+}
+enum PreflightReportSource {
+    Ready(Box<PreparedJob>),
+    Blocked(ReviewBlocker),
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MediaJump {
@@ -210,7 +217,7 @@ pub struct App {
     mapping_actual: PathBuf,
     ffmpeg: Option<PathBuf>,
     ffprobe: Option<PathBuf>,
-    close_after_cancel: bool,
+    close_when_idle: bool,
     close_confirmation: bool,
     #[cfg(target_os = "macos")]
     relink: crate::relink::Relink,
@@ -252,7 +259,7 @@ impl App {
             mapping_actual: PathBuf::new(),
             ffmpeg: None,
             ffprobe: None,
-            close_after_cancel: false,
+            close_when_idle: false,
             close_confirmation: false,
             #[cfg(target_os = "macos")]
             relink: Default::default(),
@@ -461,6 +468,29 @@ impl App {
             ctx.request_repaint();
         });
     }
+    fn save_preflight_report(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let source = if let Some(prepared) = self.prepared.take() {
+            PreflightReportSource::Ready(Box::new(prepared))
+        } else if let Some(blocker) = self.review_blocker.take() {
+            PreflightReportSource::Blocked(blocker)
+        } else {
+            return;
+        };
+        let spec = self.spec();
+        self.start(SAVING_PREFLIGHT);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &source {
+                PreflightReportSource::Ready(prepared) => prepared.save_preflight_report(&path),
+                PreflightReportSource::Blocked(blocker) => {
+                    job::save_blocked_preflight_report(&spec, blocker, &path)
+                }
+            }))
+            .unwrap_or_else(|_| Err("The preflight report could not be saved.".into()));
+            let _ = tx.send(Event::PreflightReportSaved(source, path, result));
+            ctx.request_repaint();
+        });
+    }
     fn pick(&mut self, kind: Pick, ctx: &egui::Context) {
         if self.busy {
             return;
@@ -504,6 +534,12 @@ impl App {
                     .set_title("Save a NEW job settings file")
                     .add_filter("Any NLE job", &["json"])
                     .set_file_name("Any NLE job.json")
+                    .save_file()
+                    .map(|p| vec![p]),
+                Pick::SavePreflightReport => d
+                    .set_title("Save preflight report")
+                    .add_filter("JSON report", &["json"])
+                    .set_file_name("Any NLE Preflight.json")
                     .save_file()
                     .map(|p| vec![p]),
                 Pick::SavePreset => d
@@ -604,7 +640,7 @@ impl App {
             };
             match event {
                 Event::WorkerFailed(message) => {
-                    self.close_after_cancel = false;
+                    self.close_when_idle = false;
                     self.busy = false;
                     self.wizard.invalidate();
                     self.invalidate();
@@ -649,6 +685,20 @@ impl App {
                     self.wizard.invalidate();
                     self.report = ReportBrowser::new(&c.report);
                     self.completion = Some(c);
+                }
+                Event::PreflightReportSaved(source, path, result) => {
+                    self.busy = false;
+                    match source {
+                        PreflightReportSource::Ready(prepared) => self.prepared = Some(*prepared),
+                        PreflightReportSource::Blocked(issue) => self.review_blocker = Some(issue),
+                    }
+                    match result {
+                        Ok(()) => {
+                            self.notice =
+                                Some(format!("Preflight report saved to {}", path.display()))
+                        }
+                        Err(error) => self.error = Some(error),
+                    }
                 }
                 Event::Picked(kind, paths) => {
                     self.busy = false;
@@ -730,6 +780,9 @@ impl App {
                                         Err(e) => self.error = Some(e),
                                     }
                                 }
+                                Pick::SavePreflightReport => {
+                                    self.save_preflight_report(path.clone(), ctx);
+                                }
                                 Pick::LoadJob => self.load_job(path),
                                 Pick::Ffmpeg => {
                                     self.ffmpeg = Some(path.clone());
@@ -751,7 +804,7 @@ impl App {
                 }
             }
         }
-        if self.close_after_cancel && !self.busy {
+        if self.close_when_idle && !self.busy {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -1257,7 +1310,12 @@ impl App {
         }
         ui.small("Current effect handling is fixed by the qualified translation. Choices appear only when the engine supports alternatives; all approximations and skips are listed in Review.");
     }
-    fn blocker_card(ui: &mut egui::Ui, issue: &ReviewBlocker) -> Option<ReviewAction> {
+    fn blocker_card(
+        ui: &mut egui::Ui,
+        issue: &ReviewBlocker,
+        can_save: bool,
+        browser: &mut ReportBrowser,
+    ) -> Option<ReviewAction> {
         use BlockerKind::*;
         let (title, next, button) = match issue.kind {
             ProjectSource => (
@@ -1279,6 +1337,16 @@ impl App {
                 "Required media is missing",
                 "Locate the source media to rewrap, or switch to Separate files to preserve the edits as offline clips.",
                 Some(("Locate media", ReviewAction::Media(MediaJump::Locations))),
+            ),
+            RewrapMissingOriginal => (
+                "Required linked original is missing",
+                "Reconnect the original drive or map the saved path to its current folder. You can switch to Separate files to review offline links.",
+                Some(("Open saved-path mappings", ReviewAction::Media(MediaJump::OriginalMappings))),
+            ),
+            LegacyMxfPackage => (
+                "Check legacy MXF packages",
+                "Use the package IDs and lanes below to check the files in the selected Avid media folders. If several copies claim the same package ID, select only the intended source folders.",
+                Some(("Open media locations", ReviewAction::Media(MediaJump::Locations))),
             ),
             OriginalLocator => (
                 "Locate the linked original",
@@ -1347,22 +1415,55 @@ impl App {
                         action = Some(target);
                     }
                 }
-                if issue.kind == RewrapMissingMedia && ui.button("Switch to Separate files").clicked() {
+                if matches!(issue.kind, RewrapMissingMedia | RewrapMissingOriginal)
+                    && ui.button("Switch to Separate files").clicked()
+                {
                     action = Some(ReviewAction::SwitchToSeparate { enable_offline_media: true });
                 }
-                if ui.link("Copy details").clicked() {
+                if ui.button("Copy details").clicked() {
                     let mut details = vec![issue.message.as_str()];
                     details.extend(issue.affected.iter().map(String::as_str));
                     ui.ctx().copy_text(details.join("\n"));
                 }
+                if can_save && ui.button("Save preflight report").clicked() {
+                    action = Some(ReviewAction::Choose(Pick::SavePreflightReport));
+                }
             });
             ui.separator();
             ui.label(&issue.message);
-            for affected in &issue.affected {
-                ui.label(affected);
-            }
+            Self::blocker_details(ui, &issue.affected, browser);
         });
         action
+    }
+    fn blocker_details(ui: &mut egui::Ui, details: &[String], browser: &mut ReportBrowser) {
+        if details.len() <= 8 {
+            for detail in details {
+                ui.label(detail);
+            }
+            return;
+        }
+        let changed = ui.add(
+            egui::TextEdit::singleline(&mut browser.search)
+                .hint_text("Search affected details")
+                .desired_width(220.),
+        ).changed();
+        if changed {
+            browser.refilter_details(details);
+        }
+        if browser.count(details.len()) == 0 {
+            ui.label("No affected details match your search.");
+            return;
+        }
+        let page_changed = Self::report_pages(ui, browser, details.len(), "Details");
+        let mut rows = egui::ScrollArea::vertical().id_salt("blocker-details").max_height(260.);
+        if changed || page_changed {
+            rows = rows.vertical_scroll_offset(0.);
+        }
+        rows.show(ui, |ui| {
+            for index in browser.page_indices(details.len()) {
+                ui.label(&details[index]);
+            }
+        });
     }
     fn take_review_action(&mut self, action: ReviewAction, ctx: &egui::Context) {
         match action {
@@ -1387,8 +1488,8 @@ impl App {
             self.finish(ui);
             return;
         }
-        if self.busy && self.task == CONVERTING {
-            Self::title(ui, CONVERTING, "Avid Media Composer to Premiere Pro");
+        if self.busy && matches!(self.task.as_str(), CONVERTING | SAVING_PREFLIGHT) {
+            Self::title(ui, &self.task, "Avid Media Composer to Premiere Pro");
             return;
         }
         Self::title(ui, "Review & convert", "Avid Media Composer to Premiere Pro");
@@ -1402,7 +1503,7 @@ impl App {
         let issue = missing.as_ref().or(self.review_blocker.as_ref());
         let blocked = issue.is_some();
         if let Some(issue) = issue {
-            if let Some(action) = Self::blocker_card(ui, issue) {
+            if let Some(action) = Self::blocker_card(ui, issue, missing.is_none(), &mut self.report) {
                 self.take_review_action(action, ui.ctx());
             }
         }
@@ -1457,6 +1558,7 @@ impl App {
             }
         });
 
+        let mut save_report = false;
         if !blocked {
             Self::card(ui, |ui| {
                 if let Some(review) = review {
@@ -1544,6 +1646,9 @@ impl App {
                                     });
                             }
                         });
+                    save_report = ui
+                        .add_enabled(!self.busy, egui::Button::new("Save preflight report"))
+                        .clicked();
                 } else {
                     ui.strong(if self.busy { "Preflight in progress" } else { "Preflight" });
                     ui.label(RichText::new("Checks media, translation limits and disk space before creating any output.").color(MUTED));
@@ -1583,6 +1688,9 @@ impl App {
                 }
             });
         }
+        if save_report {
+            self.pick(Pick::SavePreflightReport, ui.ctx());
+        }
     }
     fn report(
         ui: &mut egui::Ui,
@@ -1620,27 +1728,9 @@ impl App {
             });
             return;
         }
-        let previous_page = browser.page;
-        let page_count = count.div_ceil(PAGE_SIZE);
-        ui.horizontal_wrapped(|ui| {
-            if page_count > 1 {
-                if ui.add_enabled(browser.page > 0, egui::Button::new("Previous")).clicked() {
-                    browser.page -= 1;
-                }
-                let mut page_number = browser.page + 1;
-                ui.label("Page");
-                ui.add(egui::DragValue::new(&mut page_number).range(1..=page_count));
-                browser.page = page_number - 1;
-                ui.label(format!("of {page_count}"));
-                if ui.add_enabled(browser.page + 1 < page_count, egui::Button::new("Next")).clicked() {
-                    browser.page += 1;
-                }
-            }
-            let range = browser.page_range(notes.len());
-            ui.small(format!("Notes {}–{} of {count}", range.start + 1, range.end));
-        });
+        let page_changed = Self::report_pages(ui, browser, notes.len(), "Notes");
         let mut rows = egui::ScrollArea::vertical().id_salt("report-rows").max_height(360.);
-        if changed || browser.page != previous_page {
+        if changed || page_changed {
             rows = rows.vertical_scroll_offset(0.);
         }
         rows.show(ui, |ui| {
@@ -1669,6 +1759,34 @@ impl App {
                 });
             }
         });
+    }
+    fn report_pages(
+        ui: &mut egui::Ui,
+        browser: &mut ReportBrowser,
+        total: usize,
+        label: &str,
+    ) -> bool {
+        let previous_page = browser.page;
+        let count = browser.count(total);
+        let page_count = count.div_ceil(PAGE_SIZE);
+        ui.horizontal_wrapped(|ui| {
+            if page_count > 1 {
+                if ui.add_enabled(browser.page > 0, egui::Button::new("Previous")).clicked() {
+                    browser.page -= 1;
+                }
+                let mut page_number = browser.page + 1;
+                ui.label("Page");
+                ui.add(egui::DragValue::new(&mut page_number).range(1..=page_count));
+                browser.page = page_number - 1;
+                ui.label(format!("of {page_count}"));
+                if ui.add_enabled(browser.page + 1 < page_count, egui::Button::new("Next")).clicked() {
+                    browser.page += 1;
+                }
+            }
+            let range = browser.page_range(total);
+            ui.small(format!("{label} {}–{} of {count}", range.start + 1, range.end));
+        });
+        browser.page != previous_page
     }
     fn finish(&mut self, ui: &mut egui::Ui) {
         let Some(c) = self.completion.as_ref() else {
@@ -1756,6 +1874,7 @@ impl App {
                 ui.strong(&self.task);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !self.task.starts_with("Choosing")
+                        && self.task != SAVING_PREFLIGHT
                         && ui.add_enabled(!self.cancel.is_cancelled(), egui::Button::new("Cancel")).clicked()
                     {
                         self.cancel.cancel();
@@ -1906,7 +2025,7 @@ impl App {
         if self.close_confirmation {
             egui::Window::new("Conversion in progress").collapsible(false).resizable(false).show(ctx,|ui|{
                 ui.label("Cancel the current job before closing? Any retained output will be recorded by the engine.");
-                ui.horizontal(|ui|{if ui.button("Keep working").clicked(){self.close_confirmation=false;}if ui.button("Cancel job & close when safe").clicked(){self.cancel.cancel();self.close_after_cancel=true;self.close_confirmation=false;}});
+                ui.horizontal(|ui|{if ui.button("Keep working").clicked(){self.close_confirmation=false;}if ui.button("Cancel job & close when safe").clicked(){self.cancel.cancel();self.close_when_idle=true;self.close_confirmation=false;}});
             });
         }
     }
@@ -1922,7 +2041,9 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) && self.busy {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if !self.close_after_cancel {
+            if self.task == SAVING_PREFLIGHT {
+                self.close_when_idle = true;
+            } else if !self.close_when_idle {
                 self.close_confirmation = true;
             }
         }
@@ -2163,6 +2284,102 @@ fn media_status(inv: &Inventory) -> String {
 #[cfg(test)]
 mod report_view_tests {
     use super::*;
+
+    fn text_center(output: &egui::FullOutput, text: &str) -> Option<egui::Pos2> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(shape) if shape.galley.job.text == text => {
+                Some(shape.pos + shape.galley.rect.center().to_vec2())
+            }
+            _ => None,
+        })
+    }
+
+    fn click(pos: egui::Pos2) -> egui::RawInput {
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        egui::RawInput {
+            events: vec![egui::Event::PointerMoved(pos), pointer(true), pointer(false)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn preflight_recovery_opens_the_correct_media_panel() {
+        for (kind, button, expected) in [
+            (BlockerKind::RewrapMissingMedia, "Locate media", MediaJump::Locations),
+            (BlockerKind::RewrapMissingOriginal, "Open saved-path mappings", MediaJump::OriginalMappings),
+            (BlockerKind::LegacyMxfPackage, "Open media locations", MediaJump::Locations),
+            (BlockerKind::OriginalLocator, "Open saved-path mappings", MediaJump::OriginalMappings),
+        ] {
+            let issue = ReviewBlocker::new(kind, "Synthetic preflight issue");
+            let ctx = egui::Context::default();
+            let mut browser = ReportBrowser::default();
+            let mut initial = ctx.run_ui(egui::RawInput::default(), |ui| {
+                App::blocker_card(ui, &issue, true, &mut browser);
+            });
+            initial.textures_delta.clear();
+            let can_switch = initial.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(shape)
+                    if shape.galley.job.text == "Switch to Separate files")
+            });
+            assert_eq!(
+                can_switch,
+                matches!(kind, BlockerKind::RewrapMissingMedia | BlockerKind::RewrapMissingOriginal)
+            );
+            let button_center = text_center(&initial, button).expect("recovery button");
+            let mut selected = None;
+            let mut output = ctx.run_ui(click(button_center), |ui| {
+                selected = App::blocker_card(ui, &issue, true, &mut browser);
+            });
+            output.textures_delta.clear();
+            assert!(matches!(selected, Some(ReviewAction::Media(jump)) if jump == expected), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn blocked_preflight_report_searches_all_pages_and_copies_complete_details() {
+        let mut issue = ReviewBlocker::new(BlockerKind::AvidMedia, "Resolve missing media");
+        issue.affected = (1..=53).map(|index| format!("Missing file {index}")).collect();
+        let target = "MXF Café slate package 52";
+        issue.affected[51] = target.into();
+        let ctx = egui::Context::default();
+        let mut browser = ReportBrowser::default();
+        let mut frame = |raw| {
+            let mut output = ctx.run_ui(raw, |ui| {
+                App::blocker_card(ui, &issue, true, &mut browser);
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let initial = frame(egui::RawInput::default());
+        assert!(text_center(&initial, "Save preflight report").is_some());
+        assert!(text_center(&initial, "Details 1–25 of 53").is_some());
+        assert!(text_center(&initial, target).is_none());
+        let second = frame(click(text_center(&initial, "Next").unwrap()));
+        assert!(text_center(&second, "Details 26–50 of 53").is_some());
+
+        frame(click(text_center(&second, "Search affected details").unwrap()));
+        let filtered = frame(egui::RawInput {
+            events: vec![egui::Event::Text("  CAFÉ SLATE  ".into())],
+            ..Default::default()
+        });
+        assert!(text_center(&filtered, "Details 1–1 of 1").is_some());
+        assert!(text_center(&filtered, target).is_some());
+        assert!(text_center(&filtered, "Missing file 1").is_none());
+        let copied = frame(click(text_center(&filtered, "Copy details").unwrap()));
+        let full = format!("{}\n{}", issue.message, issue.affected.join("\n"));
+        assert!(
+            copied.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == &full)
+            }),
+            "clipboard commands: {:?}",
+            copied.platform_output.commands
+        );
+    }
 
     #[test]
     fn report_view_draws_only_the_selected_page() {

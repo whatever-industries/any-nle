@@ -21,6 +21,12 @@ fn corner_pin_effect(pin: avid_reader::transform::CornerPin) -> Effect {
     }
 }
 
+pub(super) fn pin_has_geometry(
+    pin: avid_reader::transform::CornerPin, raster: Option<(i64, i64)>, square_pixels: bool,
+) -> bool {
+    square_pixels && raster.is_some_and(|size| !pin.from_transform || size == (1920, 1080))
+}
+
 pub(super) fn apply_corner_pin(
     pin: avid_reader::transform::CornerPin, p: &mut Placement, budget: &mut Budget,
 ) -> Result<(), String> {
@@ -32,10 +38,10 @@ pub(super) fn apply_corner_pin(
 }
 
 pub(super) fn apply_picture_extension(
-    effect: PictureExtension, raster: Option<(i64, i64)>, p: &mut Placement,
+    effect: PictureExtension, raster: Option<(i64, i64)>, square_pixels: bool, p: &mut Placement,
     out: &mut ReadResult, budget: &mut Budget,
 ) -> Result<(), String> {
-    let effect = match picture_extension(effect, raster, &mut p.transform, !p.effects.is_empty()) {
+    let effect = match picture_extension(effect, raster, square_pixels, &mut p.transform, !p.effects.is_empty()) {
         Ok(effect) => effect,
         Err(reason) => return loss(out, budget, &p.id, "picture_effect", reason),
     };
@@ -48,9 +54,11 @@ pub(super) fn apply_picture_extension(
 fn picture_extension(
     effect: PictureExtension,
     raster: Option<(i64, i64)>,
+    square_pixels: bool,
     transform: &mut Option<Transform>,
     has_effects: bool,
 ) -> Result<Effect, &'static str> {
+    let qualified_raster = raster == Some((1920, 1080)) || square_pixels && raster.is_some();
     let (kind, params) = match effect {
         PictureExtension::Unsupported(reason) | PictureExtension::UnsupportedTransform(reason) => {
             return Err(reason);
@@ -62,8 +70,8 @@ fn picture_extension(
             return Ok(graph::picture_chain::Reflection { horizontal, vertical }.effect());
         }
         PictureExtension::WarpRoll { keys, interpolation } => {
-            if raster != Some((1920, 1080)) || transform.is_some() || has_effects {
-                return Err("Animated Warp Rotation requires isolated 1080p picture");
+            if !qualified_raster || transform.is_some() || has_effects {
+                return Err("Animated Warp Rotation requires isolated picture with verified square-pixel geometry");
             }
             let keys = keys.map(|k| obj(vec![
                 ("frame", Value::Int(k.frame)), ("x", Value::Float(k.x)),
@@ -86,10 +94,10 @@ fn picture_extension(
                 (false, true) => "avid.warp_trim_crop_linear",
                 (false, false) => "avid.warp_trim_linear",
             };
-            if raster != Some((1920, 1080)) || transform.is_some() || has_effects
+            if !qualified_raster || transform.is_some() || has_effects
                 || trim.motion.iter().any(|k| k.position.iter().any(|x| x.abs() > 64.0))
             {
-                return Err("Trimmed picture animation requires qualified 1080p geometry and an isolated effect");
+                return Err("Trimmed picture animation requires verified square-pixel geometry and an isolated effect");
             }
             *transform = Some(Transform {
                 position: trim.motion[0].position.into(),
@@ -129,8 +137,8 @@ fn picture_extension(
             if has_effects || transform.as_ref().is_some_and(|t| t.crop != [0.0; 4]) {
                 return Err("Animated picture motion with crop or another translated effect requires separate qualification");
             }
-            if raster != Some((1920, 1080)) {
-                return Err("Animated picture motion is qualified only for 1920x1080 geometry");
+            if !qualified_raster {
+                return Err("Two-key picture motion outside 1920x1080 requires verified square-pixel geometry");
             }
             if keys.iter().any(|k| k.position.iter().any(|x| x.abs() > 64.0)) {
                 return Err("Animated picture position is outside the qualified range");
@@ -184,9 +192,9 @@ pub(super) fn apply_picture_chain(
             ),
             PictureStage::Static(picture) if picture.corner_pin.is_some() => {
                 let pin = picture.corner_pin.unwrap();
-                if !square_pixels || raster != Some((1920, 1080)) {
+                if !pin_has_geometry(pin, raster, square_pixels) {
                     return loss(out, budget, &p.id, "picture_effect",
-                        "Ordered projective 3D Warp requires verified square-pixel 1080p picture");
+                        "Ordered Corner Pin requires verified square-pixel picture. The camera projection requires 1920x1080.");
                 }
                 (corner_pin_effect(pin), None)
             }
@@ -214,7 +222,7 @@ pub(super) fn apply_picture_chain(
                         "Nested picture animation requires verified square-pixel progressive geometry");
                 }
                 let mut transform = None;
-                let effect = match picture_extension(*extension, raster, &mut transform, false) {
+                let effect = match picture_extension(*extension, raster, square_pixels, &mut transform, false) {
                     Ok(effect) => effect,
                     Err(reason) => return loss(out, budget, &p.id, "picture_effect", reason),
                 };

@@ -1,12 +1,13 @@
 //! Classify the observed drive-like locator spelling on a saved MXF sibling bundle.
 use avid_reader::{
-    extract::{Essence, KIND_PICTURE, KIND_SOUND},
+    extract::{Essence, MediaTrack, KIND_PICTURE, KIND_SOUND},
     source::{Observed, Rate, SourceMaster},
 };
 use graph::Value;
 use std::{collections::HashSet, path::Path};
 
 use super::{number, text};
+use crate::index::MediaIndex;
 
 fn split_locator(path: &str) -> Option<(&str, &str)> {
     let [drive, b'/', b'/', ..] = path.as_bytes() else {
@@ -113,31 +114,69 @@ pub(crate) fn saved_sibling_directory(source: &SourceMaster) -> Option<&str> {
     directory
 }
 
+fn package_label(track: &MediaTrack, package: &str) -> String {
+    let lane = if track.kind == KIND_PICTURE { 'V' } else { 'A' };
+    format!("{lane}{} ({package})", track.index)
+}
+
+fn indexed_package<'a>(
+    index: &'a MediaIndex,
+    package: &str,
+    label: &str,
+) -> Result<Option<&'a Path>, String> {
+    if index.ambiguous.binary_search_by(|uid| uid.as_str().cmp(package)).is_ok() {
+        return Err(format!("Ambiguous legacy MXF file package for {label}"));
+    }
+    Ok(index.files.get(package).map(|path| path.as_path()))
+}
+
+/// Summarize what is known from the header index after preparation has stopped.
+pub(super) fn package_index_findings(
+    source: &SourceMaster,
+    index: &MediaIndex,
+    primary_track: Option<usize>,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (ordinal, track) in source.master.tracks.iter().enumerate() {
+        if Some(ordinal) == primary_track {
+            continue;
+        }
+        let package = track.file_mob.umid_hex();
+        let label = package_label(track, &package);
+        match indexed_package(index, &package, &label) {
+            Ok(Some(_)) => {}
+            Ok(None) => findings.push(format!("{label} absent from the selected MXF package index")),
+            Err(reason) => findings.push(reason),
+        }
+    }
+    findings
+}
+
+#[derive(Debug)]
+pub(crate) enum SiblingIssue {
+    Check(String),
+    Package { track: usize, message: String },
+}
+
 pub(crate) fn missing_siblings(
     source: &SourceMaster,
-    index: &crate::index::MediaIndex,
+    index: &MediaIndex,
     check: &mut dyn FnMut() -> Result<(), String>,
     probe: &mut dyn FnMut(&Path) -> Result<Value, String>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, SiblingIssue> {
     let mut missing = Vec::new();
     let mut paths = HashSet::new();
-    for track in &source.master.tracks {
-        check()?;
+    for (ordinal, track) in source.master.tracks.iter().enumerate() {
+        check().map_err(SiblingIssue::Check)?;
+        let at_track = |message| SiblingIssue::Package { track: ordinal, message };
         let package = track.file_mob.umid_hex();
         let video = track.kind == KIND_PICTURE;
-        let label = format!(
-            "{}{} ({package})",
-            if video { 'V' } else { 'A' },
-            track.index
-        );
-        if index.ambiguous.binary_search(&package).is_ok() {
-            return Err(format!("Ambiguous legacy MXF file package for {label}"));
-        }
-        let Some(path) = index.files.get(&package) else {
+        let label = package_label(track, &package);
+        let Some(path) = indexed_package(index, &package, &label).map_err(at_track)? else {
             missing.push(label);
             continue;
         };
-        let identity = index.identity(path)?;
+        let identity = index.identity(path).map_err(at_track)?;
         let (num, den) = if video { (24_000, 1001) } else { (48_000, 1) };
         let essence_track = (num, den, track.length);
         let timecode_track = (24_000, 1001, source.master.length);
@@ -154,14 +193,14 @@ pub(crate) fn missing_siblings(
             || identity.file_essence_tracks != 1
             || !matching_tracks
         {
-            return Err(format!(
+            return Err(at_track(format!(
                 "Legacy MXF file package, track, or extent disagrees for {label}"
-            ));
+            )));
         }
-        let physical =
-            probe(path).map_err(|e| format!("Legacy MXF probe failed for {label}: {e}"))?;
+        let physical = probe(path)
+            .map_err(|e| at_track(format!("Legacy MXF probe failed for {label}: {e}")))?;
         let Some(Value::Arr(streams)) = physical.get("streams") else {
-            return Err(format!("Legacy MXF has no readable streams for {label}"));
+            return Err(at_track(format!("Legacy MXF has no readable streams for {label}")));
         };
         let mut essence = streams
             .iter()
@@ -171,7 +210,7 @@ pub(crate) fn missing_siblings(
             .is_some_and(|s| matches_stream(s, video, track.length))
             || essence.next().is_some()
         {
-            return Err(format!("Legacy MXF physical stream disagrees for {label}"));
+            return Err(at_track(format!("Legacy MXF physical stream disagrees for {label}")));
         }
     }
     Ok(missing)

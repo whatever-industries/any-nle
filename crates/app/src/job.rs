@@ -142,12 +142,15 @@ pub struct CameraOriginalLink {
     pub audio_channels: Vec<(i64, i64)>,
     pub proxy: Option<PathBuf>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BlockerKind {
     ProjectSource,
     ProjectOutput,
     AvidMedia,
     RewrapMissingMedia,
+    RewrapMissingOriginal,
+    LegacyMxfPackage,
     OriginalLocator,
     OriginalMedia,
     NewMedia,
@@ -160,7 +163,7 @@ pub enum BlockerKind {
     SequenceTiming,
     Retry,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReviewBlocker {
     pub kind: BlockerKind,
     pub message: String,
@@ -171,12 +174,21 @@ impl ReviewBlocker {
         Self { kind, message: message.into(), affected: Vec::new() }
     }
     pub(crate) fn cli_summary(self) -> String {
-        if matches!(self.kind, BlockerKind::SequenceTiming | BlockerKind::OriginalLocator)
-            && !self.affected.is_empty()
-        {
-            format!("{}: {}", self.message, self.affected.join("; "))
-        } else {
-            self.message
+        if self.affected.is_empty() {
+            return self.message;
+        }
+        match self.kind {
+            BlockerKind::SequenceTiming => {
+                let mut summary = self.affected[..self.affected.len().min(8)].join("; ");
+                if self.affected.len() > 8 {
+                    summary.push_str("; More edits are affected in the selected bins.");
+                }
+                format!("{}: {summary}", self.message)
+            }
+            BlockerKind::OriginalLocator | BlockerKind::LegacyMxfPackage => {
+                format!("{}: {}", self.message, self.affected.join("; "))
+            }
+            _ => self.message,
         }
     }
 }
@@ -234,4 +246,6 @@ pub use inventory::inventory;
 
 mod engine;
 pub(crate) use engine::sequence_timing_blocker;
-pub use engine::{execute, load, load_encoded, prepare, prepare_for_review, PreparedJob};
+pub use engine::{
+    execute, load, load_encoded, prepare, prepare_for_review, save_blocked_preflight_report, PreparedJob,
+};

@@ -241,9 +241,10 @@ pub fn format_by_name(name: &str) -> Option<SequenceFormat> {
         format.audio_tracks = count;
         return Some(format);
     }
-    // Opt-in converter templates. Names carry exact ticks, raster and display enum;
-    // they never enter the default/qualified preset list.
-    if let Some(spec) = name.strip_prefix("anynle-op1a/") {
+    // Explicit formats carry the saved clock, raster and display enum.
+    if let Some(spec) = name.strip_prefix("anynle-op1a/")
+        .or_else(|| name.strip_prefix("anynle-linked/"))
+    {
         let fields: Vec<_> = spec.split('/').collect();
         if fields.len() != 4 {
             return None;

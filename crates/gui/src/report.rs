@@ -5,6 +5,15 @@ use std::ops::Range;
 
 pub(crate) const PAGE_SIZE: usize = 25;
 
+fn contains_lowercase(text: &mut str, query: &str) -> bool {
+    if text.is_ascii() {
+        text.make_ascii_lowercase();
+        text.contains(query)
+    } else {
+        text.to_lowercase().contains(query)
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Filter {
     #[default]
@@ -79,16 +88,23 @@ impl ReportBrowser {
                         searchable.push(' ');
                         searchable.push_str(field);
                     }
-                    let matches = if searchable.is_ascii() {
-                        searchable.make_ascii_lowercase();
-                        searchable.contains(&query)
-                    } else {
-                        searchable.to_lowercase().contains(&query)
-                    };
-                    matches.then_some(index)
+                    contains_lowercase(&mut searchable, &query).then_some(index)
                 })
                 .collect(),
         );
+    }
+
+    pub(crate) fn refilter_details(&mut self, details: &[String]) {
+        self.page = 0;
+        let query = self.search.trim().to_lowercase();
+        self.matches = (!query.is_empty()).then(|| {
+            let mut text = String::new();
+            details.iter().enumerate().filter_map(|(index, detail)| {
+                text.clear();
+                text.push_str(detail);
+                contains_lowercase(&mut text, &query).then_some(index)
+            }).collect()
+        });
     }
 
     pub(crate) fn count(&self, notes_len: usize) -> usize {

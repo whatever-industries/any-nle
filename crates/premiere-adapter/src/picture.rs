@@ -1,6 +1,6 @@
 use super::*;
 use graph::picture_chain::{Chain, Reflection};
-use prproj::convert::prepared::{CornerPin, MotionKey, PictureEffect, TrimmedMotion, TrimmedMotionKey};
+use prproj::convert::prepared::{supports_picture_motion_clock, CornerPin, MotionKey, PictureEffect, TrimmedMotion, TrimmedMotionKey, WarpRollInterpolation};
 
 fn number(value: &Value) -> Option<f64> {
     match value {
@@ -36,17 +36,52 @@ pub(super) fn corner_pin(params: &Value) -> Option<CornerPin> {
     (fields.len() == 1 + usize::from(source_crop.is_some()) && pin.is_valid()).then_some(pin)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChainGeometry {
+    Hd,
+    MatchedLinked,
+    Unverified,
+}
+
+impl ChainGeometry {
+    pub(super) fn supports_linked_motion(self, kind: &str, rate: Fraction) -> bool {
+        self == Self::MatchedLinked
+            && (matches!(kind, "avid.resize_linear" | "avid.warp_linear")
+                || (is_keyed_crop(kind) || is_trimmed_motion(kind)) && supports_motion_clock(kind, rate))
+    }
+}
+
+pub(super) fn supports_motion_clock(kind: &str, rate: Fraction) -> bool {
+    !(is_keyed_crop(kind) || is_trimmed_motion(kind)) || supports_picture_motion_clock(rate)
+}
+
+pub(super) fn is_keyed_crop(kind: &str) -> bool {
+    matches!(kind, "avid.resize_crop_linear" | "avid.warp_crop_linear")
+}
+
+pub(super) fn is_trimmed_motion(kind: &str) -> bool {
+    matches!(kind, "avid.warp_trim_linear" | "avid.resize_trim_linear") || is_trimmed_crop(kind)
+}
+
+fn is_trimmed_crop(kind: &str) -> bool {
+    matches!(kind, "avid.warp_trim_crop_linear" | "avid.resize_trim_crop_linear")
+}
+
 pub(super) fn prepare_chain(
     placement: &graph::Placement,
     effect: &graph::Effect,
     full_span: bool,
-    same_rate: bool,
-    frame_ticks: i64,
-    video_duration: Option<Rational>,
-    matched_hd_raster: bool,
+    rate: Rational,
+    canvas: (i64, i64),
+    route: &Routes,
     losses: &mut Vec<Loss>,
 ) -> R<(Option<graph::Transform>, Option<PictureEffect>, [bool; 2])> {
     let refused = (None, None, [false; 2]);
+    let same_rate = route.video_rate == Some(rate);
+    let frame_ticks = model::ticks_per_unit(fraction(rate));
+    let video_duration = route.video_duration;
+    let geometry = route.chain_geometry(canvas);
+    let matched_hd_raster = geometry == ChainGeometry::Hd;
     if let Some(Value::Arr(stages)) = effect.params.get("stages") {
         if has_spectramatte(effect) {
             let Some((rgb, motion)) = spectramatte_motion(stages) else {
@@ -76,12 +111,11 @@ pub(super) fn prepare_chain(
                     "Ordered Corner Pin requires one static pin and one horizontal reflection");
                 return Ok(refused);
             };
-            if !full_span || !same_rate || !matched_hd_raster
-                || frame_ticks != model::ticks_per_unit(Fraction::new(24, 1))
+            if !full_span || !route.supports_corner_pin(rate, canvas)
                 || placement.video_track.is_none() || placement.speed.is_some() || placement.frame_map.is_some()
             {
                 loss(losses, &placement.id, "picture_effect",
-                    "Ordered Corner Pin requires a same-rate 1080p24 picture edit over the saved span");
+                    "Ordered Corner Pin requires a supported same-rate picture edit with matching verified geometry over the saved span");
                 return Ok(refused);
             }
             return Ok((None, Some(native), [false; 2]));
@@ -95,10 +129,16 @@ pub(super) fn prepare_chain(
         }
         Err(err) => return Err(error(format!("{err} at {}", placement.id))),
     };
-    if !full_span || !same_rate || !matched_hd_raster
+    let supported_geometry = matched_hd_raster && chain.motion.as_ref().is_none_or(|motion|
+        supports_motion_clock(motion.kind, fraction(rate)))
+        || geometry == ChainGeometry::MatchedLinked
+        && chain.motion.as_ref().is_none_or(|motion|
+            motion.is_static() || geometry.supports_linked_motion(motion.kind, fraction(rate)));
+    if !full_span || !same_rate || !supported_geometry
         || placement.video_track.is_none() || placement.speed.is_some() || placement.frame_map.is_some()
     {
-        loss(losses, &placement.id, "picture_effect", "Ordered picture chains require a same-rate 1920x1080 edit over the saved span");
+        loss(losses, &placement.id, "picture_effect",
+            "Ordered picture chains require a same-rate edit over the saved span and matching 1080p geometry or a verified linked raster for supported stages");
         return Ok(refused);
     }
     let flip = chain.before.then(chain.after);
@@ -282,7 +322,6 @@ pub(super) fn prepare(
         );
         return Ok(None);
     }
-    use prproj::convert::prepared::WarpRollInterpolation;
     let roll_interpolation = match kind {
         "avid.warp_roll_linear" => Some(WarpRollInterpolation::Linear),
         "avid.warp_roll_shelf" => Some(WarpRollInterpolation::Hold),
@@ -316,8 +355,8 @@ pub(super) fn prepare(
         }
         return Ok(Some(PictureEffect::WarpRoll { keys, interpolation }));
     }
-    let trimmed_crop = matches!(kind, "avid.warp_trim_crop_linear" | "avid.resize_trim_crop_linear");
-    if trimmed_crop || matches!(kind, "avid.warp_trim_linear" | "avid.resize_trim_linear") {
+    let trimmed_crop = is_trimmed_crop(kind);
+    if is_trimmed_motion(kind) {
         let Some(Value::Arr(motion)) = key(params, "motion") else { return Err(malformed()); };
         let Some(Value::Arr(width)) = key(params, "width") else { return Err(malformed()); };
         let ([a, b, c], [d, e, f]) = (motion.as_slice(), width.as_slice()) else { return Err(malformed()); };
@@ -375,7 +414,7 @@ pub(super) fn prepare(
         return Err(malformed());
     };
     let source_in = ticks(placement.source_in, "Motion media in")?;
-    let keyed_crop = matches!(kind, "avid.resize_crop_linear" | "avid.warp_crop_linear");
+    let keyed_crop = is_keyed_crop(kind);
     let read = |v: &Value| -> R<MotionKey> {
         let frame = key(v, "frame")
             .and_then(integer)

@@ -3381,6 +3381,24 @@ fn finish_source(
         } else {
             [None, None]
         };
+        let filler_scope = |owner: Option<&str>| {
+            let owner = owner?;
+            capture.scopes.iter().find(|scope| scope.id == owner)
+                .filter(|scope| scope.class == *b"FILL" && scope.group_path
+                    && scope.position_known && scope.rate == t.rate)
+        };
+        let outgoing_filler = if matches!((t.kind, t.effect.as_deref()),
+            (KIND_SOUND, Some("BLEND_AUDIO_DISSOLVE"))
+                | (KIND_PICTURE, Some("EFF2_BLEND_DISSOLVE" | "EFF2_BLEND_DISSOLVE_LOG" | "EFF2_BLEND_DISSOLVE_LIN")))
+            && matches!(t.cutpoint, Observed::Known(0)) && t.rate.is_some()
+        {
+            filler_scope(t.outgoing.as_deref()).filter(|scope| !scope.retimed)
+                .and_then(|scope| scope.record_length).filter(|&n| n > 0)
+        } else {
+            None
+        };
+        let incoming_filler = filler_scope(t.incoming.as_deref())
+            .and_then(|scope| scope.record_length).filter(|&n| n > 0);
         transitions.push(SourceTransition {
             id: t.id,
             kind: t.kind,
@@ -3392,11 +3410,8 @@ fn finish_source(
             effect: t.effect,
             audio_curve_attribute: t.audio_curve_attribute,
             audio_curve_parameter: t.audio_curve_parameter,
-            incoming_filler: t.incoming.as_deref().and_then(|owner| {
-                capture.scopes.iter().find(|scope| scope.id == owner)
-            }).filter(|scope| scope.class == *b"FILL" && scope.group_path
-                && scope.position_known && scope.rate == t.rate)
-                .and_then(|scope| scope.record_length).filter(|&n| n > 0),
+            outgoing_filler,
+            incoming_filler,
             gain_gap_edges,
             outgoing: binding(
                 t.outgoing.as_deref(),

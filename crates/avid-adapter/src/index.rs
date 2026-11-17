@@ -11,6 +11,29 @@ pub struct MediaIndex {
     pub unreadable: Vec<(PathBuf, String)>,
     pub files_scanned: usize,
 }
+
+#[derive(Default)]
+pub(crate) struct PackageConflict<'a> {
+    count: usize,
+    paths: Vec<&'a Path>,
+}
+
+impl PackageConflict<'_> {
+    pub(crate) fn detail(&self, package: &str) -> Option<String> {
+        if self.count < 2 {
+            return None;
+        }
+        let paths = self.paths.iter().map(|path| path.display().to_string())
+            .collect::<Vec<_>>().join(" · ");
+        Some(format!(
+            "Files claiming MXF package {package} · {} of {} indexed paths · {paths}",
+            self.paths.len(), self.count
+        ))
+    }
+}
+
+pub(crate) const REVIEW_DETAIL_BUDGET: usize = 1 << 20;
+
 impl MediaIndex {
     pub fn scan(roots: &[PathBuf], wanted: &HashSet<String>) -> Result<Self, String> {
         Self::scan_controlled(roots, wanted, &mut || Ok(()))
@@ -111,6 +134,62 @@ impl MediaIndex {
             .get(path)
             .ok_or_else(|| format!("missing retained MXF identity for {}", path.display()))
     }
+
+    /// Recover paths for selected duplicate packages from headers already in the index.
+    pub(crate) fn package_conflicts(
+        &self,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<HashMap<&str, PackageConflict<'_>>, String> {
+        const MAX_PATHS_PER_PACKAGE: usize = 8;
+        let mut conflicts = HashMap::<&str, PackageConflict<'_>>::new();
+        if self.ambiguous.is_empty() {
+            return Ok(conflicts);
+        }
+        for (path, identity) in &self.identities {
+            check()?;
+            let path = path.as_path();
+            for package in &identity.file_packages {
+                if self.ambiguous.binary_search(package).is_err() {
+                    continue;
+                }
+                let conflict = conflicts.entry(package).or_default();
+                conflict.count += 1;
+                let position = conflict.paths.partition_point(|other| *other < path);
+                if position < MAX_PATHS_PER_PACKAGE {
+                    if conflict.paths.len() == MAX_PATHS_PER_PACKAGE {
+                        conflict.paths.pop();
+                    }
+                    conflict.paths.insert(position, path);
+                }
+            }
+        }
+        Ok(conflicts)
+    }
+
+    pub(crate) fn package_conflict_details(
+        &self,
+        wanted: &HashSet<String>,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Vec<String>, String> {
+        let conflicts = self.package_conflicts(check)?;
+        let mut details = Vec::new();
+        let mut bytes = 0;
+        for package in &self.ambiguous {
+            if !wanted.contains(package) {
+                continue;
+            }
+            let Some(detail) = conflicts.get(package.as_str()).and_then(|c| c.detail(package)) else {
+                continue;
+            };
+            bytes += detail.capacity() + std::mem::size_of::<String>();
+            if bytes > REVIEW_DETAIL_BUDGET {
+                details.push("Additional MXF package paths reached the diagnostic size limit.".into());
+                break;
+            }
+            details.push(detail);
+        }
+        Ok(details)
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +233,27 @@ mod tests {
         assert_eq!(index.ambiguous, vec!["BB".repeat(32)]);
         assert!(index.files.is_empty());
         assert!(index.identities.is_empty());
+        assert!(index.package_conflicts(&mut || Ok(())).unwrap().is_empty());
+
+        for n in 1..=8 {
+            std::fs::write(root.join(format!("{n:02}.mxf")), &bytes).unwrap();
+        }
+        let wanted = HashSet::from(["BB".repeat(32)]);
+        let index = MediaIndex::scan(&[root.clone(), root.clone()], &wanted).unwrap();
+        assert_eq!(index.files_scanned, 10);
+        assert!(index.files.is_empty());
+        let conflicts = index.package_conflicts(&mut || Ok(())).unwrap();
+        let evidence = &conflicts["BB".repeat(32).as_str()];
+        assert_eq!(evidence.count, 10);
+        assert_eq!(evidence.paths.len(), 8);
+        for (offset, path) in evidence.paths.iter().enumerate() {
+            assert_eq!(path.file_name().unwrap().to_str().unwrap(), format!("{:02}.mxf", offset + 1));
+        }
+        let details = index.package_conflict_details(&wanted, &mut || Ok(())).unwrap();
+        assert_eq!(details.len(), 1);
+        assert!(details[0].contains("8 of 10 indexed paths"));
+        assert!(!details[0].contains("one.mxf"));
+        assert!(index.package_conflict_details(&HashSet::new(), &mut || Ok(())).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

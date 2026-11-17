@@ -48,7 +48,31 @@ saved-path mappings, or choosing a new output. Preflight stops at the first
 blocking stage. Run it again after making a correction.
 If conversion can proceed with changes, Review shows the affected clips or
 sequences where known. Warnings and the **Full preflight report** can be expanded
-separately.
+separately. **Save preflight report** writes a new JSON file. After a successful
+preflight, it includes inventory notes and all findings, including those hidden
+by the current search or filters. You can convert from the same Review after
+saving. If preflight stops at a blocker, the report includes the blocker
+category, reason, and the details collected for that stage. If a saved path
+is missing, malformed, or ambiguous in **Rewrap to native clips**, Review
+checks the remaining saved original paths with the current mappings. It reports
+other locator problems without probing those files or preparing a project.
+When legacy MXF verification blocks Rewrap, Review uses the existing media
+index to report other absent or ambiguous package IDs on the affected clip
+and later clips. For duplicates, it shows up to eight conflicting file paths
+per package and the indexed count. The same path details are available for
+duplicate managed packages reported by the linked clip modes. An indexed
+package still needs stream verification.
+The linked clip modes can continue past duplicate packages outside the
+selected bins' saved dependencies when the dependency check is complete.
+Review records those duplicates as warnings and can still use a qualified
+omission or gap for a separate missing clip.
+For a legacy package problem, **Open media locations** takes you to the Avid
+media folders. For an unavailable linked original, **Open saved-path mappings**
+takes you to the original's path mappings. The report flags any diagnostic
+size limit reached. Reports can contain local paths and clip names.
+For a longer blocker list, use **Search affected details** to find a bin,
+clip, or package ID. Review shows up to 25 matching details per page. **Copy
+details** and **Save preflight report** include the full list.
 When ready, **Convert** uses that prepared job, and **Check again** refreshes it.
 A prepared result belongs to one exact settings revision;
 changing a path, translation choice, tool or preset invalidates it. Conversion moves that

@@ -206,9 +206,30 @@ struct Routes {
     video: Option<Option<Rational>>,
     video_rate: Option<Rational>,
     video_raster: Option<(i64, i64)>,
+    explicit_linked_raster: bool,
     video_duration: Option<Rational>,
     audio: HashMap<i64, Option<Rational>>,
     first_audio: Option<i64>,
+}
+
+impl Routes {
+    fn supports_corner_pin(&self, rate: Rational, canvas: (i64, i64)) -> bool {
+        let picture = self.video_rate.map(fraction).zip(self.video_raster);
+        prproj::convert::prepared::CornerPin::supports_geometry(
+            fraction(rate), canvas, picture, self.explicit_linked_raster,
+        )
+    }
+
+    fn chain_geometry(&self, frame_size: (i64, i64)) -> picture::ChainGeometry {
+        if self.video_raster != Some(frame_size) {
+            return picture::ChainGeometry::Unverified;
+        }
+        match frame_size {
+            (1920, 1080) => picture::ChainGeometry::Hd,
+            _ if self.explicit_linked_raster => picture::ChainGeometry::MatchedLinked,
+            _ => picture::ChainGeometry::Unverified,
+        }
+    }
 }
 type Sidecars<'a> = HashMap<(&'a str, &'a str), &'a Value>;
 type NativeMarkers<'a> = HashMap<(&'a str, usize), &'a Value>;
@@ -1097,6 +1118,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
     let mut direct_dnxhd_pcm24 = HashSet::new();
     let mut same_rate_aac_views = HashMap::new();
     let mut pcm_movie_mono_views = HashMap::new();
+    let mut explicit_linked_items = HashSet::new();
     let mut mono_view_ids = Vec::new();
     let mut group_cameras = HashMap::new();
     let media_counts: HashMap<_, _> = g.items.iter()
@@ -1495,7 +1517,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             }
             let view = if same_rate_aac_channels != 0 && items_used_for_sequence_audio.contains(item.id.as_str()) {
                 Some(&mut same_rate_aac_views)
-            } else if (c.is_wide_avc_pcm24_mov() || c.is_uhd_avc_pcm_mp4() || c.is_same_rate_linked_pcm())
+            } else if c.is_same_rate_linked_pcm()
                 && c.groups.iter().any(|g| g.len() == 2)
                 && items_used_for_mono_audio.contains(item.id.as_str())
             {
@@ -1517,6 +1539,11 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 view.insert(item.id.as_str(), mono.metadata.id.clone());
                 mono_view_ids.push(mono.metadata.id.clone());
                 clips.push(PreparedClip::Original(mono));
+            }
+            if c.video.as_ref().is_some_and(|v| (v.width, v.height) != (1920, 1080))
+                && c.supports_explicit_linked_raster()
+            {
+                explicit_linked_items.insert(item.id.as_str());
             }
             clips.push(PreparedClip::Original(c));
         } else {
@@ -1547,6 +1574,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             video: None,
             video_rate: None,
             video_raster: None,
+            explicit_linked_raster: explicit_linked_items.contains(item.id.as_str()),
             video_duration: None,
             audio: HashMap::new(),
             first_audio: None,
@@ -2010,13 +2038,28 @@ fn qualified_sequence_start(s: &SourceSequence) -> Option<Rational> {
         .flatten()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FillerSide {
+    Outgoing,
+    Incoming,
+}
+
+struct FillerReceipt<'a> {
+    effect: &'a str,
+    kind: StreamKind,
+    outgoing: Option<i64>,
+    incoming: Option<i64>,
+    same_rate: bool,
+}
+
 fn unoccupied_transition(
     s: &SourceSequence, t: &graph::source::SourceTransition, omitted: &HashSet<&str>,
+    filler: Option<(&str, FillerSide)>,
 ) -> R<bool> {
     let start = t.cut.checked_sub(t.cut_offset).ok_or_else(|| error("transition start overflow"))?;
     let end = add(start, t.duration)?;
     for p in s.placements.iter().chain(&s.disabled_placements) {
-        if omitted.contains(p.item.as_str()) {
+        if omitted.contains(p.item.as_str()) || filler.is_some_and(|(id, _)| id == p.id) {
             continue;
         }
         let same_lane = match t.kind {
@@ -2024,8 +2067,57 @@ fn unoccupied_transition(
             StreamKind::Audio => p.audio_tracks.contains(&t.track)
                 || p.grouped_audio.iter().any(|audio| audio.track == t.track),
         };
-        if same_lane && p.record_start < end && add(p.record_start, p.duration)? > start {
-            return Ok(false);
+        if same_lane {
+            let filler_side = filler.map(|(_, side)| side);
+            if p.record_start < end {
+                let last = add(p.record_start, p.duration)?;
+                if last > start || (last == start && filler_side == Some(FillerSide::Outgoing)) {
+                    return Ok(false);
+                }
+            } else if p.record_start == end && filler_side == Some(FillerSide::Incoming) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn isolated_filler_cut(
+    s: &SourceSequence,
+    t: &graph::source::SourceTransition,
+    survivor: &Placement,
+    filler: &graph::source::SourceBinding,
+    side: FillerSide,
+    omitted: &HashSet<&str>,
+) -> R<bool> {
+    let start = sub(t.cut, t.cut_offset)?;
+    let end = add(start, t.duration)?;
+    let on_lane = match t.kind {
+        StreamKind::Video => survivor.video_track == Some(t.track)
+            && survivor.audio_tracks.is_empty() && survivor.grouped_audio.is_empty(),
+        StreamKind::Audio => survivor.video_track.is_none()
+            && ((survivor.audio_tracks == [t.track] && survivor.grouped_audio.is_empty())
+                || (survivor.audio_tracks.is_empty()
+                    && matches!(survivor.grouped_audio.as_slice(), [group] if group.track == t.track))),
+    };
+    if !on_lane || survivor.duration < t.duration
+        || [start, end].iter().any(|time| time.to_units(s.rate.num())
+            .is_none_or(|units| units % s.rate.den() != 0))
+        || filler.reason.as_deref() != Some("native owner produced no source placements")
+        || !unoccupied_transition(s, t, omitted, Some((&survivor.id, side)))?
+    {
+        return Ok(false);
+    }
+    for other in &s.transitions {
+        if other.id != t.id && other.kind == t.kind && other.track == t.track {
+            let begin = sub(other.cut, other.cut_offset)?;
+            let last = add(begin, other.duration)?;
+            if (begin < end && last > start)
+                || (side == FillerSide::Outgoing && last == start)
+                || (side == FillerSide::Incoming && begin == end)
+            {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -2061,7 +2153,7 @@ fn prepare_sequence(
     };
     let source_gain = gain::SourceGain::new(facts, s, frame_size, source_gain_clips);
     let mut linear_audio = HashSet::new();
-    let mut incoming_fillers = HashMap::new();
+    let mut filler_edges = HashMap::new();
     let mut gain_gap_edges = HashMap::new();
     if let Some(raw) =
         side(&facts.sidecars, "avid.source", &s.id).and_then(|v| key(v, "native_transitions"))
@@ -2074,6 +2166,7 @@ fn prepare_sequence(
         };
         let qualified: HashSet<_> = s.transitions.iter().map(|t| t.id.as_str()).collect();
         let mut receipt_ids = HashSet::new();
+        let sequence_rate = s.rate.to_string();
         for transition in native {
             let id = key(transition, "id").and_then(str_value).ok_or_else(|| {
                 error(format!(
@@ -2090,14 +2183,24 @@ fn prepare_sequence(
             if let Some(edges) = key(transition, "gain_gap_edges") {
                 gain_gap_edges.insert(id, edges);
             }
-            if key(transition, "effect").and_then(str_value) == Some("BLEND_AUDIO_DISSOLVE")
-                && key(transition, "audio_curve_attribute").and_then(integer) == Some(0)
-                && key(transition, "audio_curve_parameter").and_then(integer) == Some(0)
-            {
+            let (effect, kind) = match key(transition, "effect").and_then(str_value) {
+                Some(effect @ "BLEND_AUDIO_DISSOLVE") => (effect, StreamKind::Audio),
+                Some(effect @ ("EFF2_BLEND_DISSOLVE" | "EFF2_BLEND_DISSOLVE_LOG" | "EFF2_BLEND_DISSOLVE_LIN")) =>
+                    (effect, StreamKind::Video),
+                _ => continue,
+            };
+            let attribute = key(transition, "audio_curve_attribute").and_then(integer);
+            let parameter = key(transition, "audio_curve_parameter").and_then(integer);
+            if kind == StreamKind::Audio && attribute == Some(0) && parameter == Some(0) {
                 linear_audio.insert(id);
-                if let Some(frames) = key(transition, "incoming_filler_frames").and_then(integer) {
-                    incoming_fillers.insert(id, frames);
-                }
+            }
+            let outgoing = key(transition, "outgoing_filler_frames").and_then(integer);
+            let incoming = key(transition, "incoming_filler_frames").and_then(integer);
+            if (outgoing.is_some() || incoming.is_some())
+                && attribute.zip(parameter).is_none_or(|(a, b)| a == b)
+            {
+                let same_rate = key(transition, "rate").and_then(str_value) == Some(sequence_rate.as_str());
+                filler_edges.insert(id, FillerReceipt { effect, kind, outgoing, incoming, same_rate });
             }
         }
     }
@@ -2125,7 +2228,7 @@ fn prepare_sequence(
             .all(|id| facts.omitted_offline_items.contains(placements[id.as_str()].item.as_str()));
         if best_effort && t.style.starts_with("avid.")
             && all_endpoints_omitted
-            && unoccupied_transition(s, t, &facts.omitted_offline_items)?
+            && unoccupied_transition(s, t, &facts.omitted_offline_items, None)?
         {
             let lane = if t.kind == StreamKind::Video { "V" } else { "A" };
             loss(losses, &t.id, "transition_omitted", format!(
@@ -2140,24 +2243,50 @@ fn prepare_sequence(
                     s.name, t.track, t.cut));
             continue;
         }
-        if let Some(&frames) = incoming_fillers.get(t.id.as_str()) {
-            if t.kind == StreamKind::Audio && t.style == "avid.BLEND_AUDIO_DISSOLVE"
-                && s.rate == Rational::new(24_000, 1001).unwrap()
-                && t.cut_offset == t.duration && frames > 0
-                && Rational::new(i128::from(frames) * 1001, 24_000)
-                    .is_some_and(|extent| extent >= t.duration)
-                && t.incoming.placements.is_empty() && t.outgoing.reason.is_none()
-            {
-                if let [out] = t.outgoing.placements.as_slice() {
-                    let p = placements[out.as_str()];
-                    if stereo_fade_sources.contains(p.item.as_str())
+        if let Some(saved) = filler_edges.get(t.id.as_str())
+            .filter(|saved| t.kind == saved.kind && t.style.strip_prefix("avid.") == Some(saved.effect))
+        {
+            let filler = match (saved.outgoing, saved.incoming) {
+                (Some(frames), None) if t.cut_offset == Rational::ZERO =>
+                    Some((FillerSide::Outgoing, &t.outgoing, &t.incoming, frames)),
+                (None, Some(frames)) if t.cut_offset == t.duration =>
+                    Some((FillerSide::Incoming, &t.incoming, &t.outgoing, frames)),
+                _ => None,
+            };
+            if let Some((side, filler, survivor, _)) = filler.filter(|(_, filler, survivor, frames)| {
+                *frames > 0 && filler.placements.is_empty() && survivor.reason.is_none()
+                    && Rational::new(i128::from(*frames) * i128::from(s.rate.den()), i128::from(s.rate.num()))
+                        .is_some_and(|extent| extent >= t.duration)
+            }) {
+                if let [id] = survivor.placements.as_slice() {
+                    let p = placements[id.as_str()];
+                    let at_cut = match side {
+                        FillerSide::Outgoing => p.record_start == t.cut,
+                        FillerSide::Incoming => add(p.record_start, p.duration)? == t.cut,
+                    };
+                    if t.kind == StreamKind::Audio && side == FillerSide::Incoming
+                        && linear_audio.contains(t.id.as_str())
+                        && s.rate == Rational::new(24_000, 1001).unwrap()
+                        && stereo_fade_sources.contains(p.item.as_str())
                         && matches!(p.grouped_audio.as_slice(), [st] if st.track == t.track
                             && st.streams == [1, 2] && st.pans.iter().all(Option::is_none))
                         && p.audio_tracks.is_empty() && p.video_track.is_none()
                         && p.speed.is_none() && p.frame_map.is_none() && p.duration >= t.duration
-                        && add(p.record_start, p.duration)? == t.cut
+                        && at_cut
                     {
-                        stereo_tail_fades.push((t, out.as_str()));
+                        stereo_tail_fades.push((t, id.as_str()));
+                        continue;
+                    }
+                    if best_effort && at_cut && saved.same_rate
+                        && isolated_filler_cut(s, t, p, filler, side, &facts.omitted_offline_items)?
+                    {
+                        let action = match side {
+                            FillerSide::Outgoing => "omitted the fade from saved filler and kept the incoming edit at its saved cut.",
+                            FillerSide::Incoming => "omitted the fade into saved filler and kept the outgoing edit through its saved cut.",
+                        };
+                        let lane = if t.kind == StreamKind::Video { "V" } else { "A" };
+                        loss(losses, &t.id, "transition_cut", format!(
+                            "{} · {lane}{} at {} seconds: {action}", s.name, t.track, t.cut));
                         continue;
                     }
                 }
@@ -2461,11 +2590,10 @@ fn prepare_sequence(
                         .ok_or_else(|| error(format!("invalid Corner Pin points or source crop for {}", p.id)))?;
                     if p.video_track.is_none() || p.effects.len() != 1 || p.transform.is_some()
                         || p.speed.is_some() || p.frame_map.is_some()
-                        || Some(s.rate) != Rational::new(24, 1) || route.video_rate != Some(s.rate)
-                        || route.video_raster != Some((1920, 1080)) || frame_size != (1920, 1080)
+                        || !route.supports_corner_pin(s.rate, frame_size)
                     {
                         loss(losses, &p.id, "picture_effect",
-                            "Corner Pin needs an isolated 1080p24 picture edit");
+                            "Corner Pin needs an isolated same-rate picture edit with matching verified geometry at a supported clock");
                     } else {
                         picture = Some(prproj::convert::prepared::PictureEffect::CornerPin(pin));
                     }
@@ -2476,10 +2604,8 @@ fn prepare_sequence(
                     }
                     must_key = picture::has_spectramatte(e);
                     let full_span = tr.start == p.record_start && tr.end == add(p.record_start, p.duration)?;
-                    let same_rate = route.video_rate == Some(s.rate);
                     (chain_transform, picture, reflection_before_motion) = picture::prepare_chain(
-                        p, e, full_span, same_rate, unit, route.video_duration,
-                        route.video_raster == Some((1920, 1080)) && frame_size == (1920, 1080), losses,
+                        p, e, full_span, s.rate, frame_size, route, losses,
                     )?;
                 }
                 "avid.color_correction" if cc.is_none() => {
@@ -2546,11 +2672,11 @@ fn prepare_sequence(
                 }
                 "avid.warp_roll_linear" | "avid.warp_roll_shelf"
                 | "avid.warp_roll_bezier" | "avid.warp_roll_spline" if picture.is_none() => {
-                    if p.effects.len() != 1 || route.video_raster != Some((1920, 1080))
-                        || frame_size != (1920, 1080) || s.rate != Rational::integer(24)
+                    if p.effects.len() != 1 || route.chain_geometry(frame_size) == picture::ChainGeometry::Unverified
+                        || !prproj::convert::prepared::supports_picture_motion_clock(fraction(s.rate))
                     {
                         loss(losses, &p.id, "picture_effect",
-                            "Animated Warp Rotation requires one isolated 1080p24 effect");
+                            "Animated Warp Rotation requires one isolated edit on a supported clock with matching 1080p or verified linked geometry");
                         continue;
                     }
                     let full_span = tr.start == p.record_start && tr.end == add(p.record_start, p.duration)?;
@@ -2560,17 +2686,19 @@ fn prepare_sequence(
                 "avid.resize_linear" | "avid.warp_linear"
                 | "avid.resize_crop_linear" | "avid.warp_crop_linear" | "avid.warp_trim_linear"
                 | "avid.resize_trim_linear" | "avid.resize_trim_crop_linear" | "avid.warp_trim_crop_linear" if picture.is_none() => {
-                    let keyed_crop = matches!(e.kind.as_str(), "avid.resize_crop_linear" | "avid.warp_crop_linear");
-                    let trimmed = matches!(e.kind.as_str(), "avid.warp_trim_linear" | "avid.resize_trim_linear"
-                        | "avid.warp_trim_crop_linear" | "avid.resize_trim_crop_linear");
-                    let needs_geometry = keyed_crop || trimmed || e.kind == "avid.warp_linear";
-                    replace_transform |= needs_geometry;
-                    if needs_geometry && frame_size != (1920, 1080) {
-                        loss(losses, &p.id, "picture_effect", "Animated crop, Warp, or trimmed Resize requires a 1920x1080 destination sequence");
+                    let keyed_crop = picture::is_keyed_crop(&e.kind);
+                    let trimmed = picture::is_trimmed_motion(&e.kind);
+                    let non_hd = frame_size != (1920, 1080)
+                        || route.video_raster.is_some_and(|raster| raster != (1920, 1080));
+                    replace_transform |= keyed_crop || trimmed || e.kind == "avid.warp_linear" || non_hd;
+                    if non_hd && !route.chain_geometry(frame_size).supports_linked_motion(&e.kind, fraction(s.rate)) {
+                        loss(losses, &p.id, "picture_effect",
+                            "Linear Motion outside 1080p needs matching verified linked geometry and a supported key clock");
                         continue;
                     }
-                    if (keyed_crop || trimmed) && Some(s.rate) != Rational::new(24_000, 1001) {
-                        loss(losses, &p.id, "picture_effect", "Animated crop or trimmed motion requires a 23.976 destination sequence");
+                    if !picture::supports_motion_clock(&e.kind, fraction(s.rate)) {
+                        loss(losses, &p.id, "picture_effect",
+                            "Animated crop or trimmed Linear Motion requires a supported destination sequence clock");
                         continue;
                     }
                     let full_span = tr.start == p.record_start && tr.end == add(p.record_start, p.duration)?;

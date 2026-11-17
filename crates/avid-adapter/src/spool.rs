@@ -74,12 +74,16 @@ impl ReceiptSpool {
             let read_keys: &[&str] = match key.as_str() {
                 "marker_native" => &["graph_index", "created"],
                 "native_transitions" => &["id", "effect", "audio_curve_attribute", "audio_curve_parameter",
-                    "incoming_filler_frames", "gain_gap_edges"],
+                    "outgoing_filler_frames", "incoming_filler_frames", "gain_gap_edges"],
                 _ => continue,
             };
             for row in rows {
                 if let Value::Obj(fields) = row {
-                    fields.retain(|(key, _)| read_keys.contains(&key.as_str()));
+                    let has_filler = key == "native_transitions"
+                        && fields.iter().any(|(key, _)|
+                            matches!(key.as_str(), "outgoing_filler_frames" | "incoming_filler_frames"));
+                    fields.retain(|(key, _)| read_keys.contains(&key.as_str())
+                        || (has_filler && key == "rate"));
                     fields.shrink_to_fit();
                 }
             }

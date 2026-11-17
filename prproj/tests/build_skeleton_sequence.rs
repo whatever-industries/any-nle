@@ -81,6 +81,17 @@ fn wide_linked_original_preset_writes_exact_raster_and_clock() {
 }
 
 #[test]
+fn explicit_linked_original_format_keeps_the_raster_and_fractional_clock() {
+    let mut tree = Tree::new();
+    let mut ids = SeededUuids::new(SEED);
+    let root = build_sequence(&mut tree, "Linked", "anynle-linked/8475667200/1600/900/103", None, None, &mut ids).unwrap();
+    let xml = String::from_utf8(serialize_element(&tree, root).unwrap()).unwrap();
+    assert!(xml.contains("<FrameRect>0,0,1600,900</FrameRect>"));
+    assert!(xml.contains("<FrameRate>8475667200</FrameRate>"));
+    assert!(xml.contains("<MZ.Sequence.VideoTimeDisplayFormat>103</MZ.Sequence.VideoTimeDisplayFormat>"));
+}
+
+#[test]
 fn custom_name_pinned_uids_and_video_tracks() {
     let mut t = Tree::new();
     let mut ids = SeededUuids::new(SEED);

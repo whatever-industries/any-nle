@@ -491,6 +491,8 @@ pub struct SourceTransition {
     pub effect: Option<String>,
     pub audio_curve_attribute: Option<i64>,
     pub audio_curve_parameter: Option<i64>,
+    /// Direct outgoing filler span on a saved dissolve starting at the cut.
+    pub outgoing_filler: Option<i64>,
     /// Direct incoming filler span at the sequence rate.
     pub incoming_filler: Option<i64>,
     /// Saved adjacency used when a Gain endpoint has no portable edit.

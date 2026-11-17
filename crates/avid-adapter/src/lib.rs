@@ -56,6 +56,8 @@ pub struct ReadResult {
     pub diagnostics: Vec<String>,
     pub audio_group_issues: Vec<String>,
     pub scan_issues: Vec<String>,
+    /// Optional file-path evidence for Review. Kept out of graph and CLI diagnostics.
+    pub package_conflict_details: Vec<String>,
     /// Scan diagnostics for ambiguous native packages needed by the selected bin tracks.
     pub ambiguous_managed_packages: Vec<String>,
     pub missing_native_picture: bool,
@@ -79,22 +81,48 @@ impl ReadResult {
 /// text separate so a caller can select a recovery action without parsing it.
 pub enum SourceReadIssue {
     Bin(String),
-    OriginalLocator { message: String, bin: usize },
-    MissingOriginal { message: String, bin: usize },
+    OriginalLocator(OriginalLocatorIssue),
     OriginalMedia(String),
     MediaScan(String),
     SourceFacts(String),
+}
+
+/// A primary locator refusal and any subsequent path-only Review findings.
+pub struct OriginalLocatorIssue {
+    pub message: String,
+    pub bin: usize,
+    pub kind: OriginalLocatorKind,
+    pub additional: Vec<(usize, String)>,
+    pub details_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginalLocatorKind {
+    SavedPath,
+    MissingOriginal,
+    LegacyMxfPackage,
+}
+
+impl OriginalLocatorIssue {
+    fn new(kind: OriginalLocatorKind, message: String, bin: usize) -> Self {
+        Self {
+            message,
+            bin,
+            kind,
+            additional: Vec::new(),
+            details_truncated: false,
+        }
+    }
 }
 
 impl SourceReadIssue {
     pub fn into_message(self) -> String {
         match self {
             Self::Bin(message)
-            | Self::OriginalLocator { message, .. }
-            | Self::MissingOriginal { message, .. }
             | Self::OriginalMedia(message)
             | Self::MediaScan(message)
             | Self::SourceFacts(message) => message,
+            Self::OriginalLocator(issue) => issue.message,
         }
     }
 }
@@ -271,10 +299,11 @@ pub fn read_with_media_policy_spooled(
         let Some(reason) = references.as_ref().and_then(unused::References::incomplete) else {
             return issue;
         };
-        let explain = |message| format!("{message}\nSkip unused clips is unavailable for this selection: {reason}.");
         match issue {
-            SourceReadIssue::MissingOriginal { message, bin } => SourceReadIssue::MissingOriginal { message: explain(message), bin },
-            SourceReadIssue::OriginalLocator { message, bin } => SourceReadIssue::OriginalLocator { message: explain(message), bin },
+            SourceReadIssue::OriginalLocator(mut issue) => {
+                issue.message.push_str(&format!("\nSkip unused clips is unavailable for this selection: {reason}."));
+                SourceReadIssue::OriginalLocator(issue)
+            }
             other => other,
         }
     })?;
@@ -321,7 +350,9 @@ fn resolve_media_and_build(
         .collect();
     let index = index::MediaIndex::scan_controlled(media_roots, &wanted, check)
         .map_err(SourceReadIssue::MediaScan)?;
-    originals.resolve_legacy_mxf(facts, &index, options, check)?;
+    let selected_media = SelectedMediaIndex::new(facts, &originals, &index, check)
+        .map_err(SourceReadIssue::MediaScan)?;
+    originals.resolve_legacy_mxf(facts, &selected_media, options, check)?;
     if options.attach_avid_proxies {
         originals.select_avid_proxies(facts, options, &index, check)?;
     }
@@ -334,11 +365,11 @@ fn resolve_media_and_build(
     let graph = if receipt_spool.is_some() {
         validate_rates(facts).map_err(SourceReadIssue::SourceFacts)?;
         let sequences = std::mem::take(&mut facts.sequences);
-        build_working_graph(facts, sequences, &index, project, bin_names, &originals, &motion_mxf, receipt_spool, observe, check)
+        build_working_graph(facts, sequences, &selected_media, project, bin_names, &originals, &motion_mxf, receipt_spool, observe, check)
     } else {
-        build_working_graph(facts, &facts.sequences, &index, project, bin_names, &originals, &motion_mxf, None, observe, check)
+        build_working_graph(facts, &facts.sequences, &selected_media, project, bin_names, &originals, &motion_mxf, None, observe, check)
     };
-    graph
+    let mut read = graph
         .map_err(|error| {
             if originals.omitted_media.is_empty() {
                 return SourceReadIssue::SourceFacts(error);
@@ -353,7 +384,12 @@ fn resolve_media_and_build(
                 let _ = write!(message, "\n{:?} · {}: {}", source.master.name, source.id, reason);
             }
             SourceReadIssue::SourceFacts(message)
-        })
+        })?;
+    if options.collect_blocked_locators && !read.ambiguous_managed_packages.is_empty() {
+        read.package_conflict_details = index.package_conflict_details(&wanted, check)
+            .map_err(SourceReadIssue::MediaScan)?;
+    }
+    Ok(read)
 }
 
 /// Bounded entry point also permits byte-free synthetic source-fact tests.
@@ -484,6 +520,63 @@ fn verify_motion_mxf<'a>(
 
 type MediaOmissions<'a> = HashMap<MobId, Vec<(&'a av::SourceMaster, std::borrow::Cow<'a, str>)>>;
 
+struct SelectedMediaIndex<'a> {
+    index: &'a index::MediaIndex,
+    unreferenced_duplicates: HashSet<&'a str>,
+}
+
+impl<'a> SelectedMediaIndex<'a> {
+    fn new(
+        facts: &av::SourceProject,
+        originals: &original::OriginalIndex,
+        index: &'a index::MediaIndex,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let mut unreferenced_duplicates = HashSet::new();
+        let dependency_packages = originals.references.as_ref()
+            .filter(|_| originals.allow_media_gaps && !index.ambiguous.is_empty())
+            .and_then(unused::References::complete_target_packages);
+        if let Some(packages) = dependency_packages {
+            unreferenced_duplicates.extend(index.ambiguous.iter().map(String::as_str));
+            let saved_tracks = facts.masters.iter().flat_map(|source| &source.master.tracks)
+                .map(|track| track.file_mob);
+            let saved_masters = facts.masters.iter().flat_map(|source| [
+                source.pcm_prefix.map(|prefix| prefix.tail_package),
+                source.managed_multistream.as_ref().map(|managed| managed.file_package),
+            ].into_iter().flatten());
+            let saved_stills = facts.imported_stills.iter().map(|still| still.file_mob);
+            let saved_renders = facts.sequences.iter().flat_map(|sequence| &sequence.events)
+                .flat_map(|event| {
+                    let gain = event.audiosuite.as_deref();
+                    let eq = event.equalizer.as_ref().and_then(|eq| eq.render);
+                    [
+                        gain.map(|render| render.file),
+                        gain.map(|render| render.input_file),
+                        eq.map(|render| render.file),
+                        eq.map(|render| render.dry_file),
+                    ].into_iter().flatten()
+                });
+            let saved_routes = facts.sequences.iter().flat_map(|sequence| &sequence.unresolved)
+                .flat_map(|issue| issue.route.iter().map(|witness| witness.mob));
+            let saved = saved_tracks.chain(saved_masters).chain(saved_stills)
+                .chain(saved_renders).chain(saved_routes).map(|mob| mob.umid_hex());
+            for package in packages.chain(saved) {
+                check()?;
+                unreferenced_duplicates.remove(package.as_str());
+                if unreferenced_duplicates.is_empty() {
+                    break;
+                }
+            }
+        }
+        Ok(Self { index, unreferenced_duplicates })
+    }
+
+    fn permits_missing_media_fallbacks(&self) -> bool {
+        self.index.unreadable.is_empty()
+            && self.index.ambiguous.len() == self.unreferenced_duplicates.len()
+    }
+}
+
 fn build_selected(
     facts: &av::SourceProject,
     index: &index::MediaIndex,
@@ -492,13 +585,14 @@ fn build_selected(
     originals: &original::OriginalIndex,
     motion_mxf: &MotionMxf,
 ) -> Result<ReadResult, String> {
-    build_working_graph(facts, &facts.sequences, index, project, bin_names, originals, motion_mxf, None, &mut |_| Ok(()), &mut || Ok(()))
+    let selected_media = SelectedMediaIndex::new(facts, originals, index, &mut || Ok(()))?;
+    build_working_graph(facts, &facts.sequences, &selected_media, project, bin_names, originals, motion_mxf, None, &mut |_| Ok(()), &mut || Ok(()))
 }
 
 fn build_working_graph(
     facts: &av::SourceProject,
     sequences: impl IntoIterator<Item = impl std::borrow::Borrow<av::SourceSequence>, IntoIter: ExactSizeIterator>,
-    index: &index::MediaIndex,
+    selected_media: &SelectedMediaIndex<'_>,
     project: &str,
     bin_names: &[String],
     originals: &original::OriginalIndex,
@@ -507,6 +601,8 @@ fn build_working_graph(
     observe: &mut dyn FnMut(SourceProgress<'_>) -> Result<(), String>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<ReadResult, String> {
+    let index = selected_media.index;
+    let permits_missing_media_fallbacks = selected_media.permits_missing_media_fallbacks();
     validate_rates(facts)?;
     if facts.accounted_bytes > av::MAX_SOURCE_FACT_BYTES {
         return Err(format!(
@@ -574,6 +670,7 @@ fn build_working_graph(
             .collect(),
         audio_group_issues: vec![],
         scan_issues: vec![],
+        package_conflict_details: vec![],
         ambiguous_managed_packages: vec![],
         missing_native_picture: false,
         missing_managed_audio: vec![],
@@ -640,6 +737,12 @@ fn build_working_graph(
         }
         for uid in &index.ambiguous {
             let issue = format!("ambiguous MXF file package {uid}");
+            if selected_media.unreferenced_duplicates.contains(uid.as_str()) {
+                out.diagnostics.push(format!(
+                    "Duplicate MXF file package {uid} is outside the selected bins' saved references."
+                ));
+                continue;
+            }
             if required.contains(uid) {
                 out.ambiguous_managed_packages.push(issue.clone());
             }
@@ -703,7 +806,7 @@ fn build_working_graph(
                 let unavailable = matches!(e, MasterError::MissingPicture(_) | MasterError::Unavailable(_))
                     && source.imported_audio.is_none()
                     && (source.pcm_prefix.is_some() || source.originals.iter().all(Option::is_none))
-                    && index.ambiguous.is_empty() && index.unreadable.is_empty();
+                    && permits_missing_media_fallbacks;
                 let omit = unavailable && originals.references.as_ref().is_some_and(|refs| refs.can_omit(source));
                 let gap = unavailable && originals.allow_media_gaps && !omit;
                 let e = match e {

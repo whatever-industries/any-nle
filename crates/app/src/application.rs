@@ -382,6 +382,7 @@ fn read_avid_source(a: &Args, link_managed_op1a: bool) -> Result<AvidRead, Strin
                 proxy_rewrap_dir: a.proxy_rewrap_dir.clone(),
                 ffmpeg: tools.ffmpeg,
                 allow_media_gaps: link_dry_gain,
+                collect_blocked_locators: false,
             }, a.allow_offline_media, link_dry_gain, &mut |_, _| Ok(()), &mut || Ok(()),
         ).map_err(avid_adapter::SourceReadIssue::into_message)?
     } else {

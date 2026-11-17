@@ -2111,6 +2111,16 @@ mod tests {
         assert_eq!(pin.corners[0], [0.5 - 400.0 / 999.0; 2]);
         assert_eq!(pin.corners[2], [0.5 + 450.0 / 999.0, 0.5 + 300.0 / 999.0]);
         assert_eq!(pin.crop, [200.0 / 1998.0, 160.0 / 1998.0, 300.0 / 1998.0, 240.0 / 1998.0]);
+        for rate in [23.976, 25.0, 29.97, 50.0, 24.0] {
+            let Some(Object::Decoded(picture_node)) = &mut file.objects[picture as usize] else {
+                unreachable!()
+            };
+            picture_node.fields.iter_mut().find(|(key, _)| *key == "edit_rate").unwrap().1 = Value::Float(rate);
+            effect.fields.iter_mut().find(|(key, _)| *key == "edit_rate").unwrap().1 = Value::Float(rate);
+            let ctx = Ctx { file: &file, mobs: HashMap::new() };
+            let expected = (rate != 50.0).then_some(pin);
+            assert_eq!(picture_extension::static_projective_warp(&ctx, &effect), expected);
+        }
         let mut flip = node(*b"TKFX", "TrackEffect");
         flip.put("effect_id", Value::Str("EFF2_BLEND_FLIP_HORZ".into()));
         flip.put("length", Value::Int(10));

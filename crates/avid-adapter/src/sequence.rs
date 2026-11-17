@@ -1279,11 +1279,16 @@ pub(super) fn append(
                 && e.color.is_none() && e.animatte.is_none() && event.picture_extension.is_none()
                 && event.picture_chain.is_empty() && p.speed.is_none() && p.frame_map.is_none());
         if let Some(pin) = corner_pin {
-            if Some(range.record_rate) != av::Rate::new(24, 1) || range.source_rate != range.record_rate
-                || raster != Some((1920, 1080)) || !item_routes[index].square_pixels
+            if range.source_rate != range.record_rate
+                || pin.from_transform && Some(range.record_rate) != av::Rate::new(24, 1)
+                || !effects::pin_has_geometry(pin, raster, item_routes[index].square_pixels)
             {
-                loss(out, budget, &p.id, "picture_effect",
-                    "3D Warp Corner Pin requires verified square-pixel 1080p24 picture")?;
+                let reason = if pin.from_transform {
+                    "3D Warp Corner Pin requires verified square-pixel 24 fps picture. The camera projection requires 1920x1080."
+                } else {
+                    "3D Warp Corner Pin requires verified same-rate square-pixel picture."
+                };
+                loss(out, budget, &p.id, "picture_effect", reason)?;
             } else {
                 effects::apply_corner_pin(pin, &mut p, budget)?;
                 if pin.from_transform {
@@ -1302,7 +1307,8 @@ pub(super) fn append(
                 if e.picture_nested {
                     effect = av::PictureExtension::Unsupported("nested picture effects require separate qualification");
                 }
-                effects::apply_picture_extension(effect, raster, &mut p, out, budget)?;
+                effects::apply_picture_extension(effect, raster, item_routes[index].square_pixels,
+                    &mut p, out, budget)?;
             }
         } else {
             effects::apply_picture_chain(&event.picture_chain, raster,
@@ -1878,6 +1884,9 @@ pub(super) fn append(
                 ("outgoing", binding_receipt(&t.outgoing)),
                 ("incoming", binding_receipt(&t.incoming)),
             ];
+            if let Some(frames) = t.outgoing_filler {
+                fields.push(("outgoing_filler_frames", Value::Int(frames)));
+            }
             if let Some(frames) = t.incoming_filler {
                 fields.push(("incoming_filler_frames", Value::Int(frames)));
             }

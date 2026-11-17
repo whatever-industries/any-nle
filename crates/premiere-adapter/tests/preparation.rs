@@ -1576,6 +1576,96 @@ fn corner_pin_round_trips_points_and_rejects_crossed_corners() {
 }
 
 #[test]
+fn linked_corner_pin_keeps_points_and_checks_matching_raster() {
+    use prproj::convert::prepared::{CornerPin, PictureEffect};
+
+    let mut g = linked_avc_pcm_picture_fixture();
+    let corners = [[0.1, 0.2], [0.8, 0.1], [0.9, 0.8], [0.2, 0.9]];
+    let crop = [0.05, 0.1, 0.15, 0.2];
+    let params = v(vec![
+        ("target_corners_tl_tr_br_bl", Value::Arr(corners.map(|xy|
+            Value::Arr(xy.map(Value::Float).into())).into())),
+        ("source_crop_ltrb", Value::Arr(crop.map(Value::Float).into())),
+    ]);
+    let axes = graph::picture_chain::Reflection { horizontal: true, vertical: false }.effect();
+    let edit = &mut g.sequences[0].placements[0];
+    let id = edit.id.clone();
+    edit.effects = vec![graph::Effect {
+        kind: graph::picture_chain::KIND.into(),
+        params: v(vec![("stages", Value::Arr(vec![
+            v(vec![("kind", Value::Str("picture.corner_pin".into())), ("params", params)]),
+            v(vec![("kind", Value::Str(axes.kind)), ("params", axes.params)]),
+        ]))]),
+    }];
+
+    let mut prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    prepared.input.validate().unwrap();
+    let [effect] = prepared.input.picture_effects.as_slice() else { panic!("expected one pin with Flop") };
+    assert_eq!(effect.effect, PictureEffect::CornerPinWithFlop {
+        pin: CornerPin { corners, source_crop: crop }, flop_before_pin: false,
+    });
+
+    let mut picture_only = g.clone();
+    picture_only.sidecars.retain(|sidecar| !g.media.iter().any(|m|
+        m.kind == StreamKind::Audio && m.id == sidecar.object));
+    picture_only.media.retain(|m| m.kind == StreamKind::Video);
+    for item in &mut picture_only.items {
+        item.stream_groups.clear();
+        item.media.retain(|binding| picture_only.media.iter().any(|m| m.id == binding.media));
+    }
+    for sequence in &mut picture_only.sequences {
+        sequence.placements.retain(|p| p.video_track.is_some());
+        sequence.tracks.retain(|track| track.kind == StreamKind::Video);
+    }
+    let picture_only = premiere_adapter::prepare_originals(
+        &picture_only, &options(), ClockProfile::LegacyImport,
+    ).unwrap();
+    picture_only.input.validate().unwrap();
+    let [picture_pin] = picture_only.input.picture_effects.as_slice() else {
+        panic!("expected Corner Pin on picture-only linked AVC");
+    };
+    assert_eq!(picture_pin.effect, effect.effect);
+
+    let mut aac = g.clone();
+    for media in aac.media.iter_mut().filter(|m| m.kind == StreamKind::Audio) {
+        media.bits = None;
+        media.codec = Some("aac".into());
+        media.original.as_mut().unwrap().sample_representation = Some("aac".into());
+    }
+    let aac = premiere_adapter::prepare_originals(&aac, &options(), ClockProfile::LegacyImport).unwrap();
+    aac.input.validate().unwrap();
+    let [aac_pin] = aac.input.picture_effects.as_slice() else {
+        panic!("expected Corner Pin on linked AVC with AAC");
+    };
+    assert_eq!(aac_pin.effect, effect.effect);
+
+    let mut prores = g.clone();
+    for media in &mut prores.media {
+        media.locations = vec!["/Synthetic/source.mov".into()];
+        media.original.as_mut().unwrap().saved_locators = vec!["/Saved/source.mov".into()];
+        if media.kind == StreamKind::Video {
+            media.codec = Some("apch".into());
+        }
+    }
+    let prores = premiere_adapter::prepare_originals(
+        &prores, &options(), ClockProfile::LegacyImport,
+    ).unwrap();
+    prores.input.validate().unwrap();
+    let [prores_pin] = prores.input.picture_effects.as_slice() else {
+        panic!("expected Corner Pin on linked ProRes HQ");
+    };
+    assert_eq!(prores_pin.effect, effect.effect);
+
+    prepared.input.sequences[0].width = 1280;
+    assert!(prepared.input.validate().unwrap_err().to_string().contains("invalid static Corner Pin"));
+
+    g.sequences[0].frame_size = Some((1920, 1080));
+    let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(prepared.input.picture_effects.is_empty());
+    assert!(prepared.losses.iter().any(|loss| loss.object == id && loss.aspect == "picture_effect"));
+}
+
+#[test]
 fn picture_effects_follow_the_bound_video_edit_and_its_source_clock() {
     use prproj::convert::prepared::PictureEffect;
     let mut g = fixture();
@@ -1673,6 +1763,125 @@ fn ordered_picture_chain_projects_reflection_on_the_correct_side_of_motion() {
     assert!(prepared.losses.iter().any(|l| l.object == id && l.reason.contains("more than one Motion")));
     let (seq, event) = prepared.ownership[&id];
     assert!(prepared.model.sequences[seq].events[event].transform.is_none());
+}
+
+fn linked_avc_pcm_picture_fixture() -> SourceGraph {
+    let mut g = original_fixture();
+    for media in &mut g.media {
+        if media.kind == StreamKind::Video {
+            media.frame_size = Some((1440, 1080));
+        } else {
+            media.bits = Some(24);
+            media.codec = Some("pcm_s24le".into());
+            media.original.as_mut().unwrap().sample_representation = Some("pcm24".into());
+        }
+    }
+    g.sequences[0].frame_size = Some((1440, 1080));
+    g
+}
+
+#[test]
+fn static_picture_chain_requires_a_matching_raster_for_linked_avc_pcm() {
+    use prproj::convert::prepared::PictureEffect;
+
+    let mut g = linked_avc_pcm_picture_fixture();
+    let edit = g.sequences[0].placements.iter_mut().find(|p| p.video_track.is_some()).unwrap();
+    let axes = graph::picture_chain::Reflection { horizontal: true, vertical: false }.effect();
+    edit.effects = vec![graph::Effect {
+        kind: graph::picture_chain::KIND.into(),
+        params: v(vec![("stages", Value::Arr(vec![
+            v(vec![
+                ("kind", Value::Str("avid.warp_static".into())),
+                ("params", v(vec![])),
+                ("transform", v(vec![
+                    ("position", Value::Arr(vec![Value::Float(0.1), Value::Float(0.0)])),
+                    ("scale", Value::Arr(vec![Value::Float(80.0), Value::Float(90.0)])),
+                    ("anchor", Value::Arr(vec![Value::Float(0.0); 2])),
+                    ("rotation", Value::Float(0.0)),
+                    ("crop", Value::Arr([0.1, 0.0, 0.2, 0.0].map(Value::Float).into())),
+                ])),
+            ]),
+            v(vec![("kind", Value::Str(axes.kind)), ("params", axes.params)]),
+        ]))]),
+    }];
+    let id = edit.id.clone();
+    let g_json = g.to_json_text().unwrap();
+    let mut g = SourceGraph::from_json_text(&g_json).unwrap();
+    let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let [effect] = prepared.input.picture_effects.as_slice() else { panic!("expected one chain") };
+    assert_eq!(effect.effect, PictureEffect::StaticMotion);
+    assert_eq!(effect.reflection_before_motion, [true, false]);
+    let transform = prepared.input.sequences[effect.sequence].events[effect.event].transform.as_ref().unwrap();
+    assert_eq!(transform.position, (-0.1, 0.0));
+    assert_eq!(transform.crop, [0.2, 0.0, 0.1, 0.0]);
+
+    g.sequences[0].frame_size = Some((1920, 1080));
+    let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(prepared.input.picture_effects.is_empty());
+    assert!(prepared.losses.iter().any(|loss| loss.object == id && loss.aspect == "picture_effect"));
+}
+
+#[test]
+fn wide_linear_motion_preserves_media_keys_and_reflection_order() {
+    use prproj::convert::prepared::PictureEffect;
+
+    let mut g = linked_avc_pcm_picture_fixture();
+    let edit = g.sequences[0].placements.iter_mut().find(|p| p.video_track.is_some()).unwrap();
+    let id = edit.id.clone();
+    let unit = prproj::convert::model::TICKS_PER_SECOND;
+    let start = edit.source_in.to_units(unit).unwrap();
+    let last = edit.duration.to_units(24).unwrap() - 1;
+    let pair = |x, y| Value::Arr([x, y].map(Value::Float).into());
+    let key = |frame, x, w| v(vec![
+        ("frame", Value::Int(frame)),
+        ("position", pair(x, 0.025)),
+        ("scale", pair(w, 100.0)),
+    ]);
+    let params = v(vec![("keys", Value::Arr(vec![key(0, -0.1, 80.0), key(last, 0.2, 90.0)]))]);
+    let axes = graph::picture_chain::Reflection { horizontal: true, vertical: false }.effect();
+    let chain = graph::Effect {
+        kind: graph::picture_chain::KIND.into(),
+        params: v(vec![("stages", Value::Arr(vec![
+            v(vec![
+                ("kind", Value::Str("avid.warp_linear".into())),
+                ("params", params.clone()),
+                ("transform", v(vec![
+                    ("position", pair(-0.1, 0.025)), ("scale", pair(80.0, 100.0)),
+                    ("anchor", pair(0.0, 0.0)), ("rotation", Value::Float(0.0)),
+                    ("crop", Value::Arr(vec![Value::Float(0.0); 4])),
+                ])),
+            ]),
+            v(vec![("kind", Value::Str(axes.kind)), ("params", axes.params)]),
+        ]))]),
+    };
+    edit.effects = vec![chain];
+    let raw = g.to_json_text().unwrap();
+    let mut g = SourceGraph::from_json_text(&raw).unwrap();
+    let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let [effect] = prepared.input.picture_effects.as_slice() else { panic!("expected one chain") };
+    let PictureEffect::Resize(keys) = effect.effect else { panic!("expected Linear Motion") };
+    assert_eq!(keys.map(|key| key.ticks), [start, start + last * (unit / 24)]);
+    assert_eq!(keys.map(|key| key.position), [[0.1, 0.025], [-0.2, 0.025]]);
+    assert_eq!(effect.reflection_before_motion, [true, false]);
+
+    let edit = g.sequences[0].placements.iter_mut().find(|p| p.id == id).unwrap();
+    edit.transform = Some(graph::Transform {
+        position: (-0.1, 0.025), scale: (80.0, 100.0),
+        anchor: (0.0, 0.0), rotation: 0.0, crop: [0.0; 4],
+    });
+    edit.effects = vec![graph::Effect { kind: "avid.resize_linear".into(), params }];
+    let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let [effect] = prepared.input.picture_effects.as_slice() else { panic!("expected single Motion") };
+    let PictureEffect::Resize(keys) = effect.effect else { panic!("expected Linear Motion") };
+    assert_eq!(keys.map(|key| key.ticks), [start, start + last * (unit / 24)]);
+    assert_eq!(keys.map(|key| key.position), [[-0.1, 0.025], [0.2, 0.025]]);
+
+    g.sequences[0].frame_size = Some((1920, 1080));
+    let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(prepared.input.picture_effects.is_empty());
+    assert!(prepared.losses.iter().any(|loss| loss.object == id && loss.aspect == "picture_effect"));
+    let (sequence, event) = prepared.ownership[&id];
+    assert!(prepared.input.sequences[sequence].events[event].transform.is_none());
 }
 
 #[test]
@@ -1793,10 +2002,118 @@ fn animated_crop_keeps_four_edges_on_the_source_frame_clock() {
     assert!(refused.model.sequences[0].events[0].transform.is_none());
 }
 
+fn linked_avc_pcm_picture_at_rate(num: i128, den: i128) -> SourceGraph {
+    let mut g = linked_avc_pcm_picture_fixture();
+    let rate = Q::new(num, den).unwrap();
+    let at_frame = |frame| Q::new(frame * den, num).unwrap();
+    for media in &mut g.media {
+        let original = media.original.as_mut().unwrap();
+        media.duration = at_frame(240);
+        if media.kind == StreamKind::Video {
+            media.rate = Some(rate);
+            original.time_base = at_frame(1);
+            original.duration_ts = 240;
+        } else {
+            original.duration_ts = media.duration.to_units(48_000).unwrap();
+        }
+    }
+    g.items[0].rate = Some(rate);
+    let sequence = &mut g.sequences[0];
+    sequence.rate = rate;
+    sequence.placements.retain(|p| p.video_track.is_some());
+    let p = &mut sequence.placements[0];
+    p.source_in = at_frame(6);
+    p.duration = at_frame(36);
+    p.transform = Some(graph::Transform {
+        position: (0.0, 0.0), scale: (100.0, 100.0),
+        rotation: 0.0, anchor: (0.0, 0.0), crop: [0.0; 4],
+    });
+    g
+}
+
 #[test]
-fn warp_interpolation_uses_the_exact_source_key_times() {
-    use prproj::convert::prepared::{PictureEffect, WarpRollInterpolation};
-    let mut g = fixture();
+fn animated_crop_checks_the_linked_raster_in_preparation_and_writer_validation() {
+    use prproj::convert::prepared::PictureEffect;
+
+    for (num, den) in [(24, 1), (24_000, 1001), (25, 1), (30_000, 1001)] {
+        let mut g = linked_avc_pcm_picture_at_rate(num, den);
+        let p = &mut g.sequences[0].placements[0];
+        let key = |frame, crop: [f64; 4]| v(vec![
+            ("frame", Value::Int(frame)),
+            ("position", Value::Arr(vec![Value::Int(0); 2])),
+            ("scale", Value::Arr(vec![Value::Int(100); 2])),
+            ("crop", Value::Arr(crop.map(Value::Float).into())),
+        ]);
+        let end = [0.1, 0.2, 0.3, 0.4];
+        p.effects = vec![graph::Effect {
+            kind: "avid.warp_crop_linear".into(),
+            params: v(vec![("keys", Value::Arr(vec![key(0, [0.0; 4]), key(35, end)]))]),
+        }];
+        let id = p.id.clone();
+        let mut prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+        prepared.input.validate().unwrap();
+        let [effect] = prepared.input.picture_effects.as_slice() else { panic!("expected one crop") };
+        let PictureEffect::Resize(keys) = effect.effect else { panic!("expected two Linear keys") };
+        let frame = prproj::convert::model::TICKS_PER_SECOND / num as i64 * den as i64;
+        assert_eq!(keys.map(|k| k.ticks), [6, 41].map(|n| n * frame));
+        assert_eq!(keys.map(|k| k.crop), [Some([0.0; 4]), Some(end)]);
+
+        prepared.input.sequences[0].width = 1280;
+        assert!(prepared.input.validate().unwrap_err().to_string().contains("invalid Linear Motion"));
+
+        g.sequences[0].frame_size = Some((1920, 1080));
+        let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+        assert!(prepared.input.picture_effects.is_empty());
+        assert!(prepared.losses.iter().any(|loss| loss.object == id && loss.aspect == "picture_effect"));
+    }
+}
+
+#[test]
+fn wide_trimmed_crop_keeps_independent_motion_and_crop_handles() {
+    use prproj::convert::prepared::PictureEffect;
+
+    let mut g = linked_avc_pcm_picture_at_rate(25, 1);
+    let edit = &mut g.sequences[0].placements[0];
+    let id = edit.id.clone();
+    let motion: Vec<_> = [0, 18, 35].into_iter().map(|frame| v(vec![
+        ("frame", Value::Int(frame)),
+        ("position", Value::Arr(vec![Value::Int(0); 2])),
+        ("height", Value::Int(100)),
+    ])).collect();
+    let width: Vec<_> = [0, 18, 44].into_iter().map(|frame|
+        Value::Arr(vec![Value::Int(frame), Value::Int(100)])).collect();
+    let params = |last| {
+        let crop = [0, 20, last].into_iter().zip([0.0, 0.04, 0.1]).map(|(frame, edge)| v(vec![
+            ("frame", Value::Int(frame)),
+            ("edges", Value::Arr(vec![Value::Float(edge); 4])),
+        ])).collect();
+        v(vec![("motion", Value::Arr(motion.clone())), ("width", Value::Arr(width.clone())),
+            ("fixed_width", Value::Bool(true)), ("crop", Value::Arr(crop))])
+    };
+    edit.effects = vec![graph::Effect { kind: "avid.warp_trim_crop_linear".into(), params: params(47) }];
+    let mut prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    prepared.input.validate().unwrap();
+    let [effect] = prepared.input.picture_effects.as_slice() else { panic!("expected a trimmed Warp") };
+    let PictureEffect::TrimmedWarp(trim) = effect.effect else { panic!("expected trimmed Warp") };
+    let frame = 10_160_640_000;
+    assert_eq!(trim.motion.map(|key| key.ticks), [6, 24, 41].map(|n| n * frame));
+    assert_eq!(trim.width.map(|key| key.0), [6, 24, 50].map(|n| n * frame));
+    assert_eq!(trim.crop.unwrap().map(|key| key.0), [6, 26, 53].map(|n| n * frame));
+    prepared.input.sequences[0].width = 1280;
+    assert!(prepared.input.validate().unwrap_err().to_string().contains("invalid trimmed Linear Motion"));
+
+    // The visible edit still fits when only the last crop key moves off media.
+    g.sequences[0].placements[0].effects[0].params = params(234);
+    let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(prepared.input.picture_effects.is_empty());
+    assert!(prepared.losses.iter().any(|loss| loss.object == id
+        && loss.reason.contains("qualified source-media handles")));
+    let (sequence, event) = prepared.ownership[&id];
+    assert_eq!(prepared.input.sequences[sequence].events[event].duration, 36 * frame);
+    assert!(prepared.input.sequences[sequence].events[event].transform.is_none());
+}
+
+fn warp_roll_fixture(mut g: SourceGraph) -> SourceGraph {
     let sequence = &mut g.sequences[0];
     sequence.placements.retain(|p| p.video_track.is_some());
     let p = &mut sequence.placements[0];
@@ -1815,6 +2132,13 @@ fn warp_interpolation_uses_the_exact_source_key_times() {
             key(12, -30.0 / 999.0, 80.0, -10.0),
         ]))]),
     }];
+    g
+}
+
+#[test]
+fn warp_interpolation_uses_the_exact_source_key_times() {
+    use prproj::convert::prepared::{PictureEffect, WarpRollInterpolation};
+    let mut g = warp_roll_fixture(fixture());
     let reopened = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
     let prepared = prepare(&reopened, &options(), ClockProfile::LegacyImport).unwrap();
     let [picture] = prepared.picture_effects.as_slice() else { panic!("expected one Warp") };
@@ -1829,6 +2153,61 @@ fn warp_interpolation_uses_the_exact_source_key_times() {
         g.sequences[0].placements[0].effects[0].kind = kind.into();
         let prepared = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
         assert_eq!(prepared.picture_effects[0].effect, PictureEffect::WarpRoll { keys, interpolation });
+    }
+}
+
+#[test]
+fn linked_warp_roll_requires_matching_picture_geometry() {
+    use prproj::convert::prepared::{PictureEffect, WarpRollInterpolation};
+
+    let mut g = warp_roll_fixture(linked_avc_pcm_picture_fixture());
+    let id = g.sequences[0].placements[0].id.clone();
+    let mut prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    prepared.input.validate().unwrap();
+    let [effect] = prepared.input.picture_effects.as_slice() else { panic!("expected one roll") };
+    let PictureEffect::WarpRoll { keys, interpolation: WarpRollInterpolation::Hold } = effect.effect
+        else { panic!("expected Hold roll keys") };
+    assert_eq!(keys.map(|k| k.ticks), [2, 7, 14].map(|n| n * 10_584_000_000));
+    assert_eq!(keys.map(|k| k.rotation), [-15.0, 25.0, -10.0]);
+    prepared.input.sequences[0].width = 1280;
+    assert!(prepared.input.validate().unwrap_err().to_string().contains("invalid Warp Rotation"));
+
+    g.sequences[0].frame_size = Some((1920, 1080));
+    let prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert!(prepared.input.picture_effects.is_empty());
+    assert!(prepared.losses.iter().any(|loss| loss.object == id && loss.aspect == "picture_effect"));
+}
+
+#[test]
+fn warp_rotation_uses_the_selected_source_frame_grid() {
+    use prproj::convert::prepared::{PictureEffect, WarpRollInterpolation};
+
+    for (num, den) in [(24, 1), (24_000, 1001), (25, 1), (30_000, 1001)] {
+        let mut g = warp_roll_fixture(linked_avc_pcm_picture_at_rate(num, den));
+        let edit = &mut g.sequences[0].placements[0];
+        edit.source_in = Q::new(17 * den, num).unwrap();
+        edit.duration = Q::new(13 * den, num).unwrap();
+        let frame = prproj::convert::model::TICKS_PER_SECOND / num as i64 * den as i64;
+        for (kind, expected) in [
+            ("avid.warp_roll_linear", WarpRollInterpolation::Linear),
+            ("avid.warp_roll_shelf", WarpRollInterpolation::Hold),
+            ("avid.warp_roll_bezier", WarpRollInterpolation::FlatBezier),
+            ("avid.warp_roll_spline", WarpRollInterpolation::FlatBezier),
+        ] {
+            g.sequences[0].placements[0].effects[0].kind = kind.into();
+            let mut prepared = premiere_adapter::prepare_originals(&g, &options(), ClockProfile::LegacyImport).unwrap();
+            prepared.input.validate().unwrap();
+            let [picture] = prepared.input.picture_effects.as_mut_slice() else {
+                panic!("expected one Warp rotation for {kind} at {num}/{den}");
+            };
+            let PictureEffect::WarpRoll { keys, interpolation } = &mut picture.effect else {
+                panic!("expected editable Warp rotation");
+            };
+            assert_eq!(*interpolation, expected);
+            assert_eq!(keys.map(|k| k.ticks), [17, 22, 29].map(|n| n * frame));
+            keys[1].ticks += 1;
+            assert!(prepared.input.validate().unwrap_err().to_string().contains("invalid Warp Rotation"));
+        }
     }
 }
 
@@ -1872,6 +2251,26 @@ fn fixed_warp_width_keeps_its_independent_source_handles() {
     let unit = prproj::convert::model::TICKS_PER_SECOND / 24_000 * 1001;
     assert_eq!(trim.motion.map(|k| k.ticks), [36 * unit, 54 * unit, 71 * unit]);
     assert_eq!(trim.width, [(24 * unit, 80.0), (47 * unit, 160.0), (71 * unit, 135.0)]);
+
+    for (num, den) in [(24, 1), (25, 1), (30_000, 1001)] {
+        let mut at_rate = g.clone();
+        let at_frame = |frames| Q::new(frames * den, num).unwrap();
+        let rate = Q::new(num, den).unwrap();
+        let media = at_rate.media.iter_mut().find(|m| m.kind == StreamKind::Video).unwrap();
+        media.rate = Some(rate);
+        media.duration = at_frame(120);
+        let seq = &mut at_rate.sequences[0];
+        seq.rate = rate;
+        seq.placements[0].source_in = at_frame(36);
+        seq.placements[0].duration = at_frame(36);
+        let prepared = prepare(&at_rate, &options(), ClockProfile::LegacyImport).unwrap();
+        let PictureEffect::TrimmedWarp(trim) = prepared.picture_effects[0].effect else {
+            panic!("expected trimmed Warp at {num}/{den}");
+        };
+        let frame = prproj::convert::model::TICKS_PER_SECOND / num as i64 * den as i64;
+        assert_eq!(trim.motion.map(|k| k.ticks), [36, 54, 71].map(|n| n * frame));
+        assert_eq!(trim.width.map(|(ticks, _)| ticks), [24, 47, 71].map(|n| n * frame));
+    }
 
     g.sequences[0].placements[0].effects[0].params = params([0, 18, 35], [-12, 11, 35], false);
     assert!(prepare(&g, &options(), ClockProfile::LegacyImport).is_err());
@@ -2018,6 +2417,211 @@ fn ambiguous_and_retimed_transition_refusals_are_named() {
         .unwrap()
         .0
         .contains("retimed_transition_endpoint"));
+}
+
+#[test]
+fn linked_audio_dissolve_into_saved_filler_keeps_the_exact_cut() {
+    let mut g = two_edits();
+    let s = &mut g.sequences[0];
+    let mut later = s.placements.pop().unwrap();
+    later.record_start = q(6);
+    let p = &mut s.placements[0];
+    for edit in [p, &mut later] {
+        edit.video_track = None;
+        edit.audio_tracks = vec![1];
+        edit.audio_streams = vec![1];
+    }
+    s.placements.push(later);
+    let t = &mut s.transitions[0];
+    t.kind = StreamKind::Audio;
+    t.cut = q(4);
+    t.cut_offset = q(1);
+    t.style = "avid.BLEND_AUDIO_DISSOLVE".into();
+    t.incoming = SourceBinding {
+        placements: vec![],
+        reason: Some("native owner produced no source placements".into()),
+    };
+    let id = t.id.clone();
+    let receipt = v(vec![
+        ("id", Value::Str(id.clone())),
+        ("effect", Value::Str("BLEND_AUDIO_DISSOLVE".into())),
+        ("rate", Value::Str(s.rate.to_string())),
+        ("audio_curve_attribute", Value::Int(1)),
+        ("audio_curve_parameter", Value::Int(1)),
+        ("incoming_filler_frames", Value::Int(48)),
+    ]);
+    let sidecar = g.sidecars.iter_mut().find(|sc| sc.object == s.id && sc.adapter == "avid.source").unwrap();
+    let Value::Obj(fields) = &mut sidecar.data else { panic!("expected sequence facts") };
+    fields.push(("native_transitions".into(), Value::Arr(vec![receipt])));
+
+    let g = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let clock = ClockProfile::LegacyImport;
+    let clean_cuts = || {
+        let mut clean = g.clone();
+        clean.sequences[0].transitions.clear();
+        let sidecar = clean.sidecars.iter_mut()
+            .find(|sc| sc.object == clean.sequences[0].id && sc.adapter == "avid.source").unwrap();
+        let Value::Obj(fields) = &mut sidecar.data else { panic!("expected sequence facts") };
+        fields.retain(|(key, _)| key != "native_transitions");
+        prepare(&clean, &options(), clock).unwrap()
+    };
+    for spooled in [false, true] {
+        let p = premiere_adapter::prepare_linked_originals(&g, &options(), clock, spooled).unwrap();
+        assert_eq!(p.input.sequences[0], clean_cuts().model.sequences[0]);
+        assert!(p.input.audio_edge_fades.is_empty());
+        assert!(p.losses.iter().any(|loss| loss.object == id && loss.aspect == "transition_cut"));
+    }
+    let refusal = |candidate: &SourceGraph| {
+        assert!(premiere_adapter::prepare_linked_originals(candidate, &options(), clock, false)
+            .err().unwrap().0.contains("unresolved_transition_topology"));
+    };
+    assert!(prepare(&g, &options(), clock).err().unwrap().0.contains("unresolved_transition_topology"));
+    let mut wrong_cut = g.clone();
+    wrong_cut.sequences[0].transitions[0].cut = q(5);
+    refusal(&wrong_cut);
+    let mut unrelated_owner = g.clone();
+    unrelated_owner.sequences[0].transitions[0].incoming.reason = Some("ambiguous owner".into());
+    refusal(&unrelated_owner);
+    let mut wrong_rate = g.clone();
+    let sidecar = wrong_rate.sidecars.iter_mut()
+        .find(|sc| sc.object == g.sequences[0].id && sc.adapter == "avid.source").unwrap();
+    let Value::Obj(fields) = &mut sidecar.data else { panic!("expected sequence facts") };
+    let (_, Value::Arr(rows)) = fields.iter_mut().find(|(key, _)| key == "native_transitions").unwrap()
+        else { panic!("expected transition rows") };
+    let Value::Obj(row) = &mut rows[0] else { panic!("expected transition facts") };
+    row.iter_mut().find(|(key, _)| key == "rate").unwrap().1 = Value::Str("25".into());
+    refusal(&wrong_rate);
+    let mut overlapping = g.clone();
+    let mut duplicate = overlapping.sequences[0].transitions[0].clone();
+    duplicate.id = "transition:two".into();
+    overlapping.sequences[0].transitions.push(duplicate);
+    refusal(&overlapping);
+    let mut occupied = g;
+    occupied.sequences[0].placements[1].record_start = Q::new(7, 2).unwrap();
+    refusal(&occupied);
+    occupied.sequences[0].placements[1].record_start = q(4);
+    refusal(&occupied);
+}
+
+#[test]
+fn linked_audio_dissolve_from_saved_filler_keeps_the_incoming_trim() {
+    let mut g = two_edits();
+    let s = &mut g.sequences[0];
+    for edit in &mut s.placements {
+        edit.video_track = None;
+        edit.audio_tracks = vec![1];
+        edit.audio_streams = vec![1];
+    }
+    s.placements[0].duration = q(1);
+    let t = &mut s.transitions[0];
+    t.kind = StreamKind::Audio;
+    t.cut = q(3);
+    t.cut_offset = Q::ZERO;
+    t.style = "avid.BLEND_AUDIO_DISSOLVE".into();
+    t.outgoing = SourceBinding {
+        placements: vec![],
+        reason: Some("native owner produced no source placements".into()),
+    };
+    let id = t.id.clone();
+    let mut clean = g.clone();
+    clean.sequences[0].transitions.clear();
+    let clock = ClockProfile::LegacyImport;
+    let base = prepare(&clean, &options(), clock).unwrap();
+    let refusal = |candidate: &SourceGraph| {
+        assert!(premiere_adapter::prepare_linked_originals(candidate, &options(), clock, false)
+            .err().unwrap().0.contains("unresolved_transition_topology"));
+    };
+    refusal(&g);
+    let sidecar = g.sidecars.iter_mut()
+        .find(|sc| sc.object == g.sequences[0].id && sc.adapter == "avid.source").unwrap();
+    let Value::Obj(fields) = &mut sidecar.data else { panic!("expected sequence facts") };
+    fields.push(("native_transitions".into(), Value::Arr(vec![v(vec![
+        ("id", Value::Str(id.clone())),
+        ("effect", Value::Str("BLEND_AUDIO_DISSOLVE".into())),
+        ("rate", Value::Str(g.sequences[0].rate.to_string())),
+        ("outgoing_filler_frames", Value::Int(72)),
+    ])])));
+    let g = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    for spooled in [false, true] {
+        let prepared = premiere_adapter::prepare_linked_originals(&g, &options(), clock, spooled).unwrap();
+        assert_eq!(prepared.input.sequences[0], base.model.sequences[0]);
+        assert!(prepared.input.audio_edge_fades.is_empty());
+        assert!(prepared.losses.iter().any(|loss| loss.object == id && loss.aspect == "transition_cut"
+            && loss.reason.contains("kept the incoming edit")));
+    }
+    let mut mismatched_cut = g.clone();
+    mismatched_cut.sequences[0].placements[1].record_start = Q::new(7, 2).unwrap();
+    refusal(&mismatched_cut);
+    let mut neighbor = g;
+    neighbor.sequences[0].placements[0].duration = q(3);
+    refusal(&neighbor);
+    neighbor.sequences[0].placements[0].duration = Q::new(7, 2).unwrap();
+    refusal(&neighbor);
+}
+
+#[test]
+fn linked_picture_filler_dissolves_keep_existing_cuts_on_both_layers() {
+    let effects = ["EFF2_BLEND_DISSOLVE", "EFF2_BLEND_DISSOLVE_LOG", "EFF2_BLEND_DISSOLVE_LIN"];
+    for (effect, from_filler) in effects.into_iter().flat_map(|effect| [(effect, true), (effect, false)]) {
+        let mut g = two_edits();
+        let s = &mut g.sequences[0];
+        s.placements[0].duration = q(8);
+        s.placements[1].video_track = Some(2);
+        s.tracks.push(SourceTrack::new(StreamKind::Video, 2, None));
+        let t = &mut s.transitions[0];
+        t.track = 2;
+        t.style = format!("avid.{effect}");
+        let filler = SourceBinding {
+            placements: vec![],
+            reason: Some("native owner produced no source placements".into()),
+        };
+        let mut edge = "outgoing_filler_frames";
+        if from_filler {
+            t.cut = q(3);
+            t.cut_offset = Q::ZERO;
+            t.outgoing = filler;
+        } else {
+            t.cut = q(7);
+            t.cut_offset = t.duration;
+            t.outgoing = t.incoming.clone();
+            t.incoming = filler;
+            edge = "incoming_filler_frames";
+        }
+        let id = t.id.clone();
+        let clock = ClockProfile::LegacyImport;
+        let mut clean = g.clone();
+        clean.sequences[0].transitions.clear();
+        let expected = prepare(&clean, &options(), clock).unwrap();
+        let sidecar = g.sidecars.iter_mut()
+            .find(|sc| sc.object == g.sequences[0].id && sc.adapter == "avid.source").unwrap();
+        let Value::Obj(fields) = &mut sidecar.data else { panic!("expected sequence facts") };
+        fields.push(("native_transitions".into(), Value::Arr(vec![v(vec![
+            ("id", Value::Str(id.clone())),
+            ("effect", Value::Str(effect.into())),
+            ("rate", Value::Str(g.sequences[0].rate.to_string())),
+            (edge, Value::Int(48)),
+        ])])));
+        let mut g = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+        for spooled in [false, true] {
+            let prepared = premiere_adapter::prepare_linked_originals(&g, &options(), clock, spooled).unwrap();
+            assert_eq!(prepared.input.sequences[0], expected.model.sequences[0]);
+            assert!(prepared.input.video_dissolves.is_empty());
+            assert!(prepared.losses.iter().any(|loss| loss.object == id
+                && loss.aspect == "transition_cut" && loss.reason.contains("V2")));
+        }
+        assert!(prepare(&g, &options(), clock).err().unwrap().0.contains("unresolved_transition_topology"));
+        let mut wrong_effect = g.clone();
+        wrong_effect.sequences[0].transitions[0].style = if effect == "EFF2_BLEND_DISSOLVE" {
+            "avid.EFF2_BLEND_DISSOLVE_LOG".into()
+        } else {
+            "avid.EFF2_BLEND_DISSOLVE".into()
+        };
+        assert!(premiere_adapter::prepare_linked_originals(&wrong_effect, &options(), clock, false)
+            .err().unwrap().0.contains("unresolved_transition_topology"));
+        g.sequences[0].placements[0].video_track = Some(2);
+        assert!(premiere_adapter::prepare_linked_originals(&g, &options(), clock, false)
+            .err().unwrap().0.contains("unresolved_transition_topology"));
+    }
 }
 
 #[test]

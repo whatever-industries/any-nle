@@ -63,6 +63,26 @@ pub struct OriginalClip {
     pub groups: Vec<Vec<i64>>,
 }
 impl OriginalClip {
+    pub(super) fn matches_explicit_linked_raster(&self, sequence: &Sequence) -> bool {
+        self.supports_explicit_linked_raster()
+            && self.video.as_ref().is_some_and(|v| v.rate == sequence.rate
+                && (v.width, v.height) == (sequence.width, sequence.height))
+    }
+
+    pub fn supports_explicit_linked_raster(&self) -> bool {
+        // Audio is validated independently by validate_original.
+        let suffix = std::path::Path::new(&self.path).extension().and_then(|ext| ext.to_str());
+        self.container == "mov"
+            && self.proxy_path.is_none()
+            && self.video.as_ref().is_some_and(|v|
+                matches!((v.rate.num, v.rate.den), (24, 1) | (24_000, 1001) | (25, 1) | (30_000, 1001))
+                    && suffix.is_some_and(|ext| match v.codec.as_str() {
+                        "avc1" => ext.eq_ignore_ascii_case("mov") || ext.eq_ignore_ascii_case("mp4"),
+                        "apch" => ext.eq_ignore_ascii_case("mov"),
+                        _ => false,
+                    }))
+    }
+
     pub fn is_same_rate_linked_pcm(&self) -> bool {
         self.proxy_path.is_none()
             && self.audio.as_ref().zip(self.video.as_ref()).is_some_and(|(a, v)| {
@@ -70,39 +90,17 @@ impl OriginalClip {
                 matches!(a.representation, SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24)
                     && a.channels == 2 && a.sample_rate == 48_000
                     && delta < ticks_per_unit(Fraction::new(48_000, 1)) as u64
-                    && is_25_or_2997(v.rate)
                     && match self.container.as_str() {
-                        "mov" => matches!(v.codec.as_str(), "avc1" | "apch") && a.duration <= v.duration,
-                        "mxf" => v.codec == "AVdn" && (v.width, v.height) == (1920, 1080)
+                        "mov" => a.duration <= v.duration
+                            && (matches!(v.codec.as_str(), "avc1" | "apch") && is_25_or_2997(v.rate)
+                                || self.supports_explicit_linked_raster() && !self.separate_mono_streams
+                                    && (v.codec == "avc1" || (v.width, v.height) != (1920, 1080))),
+                        "mxf" => is_25_or_2997(v.rate) && v.codec == "AVdn" && (v.width, v.height) == (1920, 1080)
                             && a.duration >= v.duration
                             && std::path::Path::new(&self.path).extension()
                                 .is_some_and(|ext| ext.eq_ignore_ascii_case("mxf")),
                         _ => false,
                     }
-            })
-    }
-
-    pub fn is_uhd_avc_pcm_mp4(&self) -> bool {
-        self.container == "mov" && self.proxy_path.is_none()
-            && std::path::Path::new(&self.path).extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
-            && self.audio.as_ref().zip(self.video.as_ref()).is_some_and(|(a, v)| {
-                matches!(a.representation, SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24)
-                    && a.channels == 2 && a.sample_rate == 48_000 && a.duration == v.duration
-                    && v.codec == "avc1" && (v.width, v.height) == (3840, 2160)
-                    && v.rate == Fraction::new(24_000, 1001)
-            })
-    }
-
-    pub fn is_wide_avc_pcm24_mov(&self) -> bool {
-        self.container == "mov" && self.proxy_path.is_none()
-            && std::path::Path::new(&self.path).extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
-            && self.audio.as_ref().zip(self.video.as_ref()).is_some_and(|(a, v)| {
-                a.representation == SampleRepresentation::Pcm24
-                    && a.channels == 2 && a.sample_rate == 48_000 && a.duration == v.duration
-                    && v.codec == "avc1" && (v.width, v.height) == (2048, 858)
-                    && v.rate == Fraction::new(24, 1)
             })
     }
 }
@@ -711,6 +709,11 @@ pub struct TrimmedMotion {
     pub crop: Option<[(i64, [f64; 4]); 3]>,
 }
 
+/// Qualified sequence clocks for keyed crop, trimmed Linear Motion and animated Warp rotation.
+pub fn supports_picture_motion_clock(rate: Fraction) -> bool {
+    matches!((rate.num, rate.den), (24, 1) | (24_000, 1001) | (25, 1) | (30_000, 1001))
+}
+
 impl TrimmedMotion {
     pub fn keys_fit_media(&self, end: i64) -> bool {
         self.motion.iter().map(|k| k.ticks).chain(self.width.iter().map(|k| k.0))
@@ -743,6 +746,15 @@ pub struct CornerPin {
 }
 
 impl CornerPin {
+    pub fn supports_geometry(
+        rate: Fraction, canvas: (i64, i64), picture: Option<(Fraction, (i64, i64))>,
+        linked_raster: bool,
+    ) -> bool {
+        matches!((rate.num, rate.den), (24, 1) | (24_000, 1001) | (25, 1) | (30_000, 1001))
+            && picture == Some((rate, canvas))
+            && (canvas == (1920, 1080) || linked_raster)
+    }
+
     pub fn is_valid(self) -> bool {
         let [left, top, right, bottom] = self.source_crop;
         self.source_crop.iter().all(|v| (0.0..1.0).contains(v))
@@ -787,6 +799,8 @@ impl PreparedSourceLut {
 
 pub(super) fn validate_picture_effects(
     effects: &[PreparedPictureEffect], sequences: &[Sequence], speeds: &[PreparedConstantSpeed],
+    supports_linked_raster: impl Fn(&Sequence, &Event) -> bool,
+    picture_geometry: impl Fn(&Event) -> Option<(Fraction, (i64, i64))>,
 ) -> Result<(), ModelError> {
     let fail = |s: &str| ModelError(s.into());
     if effects.len() > MAX_ITEMS { return Err(fail("prepared picture effect count exceeds limit")); }
@@ -802,8 +816,8 @@ pub(super) fn validate_picture_effects(
         }
         match p.effect {
             PictureEffect::CornerPin(pin) | PictureEffect::CornerPinWithFlop { pin, .. } if pin.is_valid()
-                && sequence.rate == Fraction::new(24, 1)
-                && (sequence.width, sequence.height) == (1920, 1080)
+                && CornerPin::supports_geometry(sequence.rate, (sequence.width, sequence.height),
+                    picture_geometry(event), supports_linked_raster(sequence, event))
                 && p.reflection_before_motion == [false; 2]
                 && event.transform.is_none() && event.matte.is_none() && event.color_correction.is_none()
                 && event.speed_ratio.is_none() && event.time_remap.is_none() => {}
@@ -841,10 +855,14 @@ pub(super) fn validate_picture_effects(
             PictureEffect::VideoToFullRange =>
                 return Err(fail("range expansion needs one plain 1080p24 picture edit")),
             PictureEffect::WarpRoll { keys, .. } => {
-                let frame = ticks_per_unit(Fraction::new(24, 1));
+                if !supports_picture_motion_clock(sequence.rate) {
+                    return Err(fail("invalid Warp Rotation keys or picture stack"));
+                }
+                let frame = ticks_per_unit(sequence.rate);
                 let end = event.source_in.checked_add(event.duration).and_then(|n| n.checked_sub(frame));
                 let [a, b, c] = keys.map(|k| k.ticks);
-                if sequence.rate != Fraction::new(24, 1) || (sequence.width, sequence.height) != (1920, 1080)
+                if ((sequence.width, sequence.height) != (1920, 1080)
+                        && !supports_linked_raster(sequence, event))
                     || event.transform.is_some() || event.matte.is_some() || event.color_correction.is_some()
                     || event.speed_ratio.is_some() || event.time_remap.is_some() || p.reflection_before_motion != [false; 2]
                     || a != event.source_in || a < 0 || Some(c) != end || !(a < b && b < c)
@@ -861,8 +879,9 @@ pub(super) fn validate_picture_effects(
                 let end = event.source_in.checked_add(event.duration).and_then(|n| n.checked_sub(frame));
                 let cropped = keys[0].crop.is_some();
                 if cropped != keys[1].crop.is_some()
-                    || (cropped && (sequence.rate != Fraction::new(24_000, 1001)
-                        || (sequence.width, sequence.height) != (1920, 1080)))
+                    || (cropped && (!supports_picture_motion_clock(sequence.rate)
+                        || ((sequence.width, sequence.height) != (1920, 1080)
+                            && !supports_linked_raster(sequence, event))))
                     || event.transform.as_ref().is_none_or(|t| t.crop != [0.0; 4] || t.rotation != 0.0 || t.anchor != (0.0, 0.0))
                     || event.matte.is_some() || event.color_correction.is_some()
                     || frame <= 0 || event.speed_ratio.is_some() || event.time_remap.is_some()
@@ -880,7 +899,10 @@ pub(super) fn validate_picture_effects(
                 }
             }
             PictureEffect::TrimmedWarp(trim) | PictureEffect::TrimmedResize(trim) => {
-                let frame = ticks_per_unit(Fraction::new(24_000, 1001));
+                if !supports_picture_motion_clock(sequence.rate) {
+                    return Err(fail("invalid trimmed Linear Motion key times or values"));
+                }
+                let frame = ticks_per_unit(sequence.rate);
                 let end = event.source_in.checked_add(event.duration).and_then(|n| n.checked_sub(frame));
                 let [a, b, c] = trim.motion.map(|k| k.ticks);
                 let [x, y, z] = trim.width.map(|(t, _)| t);
@@ -899,7 +921,8 @@ pub(super) fn validate_picture_effects(
                             aligned_width
                         }
                 };
-                if sequence.rate != Fraction::new(24_000, 1001) || (sequence.width, sequence.height) != (1920, 1080)
+                if ((sequence.width, sequence.height) != (1920, 1080)
+                        && !supports_linked_raster(sequence, event))
                     || event.transform.as_ref().is_none_or(|t| t.crop != [0.0; 4] || t.rotation != 0.0 || t.anchor != (0.0, 0.0))
                     || event.matte.is_some() || event.color_correction.is_some()
                     || event.speed_ratio.is_some() || event.time_remap.is_some()
@@ -1387,7 +1410,6 @@ impl PreparedProjectInput {
         }
         validate_texts(&self.texts, &self.sequences)?;
         validate_video_dissolves(&self.video_dissolves, &self.sequences)?;
-        validate_picture_effects(&self.picture_effects, &self.sequences, &self.constant_speeds)?;
         let fail = |s: &str| ModelError(s.into());
         for (&sequence, states) in &self.track_states {
             let seq = self.sequences.get(sequence).ok_or_else(|| fail("unknown sequence for track state"))?;
@@ -1544,6 +1566,17 @@ impl PreparedProjectInput {
                 PreparedClip::Legacy(c) => super::model::validate_clip(c, "prepared legacy clip")?,
             }
         }
+        validate_picture_effects(&self.picture_effects, &self.sequences, &self.constant_speeds,
+            |sequence, event| {
+                matches!(clips.get(event.clip.as_str()),
+                    Some(PreparedClip::Original(clip)) if clip.matches_explicit_linked_raster(sequence))
+            },
+            |event| {
+                match clips.get(event.clip.as_str()).copied()? {
+                    PreparedClip::Original(c) => c.video.as_ref().map(|v| (v.rate, (v.width, v.height))),
+                    PreparedClip::Legacy(c) => c.video.as_ref().map(|v| (v.rate, (v.width, v.height))),
+                }
+            })?;
         if self.picture_subclips.len() > MAX_ITEMS {
             return Err(fail("prepared subclip collection limit"));
         }
@@ -1862,7 +1895,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
                 .and_then(|suffix| suffix.to_str())
                 .is_some_and(|suffix| suffix.eq_ignore_ascii_case("mov"))
             && (c.audio.is_none() || c.proxy_path.is_some() || c.is_same_rate_linked_pcm())
-            && v.width == 1920 && v.height == 1080
+            && ((v.width, v.height) == (1920, 1080) || c.supports_explicit_linked_raster())
             && (v.rate == Fraction::new(24, 1) || v.rate == Fraction::new(24000, 1001) || is_25_or_2997(v.rate)));
         let raster = (v.width, v.height);
         let qualified_still = v.codec == c.container && c.audio.is_none()
@@ -1935,10 +1968,8 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
                 (SampleRepresentation::Aac, "mov") => a.channels == 2,
                 (SampleRepresentation::Mp3, "mp3") => c.video.is_none() && c.proxy_path.is_none()
                     && matches!(a.sample_rate, 44_100 | 48_000) && suffix.is_some_and(|s| s.eq_ignore_ascii_case("mp3")),
-                (SampleRepresentation::Pcm16, "mov") => c.proxy_path.is_some()
-                    || c.is_uhd_avc_pcm_mp4() || c.is_same_rate_linked_pcm(),
-                (SampleRepresentation::Pcm24, "mov") => c.proxy_path.is_some()
-                    || c.is_wide_avc_pcm24_mov() || c.is_uhd_avc_pcm_mp4() || c.is_same_rate_linked_pcm(),
+                (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "mov") =>
+                    c.proxy_path.is_some() || c.is_same_rate_linked_pcm(),
                 (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "wav") => true,
                 (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "mxf") => c.is_same_rate_linked_pcm(),
                 _ => false,

@@ -544,6 +544,65 @@ See [large project limits](SOURCE-GRAPH-MIGRATION.md#limits-and-memory).
       and crossed from 01:00:59;20 to 01:01:00;02 ten frames later.
       Other AAC layouts and fractional-frame AAC edits beyond the
       playable extent remain separate cases.
+      Stereo PCM16/24 at 48 kHz in progressive, square-pixel H.264 High
+      level 4.0 or 5.1 MOV/MP4 now uses the same saved-raster, frame-rate
+      and channel checks at 24, 23.976, 25 and 29.97. The PCM extent is
+      rounded once from the complete source duration. For a sequence
+      without a named preset, the writer can use an explicit raster
+      when every picture edit verifies the same raster and rate in
+      this linked profile. Derived AVBs with 1600×900, 1440×1080 and
+      1536×864 sources kept their settings, trims, links and channel
+      selectors after Save As and reopen in Premiere 27. All 12 sampled
+      pictures selected the expected source frames. The 29.97 test file
+      retained 76,876 PCM sample frames for 48 picture frames. Full
+      exports of the new rasters remain pending.
+- [x] **Decouple linked AVC picture geometry from audio layout.**
+      The explicit raster and matching-raster picture effects use the
+      verified picture stream. Audio keeps its own source and writer
+      checks. Picture-only, progressive square-pixel H.264 High MOV/MP4
+      at 24, 23.976, 25 and 29.97 now links at the verified source raster.
+      The new source profile checks the saved picture descriptor, zero
+      origin and complete fixed-rate packet clock. CLI and saved jobs
+      produced matching cuts and trims on 12 derived timelines.
+      After Premiere 27 Save As and reopen, 20 sampled frames matched
+      their PCM-bearing controls pixel for pixel, including Corner Pin,
+      source crop and both Pin/Flop orders. Unit checks also cover
+      applying the same geometry with AAC already admitted.
+- [x] **Use the matched-raster path for linked ProRes 422 HQ MOV.**
+      The Avid reader verifies progressive square-pixel picture at 24,
+      23.976, 25 and 29.97, the complete packet clock and the saved
+      descriptor. It checks the embedded timecode track when present
+      and verifies any stereo PCM16 or PCM24 bindings independently.
+      Eleven derived timelines at 1600×900, 1440×1080 and 1536×864
+      agreed across direct CLI, saved jobs and Premiere 27 reopen.
+      All 109 plain-cut picture frames matched Premiere direct imports.
+      Six Corner Pin and Flop controls matched the projected chart
+      points within 0.27 pixels. Both 23.976 PCM16 lanes matched exactly.
+      The 29.97 drop-frame PCM24 case preserved the source timecode and
+      reproduced the retained 1080p audio, including its one silent
+      rounding sample.
+- [x] **Stream the linked ProRes HQ picture clock verification.**
+      Verify every packet through EOF with one bounded row at a time.
+      Exact packet timing and the declared count still have to agree.
+      The verifier handles reports over 1 MiB and sources over 16,384
+      frames. The 50,000-frame controls include trims beyond the former frame
+      limit and a late two-packet discrepancy that preserves the
+      total duration and declared rate.
+- [x] **Stream the picture-only H.264 clock verification.**
+      Read one packet row at a time and track the presentation slots
+      in a bitmap of at most 128 KiB. This allows decode-order B-frames
+      and detects missing or repeated slots through EOF. The
+      1,048,576-frame count bound still applies. The
+      81,600-frame controls exercise a report over 1 MiB and a late
+      duplicate presentation timestamp with the same declared rate
+      and duration.
+- [x] **Keep linked picture packet scans running while they make progress.**
+      The ProRes HQ and picture-only H.264 verifiers refresh a 30-second
+      idle deadline after validating packet rows. The cancellable source
+      reader checks for cancellation during those scans and reaps its
+      FFprobe child on a stall or cancellation. The converter still
+      requires the complete packet proof and successful process exit.
+      Short metadata probes retain their total deadline and output bound.
 - A rejected Gain, automatic Motion Adapter, or generated Freeze Frame
   can become a marked gap when the reader proves its exact record range
   and the lane has no conflicting placement. When a Gain gap borders a
@@ -2077,11 +2136,34 @@ Implemented fixes, tests and remaining native gates.
       routing, or affected scope cannot be established, offer exclusion of the
       affected sequence once its dependencies are known. Keep checks that need
       online media distinct and preserve the existing publication guards.
+      Rewrap Review checks the remaining saved original paths when it encounters
+      a missing, malformed, or ambiguous locator. The bounded report identifies
+      affected bins and occurrences. The additional checks resolve paths using
+      the current mappings and stop short of probing the media.
+      A legacy MXF package refusal also triggers a report of other absent or
+      ambiguous package IDs on the affected clip and later clips, using the
+      existing media index. Duplicate package details include up to eight
+      conflicting paths and the indexed count. Review also lists the paths
+      for duplicate managed packages found by the linked clip modes.
+      With a complete dependency check, linked modes report duplicates
+      outside the selected bins' saved references as warnings. The same
+      check keeps qualified omissions and gaps available for missing media.
+      Package failures open Avid media locations in Review. Failures resolving
+      linked originals open saved-path mappings.
+      When source verification reaches the media scan and channel routing
+      checks, Review lists their findings separately, including when a missing
+      or unresolved master is the primary blocker.
 - [x] **Browse large preflight and completion reports.** Show 25 notes at a
       time, with a page-number field, search across all notes, and filters
       for translation changes and warnings. Keep every occurrence in the
       saved completion report. Review borrows the prepared report, which
       moves into completion. Saved jobs stream the receipt and CLI JSON.
+- [x] **Save preflight findings before conversion.** Review can export all
+      findings from a successful preflight to a new JSON file while keeping
+      the current job ready to convert. A blocked preflight can save its reason
+      and full collected details, including affected clips, Groups, or timing
+      findings. Review can search the full blocker list and browse 25 matching
+      details per page. Preflight still stops at the first blocking stage.
 - [x] **Trash/Attic opt-in** in the project step. The implemented default is off.
 - Duplicate bin names in one folder: not possible (Avid forbids two same-named bins in a
   folder, User 2026-10-14); a case-only clash on a case-insensitive disk is the one thing to
@@ -2571,11 +2653,21 @@ User's priority tiers to scope converter tasks.
       editable Motion writer on an admitted 1080p23.976 picture edit. The
       synthetic DNx comparison matched the Resize output across all 48 frames
       and kept the keys after Premiere Save As and reopen.
+- [x] **Extend uncropped two-key Motion to matching linked AVC/PCM rasters.**
+      Premiere 27 preserved editable Resize keys at 1600×900/24 and
+      1440×1080/23.976 and promoted Warp keys at 1440×1080/23.976.
+      Sampled picture matched the projected bounds within one pixel after
+      Save As and reopen, including both orders with Flop.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#writing-ordered-picture-chains).
 - [x] **Linear animated Resize and 3D Warp crop** (CONV-0047). Translate four
       source-space crop curves alongside position and independent scale to
       editable Motion. The paired 1080p23.976 synthetic DNx renders matched
       each other across 48 frames before and after Save As and reopen. Measured
       edges stayed within one pixel of the retained Avid reference.
+- [x] **Extend two-key animated crop to matching linked AVC/PCM rasters.**
+      At 23.976, Premiere 27 preserved all four editable crop curves and both
+      Flop orders at 1440×1080 and 3840×2160 after Save As and reopen.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#writing-ordered-picture-chains).
 - [x] **Saved Linear 3D Warp keys after head or tail trim** (CONV-0048).
       Preserve the saved three-key profile, including independent Fixed Width
       keys outside one visible edge where the source media has the handle.
@@ -2589,13 +2681,18 @@ User's priority tiers to scope converter tasks.
       the Avid reference on the synthetic DNx route.
 - [x] **Saved Linear animated crop on three-key trims** (CONV-0050, CONV-0056).
       Preserve four editable Motion crop curves on a shared crop clock.
-      Same-rate progressive square-pixel 1080p23.976 only, with a neutral
-      background and source media coverage for every key. Native Avid head and
+      Require same-rate progressive square-pixel 23.976, a neutral background,
+      and source media coverage for every key. The 1080p native Avid head and
       tail trims for Resize and the compact 18-control promoted Warp retained
       exact bounds and three Elastic keys after Premiere Save As and reopen.
       Across all 144 active trim frames, visible edges over black were within
       one pixel of the Avid export. The two untrimmed controls each had two
       two-pixel left-edge differences at the lowest luma threshold.
+- [x] **Extend three-key trims to matching linked AVC/PCM rasters.**
+      Premiere 27 preserved the independent width and crop clocks on Resize
+      and Warp head and tail trims at 1440×1080 and UHD. Missing handles
+      produce an occurrence loss while the visible edits survive.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#writing-ordered-picture-chains).
 - [ ] **Extend animated Resize and 3D Warp.** Qualify other rates, interpolation,
       compact Fixed clocks and additional key shapes separately. Track anchor,
       rotation and perspective in the Avid codex.
@@ -2604,7 +2701,12 @@ User's priority tiers to scope converter tasks.
       horizontal Position, independent Scale Width, and Z Rotation
       on a shared three-key clock. Premiere 27 Save As and reopen
       matched 91 Avid chart points across 13 frames within 0.12 pixels.
-      Trimmed rotation remains a separate case.
+      The Linear rule also uses the exact frame clock at 23.976, 25, and
+      29.97. One Premiere 27 project kept the three editable keys at two
+      nonzero source in-points and matched all 156 comparison frames to
+      the 23.976 controls after Save As and reopen. Keys outside the
+      visible effect span remain unqualified.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#animated-3d-warp-z-rotation).
 - [x] **Translate the compact three-key 3D Warp Shelf mode to Premiere Hold**
       (CONV-0110). Position X, Scale Width and Z Rotation keep three
       editable Hold keys. The reopened 13-frame chart holds each value
@@ -2616,6 +2718,17 @@ User's priority tiers to scope converter tasks.
       keeps the nine editable Bezier keys in each project. All 182
       chart points across 26 reopened frames agree with Avid within
       0.17 pixels. Other handle shapes and trimmed rotation remain open.
+- [x] **Share the Warp rotation clock for Shelf, Bezier and Spline.**
+      One Premiere 27 project tested 24, 23.976, 25 and 29.97 after Save
+      As and reopen. All 260 comparison frames matched the corresponding
+      23.976 controls. Shelf retained editable Hold keys. The qualified
+      Bezier and Spline curves retained zero slopes and 40% handles.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#animated-3d-warp-z-rotation).
+- [x] **Extend isolated 24 fps Warp roll to matching linked AVC/PCM rasters.**
+      Premiere 27 preserved Linear, Shelf, and the qualified Bezier and
+      Spline shapes at 1600×900 and 1440×1080. All reopened chart frames
+      matched the projected point positions within 0.21 pixels.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#animated-3d-warp-z-rotation).
 - [ ] **Projective 3D Warp geometry.** The installed renderer uses a
       separate perspective projection after the model transform, followed by
       Target translation and scaling. A destination mapping needs a
@@ -2670,6 +2783,32 @@ User's priority tiers to scope converter tasks.
       controls after Premiere 27 Save As and reopen on the 1080p24 linked
       chart. The destination comparison passes; a native Avid render of
       the combined stack remains pending.
+- [x] **Extend explicit Corner Pin targets to matching linked AVC/PCM rasters.**
+      Premiere 27 retained the editable pin, source crop and both Flop
+      orders at 1600×900 and 1440×1080 after Save As and reopen. The 1080p
+      camera-derived projection has a separate geometry check.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#static-avid-corner-pin).
+- [x] **Share static Corner Pin geometry across four Premiere clocks.**
+      Explicit targets use the same matching-raster rule in preparation
+      and writer validation at 24, 23.976, 25 and 29.97. A single Premiere
+      27 project with 28 derived timelines retained the exact trims,
+      points, crops and both Flop orders after Save As and reopen. All
+      112 decoded frames and 32 repeat frames matched their respective
+      controls. Camera-derived projection uses the 1080p24 profile.
+- [x] **Share the uncropped Linear Motion trim clock in Premiere.**
+      Two-key and trimmed Resize and 3D Warp retain their saved Linear
+      position and independent scale at 24, 23.976, 25 and 29.97. The
+      Premiere 27 project preserved off-cut keys with verified handles
+      after Save As and reopen. All 1,056 decoded frames matched the
+      corresponding 23.976 controls.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#writing-ordered-picture-chains).
+- [x] **Use the same Premiere clocks for Linear crop.**
+      Premiere 27 preserved editable Resize and 3D Warp crop on
+      untrimmed, head-trimmed and tail-trimmed edits at 24, 23.976,
+      25 and 29.97 after Save As and reopen. All 1,200 decoded comparison
+      frames matched their 23.976 controls. Measured crop edges agreed
+      with the saved curves within one pixel.
+      [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#writing-ordered-picture-chains).
 - [ ] **Extend Corner Pin.** Qualify stacked pin and reflection with
       native Avid picture, then investigate Resolve writing, animation
       and tracking separately.
@@ -2765,12 +2904,15 @@ User's priority tiers to scope converter tasks.
       ordinary Dissolve. Avid's Film Dissolve renderer remaps the evaluated
       level through an 11-point curve before mixing. Compare a matched native
       render pair to qualify the frame sampling and blend space, then check
-      whether the destination can express the curve.
+      whether the destination can express the curve. Linked conversion keeps
+      the exact cut at a verified filler edge and reports the omitted blend.
 - [ ] **Film Fade.** Saved Avid occurrences identify `EFF2_BLEND_DISSOLVE_LIN`.
       The installed renderer uses a distinct 11-point opacity curve. At 50%
       Foreground Level it sends 20.24% opacity to the mixer. Qualify fade-in
       and fade-out against matched black and picture references, measuring
       frame sampling and blend space before choosing a destination mapping.
+      Linked conversion keeps the exact cut at a verified filler edge and
+      reports the omitted blend.
 - [ ] **Dip to Color.** The Avid renderer selects one picture input on each
       side of 50% Level and reaches full color blend at 50%. Its Background
       Color path uses the saved luminance as HSV Value. Verify a nonblack
@@ -2813,6 +2955,10 @@ User's priority tiers to scope converter tasks.
       Resize or 3D Warp stage. Native Save As and reopen verified Flop
       before animated Warp in both editors using the retained Avid control.
       [Scope and measurements](SOURCE-GRAPH-MIGRATION.md#writing-ordered-picture-chains).
+- [x] **Use matching verified linked AVC/PCM rasters for Premiere static chains.**
+      Premiere 27 Save As and reopen preserved both Flop/Warp orders
+      at 1600×900 and 1440×1080. Sampled picture distinguished the crop
+      order.
 - [ ] **Expand destination picture chains.** Qualify a construction that
       can apply multiple Motion stages or other effects in saved order.
 

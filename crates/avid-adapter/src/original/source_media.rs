@@ -116,6 +116,7 @@ fn qualify(
     tool: &Path,
     stereo: bool,
     reel: Option<&str>,
+    check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(Selected, Vec<Selected>, bool), String> {
     let rate = Rational::new(clock.rate.num.into(), clock.rate.den.into())
         .ok_or("invalid camera original rate")?;
@@ -131,7 +132,8 @@ fn qualify(
                 "original requires picture, stereo PCM and one matching timecode track".into(),
             );
         };
-        let defaulted = qualify_prores_hq_parts(&path, &probe, video, tc, 2, rate, &expected)?;
+        verify_prores_hq_timecode_track(&path, &probe, video, tc, 2, rate, &expected)?;
+        let defaulted = qualify_movie_geometry_at_rate(video, (1920, 1080), rate)?;
         let bits = match text(audio, "codec_name").as_deref() {
             Some("pcm_s16le") => 16,
             Some("pcm_s24le") => 24,
@@ -232,7 +234,7 @@ fn qualify(
     {
         return Err("camera original clock, exact extent, orientation or BT.709 tags disagree with the supported profile".into());
     }
-    prove_prores_cadence(&path, tool, video, rate)?;
+    prove_prores_cadence(&path, tool, video, rate, check)?;
     Ok((
         Selected {
             path,
@@ -362,7 +364,7 @@ pub(super) fn select(
                 .find(|(key, value)| key == "Tape" && !value.is_empty())
                 .map(|(_, value)| value.as_str());
             let (selected, audio, defaulted) =
-                qualify(clock, frames, saved, path, &options.ffprobe, stereo, reel)?;
+                qualify(clock, frames, saved, path, &options.ffprobe, stereo, reel, check)?;
             let proxy = index
                 .map(|index| {
                     crate::proxy::Binding::verify(

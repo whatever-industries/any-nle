@@ -1,4 +1,4 @@
-//! Source verification for same-rate 25 and 29.97 linked movies.
+//! Source verification for linked movies with exact matching clocks.
 use super::*;
 use avid_reader::extract::{KIND_PICTURE, KIND_SOUND};
 
@@ -6,20 +6,41 @@ pub(super) fn is_25_or_2997(rate: Option<Rational>) -> bool {
     rate.is_some_and(|r| matches!((r.num(), r.den()), (25, 1) | (30_000, 1001)))
 }
 
+pub(super) fn custom_prores_raster(video: &Value) -> bool {
+    text(video, "codec_name").as_deref() == Some("prores")
+        && ratio(video, "avg_frame_rate").is_some_and(|r|
+            matches!((r.num(), r.den()), (24, 1) | (24_000, 1001) | (25, 1) | (30_000, 1001)))
+        && number(video, "width").zip(number(video, "height"))
+            .is_some_and(|(w, h)| (w, h) != (1920, 1080)
+                && (16..=16_384).contains(&w) && (16..=16_384).contains(&h))
+}
+
 pub(super) fn frame_audio_extent(frames: i64, rate: av::Rate, round_up: bool) -> Option<i64> {
-    let n = i128::from(frames) * 48_000 * i128::from(rate.den);
+    let n = i128::from(frames).checked_mul(48_000)?.checked_mul(i128::from(rate.den))?;
     let d = i128::from(rate.num);
-    i64::try_from((n + if round_up { d - 1 } else { 0 }) / d).ok()
+    i64::try_from(n.checked_add(if round_up { d - 1 } else { 0 })? / d).ok()
 }
 
 pub(super) fn select(
     path: &Path, probe: &Value, master: &av::SourceMaster, ordinal: usize,
 ) -> Result<Option<(Selected, bool)>, String> {
-    let Some(rate) = master.rate.filter(|r| is_25_or_2997(Some(crate::rational(*r)))) else {
-        return Ok(None);
-    };
-    let mp4 = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
+    let picture_only_avc = avc_picture_only_rate(path, probe);
     let mov = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
+    let custom_prores = mov && matches!(probe.get("streams"),
+        Some(Value::Arr(streams)) if streams.first().is_some_and(custom_prores_raster));
+    let Some(rate) = master.rate else {
+        return if custom_prores {
+            Err("linked ProRes HQ master edit rate is unresolved".into())
+        } else if picture_only_avc.is_some() {
+            Err("linked picture-only AVC master edit rate is unresolved".into())
+        } else {
+            Ok(None)
+        };
+    };
+    if !is_25_or_2997(Some(crate::rational(rate))) && picture_only_avc.is_none() && !custom_prores {
+        return Ok(None);
+    }
+    let mp4 = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
     let mxf = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mxf"));
     if !mp4 && !mov && !mxf { return Ok(None); }
     if mxf {
@@ -41,7 +62,10 @@ pub(super) fn select(
     let raster = number(video, "width").zip(number(video, "height"))
         .ok_or("linked movie raster is missing")?;
     let brand = probe.get("format").and_then(|f| f.get("tags")).and_then(|f| text(f, "major_brand"));
+    let avc_pcm = !mxf && is_avc_pcm_movie(streams);
     let codec = match (text(video, "codec_name").as_deref(), raster) {
+        (Some("h264"), _) if avc_pcm => "avc1",
+        (Some("h264"), _) if picture_only_avc.is_some() => "avc1",
         (Some("h264"), (1920, 1080) | (1280, 720) | (2048, 858)) if !mxf => {
             qualify_avc_high(video, 40)?;
             "avc1"
@@ -53,7 +77,8 @@ pub(super) fn select(
         (Some("hevc"), (1920, 1080)) if mp4 && text(video, "codec_tag_string").as_deref() == Some("hvc1")
             && text(video, "profile").as_deref() == Some("Main 10")
             && text(video, "pix_fmt").as_deref() == Some("yuv420p10le") => "hvc1",
-        (Some("prores"), (1920, 1080)) if mov && brand.as_deref() == Some("qt  ")
+        (Some("prores"), _) if mov && (raster == (1920, 1080) || custom_prores)
+            && brand.as_deref() == Some("qt  ")
             && text(video, "codec_tag_string").as_deref() == Some("apch")
             && text(video, "profile").as_deref() == Some("HQ")
             && text(video, "pix_fmt").as_deref() == Some("yuv422p10le") => "apch",
@@ -65,9 +90,14 @@ pub(super) fn select(
             verify_op1a_package(probe, streams, master)?;
             "AVdn"
         }
+        _ if custom_prores => return Err("linked custom-raster ProRes requires QuickTime ProRes 422 HQ/apch, 10-bit 4:2:2".into()),
         _ => return Err("linked 25/29.97 movie has an unsupported picture profile".into()),
     };
-    let defaulted = qualify_movie_geometry_at_rate(video, raster, rate_exact)?;
+    let defaulted = if avc_pcm {
+        qualify_avc_pcm(streams, path, master)?
+    } else {
+        qualify_movie_geometry_at_rate(video, raster, rate_exact)?
+    };
     let frames = if mxf && ratio(video, "time_base") == Rational::new(rate.den.into(), rate.num.into()) {
         number(video, "duration_ts")
     } else {
@@ -86,14 +116,15 @@ pub(super) fn select(
         return Err("linked movie picture extent, master locator or lane origin disagrees".into());
     }
     let (audio, timecode) = match tail {
-        [] if codec == "apch" => (&tail[..0], None),
+        [] if codec == "apch" || picture_only_avc.is_some() => (&tail[..0], None),
         [a] if is_audio(a) => (tail, None),
+        [tc] if custom_prores => (&tail[..0], Some(tc)),
         [a, tc] if codec == "apch" && is_audio(a) => (&tail[..1], Some(tc)),
         [a, b] if (codec == "avc1" && mov || mxf) && is_audio(a) && is_audio(b) => (tail, None),
         _ => return Err("linked movie has unqualified additional streams".into()),
     };
     let embedded = if codec == "apch" {
-        prores_origin(path, probe, video, timecode, master, rate)?
+        prores_origin(path, probe, video, timecode, 1 + audio.len() as i64, master, rate)?
     } else {
         if video.get("tags").is_some_and(|tags| tags.get("timecode").is_some())
             || master.master.start.as_ref().is_some_and(|tc| tc.frames != 0 || tc.drop)
@@ -106,6 +137,8 @@ pub(super) fn select(
     let expected = if audio.is_empty() { 1 } else { 3 };
     if master.master.tracks.len() != expected || master.originals.len() != expected
         || labels.len() != expected || !labels.contains(&(KIND_PICTURE, 1))
+        || expected == 1 && (picture_only_avc.is_some() || custom_prores)
+            && !master.master.stereo_pairs.is_empty()
         || expected == 3 && ![1, 2].iter().all(|&lane| labels.contains(&(KIND_SOUND, lane)))
     {
         return Err("linked movie requires the exact saved picture and audio lanes".into());
@@ -188,6 +221,94 @@ pub(super) fn select(
     }, defaulted)))
 }
 
+// The original 1080p24 admission stays in its existing route.
+pub(super) fn avc_picture_only_rate(path: &Path, probe: &Value) -> Option<Rational> {
+    if !path.extension().is_some_and(|ext|
+        ext.eq_ignore_ascii_case("mov") || ext.eq_ignore_ascii_case("mp4"))
+    {
+        return None;
+    }
+    let Value::Arr(streams) = probe.get("streams")? else { return None; };
+    let [video] = streams.as_slice() else { return None; };
+    let rate = ratio(video, "avg_frame_rate")?;
+    (text(video, "codec_name").as_deref() == Some("h264")
+        && matches!((rate.num(), rate.den()), (24, 1) | (24_000, 1001) | (25, 1) | (30_000, 1001))
+        && !(rate == Rational::integer(24) && number(video, "width") == Some(1920)
+            && number(video, "height") == Some(1080) && number(video, "level") == Some(40)))
+        .then_some(rate)
+}
+
+pub(super) fn prove_avc_picture_cadence(
+    path: &Path, tool: &Path, probe: &Value, rate: Rational,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    qualify_container(path, probe)?;
+    let Some(Value::Arr(streams)) = probe.get("streams") else {
+        return Err("linked picture-only AVC stream table is missing".into());
+    };
+    let [video] = streams.as_slice() else {
+        return Err("linked picture-only AVC requires exactly one stream".into());
+    };
+    let raster = number(video, "width").zip(number(video, "height"))
+        .filter(|(w, h)| (16..=16_384).contains(w) && (16..=16_384).contains(h))
+        .ok_or("linked picture-only AVC raster is missing or out of range")?;
+    let level = number(video, "level").filter(|n| matches!(n, 40 | 51))
+        .ok_or("linked picture-only AVC requires H.264 High level 4.0 or 5.1")?;
+    qualify_avc_high(video, level)?;
+    qualify_movie_geometry_at_rate(video, raster, rate)?;
+    let (base, extent, _) = physical_span(video)?;
+    let count = number(video, "nb_frames").filter(|&n| (1..=(1 << 20)).contains(&n))
+        .ok_or("linked picture-only AVC needs a bounded declared frame count")?;
+    let frame = Rational::new(
+        i128::from(rate.den()) * i128::from(base.den()),
+        i128::from(rate.num()) * i128::from(base.num()),
+    ).filter(|ticks| ticks.den() == 1 && ticks.num() > 0)
+        .map(Rational::num)
+        .ok_or("linked picture-only AVC frame duration does not fit its file clock")?;
+    if count.checked_mul(frame) != Some(extent) {
+        return Err("linked picture-only AVC extent disagrees with its frame count".into());
+    }
+    let mut command = Command::new(tool);
+    command.args(["-v", "error", "-protocol_whitelist", "file,pipe", "-f", "mov",
+        "-select_streams", "v:0", "-show_packets", "-show_entries",
+        "packet=pts,duration:packet_side_data=", "-of", "csv=p=0"]).arg(path);
+    run_probe(command, PICTURE_PACKET_IDLE_LIMIT, check, move |stdout, progress| {
+        verify_avc_picture_packets(BufReader::new(stdout), count as usize, frame, || {
+            progress.fetch_add(1, Ordering::Relaxed);
+        })
+    }).map_err(|reason| format!("linked picture-only AVC packet proof failed: {reason}"))
+}
+
+fn verify_avc_picture_packets(
+    mut packets: impl BufRead, count: usize, frame: i64, mut mark_verified: impl FnMut(),
+) -> Result<(), String> {
+    // AVC packets can arrive in decode order. Every presentation slot must
+    // still occur exactly once on the file's declared frame grid.
+    const WORD_BITS: usize = u64::BITS as usize;
+    let mut seen = vec![0_u64; count.div_ceil(WORD_BITS)];
+    let mut verified = 0;
+    let mut bytes = Vec::new();
+    while let Some(row) = read_picture_packet_row(&mut packets, &mut bytes)? {
+        let (pts, duration) = row.split_once(',').ok_or("linked AVC packet clock is missing")?;
+        let pts = pts.parse::<i64>().ok().filter(|&n| n >= 0 && n % frame == 0);
+        let slot = pts.and_then(|n| usize::try_from(n / frame).ok()).filter(|&n| n < count);
+        let discontinuous = "linked picture-only AVC packet clock is discontinuous";
+        let slot = slot.ok_or(discontinuous)?;
+        let bit = 1 << (slot % WORD_BITS);
+        let word = &mut seen[slot / WORD_BITS];
+        if duration.parse::<i64>().ok() != Some(frame) || *word & bit != 0 {
+            return Err(discontinuous.into());
+        }
+        *word |= bit;
+        verified += 1;
+        mark_verified();
+    }
+    if verified != count {
+        return Err("linked picture-only AVC packet count disagrees with the declared extent".into());
+    }
+    Ok(())
+}
+
 fn verify_op1a_package(probe: &Value, streams: &[Value], master: &av::SourceMaster) -> Result<(), String> {
     let format = probe.get("format").ok_or("linked MXF format declaration is absent")?;
     let tags = format.get("tags").ok_or("linked MXF package declaration is absent")?;
@@ -224,11 +345,16 @@ fn physical_span(stream: &Value) -> Result<(Rational, i64, Rational), String> {
 }
 
 fn prores_origin(
-    path: &Path, probe: &Value, video: &Value, timecode: Option<&Value>,
+    path: &Path, probe: &Value, video: &Value, timecode: Option<&Value>, timecode_index: i64,
     master: &av::SourceMaster, rate: av::Rate,
 ) -> Result<Option<i64>, String> {
     let saved = master.master.start.as_ref().ok_or("saved ProRes source timecode is absent")?;
-    let base = if rate.num == 25 { 25 } else { 30 };
+    let base = match (rate.num, rate.den) {
+        (24, 1) | (24_000, 1001) => 24,
+        (25, 1) => 25,
+        (30_000, 1001) => 30,
+        _ => return Err("saved ProRes source timecode has an unsupported rate".into()),
+    };
     let day = if saved.drop { 2_589_408 } else { base * 86_400 };
     if saved.fps != base || saved.frames < 0 || saved.frames >= day
         || saved.drop && base != 30
@@ -251,6 +377,61 @@ fn prores_origin(
     } else { frames };
     let mut label = avid_reader::extract::format_timecode(labelled, base);
     if saved.drop { label.replace_range(8..9, ";"); }
-    qualify_prores_hq_parts(path, probe, video, tc, 2, crate::rational(rate), &label)?;
+    verify_prores_hq_timecode_track(path, probe, video, tc, timecode_index, crate::rational(rate), &label)?;
     Ok(Some(frames))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picture_packet_proof_accepts_decode_order_with_exact_presentation_grid() {
+        assert!(verify_avc_picture_packets(&b"0,1001\n2002,1001\n1001,1001\n"[..], 3, 1001, || {}).is_ok());
+        for rows in [
+            "0,1001\n1001,1001\n1001,1001\n",
+            "0,1001\n1000,1001\n2002,1001\n",
+            "0,1001\n1001,1000\n2002,1001\n",
+            "0,1001\n1001,1001\n",
+            "0,1001\n1001,1001\n2002,1001\n3003,1001\n",
+        ] {
+            assert!(verify_avc_picture_packets(rows.as_bytes(), 3, 1001, || {}).is_err(), "{rows}");
+        }
+    }
+
+    #[test]
+    fn picture_packet_proof_streams_a_long_reordered_report() {
+        use std::fmt::Write;
+        let count = 81_600;
+        let frame = 10_000;
+        let mut report = String::new();
+        for group in (0..count).step_by(4) {
+            for slot in [0, 3, 1, 2] {
+                writeln!(report, "{},{frame}", (group + slot) as i64 * frame).unwrap();
+            }
+        }
+        assert!(report.len() > 1 << 20);
+        verify_avc_picture_packets(report.as_bytes(), count, frame, || {}).unwrap();
+        let last_row = report[..report.len() - 1].rfind('\n').unwrap() + 1;
+        let error = verify_avc_picture_packets(&report.as_bytes()[..last_row], count, frame, || {})
+            .unwrap_err();
+        assert!(error.contains("packet count"));
+        report.replace_range(last_row.., "815990000,10000\n");
+        let error = verify_avc_picture_packets(report.as_bytes(), count, frame, || {}).unwrap_err();
+        assert!(error.contains("clock is discontinuous"));
+    }
+
+    #[test]
+    fn linked_pcm_extent_rounds_the_full_duration_once() {
+        for (rate, samples) in [
+            ((24, 1), 96_000), ((24_000, 1001), 96_096),
+            ((25, 1), 92_160), ((30_000, 1001), 76_876),
+        ] {
+            assert_eq!(frame_audio_extent(48, av::Rate::new(rate.0, rate.1).unwrap(), false), Some(samples));
+        }
+        let ntsc = av::Rate::new(30_000, 1001).unwrap();
+        assert_eq!(frame_audio_extent(48, ntsc, true), Some(76_877));
+        assert_eq!(frame_audio_extent(50, ntsc, false), Some(80_080));
+        assert_eq!(frame_audio_extent(i64::MAX, ntsc, false), None);
+    }
 }

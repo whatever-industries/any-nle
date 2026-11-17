@@ -1371,7 +1371,23 @@ impl Writer<'_> {
         let model = self.model;
         let options = &model.options;
         let seq_name = py_str_repr(&seq.name);
-        let mut preset = preset_bound(&seq.name, seq.rate, seq.width, seq.height, &mut self.report, self.rewrapped)?;
+        let non_drop = model.non_drop_sequences.contains(&sequence_index);
+        let mut preset = preset_bound(&seq.name, seq.rate, seq.width, seq.height, &mut self.report, self.rewrapped)
+            .or_else(|error| {
+                let mut picture = seq.events.iter().filter(|event| event.video_track.is_some()).peekable();
+                if self.rewrapped || picture.peek().is_none() || !picture.all(|event| {
+                    model.originals.get(event.clip.as_str()).is_some_and(|clip|
+                        clip.matches_explicit_linked_raster(seq))
+                }) {
+                    return Err(error);
+                }
+                let drop = seq.rate == Fraction::new(30_000, 1001) && !non_drop;
+                let display = super::rewrap::display_format(seq.rate, drop).ok_or(error)?;
+                self.report.notes.push(format!(
+                    "sequence {seq_name}: explicit linked raster {}x{} at {} fps",
+                    seq.width, seq.height, seq.rate));
+                Ok(format!("anynle-linked/{}/{}/{}/{display}", ticks_per_unit(seq.rate), seq.width, seq.height))
+            })?;
         if self.native_av {
             let width=model.native_sequence_channels(seq)?;
             if width>0 {
@@ -1415,7 +1431,6 @@ impl Writer<'_> {
         }
         let mixer = model.audio_mixers.get(&sequence_index);
         let track_pans = mixer.and_then(|mixer| mixer.mono_track_pans);
-        let non_drop = model.non_drop_sequences.contains(&sequence_index);
         let sequence = if track_pans.is_some() || non_drop {
             let mut format = crate::build::sequence::format_by_name(&preset)
                 .ok_or_else(|| UnverifiedShape("unknown sequence preset".into()))?;
@@ -2310,7 +2325,10 @@ pub fn prepare_project_with_effects(model: &Model, editorial: Editorial<'_>,
     let Editorial { texts, video_dissolves, picture_effects, direct_dnxhr_origins, constant_speeds } = editorial;
     super::prepared::validate_texts(texts, &model.sequences)?;
     super::prepared::validate_video_dissolves(video_dissolves, &model.sequences)?;
-    super::prepared::validate_picture_effects(picture_effects, &model.sequences, constant_speeds)?;
+    super::prepared::validate_picture_effects(picture_effects, &model.sequences, constant_speeds,
+        |_, _| false, |event| {
+            model.clips.get(&event.clip)?.video.as_ref().map(|v| (v.rate, (v.width, v.height)))
+        })?;
     super::prepared::validate_constant_speeds(constant_speeds, &model.options, &model.sequences,
         |id, seq, event, speed| model.clips.get(id).is_some_and(|clip| speed.raw_trim(seq, event, clip).is_some()))?;
     let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),non_drop_sequences:&HashSet::new(),picture_effects,source_luts:&[],extended_sdr_grades:&HashSet::new(),edit_labels:&[],disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
@@ -2520,7 +2538,7 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
     let direct_dnxhr = direct_dnxhr_files(model, if linked_op1a.is_empty() { media } else { &[] }, native_av)?;
     dissolve_handles(model)?;
     for p in model.picture_effects {
-        if matches!(p.effect, PictureEffect::CornerPin(_)) {
+        if matches!(p.effect, PictureEffect::CornerPin(_) | PictureEffect::CornerPinWithFlop { .. }) {
             let seq = &model.sequences[p.sequence];
             let edit = &seq.events[p.event];
             let unit = ticks_per_unit(seq.rate);

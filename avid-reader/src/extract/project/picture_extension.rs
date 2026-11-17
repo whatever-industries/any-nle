@@ -365,7 +365,7 @@ const RESIZE_BACKGROUND: [(&str, f64); 3] = [
 
 fn resize_crop(ctx: &Ctx<'_>, effect: &Node, list: &Node, items: &[Value], length: i64, rate: Rate) -> Option<[ResizeKey; 2]> {
     let tracks = ctx.tracks(effect);
-    if !qualified_controls(ctx, effect, list, rate, "Resize")
+    if !linear_motion_clock(rate) || !qualified_controls(ctx, effect, list, "Resize")
         || tracks.iter().map(|track| int(track, "index")).ne([Some(1)])
     {
         return None;
@@ -453,7 +453,7 @@ fn trim_point(p: &Value, flag: i64) -> Option<(i64, f64)> {
 // The native Resize returns retain all three points even when one or more
 // lie beyond the edit. Treat their times as saved facts, independent of flag.
 fn resize_trim(ctx: &Ctx<'_>, effect: &Node, list: &Node, items: &[Value], length: i64, rate: Rate) -> Option<LinearTrim> {
-    if !qualified_controls(ctx, effect, list, rate, "Resize")
+    if !linear_motion_clock(rate) || !qualified_controls(ctx, effect, list, "Resize")
         || ctx.tracks(effect).iter().map(|track| int(track, "index")).ne([Some(1)])
         || items.len() != RESIZE_IDS.len() + RESIZE_CROP.len() + RESIZE_SWITCHES.len() + RESIZE_BACKGROUND.len()
     {
@@ -629,11 +629,15 @@ fn has_curve(item: &Node) -> bool {
 }
 
 pub(super) fn static_projective_warp(ctx: &Ctx<'_>, effect: &Node) -> Option<crate::transform::CornerPin> {
-    let mut values = compact_static_warp_controls(ctx, effect, true)?;
+    let rate = float(effect, "edit_rate").and_then(Rate::from_avid)?;
+    let mut values = compact_static_warp_controls(ctx, effect, true, rate)?;
     let count = values.len() + crate::transform::COMPACT_WARP_DEFAULTS.len();
+    let camera_clock = Some(rate) == Rate::new(24, 1);
     let mut take = |prefix: &str| values.remove(&format!("{prefix}568d7e84d511935a50f857c10000"));
     let (corners, from_transform) = match (take("0a82"), take("c881")) {
-        (Some(1.0), None) if matches!(count, 18 | 23) => {
+        (Some(1.0), None) if matches!(count, 18 | 23)
+            && matches!((rate.num, rate.den), (24, 1) | (24_000, 1001) | (25, 1) | (30_000, 1001)) =>
+        {
             let mut corners = [[0.0; 2]; 4];
             for (corner, (x, y)) in corners.iter_mut().zip([
                 ("0b82", "0c82"), ("0d82", "0e82"), ("0f82", "1082"), ("1182", "1282"),
@@ -642,10 +646,10 @@ pub(super) fn static_projective_warp(ctx: &Ctx<'_>, effect: &Node) -> Option<cra
             }
             (corners, false)
         }
-        (None, Some(1.0)) if matches!(count, 11..=14) => {
+        (None, Some(1.0)) if camera_clock && matches!(count, 11..=14) => {
             (skew_corners(&mut take)?, true)
         }
-        (None, None) if matches!(count, 13..=15 | 24) => {
+        (None, None) if camera_clock && matches!(count, 13..=15 | 24) => {
             (rotation_corners(&mut take, count == 24)?, true)
         }
         _ => return None,
@@ -673,7 +677,7 @@ pub(super) fn static_projective_warp(ctx: &Ctx<'_>, effect: &Node) -> Option<cra
 }
 
 pub(super) fn compact_affine_warp(ctx: &Ctx<'_>, effect: &Node) -> bool {
-    compact_static_warp_controls(ctx, effect, false).is_some_and(|values| {
+    compact_static_warp_controls(ctx, effect, false, Rate::new(24, 1).unwrap()).is_some_and(|values| {
         if values.len() == 15 {
             isolated_roll_controls(values)
         } else {
@@ -736,14 +740,12 @@ fn static_warp_crop(take: &mut impl FnMut(&str) -> Option<f64>) -> Option<[f64; 
 }
 
 fn compact_static_warp_controls(
-    ctx: &Ctx<'_>, effect: &Node, allow_reflections: bool,
+    ctx: &Ctx<'_>, effect: &Node, allow_reflections: bool, rate: Rate,
 ) -> Option<HashMap<String, f64>> {
     // Match the compact, curve-free controls in the retained geometry renders.
     // Unknown controls may affect geometry or the compositing result.
     let length = int(effect, "length").filter(|&n| n > 0)?;
-    let rate = float(effect, "edit_rate").and_then(Rate::from_avid)?;
     if effect.get("effect_id").and_then(Value::as_str) != Some("EFF2_SBLEND")
-        || Rate::new(24, 1) != Some(rate)
         || !effect_envelope(ctx, effect, "3DWarp")
     {
         return None;
@@ -1049,9 +1051,12 @@ fn curve_differs_from_inline(ctx: &Ctx<'_>, item: &Node) -> bool {
         })
 }
 
-fn qualified_controls(ctx: &Ctx<'_>, effect: &Node, list: &Node, rate: Rate, name: &str) -> bool {
-    list.class == *b"PRLS" && Rate::new(24_000, 1001) == Some(rate)
-        && effect_envelope(ctx, effect, name)
+fn linear_motion_clock(rate: Rate) -> bool {
+    matches!((rate.num, rate.den), (24, 1) | (24_000, 1001) | (25, 1) | (30_000, 1001))
+}
+
+fn qualified_controls(ctx: &Ctx<'_>, effect: &Node, list: &Node, name: &str) -> bool {
+    list.class == *b"PRLS" && effect_envelope(ctx, effect, name)
 }
 
 fn effect_envelope(ctx: &Ctx<'_>, effect: &Node, name: &str) -> bool {
@@ -1166,9 +1171,11 @@ fn normalize(length: i64, pairs: [[f64; 2]; 8], warp: bool) -> Option<[ResizeKey
 }
 
 fn warp_roll(ctx: &Ctx<'_>, effect: &Node, list: &Node, items: &[Value]) -> Option<PictureExtension> {
-    let rate = Rate::new(24, 1)?;
+    let rate = float(effect, "edit_rate").and_then(Rate::from_avid)?;
     let length = int(effect, "length").filter(|&n| (3..=256).contains(&n))?;
-    if list.class != *b"PRLS" || items.len() != 16 || !effect_envelope(ctx, effect, "3DWarp") {
+    if !linear_motion_clock(rate)
+        || list.class != *b"PRLS" || items.len() != 16 || !effect_envelope(ctx, effect, "3DWarp")
+    {
         return None;
     }
     let input = ordered_picture_input(ctx, effect, length, rate)?;
@@ -1282,7 +1289,7 @@ pub(super) fn warp(ctx: &Ctx<'_>, effect: &Node) -> Option<PictureExtension> {
             parts.iter().all(|(_, n)| int(n, "length").is_some_and(|l| l == 0 || l == length))
                 && parts.iter().filter(|(_, n)| int(n, "length") == Some(length)).count() == 1
         };
-        if !qualified_controls(ctx, effect, list, rate, "3DWarp")
+        if !linear_motion_clock(rate) || !qualified_controls(ctx, effect, list, "3DWarp")
             || int(background, "media_kind_id") != Some(KIND_PICTURE)
             || int(picture, "media_kind_id") != Some(KIND_PICTURE)
             || !full_span_background || !ctx.is_empty(background)

@@ -69,6 +69,14 @@ input revisions, and media checks are revalidated by saved jobs.
 
 ## Continue with omissions
 
+With complete saved dependency evidence, linked Avid → Premiere reports
+duplicate MXF packages outside the selected bins' saved references as
+diagnostic warnings. Packages referenced by a selected clip or saved
+dependency retain their blocking diagnostic. An incomplete dependency walk
+retains the scan refusal. The same check lets qualified missing-media
+omissions proceed in the presence of unrelated duplicates. The media index
+excludes ambiguous packages from physical binding in every mode.
+
 Linked Avid → Premiere conversions use best effort by default. Qualified
 media bindings and requested offline items take precedence. The linked
 reader can omit ordinary saved originals that are unavailable, a missing
@@ -85,6 +93,15 @@ source receipt. Other unsupported timing stays in the loss report, and
 the rest of the sequence can continue. Contradictory bindings, corrupt
 inputs, graph limits, and invalid project outputs still fail. The same
 default applies to older jobs.
+
+When an ordinary video or audio dissolve starts at the cut from saved
+filler or ends at the cut into saved filler, a linked conversion can keep
+the adjacent edit and report the dropped fade by occurrence. This requires
+an isolated span on the affected lane, a matching saved transition clock,
+a verified filler receipt, and an edit that already starts or ends at the
+cut. This includes Avid Film Dissolve and Film Fade when the saved effect
+identity and the filler receipt agree. Other video layers retain their
+edits. Qualified editable stereo fades take precedence.
 
 Linked Entire Project preparation can also omit a wholly offline
 managed master that cannot become a valid Premiere placeholder. It
@@ -680,9 +697,10 @@ This capture uses the compact static 24 fps control set from the
 retained Avid renders, with one direct picture input, a filler
 background and a convex target. It checks saved parameter identities
 and the absence of curve references. Other controls remain in the
-native parameter receipt. An isolated pin with verified square-pixel
-1080p24 picture also becomes a `picture.corner_pin` effect on the
-placement. It carries optional `source_crop_ltrb` fractions. An absent
+native parameter receipt. An isolated explicit pin with verified
+square-pixel picture becomes a `picture.corner_pin` effect on a same-rate
+24, 24000/1001, 25 or 30000/1001 placement. It carries optional
+`source_crop_ltrb` fractions. An absent
 field means zero crop. Premiere 27 writes editable Corner Pin and, for
 nonzero margins, Rounded Crop. The Rounded Crop offset places the matte
 around the intended source rectangle. The two effects render in the
@@ -690,13 +708,33 @@ measured order, with the saved component list placing Corner Pin first.
 Resolve writing remains open.
 CONV-0099 through CONV-0101
 
+Premiere uses matched 1920×1080 geometry or verified square-pixel linked
+picture at the same source and destination raster. This covers explicit
+targets with optional source crop and one horizontal reflection before
+or after the pin. In twelve derived cases at 1600×900 and 1440×1080,
+Premiere 27 kept the four editable target points after Save As and
+reopen. All 84 chart points matched the homography within 0.30 pixels,
+and sampled crop or picture edges were within one pixel. These compare
+Premiere frames to the geometric projection from saved targets.
+
+Premiere preparation and writer validation use the same rule for the
+four exact clocks, matching picture and canvas, and qualified linked
+rasters. In one Premiere 27 project, 28 derived timelines used the same
+compressed ProRes HQ chart pictures at all four clocks. After Save As
+and reopen, all 112 decoded frames matched their respective 24 fps
+controls pixel for pixel. Editable points, asymmetric crop and both
+Flop orders survived. A repeated reopen and render matched all 32
+additional cropped Flop frames.
+
 Static 3D Warp pitch and yaw with neutral position, scale, pivot and roll
 can also produce `picture.corner_pin`. This path allows up to one
 nondefault Perspective axis in the measured range. It records the computed
 corners under `controls.picture.projected_corners` and retains the original
 parameter values. Premiere exposes editable target points and reports the
 loss of the original Rotation and Perspective controls. The full source
-plane must have positive projective depth. CONV-0102
+plane must have positive projective depth. Camera-derived points retain
+the 1920×1080, 24 fps qualification. Both wider-raster camera controls kept their
+cuts with an explicit effect loss. CONV-0102
 
 The default camera profile also accepts bounded static Z/X/Y rotation
 combined with independent X/Y scaling, an XYZ Axis and XYZ Position.
@@ -705,15 +743,21 @@ in Z/X/Y order, and adds Position before projection. The same
 `projected_corners` receipt retains the result alongside the original
 controls. CONV-0103
 
-Compact three-key Linear Warp can also carry animated X Position,
+### Animated 3D Warp Z Rotation
+
+Compact three-key Linear Warp can carry animated X Position,
 Scale Width and Z Rotation together. Graph/2 records the three exact
 edit-relative frame positions, normalized X and the saved width and
 rotation values in `avid.warp_roll_linear`. Premiere adds the verified
-source in-point once to place the editable Motion keys. The admitted
-1080p24 profile uses a centered anchor, neutral crop, full height and no
-retiming or stack. CONV-0109
+source in-point once to place the editable Motion keys. The profile uses a
+centered anchor, neutral crop, full height and an isolated same-rate edit
+with no retiming or effect stack.
+Preparation and writer validation share the rotation frame clock rule at
+24, 24000/1001, 25 and 30000/1001. The first and last keys must still
+coincide with the first and last visible frames.
+CONV-0109
 
-The same bounded profile also carries Avid Shelf as
+Graph/2 also carries Avid Shelf as
 `avid.warp_roll_shelf`, with the identical edit-relative key layout.
 All three source curves must use Shelf. Premiere writes Hold to the
 editable Position, Width and Rotation keys, with no spatial tangents on
@@ -726,6 +770,35 @@ zero saved value tangents and temporal handles of 40% of the adjacent
 key span. Premiere writes editable Bezier timing with zero slopes and
 40% influence, and keeps the Position path straight.
 CONV-0111
+
+Premiere admits these roll controls on matched 1920×1080 picture and on
+verified square-pixel linked AVC/PCM at a matching raster. After Save As
+and reopen, the 1600×900 and 1440×1080 synthetic media controls retained
+all nine editable keys at file frames 6, 11, and 18 in each mode. All 728
+points across 104 rendered frames were within 0.21 pixels of the expected
+pixel-space projection. The new rasters use derived AVBs. Native Avid
+render comparisons at those rasters remain pending.
+
+One Premiere 27.0.0 build 88 project tested Linear rotation at all four
+clocks with matching 1600×900 linked ProRes and retained Avid curves in
+derived bins. The two source in-points put the editable keys at file
+frames 6, 11, 18 and 17, 22, 29. After Save As, close, and reopen, all
+156 decoded comparison frames matched their 24000/1001 controls. A
+second reopen reproduced 104 animated frames. All 728 measured chart
+points landed within 0.15 pixels of the saved curves' projection.
+A mismatched curve clock omitted the effect and preserved the edit.
+
+A second Premiere 27 project tested Shelf, Bezier and Spline at all four
+clocks using the same linked ProRes chart and derived AVBs. The source
+in-point put all three editable keys at file frames 17, 22 and 29.
+After Save As, close, and reopen, all 260 comparison frames, including
+the plain and Linear controls, matched their 24000/1001 counterparts.
+A second reopen reproduced 156 animated frames. All 1,092 measured
+chart points were within 0.21 pixels of the projected motion. Mixed
+interpolation and a changed handle each omitted the effect and preserved
+the edit. Native Avid renders at the added rates remain pending.
+
+### Additional static 3D Warp controls
 
 Static Skew uses simultaneous X and Y shear on the source coordinates.
 In the tested X-only profile with Z Rotation, rotation follows the
@@ -777,9 +850,19 @@ CONV-0108
 ### Writing ordered picture chains
 
 Premiere and the internal Resolve writer consume the same ordered stages.
-The current construction supports reflections and up to one qualified
-static or Linear Resize/3D Warp stage on a same-rate, matched 1920×1080
-picture edit. Motion uses a centered anchor and neutral rotation. Repeated
+Both support reflections and up to one qualified static or Linear
+Resize/3D Warp stage on a same-rate, matched 1920×1080 picture edit.
+Premiere also uses verified square-pixel linked AVC MOV or MP4 and ProRes
+422 HQ MOV for static and uncropped two-key Linear motion at a matching
+source and destination raster. This applies to a single motion effect or
+a motion stage in an ordered chain. The saved key span and source rate
+checks apply at every raster. The raster decision uses the bound picture
+stream. Any audio layout must pass its own checks. Picture-only originals
+use the same rule when the source reader establishes an exact fixed-rate
+stream. Reopened 24 fps custom-raster ProRes controls verified static
+Corner Pin with source crop and both Pin/Flop orders.
+It uses the selected destination raster when the Avid sequence canvas is
+unknown. Motion uses a centered anchor and neutral rotation. Repeated
 reflections combine per axis. Unsupported stages or multiple Motion
 stages receive an explicit loss in Premiere or refusal in Resolve.
 
@@ -800,6 +883,76 @@ all 144 decoded frames identical before and after reopening across the
 stack, standalone Warp, and synthetic reverse-order control. The latter
 matched horizontally reflected Warp edges within one pixel. The two
 orders differed by up to 480 pixels at a visible edge.
+
+Premiere 27.0.0 build 88 reopened the generated 1600×900 at 24 fps and
+1440×1080 at 24000/1001 controls after Save As and close. Derived AVBs
+combined retained effect controls with linked synthetic media. At three
+frames per timeline, Flop before Warp kept the asymmetric crop bounds,
+and Flop after Warp mirrored those bounds. The left edge fell 48 and
+44 pixels apart between the two orders, respectively. Both mono edits
+survived structural read-back. Native Avid renders at these rasters and
+rendered audio comparisons remain pending.
+
+Derived Avid two-key controls on the same rasters preserved the first and
+last Linear keys at file frames 6 and 41 after Premiere 27 Save As and
+reopen. At five sampled frames per timeline, visible edges were within
+one pixel of the bounds projected from the saved position and scale.
+Flop before motion kept those bounds. Flop after motion mirrored them.
+The paired 1440×1080 Resize and promoted Warp produced identical pixels
+at all five samples.
+
+Two-key Linear crop at 24000/1001 also uses the matched linked AVC/PCM
+profile. Derived AVBs at 1440×1080 and 3840×2160 retained editable
+position, scale and all four crop curves at the same file frames 6 and 41
+after Premiere 27 Save As and reopen. Resize and Warp produced identical
+pixels at five sampled positions per raster. Flop before Warp kept the
+visible bounds, and Flop after Warp mirrored them. The measured low-luma
+edges were within three pixels at 1440×1080 and four pixels at 3840×2160
+of the geometric projection. Native Avid render comparisons at those
+rasters remain pending.
+
+The qualified three-key 24000/1001 trim profiles also use this matched
+linked geometry. In the derived 1440×1080 and 3840×2160 head and tail
+controls, Premiere 27 preserved each saved position, width, height and
+crop key after Save As and reopen, including keys outside the visible
+edit. The UHD head trim also retained both Flop orders. Fifty sampled
+frames put the visible edges within four pixels of the piecewise Linear
+projection. Both insufficient-handle controls retained the picture and
+two mono edits with a loss for the omitted effect. Native Avid renders
+for these linked rasters remain pending.
+
+Uncropped Linear Resize and 3D Warp use the same trim clock at 24,
+24000/1001, 25 and 30000/1001. Preparation and writer validation use the
+exact same-rate sequence frame duration. A key's file-relative time is
+the edit's source in-point plus its saved frame offset. Fixed Width
+retains its own keys, and Elastic retains the saved times for each
+qualified track. Keys outside the visible edit require verified source
+handles.
+
+One Premiere 27.0.0 build 88 project used derived AVBs and identical chart
+packets on all four clocks at 1600×900. Two-key Motion, Fixed and Elastic
+Resize head trims, Fixed Width 3D Warp head and tail trims, and an
+Elastic 3D Warp tail kept the exact ranges and editable Linear keys
+after Save As, close, and reopen. All 1,056 decoded comparison frames
+matched their corresponding 24000/1001 controls. A missing handle
+omitted only the effect. These are Premiere render comparisons against
+the established clock using retained Avid curves. Native Avid renders
+at the added rates remain untested.
+
+Two-key and trimmed Linear crop use the same four clocks. The crop edges
+retain their own shared key times alongside Position, Width and Height.
+Uncropped two-key Motion retains its existing admission.
+
+The Premiere 27.0.0 build 88 crop project used matching 1600×900 linked
+ProRes and derived AVBs with the retained Avid crop curves. Resize and
+3D Warp head and tail trims retained off-cut keys. Both Flop orders
+preserved the expected crop geometry. After Save As, close, and reopen,
+all 1,200 decoded comparison frames matched their 24000/1001 controls.
+Measured edges on all 1,056 animated frames were within one pixel of
+the projection from the saved curves. Missing source handles and a
+mismatched crop clock each omitted the effect and retained the edit.
+Native Avid renders for the combined trim cases at the added rates
+remain untested.
 
 ## Compatibility profiles
 

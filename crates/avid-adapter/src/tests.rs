@@ -60,6 +60,20 @@ fn distinguishes_selected_ambiguous_packages_from_other_scan_diagnostics() {
             format!("ambiguous MXF file package {unrelated}"),
         ]
     );
+
+    let linked = original::OriginalIndex {
+        allow_media_gaps: true,
+        references: Some(unused::References::default()),
+        ..Default::default()
+    };
+    let checked = build_selected(
+        &facts, &index, "Synthetic", &["Bin".into()], &linked, &MotionMxf::default(),
+    ).unwrap();
+    assert_eq!(checked.ambiguous_managed_packages, result.ambiguous_managed_packages);
+    assert_eq!(checked.scan_issues, [format!("ambiguous MXF file package {selected}")]);
+    assert!(checked.diagnostics.iter().any(|detail|
+        detail == &format!("Duplicate MXF file package {unrelated} is outside the selected bins' saved references.")));
+    assert_eq!(checked.graph, result.graph);
 }
 
 #[test]
@@ -101,8 +115,7 @@ fn unused_managed_picture_with_unsupported_rate_gets_reported_omission() {
     assert_eq!(prepare(&facts, true).graph.losses[0].aspect, "source_master");
 }
 
-#[test]
-fn legacy_mxf_sibling_locators_are_retained_for_an_unused_omission() {
+fn legacy_mxf_fixture() -> av::SourceProject {
     let (mut facts, _) = fixture(8);
     let source = &mut facts.masters[0];
     source.id = "revision/bin/0/item/0".into();
@@ -130,12 +143,20 @@ fn legacy_mxf_sibling_locators_are_retained_for_an_unused_omission() {
             motion_audio_track_start: None,
         })
     }).collect();
+    facts
+}
+
+#[test]
+fn legacy_mxf_sibling_locators_are_retained_for_an_unused_omission() {
+    let mut facts = legacy_mxf_fixture();
     let check = |facts: &av::SourceProject, skip_unused: bool| {
         let options = original::OriginalOptions::default();
         let mut originals = original::OriginalIndex::scan_for_review_with_policy(facts, &options,
             true, None, &mut || Ok(())).map_err(SourceReadIssue::into_message)?;
         originals.references = skip_unused.then(unused::References::default);
-        originals.resolve_legacy_mxf(facts, &Default::default(), &options, &mut || Ok(()))
+        let index = Default::default();
+        let selected_media = SelectedMediaIndex::new(facts, &originals, &index, &mut || Ok(()))?;
+        originals.resolve_legacy_mxf(facts, &selected_media, &options, &mut || Ok(()))
             .map_err(SourceReadIssue::into_message)?;
         Ok::<_, String>(originals)
     };
@@ -174,11 +195,145 @@ fn legacy_mxf_sibling_locators_are_retained_for_an_unused_omission() {
     };
     assert!(verify(&index, &mut probe).unwrap().is_empty());
     index.identities.get_mut(Path::new("audio-8.mxf")).unwrap().file_tracks[0].2 -= 1;
-    assert!(verify(&index, &mut probe).unwrap_err().contains("extent disagrees for A8"));
+    let error = verify(&index, &mut probe).unwrap_err();
+    assert!(matches!(error,
+        original::legacy_mxf::SiblingIssue::Package { track: 8, message }
+        if message.contains("extent disagrees for A8")
+    ));
 
     let raw = facts.masters[0].originals[8].as_mut().unwrap();
     raw.locators[0] = "G//Saved/Example/../Lane 8.mxf".into();
     assert!(check(&facts, true).err().unwrap().contains("not a normalized absolute path"));
+}
+
+#[test]
+fn blocked_legacy_mxf_review_collects_missing_and_ambiguous_packages_from_index() {
+    let mut facts = legacy_mxf_fixture();
+    let mut later = legacy_mxf_fixture().masters.remove(0);
+    later.master.bin = 1;
+    later.id = "revision/bin/1/item/0".into();
+    for (ordinal, track) in later.master.tracks.iter_mut().enumerate() {
+        track.file_mob = mob(200 + ordinal as u32);
+    }
+    let mut index = index::MediaIndex::default();
+    index.ambiguous.push(later.master.tracks[1].file_mob.umid_hex());
+    // An indexed candidate alone does not prove the header or stream profile.
+    // Leave this candidate without any header so the test detects verification
+    // mistakenly continuing past the primary blocker.
+    let indexed = later.master.tracks[2].file_mob.umid_hex();
+    index.files.insert(indexed.clone(), "indexed-a2.mxf".into());
+    facts.masters.push(later);
+    let mut all_indexed = legacy_mxf_fixture().masters.remove(0);
+    all_indexed.master.bin = 2;
+    all_indexed.id = "revision/bin/2/item/0".into();
+    for (ordinal, track) in all_indexed.master.tracks.iter_mut().enumerate() {
+        track.file_mob = mob(300 + ordinal as u32);
+        index.files.insert(track.file_mob.umid_hex(), format!("indexed-{ordinal}.mxf").into());
+    }
+    facts.masters.push(all_indexed);
+
+    let run = |index: &index::MediaIndex, options: &original::OriginalOptions,
+               check: &mut dyn FnMut() -> Result<(), String>| {
+        let mut originals = original::OriginalIndex::scan_for_review_with_policy(
+            &facts, options, false, None, &mut || Ok(()),
+        ).map_err(SourceReadIssue::into_message).unwrap();
+        let selected_media = SelectedMediaIndex::new(&facts, &originals, index, &mut || Ok(())).unwrap();
+        originals.resolve_legacy_mxf(&facts, &selected_media, options, check)
+            .err().expect("first legacy MXF bundle must block")
+    };
+    let mut options = original::OriginalOptions::default();
+    let mut normal_checks = 0;
+    let primary = run(&index, &options, &mut || { normal_checks += 1; Ok(()) }).into_message();
+    assert!(primary.contains("Legacy MXF locators require the saved file packages"));
+
+    options.collect_blocked_locators = true;
+    let SourceReadIssue::OriginalLocator(issue) = run(&index, &options, &mut || Ok(()))
+    else {
+        panic!("expected the primary package diagnostic");
+    };
+    assert_eq!(issue.message, primary);
+    assert_eq!(issue.bin, 0);
+    assert_eq!(issue.kind, OriginalLocatorKind::LegacyMxfPackage);
+    assert!(!issue.details_truncated);
+    assert_eq!(issue.additional.len(), 1);
+    let (bin, detail) = &issue.additional[0];
+    assert_eq!(*bin, 1);
+    assert!(detail.contains("revision/bin/1/item/0"));
+    assert!(detail.contains("Ambiguous legacy MXF file package for A1"));
+    assert!(detail.contains("A8 (") && detail.contains("absent from the selected MXF package index"));
+    assert!(!detail.contains(&indexed));
+    assert!(!detail.contains("indexed-a2.mxf"));
+    let mut checks = 0;
+    assert_eq!(run(&index, &options, &mut || {
+        checks += 1;
+        if checks > normal_checks { Err("cancelled".into()) } else { Ok(()) }
+    }).into_message(), "cancelled");
+
+    // The duplicate in A2 is the first refusal. Keep missing lanes before
+    // and after it in the same clip, as well as problems on the later clip.
+    let duplicate = facts.masters[0].master.tracks[2].file_mob.umid_hex();
+    index.ambiguous.push(duplicate.clone());
+    index.ambiguous.sort();
+    for path in ["z duplicate.mxf", "a duplicate.mxf"] {
+        index.identities.insert(path.into(), MxfIdentity {
+            file_packages: vec![duplicate.clone()],
+            ..Default::default()
+        });
+    }
+    options.collect_blocked_locators = false;
+    let primary = run(&index, &options, &mut || Ok(())).into_message();
+    assert!(primary.contains("Ambiguous legacy MXF file package for A2"));
+    assert!(primary.contains(&duplicate));
+
+    options.collect_blocked_locators = true;
+    let SourceReadIssue::OriginalLocator(issue) = run(&index, &options, &mut || Ok(()))
+    else {
+        panic!("expected the primary duplicate-package diagnostic");
+    };
+    assert_eq!(issue.message, primary);
+    assert_eq!(issue.additional.len(), 3);
+    assert_eq!(issue.additional[0].0, 0);
+    assert!(issue.additional[0].1.contains("V1 (") && issue.additional[0].1.contains("A8 ("));
+    assert!(!issue.additional[0].1.contains(&duplicate));
+    assert_eq!(issue.additional[1].0, 0);
+    assert!(issue.additional[1].1.contains(&duplicate));
+    assert!(issue.additional[1].1.ends_with("2 of 2 indexed paths · a duplicate.mxf · z duplicate.mxf"));
+    assert_eq!(issue.additional[2].0, 1);
+    assert!(issue.additional[2].1.contains("Ambiguous legacy MXF file package for A1"));
+
+    let mut calls = 0;
+    let cancelled = run(&index, &options, &mut || {
+        calls += 1;
+        if calls == 1 { Err("cancelled".into()) } else { Ok(()) }
+    });
+    assert!(cancelled.into_message().ends_with("cancelled"));
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn unrelated_duplicates_do_not_block_qualified_legacy_mxf_omissions() {
+    let facts = legacy_mxf_fixture();
+    let options = original::OriginalOptions { allow_media_gaps: true, ..Default::default() };
+    let run = |index: &index::MediaIndex| {
+        let mut originals = original::OriginalIndex::scan_for_review_with_policy(
+            &facts, &options, false, None, &mut || Ok(()),
+        )?;
+        originals.references = Some(unused::References::default());
+        let selected_media = SelectedMediaIndex::new(&facts, &originals, index, &mut || Ok(()))?;
+        originals.resolve_legacy_mxf(&facts, &selected_media, &options, &mut || Ok(()))?;
+        Ok::<_, SourceReadIssue>(originals)
+    };
+    let mut index = index::MediaIndex::default();
+    index.ambiguous.push(mob(300).umid_hex());
+    let original = run(&index).map_err(SourceReadIssue::into_message).unwrap();
+    assert!(original.omitted_unused.contains_key(&facts.masters[0].id));
+    assert!(original.omitted_media.is_empty());
+    assert!(index.files.is_empty());
+    assert_eq!(index.ambiguous, [mob(300).umid_hex()]);
+
+    index.ambiguous = vec![facts.masters[0].master.tracks[0].file_mob.umid_hex()];
+    let error = run(&index).err().unwrap().into_message();
+    assert!(error.contains("Ambiguous legacy MXF file package for V1"));
 }
 
 #[test]
@@ -1152,6 +1307,7 @@ fn transition_endpoints_keep_native_identity() {
         effect: Some("DISSOLVE".into()),
         audio_curve_attribute: None,
         audio_curve_parameter: None,
+        outgoing_filler: None,
         incoming_filler: None,
         gain_gap_edges: [None, None],
         outgoing: av::Binding {
@@ -1433,12 +1589,30 @@ fn absent_pcm_prefix_siblings_can_be_omitted_but_present_unverified_files_refuse
     let (mut facts, present) = fixture(2);
     facts.masters[0].pcm_prefix = Some(av::SourcePcmPrefix { frames: 47, tail_package: mob(4) });
     facts.sequences.push(sequence(vec![event("missing-prefix", 1, 1, 0, 24, None)]));
-    let originals = original::OriginalIndex { allow_media_gaps: true, ..Default::default() };
+    let originals = original::OriginalIndex {
+        allow_media_gaps: true,
+        references: Some(unused::References::default()),
+        ..Default::default()
+    };
     let run = |index: &index::MediaIndex| build_selected(&facts, index, "test",
         &["bin".into()], &originals, &MotionMxf::default()).unwrap();
     let omitted = run(&Default::default());
     assert!(omitted.graph.losses.iter().any(|l| l.aspect == "media_bin_omission"));
     assert_eq!(omitted.graph.sequences[0].markers[0].duration, Rational::integer(1));
+    let mut unrelated = index::MediaIndex::default();
+    unrelated.ambiguous.push(mob(300).umid_hex());
+    let with_unrelated = run(&unrelated);
+    assert_eq!(with_unrelated.graph, omitted.graph);
+    assert!(with_unrelated.scan_issues.is_empty());
+    unrelated.unreadable.push(("broken.mxf".into(), "invalid header".into()));
+    let with_unreadable = run(&unrelated);
+    assert_eq!(with_unreadable.scan_issues, ["broken.mxf: invalid header"]);
+    assert!(with_unreadable.graph.sequences[0].markers.is_empty());
+    unrelated.unreadable.clear();
+    unrelated.ambiguous = vec![mob(4).umid_hex()];
+    let with_saved_tail = run(&unrelated);
+    assert_eq!(with_saved_tail.scan_issues.len(), 1);
+    assert!(with_saved_tail.graph.sequences[0].markers.is_empty());
     let unverified = run(&present);
     assert!(unverified.graph.losses.iter().any(|l| l.aspect == "source_master"));
     assert!(unverified.graph.sequences[0].markers.is_empty());
@@ -1490,6 +1664,114 @@ fn named_aac_and_smpte_ds_source_groups_preserve_declared_order() {
         assert_eq!(out.graph.sidecar("avid.source",&out.graph.items[0].id).unwrap().get("raw_groups"),Some(&Value::Arr(vec![s(raw)])));
         assert!(out.audio_group_issues.is_empty());
     }
+}
+
+#[test]
+fn blocked_original_review_checks_remaining_paths_without_probing_media() {
+    let scratch = tempfile::tempdir().unwrap();
+    let saved = scratch.path().join("saved");
+    let current = scratch.path().join("current");
+    std::fs::create_dir(&current).unwrap();
+    std::fs::write(current.join("mapped.wav"), b"intentionally invalid audio").unwrap();
+    std::fs::create_dir(current.join("directory.wav")).unwrap();
+
+    let master = |bin, names: &[&str]| {
+        let mut master = fixture(names.len() as i64).0.masters.remove(0);
+        master.id = format!("revision/bin/{bin}/item/0");
+        master.master.bin = bin;
+        master.originals = names.iter().map(|name| Some(av::OriginalTrack {
+            locators: vec![saved.join(name).to_str().unwrap().into()],
+            descriptor_class: "PCMA".into(),
+            descriptor_rate: 48000.0,
+            descriptor_length: 96000,
+            channels: Some(1),
+            sample_rate: Some(48000.0),
+            stored_quantization_bits: Some(24),
+            display_raster: None,
+            file_track: Some(1),
+            motion_audio_track_start: None,
+        })).collect();
+        master
+    };
+    let mut facts = fixture(1).0;
+    facts.masters = vec![
+        master(0, &["first.wav", "first.wav", "another.wav"]),
+        master(1, &["same.wav", "same.wav", "mapped.wav", "directory.wav"]),
+        master(2, &["same.wav"]),
+    ];
+    let mut options = original::OriginalOptions {
+        root_mappings: vec![original::RootMapping {
+            saved_root: saved.clone(),
+            current_root: current.clone(),
+        }],
+        ..Default::default()
+    };
+    let scan = |facts: &av::SourceProject, options: &original::OriginalOptions, check: &mut dyn FnMut() -> Result<(), String>| {
+        original::OriginalIndex::scan_for_review_with_policy(facts, options, false, None, check)
+            .err().expect("first original must block")
+    };
+    let mut normal_checks = 0;
+    let SourceReadIssue::OriginalLocator(original_issue) =
+        scan(&facts, &options, &mut || { normal_checks += 1; Ok(()) })
+    else {
+        panic!("expected first missing-original diagnostic");
+    };
+    assert_eq!(original_issue.kind, OriginalLocatorKind::MissingOriginal);
+    assert!(original_issue.message.contains("first.wav"));
+    assert!(original_issue.additional.is_empty());
+
+    options.collect_blocked_locators = true;
+    let SourceReadIssue::OriginalLocator(issue) = scan(&facts, &options, &mut || Ok(()))
+    else {
+        panic!("the mapped WAV must stay unprobed during blocked Review");
+    };
+    assert_eq!(issue.message, original_issue.message);
+    assert_eq!(issue.bin, 0);
+    assert_eq!(issue.kind, OriginalLocatorKind::MissingOriginal);
+    assert!(!issue.details_truncated);
+    assert_eq!(issue.additional.iter().map(|(bin, _)| *bin).collect::<Vec<_>>(), [0, 1, 1, 2]);
+    for ((_, detail), name) in issue.additional.iter().zip(["another.wav", "same.wav", "directory.wav", "same.wav"]) {
+        assert!(detail.contains(name), "{detail}");
+    }
+    assert!(issue.additional[2].1.contains("is not a file"));
+    let mut checks = 0;
+    assert_eq!(scan(&facts, &options, &mut || {
+        checks += 1;
+        if checks > normal_checks { Err("cancelled".into()) } else { Ok(()) }
+    }).into_message(), "cancelled");
+
+    std::fs::create_dir(&saved).unwrap();
+    for root in [&saved, &current] {
+        std::fs::write(root.join("ambiguous.wav"), b"the scan must never probe this").unwrap();
+    }
+    for (first, diagnosis) in [
+        ("relative.wav".into(), "not a normalized absolute path"),
+        (saved.join("ambiguous.wav").to_str().unwrap().into(), "2 exact candidates"),
+    ] {
+        facts.masters[0] = master(0, &["first.wav"]);
+        facts.masters[0].originals[0].as_mut().unwrap().locators = vec![first];
+        options.collect_blocked_locators = false;
+        let primary = scan(&facts, &options, &mut || Ok(())).into_message();
+        assert!(primary.contains(diagnosis), "{primary}");
+        options.collect_blocked_locators = true;
+        let SourceReadIssue::OriginalLocator(issue) = scan(&facts, &options, &mut || Ok(()))
+        else {
+            panic!("expected the primary locator diagnostic");
+        };
+        assert_eq!(issue.message, primary);
+        assert_eq!(issue.kind, OriginalLocatorKind::SavedPath);
+        assert!(!issue.details_truncated);
+        assert_eq!(issue.additional.iter().map(|(bin, _)| *bin).collect::<Vec<_>>(), [1, 1, 2]);
+        assert!(issue.additional[0].1.contains("0 exact candidates"));
+    }
+
+    options.root_mappings[0].current_root = "relative".into();
+    let SourceReadIssue::OriginalLocator(issue) = scan(&facts, &options, &mut || Ok(()))
+    else {
+        panic!("expected the saved mapping diagnostic");
+    };
+    assert!(issue.message.contains("current original root mappings must be absolute"));
+    assert!(issue.additional.is_empty());
 }
 
 #[test]

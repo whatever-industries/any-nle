@@ -92,6 +92,7 @@ impl TurnoverJob {
                         || *attach_avid_proxies,
                     attach_avid_proxies: *attach_avid_proxies,
                     allow_media_gaps: false,
+                    collect_blocked_locators: false,
                     proxy_rewrap_dir: proxy_rewrap_dir.clone(),
                     ffmpeg: ffmpeg.clone().unwrap_or_else(|| "ffmpeg".into()),
                     root_mappings: mappings

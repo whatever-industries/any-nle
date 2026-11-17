@@ -7,6 +7,8 @@ use std::fs::{self, File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) const RELINK_SUFFIX: &str = ".anynle-relink.json";
+
 pub(crate) fn paths<'a>(graph: &'a SourceGraph, omitted: &HashSet<&str>) -> HashSet<&'a str> {
     let retained = (!omitted.is_empty()).then(|| graph.items.iter()
         .filter(|item| !omitted.contains(item.id.as_str()))
@@ -228,7 +230,7 @@ pub(crate) fn report(
         .file_name()
         .ok_or("missing project filename")?
         .to_os_string();
-    filename.push(".anynle-relink.json");
+    filename.push(RELINK_SUFFIX);
     let online_originals = graph
         .media
         .iter()
