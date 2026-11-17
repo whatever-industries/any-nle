@@ -1,13 +1,19 @@
 //! Same-rate Premiere straight cuts into the shared Resolve turnover path.
+mod capture;
 mod components;
+pub use capture::read_premiere_media_graph;
 mod controls;
 mod fades;
 mod markers;
 mod metadata;
 mod mixer;
+mod source_capture;
 pub(crate) use metadata::{LABEL_LOSS as CLIP_LABEL_LOSS, LOSS as CLIP_METADATA_LOSS,
     SYNC_LOCK_LOSS, TIMELINE_MARK_LOSS};
 
+use self::source_capture::{
+    owning_bin, source_clock, source_receipt, source_sequence, GraphCapture, ROOT_BIN_ID,
+};
 use crate::{
     linked::{self, MediaSpec, Profile, ProjectSpec, TimelineSpec},
     media::media_digest,
@@ -16,14 +22,14 @@ use crate::{
 };
 use graph::{
     source::{
-        OriginalStream, SourceClock, SourceClockProvenance, SourceGraph, SourceItem,
+        OriginalStream, SourceClock, SourceGraph, SourceItem,
         SourceBinding, SourceItemMedia, SourceMedia, SourceSequence, SourceTrack, SourceText, SourceTransition, TextKind,
     },
-    Bin, Loss, Placement, Project as GraphProject, Rational, Sidecar, StreamKind, Value,
+    Loss, Placement, Rational, Sidecar, StreamKind, Value,
 };
 use prproj::{
     build::time::TICKS_PER_SECOND,
-    model::{ItemId, ItemType, Project, TrackData, TrackId, TrackItemId},
+    model::{ItemId, Project, SequenceId, TrackData, TrackId, TrackItemId},
     xml::{NodeId, PremiereDocument},
 };
 use serde::Serialize;
@@ -91,12 +97,9 @@ pub fn list_premiere_sequences(path: &Path) -> Result<Vec<PremiereSequenceInfo>>
         .collect())
 }
 
-pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) -> Result<Turnover> {
-    let path = premiere_path(path)?;
-    let (project, digest) = read_project(&path)?;
-    let project = &project;
+fn select_sequence(project: &Project, selector: &str) -> Result<SequenceId> {
     let sequences = project.sequences();
-    let sequence = if let Some(id) = sequences
+    Ok(if let Some(id) = sequences
         .iter()
         .copied()
         .find(|id| project.sequence_id(*id).as_deref() == Some(selector))
@@ -114,7 +117,14 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
             return Err("ambiguous Premiere sequence name; select by ObjectUID".into());
         }
         found
-    };
+    })
+}
+
+pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) -> Result<Turnover> {
+    let path = premiere_path(path)?;
+    let (project, digest) = read_project(&path)?;
+    let project = &project;
+    let sequence = select_sequence(project, selector)?;
     let id = project
         .sequence_id(sequence)
         .ok_or("Premiere sequence lacks ObjectUID")?;
@@ -139,76 +149,39 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
     if zero < 0 || zero % frame_ticks != 0 || origin >= 2_073_600 {
         return Err("Premiere sequence origin is off-frame or outside one day".into());
     }
-    let clock = SourceClock {
-        effective_count: origin,
+    let clock = source_clock(
+        origin,
         rate,
-        display_base: 24,
-        drop: false,
-        provenance: SourceClockProvenance {
-            origin_count: origin,
-            source_offset: 0,
-            source_rate: rate,
-            source_package: id.clone(),
-            timecode_track: "MZ.ZeroPoint".into(),
-            route: "Premiere sequence ticks".into(),
-        },
-    };
+        24,
+        false,
+        &id,
+        "MZ.ZeroPoint",
+        "Premiere sequence ticks",
+    );
     let sequence_panel_item = project
         .sequence_item(sequence)
         .ok_or("Premiere sequence panel owner is missing")?;
     let root = project
         .root_item()
         .ok_or("Premiere project root is absent")?;
-    let mut graph = SourceGraph {
-        project: GraphProject {
-            name: path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or("invalid project name")?
-                .into(),
-        },
-        media: vec![],
-        items: vec![],
-        bins: vec![Bin {
-            id: "premiere:root".into(),
-            name: "Master".into(),
-            parent: None,
-            items: vec![],
-        }],
-        sequences: vec![],
-        losses: vec![],
-        sidecars: vec![],
-        multicams: vec![],
-        multicam_uses: vec![],
-    };
-    let mut folder_ids = HashMap::from([(root, 0)]);
-    let sequence_bin = owning_bin(
-        project,
-        sequence_panel_item,
-        &mut folder_ids,
-        &mut graph.bins,
-    )?;
-    let mut out = SourceSequence {
-        disabled_placements: Vec::new(),
-        id: id.clone(),
-        name: project.sequence_name(sequence),
-        rate,
-        frame_size: data.frame_size,
-        start: clock.exact_start(),
-        clock: Some(clock),
-        tracks: vec![],
-        placements: vec![],
-        transitions: vec![],
-        markers: vec![],
-        texts: vec![],
-    };
+    let GraphCapture {
+        mut graph,
+        mut folder_ids,
+        sequence_bin,
+    } = GraphCapture::new(project, &path, root, sequence_panel_item)?;
+    let mut out = source_sequence(
+        id.clone(),
+        project.sequence_name(sequence),
+        data.frame_size,
+        clock,
+    );
     let mut seen_items = HashMap::new();
     let mut component_budget = components::Budget::default();
     let mut track_state = metadata::TrackStateCapture::default();
     let mut muted_tracks = Vec::new();
     let mut track_pans = [0; 2];
     let mut spec = ProjectSpec {
-        root_bin_id: Some("premiere:root".into()),
+        root_bin_id: Some(ROOT_BIN_ID.into()),
         timelines: vec![TimelineSpec {
             id: id.clone(),
             bin_id: graph.bins[sequence_bin].id.clone(),
@@ -558,11 +531,7 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
             });
         }
     }
-    let mut source_fields = vec![
-        ("bin_id".into(), Value::Str(graph.bins[sequence_bin].id.clone())),
-        ("frame_ticks".into(), Value::Int(frame_ticks)),
-        ("zero_point_ticks".into(), Value::Int(zero)),
-    ];
+    let mut source_fields = Vec::new();
     if bus_fader != 0 {
         source_fields.push((
             crate::source::mixer::MAIN_BUS_LEVEL.into(),
@@ -578,11 +547,13 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
             Value::Arr(track_pans.into_iter().map(|pan| Value::Int(i64::from(pan))).collect()),
         ));
     }
-    graph.sidecars.push(Sidecar {
-        adapter: "premiere.source".into(),
-        object: id,
-        data: Value::Obj(source_fields),
-    });
+    graph.sidecars.push(source_receipt(
+        id,
+        &graph.bins[sequence_bin].id,
+        frame_ticks,
+        zero,
+        source_fields,
+    ));
     let mut notices: Vec<_> = out
         .transitions
         .iter()
@@ -780,55 +751,6 @@ fn ticks(value: i64) -> Result<Rational> {
     )
 }
 
-fn owning_bin(
-    project: &Project,
-    item: ItemId,
-    ids: &mut HashMap<ItemId, usize>,
-    bins: &mut Vec<Bin>,
-) -> Result<usize> {
-    let mut item = project
-        .item(item)
-        .parent
-        .ok_or("unfiled Premiere panel item")?;
-    let mut ancestry = Vec::new();
-    let mut seen = HashSet::new();
-    while !ids.contains_key(&item) {
-        if project.item(item).item_type != ItemType::Bin
-            || !seen.insert(item)
-            || ancestry.len() >= 64
-        {
-            return Err("invalid Premiere bin ancestry".into());
-        }
-        ancestry.push(item);
-        item = project
-            .item(item)
-            .parent
-            .ok_or("Premiere bin is detached")?;
-    }
-    let mut parent = ids[&item];
-    for bin in ancestry.into_iter().rev() {
-        if bins.len() == 256 {
-            return Err("Premiere project exceeds bin limit".into());
-        }
-        let element = project.item(bin).element;
-        let uid = project
-            .doc
-            .tree
-            .get(element, "ObjectUID")
-            .ok_or("Premiere bin lacks ObjectUID")?;
-        let index = bins.len();
-        bins.push(Bin {
-            id: format!("premiere:bin:{uid}"),
-            parent: Some(bins[parent].id.clone()),
-            name: project.item_name(bin),
-            items: vec![],
-        });
-        ids.insert(bin, index);
-        parent = index;
-    }
-    Ok(parent)
-}
-
 fn clip_media(
     project: &Project,
     clip: TrackItemId,
@@ -987,21 +909,18 @@ fn bind(
         .to_str()
         .ok_or("invalid saved media locator")?
         .to_owned();
-    let tape = metadata::capture(project, item, media, &item_id, &spec.sha256, graph)?;
+    let tape = metadata::capture(project, item, media, &item_id, Some(&spec.sha256), graph)?;
     let clock = matches!(verified.profile, Profile::Mov { quicktime_timecode: true, .. })
-        .then(|| SourceClock {
-            effective_count: 0,
-            rate,
-            display_base: 24,
-            drop: false,
-            provenance: SourceClockProvenance {
-                origin_count: 0,
-                source_offset: 0,
-                source_rate: rate,
-                source_package: item_id.clone(),
-                timecode_track: "QuickTime tmcd".into(),
-                route: "verified original MOV timecode".into(),
-            },
+        .then(|| {
+            source_clock(
+                0,
+                rate,
+                24,
+                false,
+                &item_id,
+                "QuickTime tmcd",
+                "verified original MOV timecode",
+            )
         });
     let mut item_media = Vec::new();
     for n in 0..channels.unwrap_or(1) {

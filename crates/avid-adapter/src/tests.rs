@@ -63,6 +63,125 @@ fn distinguishes_selected_ambiguous_packages_from_other_scan_diagnostics() {
 }
 
 #[test]
+fn unused_managed_picture_with_unsupported_rate_gets_reported_omission() {
+    let (mut facts, index) = fixture(2);
+    let source = &mut facts.masters[0];
+    source.id = "revision/bin/0/item/0".into();
+    source.rate = None;
+    source.master.edit_rate = 59.831;
+    source.master.tracks.insert(0, MediaTrack {
+        kind: KIND_PICTURE,
+        index: 1,
+        file_mob: mob(100),
+        edit_rate: 59.831,
+        length: 48,
+        essence: Some(Essence::Picture {
+            compression: "RI00".into(), resolution_id: 0, width: 1920, height: 1080,
+            display_aspect: Some((16, 9)),
+        }),
+        offset: 0,
+        clip_length: 48,
+        gain_db: None,
+        pan_raw: None,
+    });
+    source.offsets.push(Observed::Known(0));
+    let prepare = |facts: &av::SourceProject, skip_unused: bool| {
+        let originals = original::OriginalIndex {
+            references: skip_unused.then(unused::References::default),
+            ..Default::default()
+        };
+        build_selected(facts, &index, "Synthetic", &["Bin".into()], &originals, &MotionMxf::default()).unwrap()
+    };
+    let strict = prepare(&facts, false);
+    assert_eq!(strict.graph.losses[0].aspect, "source_master");
+    let omitted = prepare(&facts, true);
+    assert_eq!(omitted.graph.losses[0].aspect, "unused_bin_item");
+    assert!(omitted.graph.losses[0].reason.contains("unsupported edit rate 59.831"));
+    facts.masters[0].master.edit_rate = 24.0;
+    assert_eq!(prepare(&facts, true).graph.losses[0].aspect, "source_master");
+}
+
+#[test]
+fn legacy_mxf_sibling_locators_are_retained_for_an_unused_omission() {
+    let (mut facts, _) = fixture(8);
+    let source = &mut facts.masters[0];
+    source.id = "revision/bin/0/item/0".into();
+    source.rate = Rate::new(24_000, 1001);
+    source.master.edit_rate = 23.976;
+    for track in &mut source.master.tracks { track.length = 48 * 2002; }
+    source.master.tracks.insert(0, MediaTrack {
+        kind: KIND_PICTURE, index: 1, file_mob: mob(100), edit_rate: 23.976, length: 48,
+        essence: Some(Essence::Picture {
+            compression: "AVHD".into(), resolution_id: 1253, width: 1920, height: 1080,
+            display_aspect: Some((16, 9)),
+        }),
+        offset: 0, clip_length: 48, gain_db: None, pan_raw: None,
+    });
+    source.offsets.push(Observed::Known(0));
+    source.originals = source.master.tracks.iter().enumerate().map(|(ordinal, track)| {
+        let picture = ordinal == 0;
+        Some(av::OriginalTrack {
+            locators: vec![format!("G//Saved/Example/Lane {ordinal}.mxf")],
+            descriptor_class: if picture { "CDCI" } else { "PCMA" }.into(),
+            descriptor_rate: track.edit_rate, descriptor_length: track.length,
+            channels: (!picture).then_some(1), sample_rate: (!picture).then_some(48_000.0),
+            stored_quantization_bits: (!picture).then_some(24),
+            display_raster: picture.then_some((1920, 1080)), file_track: Some(track.index),
+            motion_audio_track_start: None,
+        })
+    }).collect();
+    let check = |facts: &av::SourceProject, skip_unused: bool| {
+        let options = original::OriginalOptions::default();
+        let mut originals = original::OriginalIndex::scan_for_review_with_policy(facts, &options,
+            true, None, &mut || Ok(())).map_err(SourceReadIssue::into_message)?;
+        originals.references = skip_unused.then(unused::References::default);
+        originals.resolve_legacy_mxf(facts, &Default::default(), &options, &mut || Ok(()))
+            .map_err(SourceReadIssue::into_message)?;
+        Ok::<_, String>(originals)
+    };
+    assert!(check(&facts, false).err().unwrap().contains("Legacy MXF locators"));
+    let originals = check(&facts, true).unwrap();
+    let result = build_selected(&facts, &Default::default(), "Synthetic", &["Bin".into()],
+        &originals, &MotionMxf::default()).unwrap();
+    assert_eq!(result.graph.losses[0].aspect, "unused_bin_item");
+    let receipt = result.graph.sidecar("avid.source", "bin:0").unwrap();
+    let Value::Arr(masters) = receipt.get("omitted_unused_masters").unwrap() else { panic!("missing omitted master") };
+    let Value::Arr(tracks) = masters[0].get("tracks").unwrap() else { panic!("missing saved tracks") };
+    assert_eq!(tracks.len(), 9);
+    assert_eq!(tracks[8].get("saved_file_track"), Some(&Value::Int(8)));
+    assert_eq!(tracks[8].get("saved_locators"), Some(&Value::Arr(vec![s("G//Saved/Example/Lane 8.mxf")])));
+
+    let mut index = index::MediaIndex::default();
+    let source = &facts.masters[0];
+    for track in &source.master.tracks {
+        let package = track.file_mob.umid_hex();
+        let video = track.kind == KIND_PICTURE;
+        let path = PathBuf::from(if video { "picture.mxf".into() } else { format!("audio-{}.mxf", track.index) });
+        index.files.insert(package.clone(), path.clone());
+        index.identities.insert(path, MxfIdentity {
+            file_packages: vec![package], file_essence_tracks: 1,
+            file_tracks: vec![(24_000, 1001, 48), if video { (24_000, 1001, 48) } else { (48_000, 1, 48 * 2002) }],
+            ..Default::default()
+        });
+    }
+    let mut probe = |path: &Path| graph::json::parse(if path == Path::new("picture.mxf") {
+        r#"{"streams":[{"codec_type":"video","codec_name":"dnxhd","time_base":"1001/24000","start_pts":0,"duration_ts":48,"field_order":"progressive","sample_aspect_ratio":"1:1","width":1920,"height":1080}]}"#
+    } else {
+        r#"{"streams":[{"codec_type":"audio","codec_name":"pcm_s24le","time_base":"1/48000","start_pts":0,"duration_ts":96096,"sample_rate":"48000","channels":1}]}"#
+    });
+    let verify = |index: &index::MediaIndex, probe: &mut dyn FnMut(&Path) -> Result<Value, String>| {
+        original::legacy_mxf::missing_siblings(source, index, &mut || Ok(()), probe)
+    };
+    assert!(verify(&index, &mut probe).unwrap().is_empty());
+    index.identities.get_mut(Path::new("audio-8.mxf")).unwrap().file_tracks[0].2 -= 1;
+    assert!(verify(&index, &mut probe).unwrap_err().contains("extent disagrees for A8"));
+
+    let raw = facts.masters[0].originals[8].as_mut().unwrap();
+    raw.locators[0] = "G//Saved/Example/../Lane 8.mxf".into();
+    assert!(check(&facts, true).err().unwrap().contains("not a normalized absolute path"));
+}
+
+#[test]
 fn graph_keeps_same_named_subclip_receipts_on_their_bin() {
     let (mut facts, index) = fixture(1);
     for (number, start) in [(2, 11), (3, 41)] {
@@ -169,6 +288,7 @@ fn fixture(channels: i64) -> (av::SourceProject, index::MediaIndex) {
         marker_witnesses: vec![],
         originals: vec![],
         file_clocks: vec![],
+        pcm_prefix: None,
         managed_multistream: None,
         imported_audio: None,
         input_transforms: vec![],
@@ -202,11 +322,17 @@ fn event(
         id: id.into(),
         volume_automation: None,
         pan_automation: None,
+        subclip_center_pan_count: 0,
+        subclip_gain: None,
         picture_extension: None,
         picture_chain: Vec::new(),
         motion_adapter_phase: None,
         motion_adapter_center_pan: false,
         saved_timewarp: None,
+        dry_gain_bypass: false,
+        equalizer: None,
+        audiosuite: None,
+        gain_dry_input: None,
         constant_speed: None,
         plain_submaster: false,
         owner: format!("owner-{id}"),
@@ -262,6 +388,105 @@ fn sequence(events: Vec<av::SourceEvent>) -> av::SourceSequence {
 }
 
 #[test]
+fn timewarp_gap_keeps_the_saved_span_and_unrelated_edits() {
+    let (mut facts, index) = fixture(1);
+    let mut source = sequence(vec![event("audio", 1, 1, 0, 24, None)]);
+    source.unresolved.push(av::SourceIssue {
+        owner: "revision/seq/component/0".into(),
+        reason: "unsupported Timewarp curve".into(),
+        issue_kind: av::SourceIssueKind::Timewarp { length: 10 },
+        route: vec![],
+        record_start: Observed::Known(12),
+        record_rate: Rate::new(24, 1),
+        kind: KIND_PICTURE,
+        track: 2,
+        matte_inputs: None,
+        matte_import: None,
+        color_adapter: None,
+        submaster_inputs: vec![],
+        picture_profile: None,
+        timewarp: None,
+        nested_picture_motion: None,
+    });
+    facts.sequences.push(source);
+    let graph = build(&facts, &index, "test", &["Bin".into()]).unwrap().graph;
+    let [seq] = graph.sequences.as_slice() else { panic!("expected one sequence") };
+    assert_eq!(seq.placements.len(), 1);
+    assert_eq!(seq.placements[0].id, "audio");
+    let [marker] = seq.markers.as_slice() else { panic!("expected one gap marker") };
+    assert_eq!(marker.start, Rational::new(1, 2));
+    assert_eq!(marker.duration, Rational::new(5, 12).unwrap());
+    assert_eq!(marker.owner, MarkerOwner::Sequence);
+    assert!(graph.losses.iter().any(|loss| loss.aspect == "timewarp_gap"
+        && loss.reason.contains("component/0") && loss.reason.contains("V2")));
+    assert!(!graph.losses.iter().any(|loss| loss.aspect == UNQUALIFIED_ROUTE_TIMING));
+    facts.sequences[0].unresolved[0].record_rate = Rate::new(25, 1);
+    let graph = build(&facts, &index, "test", &["Bin".into()]).unwrap().graph;
+    assert!(graph.sequences[0].markers.is_empty());
+    assert!(graph.losses.iter().any(|loss| loss.aspect == UNQUALIFIED_ROUTE_TIMING));
+}
+
+#[test]
+fn unsupported_effect_marks_an_exact_gap_only_on_an_unoccupied_lane() {
+    let (mut facts, index) = fixture(1);
+    let mut source = sequence(vec![
+        event("before", 1, 1, 0, 12, None),
+        event("after", 1, 1, 24, 12, None),
+    ]);
+    source.unresolved.push(av::SourceIssue {
+        owner: "revision/seq/component/1".into(),
+        reason: "Gain render unavailable".into(),
+        issue_kind: av::SourceIssueKind::UntranslatedEffect { effect: "AudioSuite Gain", length: 12 },
+        route: vec![],
+        record_start: Observed::Known(12),
+        record_rate: Rate::new(24, 1),
+        kind: KIND_SOUND,
+        track: 1,
+        matte_inputs: None,
+        matte_import: None,
+        color_adapter: None,
+        submaster_inputs: vec![],
+        picture_profile: None,
+        timewarp: None,
+        nested_picture_motion: None,
+    });
+    facts.sequences.push(source);
+    let graph = build(&facts, &index, "test", &["Bin".into()]).unwrap().graph;
+    let seq = &graph.sequences[0];
+    assert_eq!(seq.placements.iter().map(|p| (p.id.as_str(), p.record_start)).collect::<Vec<_>>(),
+        [("before", Rational::ZERO), ("after", Rational::new(1, 1).unwrap())]);
+    let [marker] = seq.markers.as_slice() else { panic!("expected one gap marker") };
+    assert_eq!(marker.name, "AudioSuite Gain omitted · A1");
+    assert_eq!(marker.start, Rational::new(1, 2));
+    assert_eq!(marker.duration, Rational::new(1, 2).unwrap());
+    assert!(graph.losses.iter().any(|loss| loss.aspect == "effect_gap"));
+    assert!(!graph.losses.iter().any(|loss| loss.aspect == UNQUALIFIED_ROUTE_TIMING));
+
+    for (start, rate) in [(11, Rate::new(24, 1)), (12, Rate::new(25, 1))] {
+        let issue = &mut facts.sequences[0].unresolved[0];
+        issue.record_start = Observed::Known(start);
+        issue.record_rate = rate;
+        let graph = build(&facts, &index, "test", &["Bin".into()]).unwrap().graph;
+        assert!(graph.sequences[0].markers.is_empty());
+        assert!(graph.losses.iter().any(|loss| loss.aspect == UNQUALIFIED_ROUTE_TIMING));
+    }
+
+    let (mut grouped_facts, grouped_index) = fixture(2);
+    let mut grouped = sequence(vec![
+        event("left", 1, 1, 0, 24, Some((7, 0))),
+        event("right", 1, 2, 0, 24, Some((7, 1))),
+    ]);
+    let mut issue = facts.sequences[0].unresolved.pop().unwrap();
+    issue.record_rate = Rate::new(24, 1);
+    grouped.unresolved.push(issue);
+    grouped_facts.sequences.push(grouped);
+    let graph = build(&grouped_facts, &grouped_index, "test", &["Bin".into()]).unwrap().graph;
+    assert_eq!(graph.sequences[0].placements[0].grouped_audio[0].track, 1);
+    assert!(graph.sequences[0].markers.is_empty());
+    assert!(graph.losses.iter().any(|loss| loss.aspect == UNQUALIFIED_ROUTE_TIMING));
+}
+
+#[test]
 fn matte_key_loss_is_locatable_after_graph_reload() {
     let (mut facts, index) = fixture(1);
     let mut source = sequence(vec![event("unchanged-audio", 1, 1, 0, 24, None)]);
@@ -275,13 +500,13 @@ fn matte_key_loss_is_locatable_after_graph_reload() {
         record_rate: Rate::new(24, 1),
         kind: KIND_PICTURE,
         track: 2,
-        matte_inputs: Some(av::MatteInputs {
+        matte_inputs: Some(Box::new(av::MatteInputs {
             background: av::MatteBackground::LowerTrack,
             fill: Some(av::MatteInput {
                 mob: mob(10), track: 1, start: 8, length: 3, rate: Rate::new(24, 1).unwrap(),
             }),
             matte: None,
-        }),
+        })),
         matte_import: Some(av::MatteImport {
             ignore_alpha: Some(false),
             invert_alpha: None,
@@ -290,6 +515,8 @@ fn matte_key_loss_is_locatable_after_graph_reload() {
         color_adapter: None,
         submaster_inputs: Vec::new(),
         picture_profile: None,
+        timewarp: None,
+        nested_picture_motion: None,
     });
     facts.sequences.push(source);
     let built = run(&facts, &index).graph;
@@ -318,6 +545,11 @@ fn matte_key_loss_is_locatable_after_graph_reload() {
 
 #[test]
 fn color_adapter_receipt_binds_only_the_owned_picture_placement() {
+    const RANGE: &str = concat!(
+        "<ColorTransformationList><ColorTransformation><LinearLut>",
+        "<Name>Levels scaling (video levels to full range)</Name><BitDepth>10</BitDepth>",
+        "<Black>64</Black><White>940</White></LinearLut></ColorTransformation></ColorTransformationList>",
+    );
     let (mut facts, mut index) = fixture(1);
     let track = &mut facts.masters[0].master.tracks[0];
     track.kind = KIND_PICTURE;
@@ -346,16 +578,23 @@ fn color_adapter_receipt_binds_only_the_owned_picture_placement() {
         track: 1,
         matte_inputs: None,
         matte_import: None,
-        color_adapter: Some(av::SourceColorAdapter {
+        color_adapter: Some(Box::new(av::SourceColorAdapter {
+            centered_still_fit: false,
             master: mob(1),
             master_track: 1,
             source_in: 0,
+            subclip_master: None,
+            subclip_motion: None,
             picture_file: Observed::Known(file_mob),
-            transform: "<ColorTransformationList/>".into(),
+            transform: RANGE.into(),
             neutral_wrapper: true,
-        }),
+            wrapper_clip_color: Some([48_896; 3]),
+            managed_picture_span: None,
+        })),
         submaster_inputs: vec![],
         picture_profile: None,
+        timewarp: None,
+        nested_picture_motion: None,
     });
     facts.sequences.push(source);
     for (owner, expected) in [
@@ -369,11 +608,80 @@ fn color_adapter_receipt_binds_only_the_owned_picture_placement() {
         let Some(Value::Arr(issues)) = sidecar.get("unresolved") else { panic!("expected issues") };
         let adapter = issues[0].get("color_adapter").unwrap();
         assert_eq!(adapter.get("placement"), Some(&expected.map(s).unwrap_or(Value::Null)));
+        assert_eq!(adapter.get("wrapper_clip_color_rgb16"),
+            Some(&Value::Arr(vec![Value::Int(48_896); 3])));
         assert_eq!(adapter.get("picture_file"), Some(&s(file_mob.urn())));
         assert_eq!(adapter.get("neutral_wrapper"), Some(&Value::Bool(true)));
-        assert!(graph.losses.iter().any(|loss| loss.aspect == "source_color_adapter"
-            && loss.object == expected.unwrap_or("revision/seq")));
+        let range = adapter.get("linear_range").unwrap();
+        assert_eq!(range.get("direction"), Some(&s("video_to_full")));
+        assert_eq!(range.get("bit_depth"), Some(&Value::Int(10)));
+        assert_eq!(range.get("video_black"), Some(&Value::Int(64)));
+        assert_eq!(range.get("video_white"), Some(&Value::Int(940)));
+        let loss = graph.losses.iter().find(|loss| loss.aspect == "source_color_adapter"
+            && loss.object == expected.unwrap_or("revision/seq")).unwrap();
+        assert_eq!(loss.reason.contains("unapplied"), expected.is_some());
     }
+    let source = &mut facts.sequences[0];
+    let adapter = source.unresolved[0].color_adapter.as_mut().unwrap();
+    adapter.master = mob(2);
+    adapter.master_track = 4;
+    adapter.source_in = 3;
+    adapter.subclip_master = Some(Box::new(av::ColorAdapterMaster {
+        mob: mob(1), track: 1, source_in: 8,
+    }));
+    let event = &mut source.events[0];
+    event.owner = "sequence/component/1/component/0".into();
+    event.event.source_in = 8;
+    let range = event.range.as_mut().unwrap();
+    range.source_in = 8;
+    range.route = vec![
+        av::RouteWitness {
+            mob: mob(2), track: 4, rate: Rate::new(24, 1),
+            source_offset: Observed::Known(3), length: Observed::Known(24),
+        },
+        av::RouteWitness {
+            mob: mob(1), track: 1, rate: Rate::new(24, 1),
+            source_offset: Observed::Known(5), length: Observed::Known(40),
+        },
+    ];
+    for (underlying_start, expected) in [(5, Some("picture")), (6, None)] {
+        facts.sequences[0].events[0].range.as_mut().unwrap().route[1].source_offset =
+            Observed::Known(underlying_start);
+        let graph = run(&facts, &index).graph;
+        let graph = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+        let sidecar = graph.sidecar("avid.source", "revision/seq").unwrap();
+        let Some(Value::Arr(issues)) = sidecar.get("unresolved") else { panic!("expected issues") };
+        let adapter = issues[0].get("color_adapter").unwrap();
+        assert_eq!(adapter.get("placement"), Some(&expected.map(s).unwrap_or(Value::Null)));
+        assert_eq!(adapter.get("master"), Some(&s(mob(2).urn())));
+        let backing = adapter.get("subclip_master").unwrap();
+        assert_eq!(backing.get("mob"), Some(&s(mob(1).urn())));
+        assert_eq!(backing.get("source_in"), Some(&Value::Int(8)));
+    }
+    let adapter = facts.sequences[0].unresolved[0].color_adapter.as_mut().unwrap();
+    adapter.subclip_master = None;
+    adapter.picture_file = Observed::Unresolved("unqualified retimed picture".into());
+    adapter.subclip_motion = Some(Box::new(av::SourceSubclipMotion {
+        input_mob: mob(1), input_track: 1, input_start: 5, input_length: 99, length: 50,
+        advanced: false, span_ratio: (50, 99), speed: 2.0, speed_key_frame: (-3, 1),
+        position: [0.0, 100.0], phase_offset: 2, offset_adjust: 6.0, render_mode: 2,
+        ignore_render_setting: 0, new_source_calculation: true, graph_mode: Some(1),
+        sampled_input_frames: None,
+        sampled_picture_master: None,
+        sampled_picture_file: None,
+    }));
+    let built = run(&facts, &index).graph;
+    let graph = SourceGraph::from_json_text(&built.to_json_text().unwrap()).unwrap();
+    let sidecar = graph.sidecar("avid.source", "revision/seq").unwrap();
+    let Some(Value::Arr(issues)) = sidecar.get("unresolved") else { panic!("expected issues") };
+    let adapter = issues[0].get("color_adapter").unwrap();
+    assert_eq!(adapter.get("placement"), Some(&Value::Null));
+    assert!(adapter.get("picture_file").is_none());
+    let motion = adapter.get("subclip_motion").unwrap();
+    assert_eq!(motion.get("speed"), Some(&Value::Float(2.0)));
+    assert_eq!(motion.get("span_ratio"), Some(&Value::Arr(vec![Value::Int(50), Value::Int(99)])));
+    assert_eq!(motion.get("speed_key_frame"), Some(&Value::Arr(vec![Value::Int(-3), Value::Int(1)])));
+    assert!(motion.get("sampled_input_frames").is_none());
 }
 
 #[test]
@@ -410,6 +718,8 @@ fn layered_submaster_keeps_ordered_input_facts_without_placing_a_composite() {
             }
         }).collect(),
         picture_profile: None,
+        timewarp: None,
+        nested_picture_motion: None,
     });
     facts.sequences.push(source);
     let built = run(&facts, &index).graph;
@@ -504,6 +814,7 @@ fn native_color_receipt_survives_an_unavailable_picture_route() {
             ("scalar".into(), ParamValue::Float(-0.0)),
             ("payload".into(), ParamValue::Bytes(opaque)),
         ],
+        ..Default::default()
     });
     facts.sequences.push(sequence(vec![audio, picture]));
     let graph = run(&facts, &index).graph;
@@ -553,7 +864,7 @@ fn ordered_projective_warp_receipt_survives_without_linked_picture() {
         }),
         av::PictureStage::Static(std::sync::Arc::new(PictureEffect {
             kind: Kind::Warp,
-            params: ColorCorrection { params: vec![(yaw_id.into(), ParamValue::Float(30.0))] },
+            params: ColorCorrection { params: vec![(yaw_id.into(), ParamValue::Float(30.0))], ..Default::default() },
             corner_pin: Some(pin),
             compact_affine_warp: false,
         })),
@@ -600,12 +911,12 @@ fn source_resize_curves_override_the_cached_static_values() {
         compact_affine_warp: false,
         params: ColorCorrection { params: vec![
             ("2581568d7e84d511935a50f857c10000".into(), ParamValue::Float(3000.0)),
-        ] },
+        ], ..Default::default() },
     });
-    e.picture_extension = Some(av::PictureExtension::Resize([
+    e.picture_extension = Some(Box::new(av::PictureExtension::Resize([
         av::ResizeKey { frame: 0, position: [-0.15, 0.075], scale: [80.0, 120.0], crop: [0.0; 4] },
         av::ResizeKey { frame: 47, position: [0.2, -0.125], scale: [135.0, 65.0], crop: [0.0; 4] },
-    ]));
+    ])));
     f.sequences.push(sequence(vec![e]));
     let out = run(&f, &i);
     let p = &out.graph.sequences[0].placements[0];
@@ -795,6 +1106,12 @@ fn missing_stereo_member_preserves_survivor_and_original_numbering() {
     assert_eq!(p.audio_streams, [2]);
     assert_eq!(p.track_pans, [Some(100.0)]);
     assert!(!out.audio_group_issues.is_empty());
+    let originals = original::OriginalIndex { allow_media_gaps: true, ..Default::default() };
+    let linked = build_selected(&f, &i, "Synthetic", &["Bin".into()], &originals, &MotionMxf::default()).unwrap();
+    assert!(linked.audio_group_issues.is_empty());
+    assert_eq!(linked.graph.sequences[0].placements, out.graph.sequences[0].placements);
+    assert!(linked.graph.items[0].stream_groups.is_empty());
+    assert!(linked.graph.losses.iter().any(|l| l.aspect == "audio_group" && l.reason.contains("missing a channel")));
 }
 #[test]
 fn unknown_marker_local_position_is_not_invented() {
@@ -836,6 +1153,7 @@ fn transition_endpoints_keep_native_identity() {
         audio_curve_attribute: None,
         audio_curve_parameter: None,
         incoming_filler: None,
+        gain_gap_edges: [None, None],
         outgoing: av::Binding {
             placements: vec!["out".into()],
             reason: None,
@@ -858,10 +1176,13 @@ fn transition_endpoints_keep_native_identity() {
 #[test]
 fn oversized_facts_and_expansion_refuse() {
     let (mut f, i) = fixture(1);
+    f.accounted_bytes = av::MAX_SOURCE_FACT_BYTES;
+    assert!(build(&f, &i, "p", &["b".into()]).is_ok());
     f.accounted_bytes = av::MAX_SOURCE_FACT_BYTES + 1;
     assert!(build(&f, &i, "p", &["b".into()]).is_err());
     let mut b = Budget::default();
-    assert!(b.charge(av::MAX_SOURCE_FACT_BYTES).is_ok());
+    assert!(b.charge(graph::source::MAX_SOURCE_GRAPH_BYTES).is_ok());
+    assert!(b.charge(MAX_GRAPH_CONSTRUCTION_BYTES - graph::source::MAX_SOURCE_GRAPH_BYTES).is_ok());
     assert!(b.charge(1).is_err());
 }
 
@@ -882,6 +1203,7 @@ fn native_only_controls_and_missing_marker_witness_survive() {
                 "unknown-control".into(),
                 ParamValue::Bytes(vec![0, 1, 254, 255]),
             )],
+            ..Default::default()
         },
     });
     let mut seq = sequence(vec![e]);
@@ -985,6 +1307,7 @@ fn original_effect_bytes_are_preserved_on_ordinary_sequences() {
     let mut e = event("event", 1, 1, 0, 24, None);
     e.event.color = Some(ColorCorrection {
         params: vec![("unknown-guid".into(), ParamValue::Bytes(vec![1, 128, 255]))],
+        ..Default::default()
     });
     facts.sequences.push(sequence(vec![e]));
     let out = run(&facts, &index);
@@ -1063,6 +1386,65 @@ fn omitted_master_and_sequence_keep_distinct_receipts_on_one_bin() {
 }
 
 #[test]
+fn omitted_media_marks_exact_spans_and_refuses_overlapping_edits() {
+    let (mut facts, index) = fixture(1);
+    let source_id = facts.masters[0].id.clone();
+    let (mut retained, _) = fixture(1);
+    let mut retained = retained.masters.pop().unwrap();
+    retained.id = "revision/retained".into();
+    retained.master.mob_id = mob(2);
+    facts.masters.push(retained);
+    let originals = original::OriginalIndex {
+        omitted_media: HashMap::from([(source_id.clone(), "Test unsupported original".into())]),
+        ..Default::default()
+    };
+    let mut kept = event("kept-edit", 2, 1, 0, 12, None);
+    kept.event.master = mob(2);
+    facts.sequences.push(sequence(vec![kept,
+        event("missing-edit", 2, 1, 12, 24, None),
+        event("other-lane", 3, 1, 12, 24, None),
+    ]));
+    let build = |facts: &av::SourceProject| build_selected(facts, &index, "test",
+        &["bin".into()], &originals, &MotionMxf::default()).unwrap();
+    let out = build(&facts);
+    let seq = &out.graph.sequences[0];
+    assert_eq!(seq.placements.len(), 1);
+    assert_eq!(seq.placements[0].record_start, Rational::ZERO);
+    assert_eq!(seq.placements[0].duration, Rational::new(1, 2).unwrap());
+    assert_eq!(seq.markers.len(), 2);
+    assert_eq!(seq.markers[0].name, "Media omitted · A2");
+    assert_eq!(seq.markers[0].owner_occurrence, "missing-edit");
+    assert_eq!(seq.markers[0].start, Rational::new(1, 2));
+    assert_eq!(seq.markers[0].duration, Rational::integer(1));
+    assert!(seq.tracks.iter().any(|t| t.kind == StreamKind::Audio && t.index == 2));
+    let receipt = out.graph.sidecar("avid.source", "bin:0").unwrap();
+    assert!(receipt.get("omitted_media_masters").is_some());
+    assert_eq!(out.graph.losses.iter().filter(|l| l.aspect == "media_gap").count(), 2);
+    assert!(!out.graph.losses.iter().any(|l| l.aspect == "source_master"));
+
+    facts.sequences[0].events.push(event("overlap", 2, 1, 24, 24, None));
+    let out = build(&facts);
+    assert_eq!(out.graph.sequences[0].markers.len(), 1);
+    assert_eq!(out.graph.losses.iter().filter(|l| l.aspect == UNQUALIFIED_ROUTE_TIMING).count(), 2);
+}
+
+#[test]
+fn absent_pcm_prefix_siblings_can_be_omitted_but_present_unverified_files_refuse() {
+    let (mut facts, present) = fixture(2);
+    facts.masters[0].pcm_prefix = Some(av::SourcePcmPrefix { frames: 47, tail_package: mob(4) });
+    facts.sequences.push(sequence(vec![event("missing-prefix", 1, 1, 0, 24, None)]));
+    let originals = original::OriginalIndex { allow_media_gaps: true, ..Default::default() };
+    let run = |index: &index::MediaIndex| build_selected(&facts, index, "test",
+        &["bin".into()], &originals, &MotionMxf::default()).unwrap();
+    let omitted = run(&Default::default());
+    assert!(omitted.graph.losses.iter().any(|l| l.aspect == "media_bin_omission"));
+    assert_eq!(omitted.graph.sequences[0].markers[0].duration, Rational::integer(1));
+    let unverified = run(&present);
+    assert!(unverified.graph.losses.iter().any(|l| l.aspect == "source_master"));
+    assert!(unverified.graph.sequences[0].markers.is_empty());
+}
+
+#[test]
 fn master_output_mix_preserves_types_absence_and_unresolved_receipts() {
     use avid_reader::extract::MasterOutputMix as M;
     for (input, kind, raw) in [
@@ -1093,7 +1475,7 @@ fn master_output_mix_preserves_types_absence_and_unresolved_receipts() {
 
 #[test]
 fn master_output_mix_payload_is_budgeted_before_graph_copy() {
-    let mut budget=Budget {used:av::MAX_SOURCE_FACT_BYTES-256};
+    let mut budget=Budget {used:MAX_GRAPH_CONSTRUCTION_BYTES-256, ..Default::default()};
     assert!(output_mix(&extract::MasterOutputMix::Bytes(vec![7;1024]),&mut budget).is_err());
     assert!(output_mix(&extract::MasterOutputMix::Text("x".repeat(1024)),&mut budget).is_err());
 }

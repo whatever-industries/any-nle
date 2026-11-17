@@ -74,7 +74,7 @@ impl TryFrom<LegacyProbeJob> for TurnoverJob {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    const USAGE: &str = "usage: resolve-turnover-probe JOB.json [--review | --graph | --accept-losses]\n       resolve-turnover-probe --list-premiere-sequences INPUT.prproj";
+    const USAGE: &str = "usage: resolve-turnover-probe JOB.json [--review | --graph | --accept-losses]\n       resolve-turnover-probe --list-premiere-sequences INPUT.prproj\n       resolve-turnover-probe --capture-premiere INPUT.prproj SEQUENCE_ID FFPROBE";
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let (job, flags) = args.split_first().ok_or(USAGE)?;
     if job == "--list-premiere-sequences" {
@@ -84,6 +84,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let sequences = anynle_resolve_adapter::list_premiere_sequences(Path::new(path))?;
         serde_json::to_writer_pretty(std::io::stdout().lock(), &sequences)?;
         println!();
+        return Ok(());
+    }
+    if job == "--capture-premiere" {
+        let [input, selector, ffprobe] = flags else {
+            return Err(USAGE.into());
+        };
+        let selector = selector.to_str().ok_or("invalid Premiere sequence selector")?;
+        let graph = anynle_resolve_adapter::read_premiere_media_graph(
+            Path::new(input), selector, Path::new(ffprobe)
+        )?;
+        graph.write_json(&mut std::io::stdout().lock())?;
         return Ok(());
     }
     let (review, graph, accept) = match flags {

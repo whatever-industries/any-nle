@@ -10,6 +10,8 @@ def run(output):
     workspace=ROOT/'crates/Cargo.toml'
     selected=[(n,args,minimum,workspace) for n,args,minimum in SUITES+[(n,['-p','anynle-app','--lib',n],1) for n in APP_TESTS]]
     selected += [
+        ('gui_report', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'report'], 3, workspace),
+        ('media_verification', ['-p', 'anynle-media-verification', '--lib'], 4, workspace),
         ('premiere_preparation', ['-p', 'anynle-premiere-adapter', '--test', 'preparation'], 54, workspace),
         ('graph_output', ['-p', 'anynle-app', '--test', 'graph_output'], 11 if os.name == 'nt' else 13, workspace),
     ]

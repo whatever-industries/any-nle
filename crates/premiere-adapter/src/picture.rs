@@ -48,6 +48,26 @@ pub(super) fn prepare_chain(
 ) -> R<(Option<graph::Transform>, Option<PictureEffect>, [bool; 2])> {
     let refused = (None, None, [false; 2]);
     if let Some(Value::Arr(stages)) = effect.params.get("stages") {
+        if has_spectramatte(effect) {
+            let Some((rgb, motion)) = spectramatte_motion(stages) else {
+                loss(losses, &placement.id, "picture_effect",
+                    "Omitted SpectraMatte overlay because its color, Warp, or stage order is outside the qualified profile");
+                return Ok(refused);
+            };
+            if !full_span || !same_rate || !matched_hd_raster
+                || frame_ticks != model::ticks_per_unit(Fraction::new(24_000, 1001))
+                || placement.video_track.is_none_or(|lane| lane < 2)
+                || !placement.audio_tracks.is_empty() || !placement.grouped_audio.is_empty()
+                || placement.speed.is_some() || placement.frame_map.is_some()
+            {
+                loss(losses, &placement.id, "picture_effect",
+                    "Omitted SpectraMatte overlay because it needs one straight square-pixel 1080p23.976 picture edit above its background");
+                return Ok(refused);
+            }
+            loss(losses, &placement.id, "picture_effect_approximation",
+                "SpectraMatte uses editable Premiere Ultra Key before static Motion. Matte edges and spill can differ from Avid.");
+            return Ok((Some(motion), Some(PictureEffect::UltraKey { rgb }), [false; 2]));
+        }
         if stages.iter().any(is_pin_stage) {
             let Some(native) = prepare_pin_chain(stages, &effect.params)
                 .map_err(|()| error(format!("malformed ordered Corner Pin at {}", placement.id)))?
@@ -101,6 +121,39 @@ pub(super) fn prepare_chain(
         reflect_motion(effect, chain.after)
     };
     Ok((Some(transform), Some(native), [flip.horizontal, flip.vertical]))
+}
+
+pub(super) fn has_spectramatte(effect: &graph::Effect) -> bool {
+    effect.kind == graph::picture_chain::KIND
+        && matches!(effect.params.get("stages"), Some(Value::Arr(stages))
+            if stages.iter().any(|stage|
+                matches!(stage.get("kind"), Some(Value::Str(kind)) if kind == "avid.spectramatte")))
+}
+
+fn spectramatte_motion(stages: &[Value]) -> Option<([u8; 3], graph::Transform)> {
+    let [keyer, warp] = stages else { return None };
+    if !matches!(keyer, Value::Obj(fields) if fields.len() == 2)
+        || !matches!(warp, Value::Obj(fields) if fields.len() == 3)
+        || !matches!(keyer.get("kind"), Some(Value::Str(kind)) if kind == "avid.spectramatte")
+        || !matches!(warp.get("kind"), Some(Value::Str(kind)) if kind == "avid.warp_static")
+        || !matches!(warp.get("params"), Some(Value::Obj(fields)) if fields.is_empty())
+    {
+        return None;
+    }
+    let params = keyer.get("params")?;
+    if !matches!(params, Value::Obj(fields) if fields.len() == 3)
+        || params.get("square_pixels_verified") != Some(&Value::Bool(true))
+        || !matches!(params.get("saved_progress_end_frame"), Some(Value::Int(n)) if *n > 0)
+    {
+        return None;
+    }
+    let Value::Arr(channels) = params.get("key_rgb8")? else { return None };
+    let [Value::Int(r), Value::Int(g), Value::Int(b)] = channels.as_slice() else { return None };
+    let rgb = [u8::try_from(*r).ok()?, u8::try_from(*g).ok()?, u8::try_from(*b).ok()?];
+    let motion = graph::picture_chain::read_transform(warp.get("transform")?).ok()?;
+    (g > r && g > b && motion.rotation == 0.0 && motion.anchor == (0.0, 0.0)
+        && motion.crop == [0.0; 4] && motion.scale.0 == motion.scale.1 && motion.scale.0 > 0.0)
+        .then_some((rgb, motion))
 }
 
 fn is_pin_stage(stage: &Value) -> bool {

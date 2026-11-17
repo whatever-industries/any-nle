@@ -11,6 +11,15 @@ struct Name<'a> {
     ambiguous: bool,
 }
 
+fn saved_lane(entry: &Value) -> Option<PreparedTrackLane> {
+    let label = key(entry, "track").and_then(integer)?;
+    match key(entry, "kind").and_then(integer)? {
+        1 => Some(PreparedTrackLane::Picture(label)),
+        2 => Some(PreparedTrackLane::Audio(label)),
+        _ => None,
+    }
+}
+
 fn legacy_names<'a>(
     facts: &PreparationFacts<'a>,
     source: &SourceSequence,
@@ -28,14 +37,8 @@ fn legacy_names<'a>(
         return Vec::new();
     }
     entries.iter().filter_map(|entry| {
-        let label = key(entry, "track").and_then(integer)?;
-        let lane = match key(entry, "kind").and_then(integer) {
-            Some(1) => PreparedTrackLane::Picture(label),
-            Some(2) => PreparedTrackLane::Audio(label),
-            _ => return None,
-        };
         Some(Name {
-            lane,
+            lane: saved_lane(entry)?,
             name: key(entry, "name").and_then(str_value)?,
             empty: key(entry, "plain_empty").and_then(boolean) == Some(true),
             ambiguous: key(entry, "ambiguous").and_then(boolean) != Some(false),
@@ -63,6 +66,14 @@ pub(super) fn prepare(
     if entries.is_empty() {
         return Vec::new();
     }
+    let mut layouts = HashMap::new();
+    if let Some(Value::Arr(saved)) = side(&facts.sidecars, "avid.plain_track_layouts", &source.id) {
+        if saved.len() <= 198 {
+            for lane in saved.iter().filter_map(saved_lane) {
+                *layouts.entry(lane).or_insert(0usize) += 1;
+            }
+        }
+    }
     let mut counts = HashMap::new();
     for entry in &entries {
         *counts.entry(entry.lane).or_insert(0usize) += 1;
@@ -75,7 +86,7 @@ pub(super) fn prepare(
             PreparedTrackLane::Audio(label) => ("A", label),
         };
         let has_placements = populated.contains(&lane);
-        let create_empty = !has_placements && empty;
+        let create_empty = !has_placements && (empty || layouts.get(&lane) == Some(&1));
         let omitted = if ambiguous || counts[&lane] != 1 {
             Some("saved track identity or name is ambiguous")
         } else if !enabled {

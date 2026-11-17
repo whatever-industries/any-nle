@@ -1,12 +1,13 @@
 use crate::model::{Choices, ClipMode, Page, Preset, RequiredInput, Wizard};
+use crate::report::{Filter, PAGE_SIZE, ReportBrowser};
 use crate::{direction, palette, storage};
 use anynle_app::job::{
     self, BlockerKind, CancelToken, Completion, CompletionStatus, Inventory, JobSpec, PreparedJob,
-    Progress, Review, ReviewBlocker,
+    Progress, ReviewBlocker,
 };
 use eframe::egui::{self, Color32, RichText};
 use mapping::{AvidToPremiere, BinMode};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::Duration;
@@ -22,6 +23,7 @@ const SELECTED: Color32 = Color32::from_rgb(37, 49, 63);
 const PRIMARY: Color32 = Color32::from_rgb(48, 77, 112);
 const GOOD: Color32 = Color32::from_rgb(133, 222, 190);
 const AMBER: Color32 = Color32::from_rgb(244, 199, 137);
+const CONVERTING: &str = "Converting project";
 const WHY: &str = include_str!("../../../docs/DECISIONS-EXPLAINED.md");
 #[derive(Clone, Copy)]
 enum Pick {
@@ -186,10 +188,10 @@ pub struct App {
     wizard: Wizard,
     inventory: Option<Inventory>,
     prepared: Option<PreparedJob>,
-    review: Option<Review>,
     review_blocker: Option<ReviewBlocker>,
     media_jump: Option<MediaJump>,
     completion: Option<Completion>,
+    completion_subjects: HashMap<String, String>,
     tx: SyncSender<Event>,
     rx: Receiver<Event>,
     cancel: CancelToken,
@@ -199,7 +201,7 @@ pub struct App {
     error: Option<String>,
     notice: Option<String>,
     search: String,
-    report_search: String,
+    report: ReportBrowser,
     custom_color: String,
     why: Option<String>,
     preset_name: String,
@@ -228,10 +230,10 @@ impl App {
             wizard,
             inventory: None,
             prepared: None,
-            review: None,
             review_blocker: None,
             media_jump: None,
             completion: None,
+            completion_subjects: HashMap::new(),
             tx,
             rx,
             cancel: CancelToken::default(),
@@ -241,7 +243,7 @@ impl App {
             error,
             notice: None,
             search: String::new(),
-            report_search: String::new(),
+            report: ReportBrowser::default(),
             custom_color: String::new(),
             why: None,
             preset_name: "My preset".into(),
@@ -331,6 +333,7 @@ impl App {
                 ClipMode::Separate => job::ClipMode::Separate,
             },
             allow_offline_media: c.mode != ClipMode::Rewrap && c.allow_offline_media,
+            skip_unused_bin_items: false,
             prefer_source_media: c.uses_camera_originals(),
             attach_avid_proxies: c.attaches_avid_proxies(),
             proxy_rewrap_dir: if c.attaches_avid_proxies() {
@@ -366,9 +369,10 @@ impl App {
     }
     fn invalidate(&mut self) {
         self.prepared = None;
-        self.review = None;
         self.review_blocker = None;
         self.completion = None;
+        self.completion_subjects = HashMap::new();
+        self.report = ReportBrowser::default();
     }
     fn start(&mut self, label: &str) {
         self.busy = true;
@@ -414,9 +418,7 @@ impl App {
         let spec = self.spec();
         let revision = self.wizard.revision();
         self.start("Checking conversion");
-        self.prepared = None;
-        self.review = None;
-        self.review_blocker = None;
+        self.invalidate();
         let (tx, cancel, ctx) = (self.tx.clone(), self.cancel.clone(), ctx.clone());
         std::thread::spawn(move || {
             let mut progress = |p| {
@@ -439,10 +441,12 @@ impl App {
         if self.busy || !self.wizard.can_convert() {
             return;
         }
-        let Some(prepared) = self.prepared.take() else {
+        let Some(mut prepared) = self.prepared.take() else {
             return;
         };
-        self.start("Converting");
+        self.completion_subjects = prepared.take_review_subjects();
+        self.report = ReportBrowser::default();
+        self.start(CONVERTING);
         let (tx, cancel, ctx) = (self.tx.clone(), self.cancel.clone(), ctx.clone());
         std::thread::spawn(move || {
             let mut progress = |p| {
@@ -603,7 +607,7 @@ impl App {
                     self.close_after_cancel = false;
                     self.busy = false;
                     self.wizard.invalidate();
-                    self.prepared = None;
+                    self.invalidate();
                     self.error = Some(message);
                 }
                 Event::Progress(p) => self.progress = Some(p),
@@ -633,7 +637,7 @@ impl App {
                     match result {
                         Ok(p) => {
                             self.wizard.accept_review(revision);
-                            self.review = Some(p.review().clone());
+                            self.report = ReportBrowser::new(&p.review().notes);
                             self.inventory = Some(p.review().inventory.clone());
                             self.prepared = Some(*p);
                         }
@@ -643,6 +647,7 @@ impl App {
                 Event::Finished(c) => {
                     self.busy = false;
                     self.wizard.invalidate();
+                    self.report = ReportBrowser::new(&c.report);
                     self.completion = Some(c);
                 }
                 Event::Picked(kind, paths) => {
@@ -1377,34 +1382,13 @@ impl App {
             }
         }
     }
-    fn review_attention(ui: &mut egui::Ui, review: &Review, severity: &str, visible: usize) {
-        let matching = || review.notes.iter().filter(|n| n.severity == severity);
-        let count = matching().count();
-        let row = |ui: &mut egui::Ui, note: &job::ReportNote| {
-            if let Some(name) = review.subjects.get(&note.object) {
-                ui.strong(name);
-            }
-            ui.label(&note.message);
-        };
-        for note in matching().take(visible) {
-            row(ui, note);
-        }
-        if count > visible {
-            let label = if severity == "loss" {
-                format!("{} more", counted(count - visible, "translation change", "translation changes"))
-            } else {
-                format!("Warnings · {count}")
-            };
-            egui::CollapsingHeader::new(label).id_salt(severity).show(ui, |ui| {
-                for note in matching().skip(visible) {
-                    row(ui, note);
-                }
-            });
-        }
-    }
     fn review(&mut self, ui: &mut egui::Ui) {
         if self.completion.is_some() {
             self.finish(ui);
+            return;
+        }
+        if self.busy && self.task == CONVERTING {
+            Self::title(ui, CONVERTING, "Avid Media Composer to Premiere Pro");
             return;
         }
         Self::title(ui, "Review & convert", "Avid Media Composer to Premiere Pro");
@@ -1425,7 +1409,8 @@ impl App {
         let i = &self.wizard.inputs;
         let choices = &self.wizard.choices;
         let rewrap = choices.mode == ClipMode::Rewrap;
-        let creates_media = self.review.as_ref().is_some_and(|review| review.estimated_bytes.is_some());
+        let review = self.prepared.as_ref().map(PreparedJob::review);
+        let creates_media = review.is_some_and(|review| review.estimated_bytes.is_some());
 
         Self::card(ui, |ui| {
             ui.strong("Output");
@@ -1464,7 +1449,7 @@ impl App {
                 if let Some(path) = if rewrap { &i.new_media } else { &i.proxy_rewrap_dir } {
                     review_path(ui, if rewrap { "Media folder" } else { "Proxy folder" }, path);
                 }
-            } else if rewrap && self.review.is_none() {
+            } else if rewrap && review.is_none() {
                 ui.label(RichText::new("A new media folder is needed for native OP-Atom rewraps.").color(MUTED));
                 if let Some(path) = &i.new_media {
                     review_path(ui, "Media folder", path);
@@ -1474,9 +1459,9 @@ impl App {
 
         if !blocked {
             Self::card(ui, |ui| {
-                if let Some(review) = self.review.as_ref() {
+                if let Some(review) = review {
                     let inv = &review.inventory;
-                    let changes = review.notes.iter().filter(|n| n.severity == "loss").count();
+                    let changes = self.report.changes;
                     let (status, color) = if changes == 0 {
                         ("Ready to convert", GOOD)
                     } else {
@@ -1532,17 +1517,32 @@ impl App {
                     if changes > 0 {
                         ui.separator();
                         ui.strong(format!("Translation changes · {changes}"));
-                        Self::review_attention(ui, review, "loss", 3);
+                        for &index in &self.report.change_examples {
+                            let note = &review.notes[index];
+                            if let Some(name) = review.subjects.get(&note.object) {
+                                ui.strong(name);
+                            }
+                            ui.label(&note.message);
+                        }
                     }
-                    Self::review_attention(ui, review, "warning", 0);
+                    if self.report.warnings > 0 {
+                        ui.colored_label(AMBER, counted(self.report.warnings, "warning", "warnings"));
+                    }
                     let label = format!("Full preflight report · {}", counted(review.notes.len(), "note", "notes"));
                     egui::CollapsingHeader::new(label)
                         .id_salt("preflight-report")
                         .show(ui, |ui| {
-                            for note in &inv.notes {
-                                ui.label(RichText::new(note).color(MUTED));
+                            Self::report(ui, &review.notes, Some(&review.subjects), &mut self.report, &mut self.why);
+                            if !inv.notes.is_empty() {
+                                egui::CollapsingHeader::new(format!("Inventory notes · {}", inv.notes.len()))
+                                    .show(ui, |ui| {
+                                        egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
+                                            for note in &inv.notes {
+                                                ui.label(RichText::new(note).color(MUTED));
+                                            }
+                                        });
+                                    });
                             }
-                            Self::report(ui, &review.notes, Some(&review.subjects), &mut self.report_search, &mut self.why);
                         });
                 } else {
                     ui.strong(if self.busy { "Preflight in progress" } else { "Preflight" });
@@ -1566,7 +1566,7 @@ impl App {
                 on_off(p.match_avid_default_pan)
             ));
         });
-        if let Some(review) = &self.review {
+        if let Some(review) = review {
             egui::CollapsingHeader::new("Command-line replay").show(ui, |ui| {
                 if review.cli_equivalent.is_empty() {
                     ui.label("Use Save job settings and run any-nle run --job SETTINGS.json.");
@@ -1587,57 +1587,88 @@ impl App {
     fn report(
         ui: &mut egui::Ui,
         notes: &[job::ReportNote],
-        subjects: Option<&std::collections::HashMap<String, String>>,
-        search: &mut String,
+        subjects: Option<&HashMap<String, String>>,
+        browser: &mut ReportBrowser,
         why: &mut Option<String>,
     ) {
-        ui.horizontal(|ui| {
-            ui.strong(format!("Report · {} notes", notes.len()));
-            ui.add(
-                egui::TextEdit::singleline(search)
-                    .hint_text("Search report")
-                    .desired_width(260.),
-            );
-        });
-        let query = search.to_lowercase();
-        let mut visible = 0;
-        for n in notes {
-            let subject = subjects.and_then(|names| names.get(&n.object)).map(String::as_str);
-            if !format!("{} {} {} {}", n.severity, n.object, n.message, subject.unwrap_or(""))
-                .to_lowercase()
-                .contains(&query)
-            {
-                continue;
+        let changed = ui.horizontal_wrapped(|ui| {
+            let filters = [
+                (Filter::All, format!("All · {}", notes.len())),
+                (Filter::Changes, format!("Changes · {}", browser.changes)),
+                (Filter::Warnings, format!("Warnings · {}", browser.warnings)),
+            ];
+            let mut changed = false;
+            for (filter, label) in filters {
+                changed |= ui.selectable_value(&mut browser.filter, filter, label).changed();
             }
-            visible += 1;
-            Self::card(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(&n.severity).small().color(
-                        match n.severity.to_lowercase().as_str() {
-                            "error" | "failure" => Color32::LIGHT_RED,
-                            "loss" | "warning" => AMBER,
-                            _ => MUTED,
-                        },
-                    ));
-                    ui.strong(subject.unwrap_or(&n.object)).on_hover_text(&n.object);
-                    if ui.link("Why?").clicked() {
-                        *why = Some(if n.why.is_empty() {
-                            n.message.clone()
-                        } else {
-                            n.why.clone()
-                        });
-                    }
-                });
-                ui.label(&n.message);
-            });
+            let search_changed = ui.add(
+                egui::TextEdit::singleline(&mut browser.search)
+                    .hint_text("Search report")
+                    .desired_width(180.),
+            ).changed();
+            changed || search_changed
+        }).inner;
+        if changed {
+            browser.refilter(notes, subjects);
         }
-        if visible == 0 {
+        let count = browser.count(notes.len());
+        if count == 0 {
             ui.label(if notes.is_empty() {
                 "No translation notes reported."
             } else {
-                "No notes match your search."
+                "No notes match these filters."
             });
+            return;
         }
+        let previous_page = browser.page;
+        let page_count = count.div_ceil(PAGE_SIZE);
+        ui.horizontal_wrapped(|ui| {
+            if page_count > 1 {
+                if ui.add_enabled(browser.page > 0, egui::Button::new("Previous")).clicked() {
+                    browser.page -= 1;
+                }
+                let mut page_number = browser.page + 1;
+                ui.label("Page");
+                ui.add(egui::DragValue::new(&mut page_number).range(1..=page_count));
+                browser.page = page_number - 1;
+                ui.label(format!("of {page_count}"));
+                if ui.add_enabled(browser.page + 1 < page_count, egui::Button::new("Next")).clicked() {
+                    browser.page += 1;
+                }
+            }
+            let range = browser.page_range(notes.len());
+            ui.small(format!("Notes {}–{} of {count}", range.start + 1, range.end));
+        });
+        let mut rows = egui::ScrollArea::vertical().id_salt("report-rows").max_height(360.);
+        if changed || browser.page != previous_page {
+            rows = rows.vertical_scroll_offset(0.);
+        }
+        rows.show(ui, |ui| {
+            for index in browser.page_indices(notes.len()) {
+                let n = &notes[index];
+                let subject = subjects.and_then(|names| names.get(&n.object)).map(String::as_str);
+                Self::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&n.severity).small().color(
+                            match n.severity.to_lowercase().as_str() {
+                                "error" | "failure" => Color32::LIGHT_RED,
+                                "loss" | "warning" => AMBER,
+                                _ => MUTED,
+                            },
+                        ));
+                        ui.strong(subject.unwrap_or(&n.object)).on_hover_text(&n.object);
+                        if ui.link("Why?").clicked() {
+                            *why = Some(if n.why.is_empty() {
+                                n.message.clone()
+                            } else {
+                                n.why.clone()
+                            });
+                        }
+                    });
+                    ui.label(&n.message);
+                });
+            }
+        });
     }
     fn finish(&mut self, ui: &mut egui::Ui) {
         let Some(c) = self.completion.as_ref() else {
@@ -1710,12 +1741,10 @@ impl App {
             "Conversion report · {}",
             counted(c.report.len(), "note", "notes")
         ))
-        .show(ui, |ui| Self::report(ui, &c.report, self.review.as_ref().map(|review| &review.subjects),
-            &mut self.report_search, &mut self.why));
+        .show(ui, |ui| Self::report(ui, &c.report, Some(&self.completion_subjects),
+            &mut self.report, &mut self.why));
         if ui.button("Convert another project").clicked() {
-            self.completion = None;
-            self.review = None;
-            self.prepared = None;
+            self.invalidate();
             self.wizard.page = Page::Direction;
             self.wizard.invalidate();
         }
@@ -1959,8 +1988,10 @@ impl eframe::App for App {
                     });
                 if self.wizard.changed_since(&before) {
                     self.invalidate();
-                    if let Err(e) = storage::save(&self.wizard.choices) {
-                        self.error = Some(e);
+                    if before.choices != self.wizard.choices {
+                        if let Err(e) = storage::save(&self.wizard.choices) {
+                            self.error = Some(e);
+                        }
                     }
                 }
             });
@@ -2126,5 +2157,39 @@ fn media_status(inv: &Inventory) -> String {
             "Last pre-flight: {} of {} media files found · {} native · {} qualified original links",
             inv.found_media, inv.total_media, inv.native_media, inv.ume_originals
         )
+    }
+}
+
+#[cfg(test)]
+mod report_view_tests {
+    use super::*;
+
+    #[test]
+    fn report_view_draws_only_the_selected_page() {
+        let notes: Vec<_> = (1..=53).map(|index| job::ReportNote {
+            severity: "loss".into(),
+            object: format!("Edit {index}"),
+            message: format!("Report message {index}"),
+            why: String::new(),
+        }).collect();
+        let mut report = ReportBrowser::new(&notes);
+        let ctx = egui::Context::default();
+        let mut why = None;
+        for (page, expected, visible, hidden) in [
+            (0, "Notes 1–25 of 53", "Report message 1", "Report message 53"),
+            (2, "Notes 51–53 of 53", "Report message 53", "Report message 1"),
+        ] {
+            report.page = page;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                App::report(ui, &notes, None, &mut report, &mut why);
+            });
+            output.textures_delta.clear();
+            let shown = |text| output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(shape) if shape.galley.job.text == text)
+            });
+            assert!(shown(expected));
+            assert!(shown(visible));
+            assert!(!shown(hidden));
+        }
     }
 }

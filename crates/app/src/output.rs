@@ -1,6 +1,6 @@
 //! Shared CLI output checks. Snapshot creation also checks exclusively at write time.
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 fn exists(path: &Path) -> String {
@@ -87,6 +87,40 @@ pub(crate) fn write_relink_report(
     retained.push(path.to_owned());
     report.write_all(text.as_bytes())
         .map_err(|e| format!("Partial offline relink report retained at {}: {e}", path.display()))
+}
+
+pub(crate) fn write_graph_debug(
+    path: &Path,
+    source: &mut File,
+    retained: &mut Vec<PathBuf>,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<(), String> {
+    const PROGRESS_INTERVAL: u64 = 64 * 1024 * 1024;
+    let total = source.metadata()
+        .and_then(|metadata| Ok(metadata.len().saturating_sub(source.stream_position()?)))
+        .map_err(|e| format!("Could not read staged graph diagnostics: {e}"))?;
+    let mut report = open_new_output(path)?;
+    retained.push(path.to_owned());
+    (|| -> io::Result<()> {
+        let mut written = 0;
+        if total > 0 {
+            progress(0, total);
+        }
+        while written < total {
+            let length = (total - written).min(PROGRESS_INTERVAL);
+            let copied = io::copy(&mut (&mut *source).take(length), &mut report)?;
+            if copied != length {
+                return Err(io::Error::new(ErrorKind::UnexpectedEof, "staged graph diagnostics ended early"));
+            }
+            written += copied;
+            if written < total {
+                progress(written, total);
+            }
+        }
+        report.flush()?;
+        progress(written, total);
+        Ok(())
+    })().map_err(|e| format!("Partial graph diagnostics retained at {}: {e}", path.display()))
 }
 
 pub(crate) struct SnapshotWriteError {

@@ -8,7 +8,12 @@ use crate::io::MobId;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub const MAX_SOURCE_FACT_BYTES: usize = 64 << 20;
+/// Project-wide source capture budget, independent of the per-bin decoder.
+pub const MAX_SOURCE_FACT_BYTES: usize = if usize::BITS >= 64 {
+    (8_u64 << 30) as usize
+} else {
+    256 << 20
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rate {
@@ -100,7 +105,7 @@ pub struct SourceProject {
     pub sequences: Vec<SourceSequence>,
     pub skipped: Vec<Skipped>,
     pub duplicates: Vec<(String, usize)>,
-    /// Accounted retained facts, not a process RSS or decoder-allocation measurement.
+    /// Peak accounted source allocations during extraction, in bytes.
     pub accounted_bytes: usize,
 }
 /// Saved picture master and original PNG locator, independent of managed codec support.
@@ -165,12 +170,20 @@ pub struct SourceMaster {
     pub managed_multistream: Option<ManagedMultistream>,
     /// A saved import route. The original WAV bytes have not been verified.
     pub imported_audio: Option<Box<SavedPcmImport>>,
+    /// A verified saved master topology with two PCM siblings followed by
+    /// one MPEG audio frame. Separate physical coverage is required.
+    pub pcm_prefix: Option<SourcePcmPrefix>,
     /// Observed on the directly referenced picture file mob, in master track order.
     pub input_transforms: Vec<SourceInputTransform>,
     /// Picture master selected by a qualified traditional Freeze Frame owner.
     pub rendered_freeze: bool,
     /// Upstream precompute identity for a timeline-bound AudioSuite Gain master.
     pub rendered_gain: Option<crate::io::MobId>,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct SourcePcmPrefix {
+    pub frames: i64,
+    pub tail_package: MobId,
 }
 #[derive(Debug)]
 pub struct ManagedMultistream {
@@ -298,7 +311,12 @@ pub struct SourceEvent {
     pub reason: Option<String>,
     pub volume_automation: Option<VolumeAutomation>,
     pub pan_automation: Option<PanAutomation>,
-    pub picture_extension: Option<PictureExtension>,
+    /// Subclip PVOLs on the source route with unset unity gain and saved center pan.
+    pub subclip_center_pan_count: u8,
+    /// Explicit level stored on one same-rate subclip wrapper, independent of timeline gain.
+    pub subclip_gain: Option<SourceSubclipGain>,
+    /// An infrequent picture payload kept out of the event array.
+    pub picture_extension: Option<Box<PictureExtension>>,
     /// Full-span picture effects in input-to-output order, if the chain is resolved.
     pub picture_chain: Vec<PictureStage>,
     /// Saved phase for the bounded automatic adapter between 24 and 24000/1001.
@@ -307,10 +325,71 @@ pub struct SourceEvent {
     pub motion_adapter_center_pan: bool,
     /// Visible source frame offsets from the qualified range start for a saved Timewarp map.
     pub saved_timewarp: Option<Vec<i64>>,
+    /// A single AudioSuite Gain was omitted from this otherwise qualified dry route.
+    pub dry_gain_bypass: bool,
+    /// Raw controls and optional cache binding for a legacy EQMB.
+    pub equalizer: Option<Box<SourceEqualizer>>,
+    /// A saved single AudioSuite effect and the verified AVB binding to its render.
+    pub audiosuite: Option<Box<SourceAudioSuiteRender>>,
+    /// Direct dry master and in-point proved by the saved Gain binding.
+    pub gain_dry_input: Option<Box<(MobId, i64)>>,
     /// Signed playback ratio established by the saved constant Speed and Position controls.
     pub constant_speed: Option<(i64, i64)>,
     /// A top-level, neutral Collapse over one full-span picture edit.
     pub plain_submaster: bool,
+}
+#[derive(Debug)]
+pub struct SourceAudioSuiteRender {
+    pub file: MobId,
+    pub origin: MobId,
+    pub start: i64,
+    pub frames: i64,
+    pub padding_samples: i64,
+    /// The saved subclip input and its local channel and in-point, if present.
+    pub input_subclip: Option<(MobId, i64, i64)>,
+    pub input_master: MobId,
+    pub input_track: i64,
+    pub input_file: MobId,
+    pub file_track: i64,
+    pub input_start: i64,
+    pub name: String,
+    pub manufacturer_id: u32,
+    pub product_id: u32,
+    pub plugin_id: u32,
+    pub chunk_id: u32,
+    pub chunk_version: i64,
+    pub chunk: Vec<u8>,
+}
+#[derive(Debug, PartialEq)]
+pub struct SourceEqualizer {
+    pub enabled: bool,
+    pub filter_name: String,
+    pub bands: Vec<SourceEqualizerBand>,
+    pub render: Option<SourceEqualizerRender>,
+    pub pitch: Option<Box<SourcePitchCache>>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceEqualizerRender {
+    pub file: MobId,
+    pub origin: MobId,
+    pub start: i64,
+    pub frames: i64,
+    pub dry_master: MobId,
+    pub dry_master_track: i64,
+    pub dry_file: MobId,
+    pub dry_track: i64,
+    pub dry_start: i64,
+    pub dry_subclip: Option<MobId>,
+    pub dry_wrapped_master: bool,
+    pub input_gain: Option<SourceSubclipGain>,
+}
+#[derive(Debug, PartialEq)]
+pub struct SourceEqualizerBand {
+    pub filter_type: i64,
+    pub frequency: i64,
+    pub gain: i64,
+    pub q: i64,
+    pub enabled: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct ResizeKey {
@@ -370,13 +449,14 @@ pub enum PictureExtension {
 pub enum PictureStage {
     Static(std::sync::Arc<crate::transform::PictureEffect>),
     Extension(PictureExtension),
+    SpectraMatte { rgb: [u8; 3], progress_end: i64 },
 }
 impl PictureExtension {
-    pub fn replaces_static_transform(self) -> bool {
+    pub fn replaces_static_transform(&self) -> bool {
         self.requires_square_pixels() || matches!(self, Self::UnsupportedTransform(_))
     }
 
-    pub fn requires_square_pixels(self) -> bool {
+    pub fn requires_square_pixels(&self) -> bool {
         matches!(self, Self::ResizeCrop(_) | Self::Warp(_) | Self::WarpRoll { .. } | Self::WarpTrim(_) | Self::ResizeTrim(_))
     }
 }
@@ -413,8 +493,15 @@ pub struct SourceTransition {
     pub audio_curve_parameter: Option<i64>,
     /// Direct incoming filler span at the sequence rate.
     pub incoming_filler: Option<i64>,
+    /// Saved adjacency used when a Gain endpoint has no portable edit.
+    pub gain_gap_edges: [Option<GainGapEdge>; 2],
     pub outgoing: Binding,
     pub incoming: Binding,
+}
+#[derive(Debug)]
+pub enum GainGapEdge {
+    Gain(String),
+    Filler,
 }
 #[derive(Debug)]
 pub struct SourceMarker {
@@ -434,10 +521,21 @@ pub struct SourceMarker {
 pub enum SourceIssueKind {
     Route,
     RouteTiming,
+    /// An unsupported effect with a verified interval on its record lane.
+    UntranslatedEffect { effect: &'static str, length: i64 },
+    /// Untranslated Timewarp with exact record bounds. The optional route identifies
+    /// its saved render master, file and origin, in that order.
+    Timewarp { length: i64 },
     MatteKey { length: Option<i64> },
     ColorAdapter { length: Option<i64> },
     LayeredSubmaster { length: Option<i64>, input_count: usize },
     DisabledClip { length: i64, backing_class: [u8; 4], plain_mono: bool, plain_stereo: bool, neutral_picture: Option<MobId> },
+}
+/// Saved subclip PVOL scalars. The pan field is center in this profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceSubclipGain {
+    pub level_q29: i32,
+    pub pan_set: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatteInput {
@@ -502,13 +600,93 @@ pub struct SourceIssue {
     pub record_rate: Option<Rate>,
     pub kind: i64,
     pub track: i64,
-    pub matte_inputs: Option<MatteInputs>,
+    pub matte_inputs: Option<Box<MatteInputs>>,
     pub matte_import: Option<MatteImport>,
-    pub color_adapter: Option<SourceColorAdapter>,
+    pub color_adapter: Option<Box<SourceColorAdapter>>,
     pub submaster_inputs: Vec<SubmasterInput>,
     /// Saved control/route match only. Media identity and destination composition
     /// still require verification; a match does not remove the source loss.
     pub picture_profile: Option<SourcePictureProfile>,
+    /// Saved Timewarp controls when the occurrence could not become a portable map.
+    pub timewarp: Option<Box<SourceTimewarpControls>>,
+    /// Verified sampling on a plain source clip that selects a retimed picture subclip.
+    pub nested_picture_motion: Option<Box<SourceSubclipMotion>>,
+}
+
+/// Saved inner AudioSuite cache. The enclosing EQ render supplies playback.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SourcePitchCache {
+    pub master: MobId,
+    pub file: MobId,
+    pub origin: MobId,
+    pub samples: i64,
+    pub pitch_chunk: [u8; 148],
+}
+
+#[derive(Debug)]
+pub struct SourceTimewarpControls {
+    pub span_ratio: Option<(i64, i64)>,
+    pub phase_offset: Option<i64>,
+    pub offset_adjust: Option<f64>,
+    pub render_mode: Option<i64>,
+    pub ignore_render_setting: Option<i64>,
+    pub graph_mode: Option<i64>,
+    pub input_format: Option<i64>,
+    pub output_format: Option<i64>,
+    pub new_source_calculation: Option<bool>,
+    pub input: Option<TimewarpInput>,
+    pub precompute: Option<TimewarpInput>,
+    pub precompute_present: bool,
+    /// Owner of a verified saved-cache reference for the enclosing Resize.
+    pub resize_render_owner: Option<String>,
+    pub curves: Vec<SourceTimewarpCurve>,
+}
+
+impl SourceTimewarpControls {
+    /// Names read back in Media Composer for explicit interpolation overrides.
+    pub fn explicit_fluid_motion(&self) -> Option<&'static str> {
+        match (self.ignore_render_setting, self.render_mode) {
+            (Some(1), Some(6)) => Some("FluidMotion"),
+            (Some(1), Some(7)) => Some("FluidMotion Draft"),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TimewarpInput {
+    pub mob: MobId,
+    pub track: Option<i64>,
+    pub start: Option<i64>,
+    pub length: Option<i64>,
+    pub rate: Option<Rate>,
+}
+
+#[derive(Debug)]
+pub struct SourceTimewarpCurve {
+    pub parameter: crate::io::Uuid,
+    pub enabled: Option<bool>,
+    pub interpolation: Option<i64>,
+    pub extrapolation: Option<i64>,
+    pub fields: Option<i64>,
+    pub point_count: usize,
+    pub points: Option<SourceTimewarpPoints>,
+}
+
+#[derive(Debug)]
+pub enum SourceTimewarpPoints {
+    HalfFrameSamples { first: i64, values: Vec<f64> },
+    Keys(Vec<SourceTimewarpKey>),
+}
+
+#[derive(Debug)]
+pub struct SourceTimewarpKey {
+    pub time: (i64, i64),
+    pub timescale: i64,
+    pub value: f64,
+    pub handles: [Option<f64>; 4],
+    pub anchor: Option<f64>,
+    pub flags: Option<i64>,
 }
 /// An edit-side payload and its checked relationship to the direct picture source.
 #[derive(Debug)]
@@ -516,9 +694,111 @@ pub struct SourceColorAdapter {
     pub master: MobId,
     pub master_track: i64,
     pub source_in: i64,
+    /// Master coordinates after one checked picture subclip hop.
+    pub subclip_master: Option<Box<ColorAdapterMaster>>,
+    /// Saved controls for a nested motion effect whose rendered cadence is unqualified.
+    pub subclip_motion: Option<Box<SourceSubclipMotion>>,
     pub picture_file: Observed<MobId>,
     pub transform: String,
     pub neutral_wrapper: bool,
+    /// Saved edit-side clip color on the effect wrapper, separate from the transform.
+    pub wrapper_clip_color: Option<[u16; 3]>,
+    pub managed_picture_span: Option<(i64, i64)>,
+    pub centered_still_fit: bool,
+}
+
+/// The two saved, standalone 10-bit range transforms observed in Avid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceColorRange {
+    VideoToFull,
+    FullToVideo,
+}
+
+impl SourceColorRange {
+    pub fn from_saved_xml(text: &str) -> Option<Self> {
+        // Match the entire native list, including the direction flag.
+        match text {
+            concat!(
+                "<ColorTransformationList><ColorTransformation><LinearLut>",
+                "<Name>Levels scaling (video levels to full range)</Name><BitDepth>10</BitDepth>",
+                "<Black>64</Black><White>940</White></LinearLut></ColorTransformation></ColorTransformationList>",
+            ) => Some(Self::VideoToFull),
+            concat!(
+                "<ColorTransformationList><ColorTransformation><LinearLut>",
+                "<Name>Levels scaling (full range to video levels)</Name><BitDepth>10</BitDepth>",
+                "<Black>64</Black><White>940</White><Inverted/></LinearLut></ColorTransformation></ColorTransformationList>",
+            ) => Some(Self::FullToVideo),
+            _ => None,
+        }
+    }
+
+    pub const BIT_DEPTH: i64 = 10;
+    pub const VIDEO_BLACK: i64 = 64;
+    pub const VIDEO_WHITE: i64 = 940;
+}
+
+/// The single 3D .cube descriptor saved on the qualified Avid effect wrapper.
+pub fn is_canonical_external_cube(xml: &str) -> bool {
+    let Some(body) = xml.strip_prefix("<ColorTransformationList><ColorTransformation><ExternalLut><Name>")
+        .and_then(|s| s.strip_suffix("</LutFileName><LutDimension>3D</LutDimension><InhibitScaling/></ExternalLut></ColorTransformation></ColorTransformationList>"))
+    else { return false };
+    let Some((name, file)) = body.split_once("</Name><LutFileName>") else { return false };
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b" ._()-".contains(&b))
+        && file.len() <= 128 && file.strip_suffix(".cube").is_some_and(|stem| !stem.is_empty())
+        && file.bytes().all(|b| b.is_ascii_alphanumeric() || b" ._()-".contains(&b))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorAdapterMaster {
+    pub mob: MobId,
+    pub track: i64,
+    pub source_in: i64,
+}
+#[derive(Debug)]
+pub struct SourceSubclipMotion {
+    pub input_mob: MobId,
+    pub input_track: i64,
+    pub input_start: i64,
+    pub input_length: i64,
+    pub length: i64,
+    pub advanced: bool,
+    pub span_ratio: (i64, i64),
+    pub speed: f64,
+    pub speed_key_frame: (i64, i64),
+    pub position: [f64; 2],
+    pub phase_offset: i64,
+    pub offset_adjust: f64,
+    pub render_mode: i64,
+    pub ignore_render_setting: i64,
+    pub new_source_calculation: bool,
+    pub graph_mode: Option<i64>,
+    pub sampled_input_frames: Option<SourceSubclipSampling>,
+    /// When the saved input is itself a subclip, the backing master and its
+    /// first selected frame. The saved input ID and cadence stay separate.
+    pub sampled_picture_master: Option<ColorAdapterMaster>,
+    /// Saved package for a direct, zero-offset picture route over the sampled range.
+    pub sampled_picture_file: Option<MobId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SourceSubclipSampling {
+    /// First and last selected frames in the saved input's clock.
+    pub first: i64,
+    pub last: i64,
+    /// Exact source frames per record frame.
+    pub ratio: (i64, i64),
+    /// Fractional part of the unrounded first position, in units of 1/ratio.1.
+    pub phase: i64,
+}
+
+impl SourceSubclipSampling {
+    /// Exclusive bound of the raw trim, rounded up to the next whole frame.
+    pub fn source_end(self, length: i64) -> Option<i64> {
+        let (num, den) = self.ratio;
+        let span = i128::from(self.phase) + i128::from(length) * i128::from(num);
+        let frames = span.checked_add(i128::from(den.checked_sub(1)?))?.checked_div(i128::from(den))?;
+        self.first.checked_add(i64::try_from(frames).ok()?)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourcePictureProfile {
@@ -553,6 +833,8 @@ pub struct SourceTrackName {
     pub label: i64,
     pub name: String,
     pub ambiguous: bool,
+    /// Direct picture or an explicitly saved standard mono audio lane.
+    pub plain_layout: bool,
     /// Direct filler only, with a standard mono format on audio tracks.
     pub plain_empty: bool,
 }
@@ -691,6 +973,15 @@ pub fn extract_source_paths(
 
 /// Called before each bin is decoded, on the calling thread. Returning an error cancels further reads.
 pub fn extract_source_paths_observed(inputs:&[SourceInput],limits:SourceLimits,before:&mut dyn FnMut(usize,&Path)->Result<(),String>)->Result<SourceProject,SourceReadError>{crate::extract::project::extract_source_paths_observed(inputs,limits,before)}
+
+/// Inspect the same decoded bin used for source capture while it is resident.
+pub fn extract_source_paths_inspected(
+    inputs: &[SourceInput], limits: SourceLimits,
+    before: &mut dyn FnMut(usize, &Path) -> Result<(), String>,
+    inspect: &mut dyn FnMut(&crate::file::AvbFile) -> Result<(), String>,
+) -> Result<SourceProject, SourceReadError> {
+    crate::extract::project::extract_source_paths_inspected(inputs, limits, before, inspect)
+}
 
 pub(crate) fn failure(path: &Path, message: impl Into<String>) -> SourceReadError {
     SourceReadError {

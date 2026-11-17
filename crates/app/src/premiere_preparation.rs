@@ -24,20 +24,33 @@ pub(crate) fn prepare_typed(
     graph: &SourceGraph,
     options: &Options,
     clock: ClockProfile,
+    native_rewrap: bool,
     matte: &mut png_mattes::Plan,
     bins: &[SourceInput],
     ffprobe: &Path,
+    spooled: bool,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(PreparedPremiereInput, crate::source_luts::Applied), String> {
-    let mut prepared = premiere_adapter::prepare_originals(graph, options, clock)
-        .map_err(|e| format!("Premiere preparation failed: {e}"))?;
+    let mut prepared = if clock == ClockProfile::LegacyImport {
+        premiere_adapter::prepare_linked_originals(graph, options, clock, spooled)
+    } else {
+        premiere_adapter::prepare_originals(graph, options, clock)
+    }.map_err(|e| format!("Premiere preparation failed: {e}"))?;
     matte.apply(&mut prepared.input, graph)?;
     prepared.losses.retain(|loss| matte.keeps_loss(loss));
-    let luts = if clock == ClockProfile::LegacyImport {
-        crate::source_luts::apply(&mut prepared, graph, bins, ffprobe, check)?
+    let mut luts = if clock == ClockProfile::LegacyImport || native_rewrap {
+        let color_media = if native_rewrap {
+            crate::source_luts::ColorMedia::Rewrap
+        } else {
+            crate::source_luts::ColorMedia::Linked
+        };
+        crate::source_luts::apply(&mut prepared, graph, bins, ffprobe, color_media, check)?
     } else {
         Default::default()
     };
+    if clock == ClockProfile::LegacyImport && !native_rewrap {
+        crate::source_luts::prepare_extended_sdr(&mut prepared, graph, ffprobe, &mut luts, check)?;
+    }
     Ok((prepared, luts))
 }
 

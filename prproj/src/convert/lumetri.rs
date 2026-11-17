@@ -204,10 +204,18 @@ pub fn apply_lumetri(
 
 /// `write_cube` text: a `.cube` 3D LUT.
 pub fn cube_text(points: &[(f64, f64, f64)], size: i64, title: &str) -> String {
+    cube_text_domain(points, size, title, [0.0, 1.0])
+}
+
+pub(super) fn cube_text_domain(points: &[(f64, f64, f64)], size: i64, title: &str, domain: [f32; 2]) -> String {
     use crate::build::fmt::fmt_f;
     // Match the Python oracle: only the optional .cube title is restricted to ASCII.
     let title: String = title.chars().map(|c| if (' '..='~').contains(&c) && c != '"' { c } else { '?' }).collect();
-    let mut lines = vec![format!("TITLE \"{title}\""), format!("LUT_3D_SIZE {size}"), "DOMAIN_MIN 0.0 0.0 0.0".to_string(), "DOMAIN_MAX 1.0 1.0 1.0".to_string()];
+    let [lo, hi] = domain.map(|v| {
+        if v.fract() == 0.0 { format!("{v:.1}") } else { v.to_string() }
+    });
+    let mut lines = vec![format!("TITLE \"{title}\""), format!("LUT_3D_SIZE {size}"),
+        format!("DOMAIN_MIN {lo} {lo} {lo}"), format!("DOMAIN_MAX {hi} {hi} {hi}")];
     lines.extend(points.iter().map(|p| format!("{} {} {}", fmt_f(p.0, 6), fmt_f(p.1, 6), fmt_f(p.2, 6))));
     lines.join("\n") + "\n"
 }
@@ -225,12 +233,24 @@ pub fn write_cube(path: &Path, points: &[(f64, f64, f64)], size: i64, title: &st
 /// `embedded_lut`: Premiere's "Embedded LUTs" value: 16-byte ID, u32 length of the rest, `ITX3`,
 /// size, channels 3, 0, f32 domain min x3 and max x3, then `size^3` f32 RGB, red fastest.
 pub fn embedded_lut(lut_id: [u8; 16], points: &[(f64, f64, f64)], size: u32) -> Vec<u8> {
+    let body = itx3_lut(points, size);
+    let mut out = lut_id.to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+pub(super) fn itx3_lut(points: &[(f64, f64, f64)], size: u32) -> Vec<u8> {
+    itx3_lut_domain(points, size, [0.0, 1.0])
+}
+
+pub(super) fn itx3_lut_domain(points: &[(f64, f64, f64)], size: u32, [lo, hi]: [f32; 2]) -> Vec<u8> {
     let mut body = Vec::with_capacity(40 + points.len() * 12);
     body.extend_from_slice(b"ITX3");
     for v in [size, 3, 0] {
         body.extend_from_slice(&v.to_le_bytes());
     }
-    for v in [0.0f32, 0.0, 0.0, 1.0, 1.0, 1.0] {
+    for v in [lo, lo, lo, hi, hi, hi] {
         body.extend_from_slice(&v.to_le_bytes());
     }
     for p in points {
@@ -238,10 +258,7 @@ pub fn embedded_lut(lut_id: [u8; 16], points: &[(f64, f64, f64)], size: u32) -> 
             body.extend_from_slice(&(v as f32).to_le_bytes());
         }
     }
-    let mut out = lut_id.to_vec();
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&body);
-    out
+    body
 }
 
 /// `apply_lumetri_lut`: Lumetri Color with a Creative Look LUT embedded in the project, so it

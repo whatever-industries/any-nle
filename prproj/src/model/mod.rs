@@ -269,6 +269,8 @@ pub struct Project {
     sequences: Vec<SequenceData>,
     tracks: Vec<TrackData>,
     track_items: Vec<TrackItemData>,
+    /// The writer batches extent updates while assembling one new sequence.
+    pending_sequence_extent: Option<(SequenceId, i64)>,
     /// `_import_target`: the bin [`Project::attach_imported_item`] files into (root when `None`).
     pub import_target: Option<ItemId>,
     /// `_imported_media`: `Media` objects whose `RelativePath` is re-derived on save.

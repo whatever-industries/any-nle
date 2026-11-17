@@ -30,7 +30,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 _ => return Err("expected only --accept-losses after the Premiere output path".into()),
             };
             let graph = graph::source::SourceGraph::from_json_text(&support::read(
-                Path::new(input), graph::MAX_GRAPH_BYTES,
+                Path::new(input), graph::source::MAX_SOURCE_GRAPH_BYTES,
             )?)?;
             for loss in anynle_resolve_adapter::premiere_export::write_with_options(
                 graph, text(id)?, Path::new(ffprobe), Path::new(output), accept_metadata_losses,

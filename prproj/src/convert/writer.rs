@@ -3,7 +3,7 @@
 //!
 //! [`write_project`] is the whole conversion: bins and clips (separate, merged, grouped and
 //! stereo builds), sequences with linked placements at exact ticks, speed, audio gain / volume
-//! / pan / track levels / crossfades, Avid colour correction as an embedded Lumetri LUT (plus a
+//! / pan / track levels / crossfades, Avid colour correction as an embedded LUT (plus a
 //! `.cube` in `"<stem> LUTs"` next to the project), clip / sequence / edit / filler markers
 //! (edit copies, marker-conflict rules, adjustment layers), and the save.
 //!
@@ -17,13 +17,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::audio::{add_crossfade, set_clip_gain, set_clip_volume, set_mix_level, set_mono_track_pan, set_track_level, split_overflow};
-use super::avid_color;
+use super::avid_color::{self, ExtendedSdrGrade};
+use super::color_mode::ClipLut;
 use super::colors;
 use super::combined::{
     combined_order, create_grouped_with_media as create_grouped, create_merged, create_stereo_nest, declare_stereo_chain, display_format,
     group_for_channel, move_to_processed_clips, narrow_to_group, parts_bin, set_clip_pan, set_clip_pan_keys, tag_merged_audio, tag_merged_picture, Pan,
 };
-use super::lumetri::{apply_lumetri_lut, cube_text};
+use super::lumetri::{apply_lumetri_lut, cube_text, cube_text_domain, itx3_lut_domain};
 use super::markers as mk;
 use super::matte::apply_matte;
 use super::motion::{apply_corner_pin, apply_corner_pin_with_flop, apply_flip, apply_motion_keys};
@@ -35,7 +36,7 @@ use super::model::{event_audio_files, py_str_repr, ticks_per_unit, Clip, ColorCo
 use super::opatom::{add_audio_item, add_video_item, source_item_names, DirectDnxhrFile, MediaTable, OpatomError, UnverifiedShape};
 use super::placement::normalize_placement;
 use crate::build::fmt::{fmt_f, py_repr};
-use crate::build::sequence::{extra_formats, formats};
+use crate::build::sequence::{extra_formats, formats, linked_original_formats};
 use crate::build::time::{floor_div, Time};
 use crate::error::Error;
 use crate::ids::UuidSource;
@@ -52,7 +53,9 @@ mod png_mattes;
 pub const LUT_SIZE: i64 = 33;
 
 /// Presets of py_premiere's `FORMATS` the converter uses as they are.
-const VERIFIED_PRESETS: [&str; 5] = ["1080p23976", "1080p25", "1080p2997", "1080p50", "1080p5994"];
+const VERIFIED_PRESETS: [&str; 8] = [
+    "1080p23976", "1080p25", "1080p2997", "1080p50", "1080p5994", "2160p23976", "2160p25", "2160p2997",
+];
 
 /// Why a write failed, by the Python exception class (the CLI exits 2 for the first four,
 /// like `avid2prproj`; anything else is a traceback there).
@@ -162,12 +165,14 @@ pub fn preset(name: &str, rate: Fraction, width: i64, height: i64, report: &mut 
             return Ok(preset.to_string());
         }
     }
-    for (preset, f) in extra_formats() {
+    for (preset, f) in extra_formats().into_iter().chain(linked_original_formats()) {
         if matches(f.frame_rate, f.width, f.height) {
-            report.notes.push(format!(
-                "sequence {}: converter format {preset} (User-reported in Premiere 26.5.2, PRPROJ-0010)",
-                py_str_repr(name)
-            ));
+            let provenance = if preset == "avid2prproj-1080p24" {
+                " (User-reported in Premiere 26.5.2, PRPROJ-0010)"
+            } else {
+                ""
+            };
+            report.notes.push(format!("sequence {}: converter format {preset}{provenance}", py_str_repr(name)));
             return Ok(preset.to_string());
         }
     }
@@ -322,17 +327,29 @@ fn check_lut_directory(path: &Path) -> Result<()> {
 /// validated payload hash is checked again on publication; UUIDs are not consumed.
 struct PreparedLut {
     path: PathBuf,
-    color: ColorCorrection,
+    recipe: LutRecipe,
     title: String,
     sha256: String,
 }
+
+enum LutRecipe {
+    Legacy(ColorCorrection),
+    Extended(ExtendedSdrGrade),
+}
+
 impl PreparedLut {
     fn bytes(&self) -> Result<Vec<u8>> {
-        let curves = self.color.curves.iter().map(|(k,v)|
-            (k.clone(),v.iter().map(|&(x,y)|(x*255.0,y*255.0)).collect())).collect::<Vec<_>>();
-        let transform=avid_color::rgb_transform(&self.color.tone,self.color.saturation,&curves)?;
-        let points=avid_color::cube_lut(&*transform,LUT_SIZE)?;
-        let bytes=cube_text(&points,LUT_SIZE,&self.title).into_bytes();
+        let bytes = match &self.recipe {
+            LutRecipe::Legacy(color) => {
+                let curves = color.curves.iter().map(|(k,v)|
+                    (k.clone(),v.iter().map(|&(x,y)|(x*255.0,y*255.0)).collect())).collect::<Vec<_>>();
+                let transform = avid_color::rgb_transform(&color.tone, color.saturation, &curves)?;
+                let points = avid_color::cube_lut(&*transform, LUT_SIZE)?;
+                cube_text(&points, LUT_SIZE, &self.title)
+            }
+            LutRecipe::Extended(grade) => cube_text_domain(&grade.points(),
+                i64::from(ExtendedSdrGrade::EDGE), &self.title, ExtendedSdrGrade::DOMAIN),
+        }.into_bytes();
         if crate::hash::hex(&crate::hash::sha256(&bytes))!=self.sha256 {
             return Err(other("prepared LUT payload changed before publication"));
         }
@@ -565,8 +582,10 @@ struct WriterInput<'a> {
     audio_pans: &'a [super::prepared::PreparedAudioPan],
     audio_mixers: &'a BTreeMap<usize, super::prepared::PreparedAudioMixer>,
     track_states: &'a BTreeMap<usize, Vec<super::prepared::PreparedTrackState>>,
+    non_drop_sequences: &'a HashSet<usize>,
     picture_effects: &'a [PreparedPictureEffect],
     source_luts: &'a [super::prepared::PreparedSourceLut],
+    extended_sdr_grades: &'a HashSet<(usize, usize)>,
     edit_labels: &'a [super::prepared::PreparedEditLabel],
     disabled_edits: &'a HashSet<(usize, usize)>,
     direct_dnxhr_origins: &'a HashMap<String, i64>,
@@ -615,6 +634,7 @@ struct Writer<'a> {
     out_path: PathBuf,
     assets: Vec<PreparedLut>,
     asset_names: HashSet<String>,
+    extended_luts: HashMap<ExtendedSdrGrade, (String, ClipLut)>,
     /// clip id -> (video item, audio items in model order)
     items: HashMap<String, (Option<ItemId>, Vec<ItemId>)>,
     /// clip id -> ("separate" | "merged" | "grouped", payload)
@@ -656,6 +676,38 @@ fn track_at(tracks: &[TrackId], number: i64) -> Result<TrackId> {
 }
 
 impl Writer<'_> {
+    fn apply_extended_sdr_grade(
+        &mut self,
+        grade: ExtendedSdrGrade,
+        picture: TrackItemId,
+    ) -> Result<&str> {
+        use std::collections::hash_map::Entry;
+        let (filename, lut) = match self.extended_luts.entry(grade) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let stem = self.out_path.file_stem().unwrap_or_default().to_string_lossy();
+                let folder = py_join(&py_parent(&self.out_path), &format!("{stem} LUTs"));
+                check_lut_directory(&folder)?;
+                let title = grade.title().to_owned();
+                let requested = py_join(&folder, &format!("{title}.cube"));
+                let path = plan_cube_file(&requested, &mut self.asset_names)?;
+                let filename = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                let name = filename.strip_suffix(".cube")
+                    .ok_or_else(|| other("extended SDR LUT filename has no .cube suffix"))?;
+                let points = grade.points();
+                let edge = ExtendedSdrGrade::EDGE;
+                let domain = ExtendedSdrGrade::DOMAIN;
+                let sha256 = crate::hash::hex(&crate::hash::sha256(
+                    cube_text_domain(&points, i64::from(edge), &title, domain).as_bytes()));
+                let lut = ClipLut::new(name, itx3_lut_domain(&points, edge, domain));
+                self.assets.push(PreparedLut { path, recipe: LutRecipe::Extended(grade), title, sha256 });
+                e.insert((filename, lut))
+            }
+        };
+        lut.apply(&mut self.project, picture)?;
+        Ok(filename)
+    }
+
     fn add_clip_marker(&mut self, item: ItemId, marker: &Marker, start: i64) -> Result<()> {
         mk::add_clip_marker(&mut self.project, item, marker, start, &self.model.options, &mut self.report.notes, self.ids)?;
         Ok(())
@@ -1363,18 +1415,23 @@ impl Writer<'_> {
         }
         let mixer = model.audio_mixers.get(&sequence_index);
         let track_pans = mixer.and_then(|mixer| mixer.mono_track_pans);
-        let sequence = if let Some(pans) = track_pans {
+        let non_drop = model.non_drop_sequences.contains(&sequence_index);
+        let sequence = if track_pans.is_some() || non_drop {
             let mut format = crate::build::sequence::format_by_name(&preset)
                 .ok_or_else(|| UnverifiedShape("unknown sequence preset".into()))?;
-            if format.mono_discrete || format.grouped_channels != 0 || format.audio_tracks < 2 {
-                return Err(UnverifiedShape("track pan requires two mono inputs and a stereo mix".into()).into());
+            if let Some(pans) = track_pans {
+                if format.mono_discrete || format.grouped_channels != 0 || format.audio_tracks < 2 {
+                    return Err(UnverifiedShape("track pan requires two mono inputs and a stereo mix".into()).into());
+                }
+                format.mono_stereo_inputs = pans.map(|pan| pan.is_some());
             }
-            format.mono_stereo_inputs = pans.map(|pan| pan.is_some());
+            if non_drop { format.time_display = 103; }
             format.video_tracks = format.video_tracks.max(picture_tracks);
             self.project.add_sequence_with_format(&seq.name, &format, self.ids)?
         } else {
             self.project.add_sequence(&seq.name, &preset, (picture_tracks > base.video_tracks).then_some(picture_tracks), self.ids)?
         };
+        self.project.defer_sequence_extent(sequence);
         if let Some(parent) = self.sequence_parent {
             let item = self.project.sequence_item(sequence).ok_or_else(|| other("sequence has no project-panel item"))?;
             self.project.move_item(item, parent)?;
@@ -1700,7 +1757,10 @@ impl Writer<'_> {
                         .source_duration
                         .ok_or_else(|| other("unsupported operand type(s) for +: 'int' and 'NoneType'"))?;
                     if let Some(&speed) = self.constant_speeds.get(&(sequence_index, i)) {
-                        let (start, end) = clip.and_then(|clip| speed.raw_trim(seq, e, clip))
+                        let (start, end) = match original {
+                            Some(original) => speed.raw_original_trim(seq, e, original),
+                            None => clip.and_then(|clip| speed.raw_trim(seq, e, clip)),
+                        }
                             .ok_or_else(|| other("qualified constant-speed trim is out of range"))?;
                         span = end - start;
                         raw_start = Some(start);
@@ -1868,14 +1928,43 @@ impl Writer<'_> {
                     }
                 }
             }
+            if let Some(PictureEffect::UltraKey { rgb }) = picture_effect {
+                let mut picture = placed.iter().copied().filter(|&item|
+                    self.project.doc.tree.tag(self.project.track_item(item).element) == "VideoClipTrackItem");
+                let item = picture.next().filter(|_| picture.next().is_none())
+                    .ok_or_else(|| other("Ultra Key did not produce one Premiere picture edit"))?;
+                super::ultra_key::apply(&mut self.project, item, rgb)?;
+            }
+            if let Some(PictureEffect::VideoToFullRange) = picture_effect {
+                let mut picture = placed.iter().copied().filter(|&item|
+                    self.project.doc.tree.tag(self.project.track_item(item).element) == "VideoClipTrackItem");
+                let item = picture.next().filter(|_| picture.next().is_none())
+                    .ok_or_else(|| other("range expansion did not produce one Premiere picture edit"))?;
+                super::asc_cdl::apply_video_to_full(&mut self.project, item)?;
+            }
             if let Some(lut) = self.source_luts.get(&(sequence_index, i)) {
                 let mut picture = placed.iter().copied().filter(|&item|
                     self.project.doc.tree.tag(self.project.track_item(item).element) == "VideoClipTrackItem");
                 let item = picture.next().filter(|_| picture.next().is_none())
                     .ok_or_else(|| other("source LUT did not produce one Premiere picture edit"))?;
-                apply_lumetri_lut(&mut self.project, item, &lut.points, 2, Path::new(&lut.filename), self.ids)?;
+                if lut.edge == 2 {
+                    super::color_mode::apply_lut(&mut self.project, item, lut)?;
+                } else {
+                    apply_lumetri_lut(&mut self.project, item, &lut.points, lut.edge, Path::new(&lut.filename), self.ids)?;
+                }
             }
-            if let Some(cc) = &e.color_correction {
+            if self.model.extended_sdr_grades.contains(&(sequence_index, i)) {
+                let grade = e.color_correction.as_ref().and_then(ExtendedSdrGrade::from_correction)
+                    .ok_or_else(|| other("extended SDR LUT lost its prepared grade"))?;
+                let mut picture = placed.iter().copied().filter(|&item|
+                    self.project.doc.tree.tag(self.project.track_item(item).element) == "VideoClipTrackItem");
+                let item = picture.next().filter(|_| picture.next().is_none())
+                    .ok_or_else(|| other("extended SDR LUT did not produce one Premiere picture edit"))?;
+                let filename = self.apply_extended_sdr_grade(grade, item)?.to_owned();
+                self.report.notes.push(format!(
+                    "sequence {seq_name} event {i}: embedded extended Rec.709 SDR Color Mode LUT ({filename}); visible SDR approximation, extreme YCbCr levels may differ"
+                ));
+            } else if let Some(cc) = &e.color_correction {
                 let curves_ui8: Vec<(String, Vec<(f64, f64)>)> =
                     cc.curves.iter().map(|(k, v)| (k.clone(), v.iter().map(|&(x, y)| (x * 255.0, y * 255.0)).collect())).collect();
                 if !avid_color::is_identity(&cc.tone, cc.saturation, &curves_ui8) {
@@ -1893,7 +1982,7 @@ impl Writer<'_> {
                     let cube = plan_cube_file(&requested_cube, &mut self.asset_names)?;
                     let title=format!("Avid Color Correction, {} {tc}",seq.name);
                     let digest=crate::hash::hex(&crate::hash::sha256(cube_text(&points,LUT_SIZE,&title).as_bytes()));
-                    self.assets.push(PreparedLut {path:cube.clone(),color:cc.clone(),title,sha256:digest});
+                    self.assets.push(PreparedLut {path:cube.clone(),recipe:LutRecipe::Legacy(cc.clone()),title,sha256:digest});
                     for &t in &placed {
                         if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
                             apply_lumetri_lut(&mut self.project, t, &points, LUT_SIZE as u32, &cube, self.ids)?;
@@ -2126,6 +2215,7 @@ impl Writer<'_> {
                 .push(format!("sequence {seq_name}: {} marker(s) on empty V{track_no} carried by an adjustment layer", carried.len()));
         }
         order_track_items(&mut self.project, sequence)?;
+        self.project.finish_sequence_extent()?;
         if let Some(states) = model.track_states.get(&sequence_index) {
             for state in states {
                 let track = match state.lane {
@@ -2220,10 +2310,10 @@ pub fn prepare_project_with_effects(model: &Model, editorial: Editorial<'_>,
     let Editorial { texts, video_dissolves, picture_effects, direct_dnxhr_origins, constant_speeds } = editorial;
     super::prepared::validate_texts(texts, &model.sequences)?;
     super::prepared::validate_video_dissolves(video_dissolves, &model.sequences)?;
-    super::prepared::validate_picture_effects(picture_effects, &model.sequences)?;
+    super::prepared::validate_picture_effects(picture_effects, &model.sequences, constant_speeds)?;
     super::prepared::validate_constant_speeds(constant_speeds, &model.options, &model.sequences,
         |id, seq, event, speed| model.clips.get(id).is_some_and(|clip| speed.raw_trim(seq, event, clip).is_some()))?;
-    let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),picture_effects,source_luts:&[],edit_labels:&[],disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
+    let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),non_drop_sequences:&HashSet::new(),picture_effects,source_luts:&[],extended_sdr_grades:&HashSet::new(),edit_labels:&[],disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
     prepare_view(&view,model,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new())
 }
 
@@ -2256,9 +2346,34 @@ pub fn prepare_linked_op1a_project(
 
 fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>,linked_op1a:&HashSet<String>)->Result<PreparedProject> {
     if let Some(layout) = layout { layout.validate(&input.bins)?; }
-    input.validate()?;
-    let legacy=Model{project_name:input.project_name.clone(),options:input.options.clone(),clips:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Legacy(c)=>Some(c.clone()),_=>None}).collect(),bins:input.bins.iter().map(|b|super::model::Bin{name:b.name.clone(),clips:b.clips.iter().filter(|id|input.clips.iter().any(|c|matches!(c,super::prepared::PreparedClip::Legacy(c) if c.id==**id))).cloned().collect()}).collect(),sequences:input.sequences.iter().map(|s|{let mut s=s.clone();s.events.retain(|e|input.clips.iter().any(|c|matches!(c,super::prepared::PreparedClip::Legacy(c) if c.id==e.clip)));s.markers.clear();s}).collect()};
-    let view=WriterInput{options:&input.options,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,picture_effects:&input.picture_effects,source_luts:&input.source_luts,edit_labels:&input.edit_labels,disabled_edits:&input.disabled_edits,direct_dnxhr_origins:&input.direct_dnxhr_origins,direct_dnxhd_pcm24:Some(&input.direct_dnxhd_pcm24),constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,autosync_bins:&input.autosync_bins,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,layered_submasters:&input.layered_submasters,png_mattes:&input.png_mattes};
+    if !native_av && layout.is_some() {
+        input.validate_whole_project()?;
+    } else {
+        input.validate()?;
+    }
+    let mut legacy = Model {
+        project_name: input.project_name.clone(),
+        options: input.options.clone(),
+        clips: input.clips.iter().filter_map(|clip| match clip {
+            super::prepared::PreparedClip::Legacy(clip) => Some(clip.clone()),
+            _ => None,
+        }).collect(),
+        bins: Vec::new(),
+        sequences: Vec::new(),
+    };
+    if native_av {
+        legacy.bins = input.bins.iter().map(|bin| super::model::Bin {
+            name: bin.name.clone(),
+            clips: bin.clips.iter().filter(|id| legacy.clips.contains_key(*id)).cloned().collect(),
+        }).collect();
+        legacy.sequences = input.sequences.iter().map(|sequence| {
+            let mut sequence = sequence.clone();
+            sequence.events.retain(|event| legacy.clips.contains_key(&event.clip));
+            sequence.markers.clear();
+            sequence
+        }).collect();
+    }
+    let view=WriterInput{options:&input.options,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,non_drop_sequences:&input.non_drop_sequences,picture_effects:&input.picture_effects,source_luts:&input.source_luts,extended_sdr_grades:&input.extended_sdr_grades,edit_labels:&input.edit_labels,disabled_edits:&input.disabled_edits,direct_dnxhr_origins:&input.direct_dnxhr_origins,direct_dnxhd_pcm24:Some(&input.direct_dnxhd_pcm24),constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,autosync_bins:&input.autosync_bins,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,layered_submasters:&input.layered_submasters,png_mattes:&input.png_mattes};
     prepare_view(&view,&legacy,out_path,ids,media,native_av,layout,offline,linked_op1a)
 }
 fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
@@ -2575,6 +2690,7 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         out_path: out_path.clone(),
         assets: Vec::new(),
         asset_names: HashSet::new(),
+        extended_luts: HashMap::new(),
         items: HashMap::new(),
         placement: HashMap::new(),
         clip_bins: HashMap::new(),

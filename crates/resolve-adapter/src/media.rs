@@ -56,6 +56,28 @@ impl VerifiedBinding {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileStamp {
+    pub(crate) bytes: u64,
+    pub(crate) modified: std::time::SystemTime,
+    #[cfg(unix)]
+    pub(crate) identity: (u64, u64, i64, i64),
+}
+
+pub(crate) fn stamp(meta: std::fs::Metadata) -> Result<FileStamp> {
+    if !meta.is_file() {
+        return Err("expected a regular media file".into());
+    }
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Ok(FileStamp {
+        bytes: meta.len(),
+        modified: meta.modified()?,
+        #[cfg(unix)]
+        identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
+    })
+}
+
 pub(crate) fn media_digest(path: &Path) -> Result<[u8; 32]> {
     let meta = fs::metadata(path)?;
     if !meta.is_file() || meta.len() > MAX_MEDIA_BYTES {
@@ -179,6 +201,17 @@ pub(crate) fn verify_mov_packet_grid(
     ticks_per_frame: i64,
     reordered: bool,
 ) -> Result<()> {
+    verify_picture_packet_grid(tool, path, "mov", frame_count, ticks_per_frame, reordered)
+}
+
+pub(crate) fn verify_picture_packet_grid(
+    tool: &Path,
+    path: &Path,
+    container: &str,
+    frame_count: i64,
+    ticks_per_frame: i64,
+    reordered: bool,
+) -> Result<()> {
     if ticks_per_frame <= 0 || frame_count <= 0 {
         return Err("invalid MOV picture packet grid".into());
     }
@@ -188,6 +221,7 @@ pub(crate) fn verify_mov_packet_grid(
     inspect_movie_packets(
         tool,
         path,
+        container,
         "v:0",
         "packet=pts,dts,duration",
         "csv=p=0",
@@ -225,7 +259,13 @@ pub(crate) fn verify_mov_packet_grid(
                         _ => false,
                     }
                 } else {
-                    fields.eq([Ok(pts), Ok(pts), Ok(ticks_per_frame)])
+                    matches!(
+                        (fields.next(), fields.next(), fields.next(), fields.next()),
+                        (Some(Ok(p)), Some(Ok(d)), Some(Ok(n)), None)
+                            if anynle_media_verification::ordered_picture_packet(
+                                [p.into(), d.into(), n.into()], pts.into(), ticks_per_frame.into(),
+                            )
+                    )
                 };
                 if !valid {
                     return Err(format!(
@@ -249,6 +289,7 @@ pub(crate) fn verify_aac_packet_grid(tool: &Path, path: &Path, samples: i64) -> 
     inspect_movie_packets(
         tool,
         path,
+        "mov",
         "a:0",
         "packet=pts,dts,duration:packet_side_data=skip_samples,discard_padding",
         "compact=p=0:nk=1",
@@ -283,9 +324,56 @@ pub(crate) fn verify_aac_packet_grid(tool: &Path, path: &Path, samples: i64) -> 
     )
 }
 
+pub(crate) fn verify_pcm_packet_grid(
+    tool: &Path,
+    path: &Path,
+    container: &str,
+    index: i64,
+    samples: i64,
+    byte_stride: i64,
+) -> Result<()> {
+    inspect_movie_packets(
+        tool,
+        path,
+        container,
+        &index.to_string(),
+        "packet=pts,dts,duration,size",
+        "csv=p=0",
+        |output| {
+            let mut cursor = 0i64;
+            let mut row = String::new();
+            while cursor < samples {
+                row.clear();
+                (&mut *output).take(96).read_line(&mut row)?;
+                let columns: Vec<_> = row.trim_end().split(',').collect();
+                let [pts, dts, duration, size] = columns.as_slice() else {
+                    return Err("PCM packet layout is incomplete".into());
+                };
+                let count: i64 = duration.parse()?;
+                let Some(next) = anynle_media_verification::pcm_packet_end(cursor, count, samples)
+                    .filter(|_| row.ends_with('\n'))
+                else {
+                    return Err("PCM packets contradict the playable sample extent".into());
+                };
+                if pts.parse::<i64>()? != cursor || dts.parse::<i64>()? != cursor
+                    || !anynle_media_verification::pcm_payload_matches(count, byte_stride, size.parse()?)
+                {
+                    return Err("PCM packets contradict the playable sample extent".into());
+                }
+                cursor = next;
+            }
+            if !output.fill_buf()?.is_empty() {
+                return Err("PCM packets exceed the declared sample extent".into());
+            }
+            Ok(())
+        },
+    )
+}
+
 fn inspect_movie_packets(
     tool: &Path,
     path: &Path,
+    container: &str,
     stream: &str,
     entries: &str,
     format: &str,
@@ -298,7 +386,7 @@ fn inspect_movie_packets(
             "-protocol_whitelist",
             "file,pipe",
             "-f",
-            "mov",
+            container,
             "-select_streams",
             stream,
             "-show_entries",

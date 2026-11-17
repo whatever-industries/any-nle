@@ -51,6 +51,9 @@ pub struct JobSpec {
     pub mode: ClipMode,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub allow_offline_media: bool,
+    /// Accepted for existing jobs. Linked conversions now check unused clips by default.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub skip_unused_bin_items: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub prefer_source_media: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -79,6 +82,7 @@ impl Default for JobSpec {
             project_name: None,
             mode: ClipMode::RewrapNative,
             allow_offline_media: false,
+            skip_unused_bin_items: false,
             prefer_source_media: false,
             attach_avid_proxies: false,
             proxy_rewrap_dir: None,

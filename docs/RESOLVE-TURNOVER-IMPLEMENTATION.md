@@ -6,6 +6,38 @@ destination preparation and archive writer. The probe uses original files in
 place. Resolve Studio 21.2.0 build 00006, project version 17, remains the native
 qualification target.
 
+## Premiere linked-media source capture
+
+`resolve-turnover-probe --capture-premiere INPUT.prproj SEQUENCE_ID FFPROBE`
+writes a selected Premiere 27 straight-cut timeline to graph/2 on standard
+output. The probe checks the saved media references against the original
+files and reports contradictory selectors, extents, or clocks before it
+writes the graph. It records exact source trims and record clocks, source
+raster separately from the timeline canvas, physical streams and channels,
+and an embedded source timecode when it agrees with the Premiere save.
+The capture inspects the original files and checks for changes without
+hashing every media file.
+
+The Premiere 27 Save As and reopen controls cover:
+
+| Rate | Linked source evidence |
+| --- | --- |
+| 24 | Eleven trimmed native edits covering AVC MP4/MOV with 48 kHz AAC-LC or PCM, independent mono MOV streams, ProRes HQ MOV with or without PCM, and Main 10 HEVC MP4 with AAC-LC. |
+| 25 and 30000/1001 | Fifteen sources per rate, including UHD AVC with AAC-LC or PCM16/24, 720p and 2048×858 AVC, ProRes HQ, Main 10 HEVC, and DNxHR LB OP1a MXF with PCM16/24. Both the native imports and the saved outputs of the Avid conversion were checked. |
+| 24000/1001 | UHD AVC MP4 with PCM16, PCM24, or AAC-LC. The native AAC saves cover both one stereo edit and two independent mono edits. |
+
+The 29.97 ProRes control retains its `00:00:59;20` file source clock
+independently of the sequence origin. When a full-length native audio edit
+ends less than one sample beyond the file at the final picture frame, the
+graph carries the playable PCM or AAC extent and records the exact saved
+end in `premiere.saved_audio_tail`. A whole-sample overrun fails capture.
+A retained 24 fps ProRes/48 kHz PCM WAV control also verifies the explicit
+left and right selectors used by split-mono edits of a stereo WAV master.
+
+This command covers source media and edit timing. Clip processing and mix
+controls still need their own destination preparation. Resolve publication
+continues to use its existing qualified media and effect profiles.
+
 ## Inputs and review
 
 The probe accepts an internal `anynle.job/2` document. Set `schema` to

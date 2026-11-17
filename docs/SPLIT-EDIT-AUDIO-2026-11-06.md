@@ -279,8 +279,13 @@ V5 and A6 in Separate files, Grouped, and Merged. Premiere 27 Save As,
 close, and reopen of the Separate project retained both names at the
 saved track numbers with zero clips. The 24 populated edit placements
 retain the same media paths and trims as the earlier reopened control.
-A7 remains source metadata with a lane-specific report. Other empty audio
-layouts and tracks containing unsupported content are outside this mapping.
+A7 remains source metadata with a lane-specific report.
+
+For media omitted during linked conversion, the same writer retains
+named picture lanes and named audio lanes with an explicitly saved
+standard mono layout. The lane is empty in Premiere, and omitted edit
+spans retain their gap markers and diagnostics. Unverified or stereo
+audio layouts still receive a lane-specific track-name loss.
 
 The 35 retained Avid linked AAFs had no names on their 98 picture and
 sound composition slots. Four sound slots carried only filler. A fresh

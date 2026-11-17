@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 use anynle_gui::model;
 mod direction;
 mod palette;
 #[cfg(target_os = "macos")]
 mod relink;
+mod report;
 mod storage;
 mod wizard;
 

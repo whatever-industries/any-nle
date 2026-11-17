@@ -10,7 +10,9 @@ name = "avid_adapter"
 [dependencies]
 avid-reader = { path = "../../avid-reader" }
 anynle-graph = { path = "../graph" }
+anynle-media-verification = { path = "../media-verification" }
 hex = "0.4"
 fs2 = "=0.4.3"
 png = "=0.18.1"
 sha2 = "0.10"
+tempfile = "=3.27.0"

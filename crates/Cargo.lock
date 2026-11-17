@@ -191,11 +191,13 @@ name = "anynle-avid-adapter"
 version = "0.1.0"
 dependencies = [
  "anynle-graph",
+ "anynle-media-verification",
  "avid-reader",
  "fs2",
  "hex",
  "png",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -246,6 +248,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "anynle-media-verification"
+version = "0.1.0"
+dependencies = [
+ "anynle-graph",
+]
+
+[[package]]
 name = "anynle-premiere-adapter"
 version = "0.1.0"
 dependencies = [
@@ -260,6 +269,7 @@ version = "0.1.0"
 dependencies = [
  "anynle-avid-adapter",
  "anynle-graph",
+ "anynle-media-verification",
  "anynle-premiere-adapter",
  "avid-reader",
  "flate2",

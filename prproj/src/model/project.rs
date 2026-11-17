@@ -155,6 +155,7 @@ impl Project {
             sequences: Vec::new(),
             tracks: Vec::new(),
             track_items: Vec::new(),
+            pending_sequence_extent: None,
             import_target: None,
             imported_media: Vec::new(),
             item_extra: HashMap::new(),

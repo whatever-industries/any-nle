@@ -20,12 +20,15 @@
 pub mod audio;
 pub mod avid_color;
 pub mod colors;
+mod color_mode;
 pub mod combined;
 pub mod lumetri;
 pub mod markers;
 pub mod matte;
 pub mod metadata;
 pub mod motion;
+mod ultra_key;
+mod asc_cdl;
 pub mod model;
 pub mod opatom;
 pub mod native_av;

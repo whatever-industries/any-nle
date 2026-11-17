@@ -1,5 +1,8 @@
 use super::*;
 mod trim_defaults;
+mod spectramatte;
+pub(super) use spectramatte::spectramatte_warp;
+pub(super) use spectramatte::ID as SPECTRAMATTE_ID;
 use crate::source::{PictureExtension, PictureStage, Rate, ResizeKey, SourceEvent, LinearTrim, LinearTrimKey, WarpRollInterpolation, WarpRollKey};
 
 #[derive(Debug)]
@@ -111,7 +114,7 @@ fn ordered_picture_input<'a>(ctx: &Ctx<'a>, effect: &Node, length: i64, rate: Ra
     match (effect.get("effect_id")?.as_str()?, tracks.as_slice()) {
         ("EFF2_BLEND_RESIZE", [picture]) => input(picture),
         (name, [picture]) if flip(name).is_some() => input(picture),
-        ("EFF2_SBLEND", [background, picture]) => {
+        ("EFF2_SBLEND" | spectramatte::ID, [background, picture]) => {
             let (Value::Node(back_track), Value::Node(picture_track)) = (background, picture) else { return None };
             if (int(back_track, "index"), int(picture_track, "index")) != (Some(1), Some(2)) {
                 return None;
@@ -149,7 +152,7 @@ impl Capture {
 
     pub(super) fn resolve(&self, single: bool, event: &SourceEvent) -> PictureExtension {
         let replaces_static_transform = (self.effect.replaces_static_transform() && !event.event.picture_nested)
-            || event.picture_extension.is_some_and(PictureExtension::replaces_static_transform);
+            || event.picture_extension.as_deref().is_some_and(PictureExtension::replaces_static_transform);
         let unsupported = |reason| {
             if replaces_static_transform {
                 PictureExtension::UnsupportedTransform(reason)

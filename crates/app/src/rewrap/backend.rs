@@ -4,7 +4,7 @@ use graph::json::{self, Value};
 use prproj::convert::model::TICKS_PER_SECOND as TPS;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 
 const LIMIT: usize = 4 << 20;
 fn strv<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
@@ -45,6 +45,18 @@ pub(super) fn bounded(mut r: impl Read, max: usize) -> std::io::Result<(Vec<u8>,
     Ok((out, overflow))
 }
 pub(super) fn run(cmd: &mut Command) -> R<String> {
+    let (bytes, large) = read_stdout(cmd, |stdout| {
+        bounded(stdout, LIMIT).map_err(|e| e.to_string())
+    })?;
+    if large {
+        return Err("backend output exceeds 4 MiB".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "backend output is not UTF-8".into())
+}
+pub(super) fn read_stdout<T>(
+    cmd: &mut Command,
+    read: impl FnOnce(ChildStdout) -> R<T>,
+) -> R<T> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -53,23 +65,24 @@ pub(super) fn run(cmd: &mut Command) -> R<String> {
         .map_err(|e| format!("cannot start backend: {e}"))?;
     let err = child.stderr.take().unwrap();
     let thread = std::thread::spawn(move || bounded(err, 65536));
-    let out = bounded(child.stdout.take().unwrap(), LIMIT);
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let out = read(child.stdout.take().unwrap());
+    if out.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait();
     let (errors, _) = thread
         .join()
         .map_err(|_| "backend reader panicked")?
         .map_err(|e| e.to_string())?;
-    let (bytes, large) = out.map_err(|e| e.to_string())?;
+    let out = out?;
+    let status = status.map_err(|e| e.to_string())?;
     if !status.success() {
         return Err(format!(
             "backend failed ({status}): {}",
             String::from_utf8_lossy(&errors)
         ));
     }
-    if large {
-        return Err("backend output exceeds 4 MiB".into());
-    }
-    String::from_utf8(bytes).map_err(|_| "backend output is not UTF-8".into())
+    Ok(out)
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Stream {
@@ -98,6 +111,7 @@ pub(super) struct Probe {
     pub(super) references: Vec<(String, String)>,
 }
 pub(super) const OP_ATOM: &str = "060e2b34040101020d01020110030000";
+pub(super) const AVID_PRORES_LT_ATOM: &str = "060e2b34040101020d01020110010000";
 pub(super) fn umid(s: &str) -> R<String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -159,19 +173,23 @@ pub(super) fn probe(tool: &Path, path: &Path) -> R<Probe> {
             );
         }
         let id = avid_reader::mxf::read_identity(path).map_err(|e| e.to_string())?;
-        let Some(Value::Arr(raw_streams)) = p.raw.get("streams") else {
-            unreachable!()
-        };
-        let selected = &raw_streams[p.stream_indices[0]];
-        let selected_id = selected
-            .get("tags")
-            .and_then(|t| strv(t, "file_package_umid"))
-            .ok_or("selected stream lacks file-package identity")?;
-        if id.file_packages != [umid(selected_id)?] {
-            return Err("selected stream disagrees with physical MXF file-package identity".into());
-        }
+        verify_stream_package(&p, &id.file_packages)?;
     }
     Ok(p)
+}
+
+pub(super) fn verify_stream_package(probe: &Probe, packages: &[String]) -> R<()> {
+    let Some(Value::Arr(streams)) = probe.raw.get("streams") else {
+        return Err("probe has no streams".into());
+    };
+    let selected = streams.get(probe.stream_indices[0])
+        .and_then(|s| s.get("tags"))
+        .and_then(|tags| strv(tags, "file_package_umid"))
+        .ok_or("selected stream lacks file-package identity")?;
+    if packages != [umid(selected)?] {
+        return Err("selected stream disagrees with physical MXF file-package identity".into());
+    }
+    Ok(())
 }
 
 fn interpret_probe(raw: Value) -> R<Probe> {
@@ -285,7 +303,7 @@ fn interpret_probe(raw: Value) -> R<Probe> {
             return Err("reference points to selected essence package".into());
         }
     }
-    if op == OP_ATOM && streams.len() == 1 {
+    if matches!(op.as_str(), OP_ATOM | AVID_PRORES_LT_ATOM) && streams.len() == 1 {
         if let Some(stream_tc) = ss[stream_indices[0]]
             .get("tags")
             .and_then(|t| strv(t, "timecode"))

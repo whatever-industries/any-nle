@@ -85,11 +85,13 @@ impl TurnoverJob {
                 }
                 let options = OriginalOptions {
                     link_managed_op1a: false,
+                    link_dry_gain: false,
                     ffprobe: self.ffprobe.clone(),
                     prefer_source_media: *prefer_source_media
                         || *require_camera_originals
                         || *attach_avid_proxies,
                     attach_avid_proxies: *attach_avid_proxies,
+                    allow_media_gaps: false,
                     proxy_rewrap_dir: proxy_rewrap_dir.clone(),
                     ffmpeg: ffmpeg.clone().unwrap_or_else(|| "ffmpeg".into()),
                     root_mappings: mappings

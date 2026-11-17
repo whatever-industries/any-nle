@@ -1,6 +1,6 @@
 //! Internal qualification harness for two-camera, fixed-audio Avid Groups.
 use anynle_resolve_adapter::{prepare_group, publish_group, verify_group_binding, BindingSpec};
-use graph::{source::SourceGraph, MAX_GRAPH_BYTES};
+use graph::source::{SourceGraph, MAX_SOURCE_GRAPH_BYTES};
 use std::{ffi::OsString, path::Path};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -22,7 +22,7 @@ fn run() -> Result<()> {
     } else {
         Some(origin.parse()?)
     };
-    let graph = SourceGraph::from_json_text(&read(Path::new(graph), MAX_GRAPH_BYTES)?)?;
+    let graph = SourceGraph::from_json_text(&read(Path::new(graph), MAX_SOURCE_GRAPH_BYTES)?)?;
     let verify = |arg| -> Result<_> {
         let spec: BindingSpec = serde_json::from_str(&read(Path::new(arg), 32 << 10)?)?;
         verify_group_binding(spec, Path::new(ffprobe))

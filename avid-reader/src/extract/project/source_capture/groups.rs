@@ -465,6 +465,7 @@ pub(super) fn resolve_group(
                 rate,
                 0,
                 Vec::new(),
+                SubclipMix::Exclude,
                 &context,
                 b,
                 &mut pieces,

@@ -16,6 +16,17 @@ pub(super) fn bind(
 ) -> Result<(), SourceReadIssue> {
     let mut revisions = HashMap::new();
     for source in &facts.masters {
+        if originals.omitted_unused.contains_key(&source.id) {
+            continue;
+        }
+        if source.managed_multistream.is_none()
+            && !source.master.tracks.is_empty()
+            && source.master.tracks.iter().enumerate().all(|(i, _)|
+                originals.tracks.get(&(source.id.clone(), i))
+                    .is_some_and(|track| track.stream.container == "mxf"))
+        {
+            continue;
+        }
         let Some(saved) = &source.managed_multistream else {
             if source.master.tracks.iter().any(
                 |track| matches!(&track.essence, Some(Essence::Other(class)) if class == "MULD"),
@@ -521,7 +532,7 @@ pub(super) fn saved_facts(
     managed: &av::ManagedMultistream,
     budget: &Budget,
 ) -> Result<Value, String> {
-    let mut reservation = Budget { used: budget.used };
+    let mut reservation = *budget;
     reservation.charge(512 + managed.tracks.len() * 1500 + managed.descriptors.len() * 1200)?;
     let int = |number: Option<i64>| number.map(Value::Int).unwrap_or(Value::Null);
     let rate = |rate: Option<Rate>| rate.map(|r| s(rational(r))).unwrap_or(Value::Null);

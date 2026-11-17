@@ -205,7 +205,7 @@ pub(super) fn append<'a>(
         out.graph.multicams.push(m);
         // Reserve native value expansion before allocating the receipt. These
         // fields are provenance, not inferred authoring method or timecode.
-        let mut reservation = Budget { used: budget.used };
+        let mut reservation = *budget;
         reservation.charge(8192 + g.id.len() * 3 + g.reason.as_ref().map_or(0, String::len))?;
         for l in &g.lanes {
             reservation.charge(4096 + l.reason.as_ref().map_or(0, String::len))?;

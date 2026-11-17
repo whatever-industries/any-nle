@@ -6,7 +6,9 @@ mod multicam;
 pub use multicam::{Multicam, MulticamLane, MulticamAlternative, MulticamPiece, MulticamUse};
 
 pub const SCHEMA: &str = "anynle.graph/2";
+pub const MAX_SOURCE_GRAPH_BYTES: usize = 256 << 20;
 pub const AVID_SOURCE_COLUMNS_TIMECODE: &str = "avid_source_columns_verified_mov_timecode";
+pub const AVID_LINKED_MOV_TIMECODE: &str = "avid_linked_mov_timecode";
 
 /// Exact source timecode facts. Display base and physical counting rate are distinct.
 #[derive(Clone, Debug, PartialEq)]
@@ -387,7 +389,21 @@ impl SourceGraph {
                 text(&o.container, &w)?;
                 rate(o.time_base, &w)?;
                 require(o.stream_index >= 0 && o.start_pts == 0 && o.duration_ts > 0, &w, "unsupported original stream origin or extent")?;
-                require(Rational::new(o.duration_ts as i128 * o.time_base.num() as i128, o.time_base.den() as i128) == Some(m.duration), &w, "original physical duration contradicts stream clock")?;
+                if matches!(o.container.as_str(), "jpeg" | "png" | "tiff") {
+                    let still_raster = match o.container.as_str() {
+                        "tiff" => m.frame_size == Some((1920, 64)),
+                        "png" => matches!(m.frame_size, Some((1920, 1080) | (1536, 1024))),
+                        _ => m.frame_size == Some((1920, 1080)),
+                    };
+                    require(m.kind == StreamKind::Video && m.codec.as_deref() == Some(o.container.as_str())
+                        && m.online == Some(true) && o.stream_index == 0 && o.duration_ts == 1
+                        && o.time_base == Rational::new(1, 24).unwrap() && m.rate == Some(Rational::integer(24))
+                        && still_raster
+                        && m.duration.to_units(24).is_some_and(|n| n > 0),
+                        &w, "invalid original still or editorial hold")?;
+                } else {
+                    require(Rational::new(o.duration_ts as i128 * o.time_base.num() as i128, o.time_base.den() as i128) == Some(m.duration), &w, "original physical duration contradicts stream clock")?;
+                }
                 match m.kind {
                     StreamKind::Video => require(o.channels.is_none() && o.channel_index.is_none() && o.sample_representation.is_none(), &w, "picture cannot have audio channel facts")?,
                     StreamKind::Audio => {
@@ -397,7 +413,21 @@ impl SourceGraph {
                                     && m.sample_rate == Some(48000)
                                     && o.sample_representation.as_deref() == Some("pcm16"))),
                             &w, "invalid physical audio channel")?;
-                        require(match o.sample_representation.as_deref() { Some("aac") => m.bits.is_none(), Some("pcm16") => m.bits==Some(16), Some("pcm24") => m.bits==Some(24), _=>false }, &w, "audio sample representation contradicts bit depth")?;
+                        require(match o.sample_representation.as_deref() {
+                            Some("aac") => m.bits.is_none(),
+                            Some("mp3") => m.bits.is_none()
+                                && o.container == "mp3"
+                                && m.codec.as_deref() == Some("mp3")
+                                && m.online == Some(true)
+                                && o.stream_index == 0
+                                && m.sample_rate.is_some_and(|rate| {
+                                    matches!(rate, 44_100 | 48_000)
+                                        && Some(o.time_base) == Rational::new(1, rate.into())
+                                }),
+                            Some("pcm16") => m.bits == Some(16),
+                            Some("pcm24") => m.bits == Some(24),
+                            _ => false,
+                        }, &w, "audio sample representation contradicts bit depth or media profile")?;
                     }
                 }
             }
@@ -720,6 +750,20 @@ impl SourceGraph {
     }
 }
 
+/// Encode one source receipt for the private native-conversion spool, with the
+/// same number and string encodings and per-record bound used by graph/2.
+pub fn write_source_receipt(writer: &mut impl Write, owner: &str, data: &Value) -> R<usize> {
+    let mut out = JsonOut { writer, bytes: 0 };
+    out.object(|out, first| {
+        out.field("owner", first)?;
+        out.text(owner)?;
+        out.field("data", first)?;
+        out.value(data)
+    })?;
+    out.raw("\n")?;
+    Ok(out.bytes)
+}
+
 fn add_id<'a>(ids: &mut HashMap<&'a str, &'static str>, id: &'a str, kind: &'static str) -> R<()> {
     super::validation::text(id, "source id")?;
     super::validation::require(!id.is_empty(), "source graph", "empty id")?;
@@ -806,8 +850,8 @@ impl<W: Write> JsonOut<'_, W> {
         self.bytes = self
             .bytes
             .checked_add(text.len())
-            .filter(|n| *n <= MAX_GRAPH_BYTES)
-            .ok_or_else(|| GraphError("source graph encoding exceeds 64 MiB".into()))?;
+            .filter(|n| *n <= MAX_SOURCE_GRAPH_BYTES)
+            .ok_or_else(|| GraphError("source graph encoding exceeds 256 MiB".into()))?;
         self.writer
             .write_all(text.as_bytes())
             .map_err(|e| GraphError(format!("source graph output: {e}")))
@@ -1418,7 +1462,7 @@ impl SourceGraph {
     }
 
     pub fn from_json_text(text: &str) -> R<Self> {
-        if text.len() > MAX_GRAPH_BYTES {
+        if text.len() > MAX_SOURCE_GRAPH_BYTES {
             return fail("source graph: file too large");
         }
         Self::from_json(&json::parse(text).map_err(GraphError)?)
@@ -2119,12 +2163,12 @@ mod tests {
         assert!(g.write_json(&mut bytes).is_err());
         assert!(bytes.is_empty());
         let mut g = example();
-        g.sidecars[0].data = Value::Str("x".repeat(MAX_GRAPH_BYTES));
+        g.sidecars[0].data = Value::Str("x".repeat(MAX_SOURCE_GRAPH_BYTES));
         assert!(g
             .write_json(&mut bytes)
             .unwrap_err()
             .to_string()
-            .contains("exceeds 64 MiB"));
+            .contains("exceeds 256 MiB"));
         assert!(bytes.is_empty());
     }
     #[test]

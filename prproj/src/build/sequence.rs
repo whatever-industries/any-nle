@@ -216,8 +216,19 @@ pub fn extra_formats() -> Vec<(&'static str, SequenceFormat)> {
     vec![("avid2prproj-1080p24", SequenceFormat::new(10584000000, 1920, 1080, 100))]
 }
 
-/// A preset by name from `FORMATS`, falling back to `EXTRA_FORMATS` (which the writer registers
-/// in `FORMATS` before building).
+/// Additional formats verified for linked originals in Premiere.
+pub(crate) fn linked_original_formats() -> [(&'static str, SequenceFormat); 5] {
+    let sq = SequenceFormat::new;
+    [
+        ("anynle-2048x858p24", sq(10584000000, 2048, 858, 100)),
+        ("anynle-2048x858p25", sq(10160640000, 2048, 858, 101)),
+        ("anynle-2048x858p2997", sq(8475667200, 2048, 858, 103)),
+        ("anynle-720p25", sq(10160640000, 1280, 720, 101)),
+        ("anynle-720p2997", sq(8475667200, 1280, 720, 103)),
+    ]
+}
+
+/// A preset by name from the built-in, converter, or linked-original formats.
 pub fn format_by_name(name: &str) -> Option<SequenceFormat> {
     if let Some(spec) = name.strip_prefix("anynle-tracks/") {
         let (count, base) = spec.split_once('/')?;
@@ -266,6 +277,7 @@ pub fn format_by_name(name: &str) -> Option<SequenceFormat> {
     formats()
         .into_iter()
         .chain(extra_formats())
+        .chain(linked_original_formats())
         .find(|(n, _)| *n == name)
         .map(|(_, f)| f)
 }

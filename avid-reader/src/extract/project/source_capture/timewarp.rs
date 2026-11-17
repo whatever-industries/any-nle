@@ -7,6 +7,7 @@ const POSITION: &str = "8d56827d-847e-11d5-935a-50f857c10000";
 const EDITABLE_POSITION: &str = "8d56827a-847e-11d5-935a-50f857c10000";
 const AUXILIARY: &str = "8d568283-847e-11d5-935a-50f857c10000";
 const FRAMES: i64 = 48;
+pub(super) const MAX_SAVED_PICTURE_FRAMES: i64 = 4096;
 pub(super) const SPARSE_FRAMES: usize = 1666;
 const FLOAT_NOISE: f64 = 1e-9;
 
@@ -87,7 +88,17 @@ pub(in crate::extract::project) fn direct_input<'a>(
         return None;
     };
     let component = ctx.deref(track.get("component"))?;
-    let input = if component.class == *b"SEQU" {
+    single_clip(ctx, component, effect)
+}
+
+fn single_clip<'a>(ctx: &Ctx<'a>, component: &'a Node, effect: &Node) -> Option<&'a Node> {
+    let clip = single_component(ctx, component, effect)?;
+    (clip.class == *b"SCLP" && null(clip, "precomputed") && null(clip, "param_list"))
+        .then_some(clip)
+}
+
+pub(super) fn single_component<'a>(ctx: &Ctx<'a>, component: &'a Node, effect: &Node) -> Option<&'a Node> {
+    if component.class == *b"SEQU" {
         let Value::RefList(parts) = component.get("components")? else {
             return None;
         };
@@ -107,16 +118,226 @@ pub(in crate::extract::project) fn direct_input<'a>(
                 return None;
             }
         }
-        clip?
+        clip
     } else {
-        component
-    };
-    (input.class == *b"SCLP" && null(input, "precomputed") && null(input, "param_list"))
-        .then_some(input)
+        Some(component)
+    }
 }
 
 fn null(node: &Node, field: &str) -> bool {
     matches!(node.get(field), None | Some(Value::Null))
+}
+
+/// Retain the saved controls even when their application to the source route
+/// or to the renderer is unresolved. Sample values are relative to the
+/// motion owner and are not a file-relative frame map.
+pub(super) fn observe(
+    ctx: &Ctx<'_>, effect: &Node, budget: &SharedBudget,
+) -> Option<Box<SourceTimewarpControls>> {
+    const MAX_CURVES: usize = 16;
+    if !charge(budget, size_of::<SourceTimewarpControls>()) { return None; }
+    let attrs = borrowed_attrs(ctx, effect);
+    let attr = |name| unique_attribute(attrs, name).and_then(Value::as_int);
+    let input = |node: &Node| Some(TimewarpInput {
+        mob: mob_id(node)?,
+        track: int(node, "track_id"),
+        start: int(node, "start_time"),
+        length: int(node, "length"),
+        rate: float(node, "edit_rate").and_then(Rate::from_avid),
+    });
+    let mut curves = Vec::new();
+    if let Some(Value::RefList(items)) = ctx.deref(effect.get("param_list")).and_then(|n| n.get("items")) {
+        if items.len() <= MAX_CURVES && reserve(budget, &mut curves, items.len()) {
+            for item in items.iter().filter_map(|item| ctx.deref(Some(item))) {
+                let Some(Value::Uuid(parameter)) = item.get("uuid") else { continue; };
+                let track = ctx.deref(item.get("control_track"));
+                let saved = track.and_then(points);
+                let (interpolation, extrapolation, fields) = track.map_or((None, None, None), |n|
+                    (int(n, "interp_kind"), int(n, "extrap_kind"), int(n, "fields")));
+                curves.push(SourceTimewarpCurve {
+                    parameter: *parameter,
+                    enabled: item.get("enable").and_then(flag),
+                    interpolation, extrapolation, fields,
+                    point_count: saved.map_or(0, <[_]>::len),
+                    points: saved.and_then(|points| observe_points(points, interpolation, budget)),
+                });
+            }
+        }
+    }
+    let span_ratio = match effect.get("speed_ratio") {
+        Some(Value::List(values)) => match values.as_slice() {
+            [Value::Int(n), Value::Int(d)] => Some((*n, *d)),
+            _ => None,
+        },
+        _ => None,
+    };
+    Some(Box::new(SourceTimewarpControls {
+        span_ratio,
+        phase_offset: int(effect, "phase_offset"),
+        offset_adjust: float(effect, "offset_adjust").filter(|v| v.is_finite()),
+        render_mode: attr("_SFX_RENDER"),
+        ignore_render_setting: attr("_SFX_IGNORE_RENDER_SETTING"),
+        graph_mode: attr("_MFX_GRAPH_ENABLED"),
+        input_format: attr("_MFX_INPUT_FORMAT"),
+        output_format: attr("_MFX_OUTPUT_FORMAT"),
+        new_source_calculation: effect.get("new_source_calculation").and_then(flag),
+        input: direct_input(ctx, effect).and_then(input),
+        precompute: saved_render_clip(ctx, effect).and_then(input),
+        precompute_present: !null(effect, "precomputed"),
+        resize_render_owner: None,
+        curves,
+    }))
+}
+
+fn flag(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn key_parts(raw: &Value) -> Option<(&Node, i64, i64, i64, f64)> {
+    let Value::Node(node) = raw else { return None; };
+    let Value::List(offset) = node.get("offset")? else { return None; };
+    let [Value::Int(num), Value::Int(den)] = offset.as_slice() else { return None; };
+    let value = match node.get("value")? {
+        Value::Float(value) => *value,
+        Value::Int(value) => *value as f64,
+        _ => return None,
+    };
+    (*den > 0 && value.is_finite()).then_some((node, *num, *den, int(node, "timescale")?, value))
+}
+
+fn observe_points(
+    points: &[Value], interpolation: Option<i64>, budget: &SharedBudget,
+) -> Option<SourceTimewarpPoints> {
+    const MAX_SAMPLES: usize = 2 * MAX_SAVED_PICTURE_FRAMES as usize + 1;
+    const MAX_KEYS: usize = 64;
+    if interpolation == Some(3) && (3..=MAX_SAMPLES).contains(&points.len()) {
+        let (_, num, den, _, _) = key_parts(points.first()?)?;
+        let first = num.checked_mul(2)?.checked_div(den)?;
+        let samples = points.iter().enumerate().map(|(index, raw)| {
+            let (node, num, den, timescale, value) = key_parts(raw)?;
+            let position = first.checked_add(index as i64)?;
+            (timescale == 1 && no_properties(node) &&
+                i128::from(num) * 2 == i128::from(den) * i128::from(position)).then_some(value)
+        });
+        if samples.clone().all(|point| point.is_some()) {
+            let mut values = Vec::new();
+            if !reserve(budget, &mut values, points.len()) { return None; }
+            values.extend(samples.flatten());
+            return Some(SourceTimewarpPoints::HalfFrameSamples { first, values });
+        }
+    }
+    if points.len() > MAX_KEYS { return None; }
+    let mut keys = Vec::new();
+    if !reserve(budget, &mut keys, points.len()) { return None; }
+    for raw in points {
+        let (node, num, den, timescale, value) = key_parts(raw)?;
+        let Value::List(properties) = node.get("pp")? else { return None; };
+        let mut key = SourceTimewarpKey {
+            time: (num, den), timescale, value, handles: [None; 4], anchor: None, flags: None,
+        };
+        for property in properties {
+            let Value::Node(property) = property else { return None; };
+            match int(property, "code")? {
+                code @ 5..=8 if int(property, "type") == Some(2) => {
+                    let v = float(property, "value").filter(|v| v.is_finite())?;
+                    if key.handles[(code - 5) as usize].replace(v).is_some() { return None; }
+                }
+                14 if int(property, "type") == Some(2) => {
+                    let v = float(property, "value").filter(|v| v.is_finite())?;
+                    if key.anchor.replace(v).is_some() { return None; }
+                }
+                9 if int(property, "type") == Some(1) => {
+                    if key.flags.replace(int(property, "value")?).is_some() { return None; }
+                }
+                _ => return None,
+            }
+        }
+        keys.push(key);
+    }
+    Some(SourceTimewarpPoints::Keys(keys))
+}
+
+fn saved_render_clip<'a>(ctx: &Ctx<'a>, effect: &Node) -> Option<&'a Node> {
+    let render = ctx.deref(effect.get("precomputed"))?;
+    if !null(render, "precomputed") || !null(render, "param_list") {
+        return None;
+    }
+    single_clip(ctx, render, effect)
+}
+
+fn resize_over_timewarp(ctx: &Ctx<'_>, node: &Node, input: &Node, length: i64) -> bool {
+    int(node, "length") == Some(length) && int(node, "info_is_reversed") == Some(0)
+        && int(node, "media_kind_id") == Some(KIND_PICTURE)
+        && single_component(ctx, input, node).is_some_and(|child| {
+            child.class == *b"SPED"
+                && child.get("effect_id").and_then(Value::as_str) == Some("EFF_ADV_MOTION_CTL")
+                && float(child, "edit_rate") == float(node, "edit_rate")
+                && int(child, "media_kind_id") == Some(KIND_PICTURE)
+                && int(child, "length") == Some(length)
+        })
+}
+
+/// The occurrence itself names this precompute. Keep the saved record-relative
+/// trim when it lies entirely inside a single same-rate render package.
+pub(super) fn precompute(
+    ctx: &Ctx<'_>, effect: &Node, length: i64, rate: Rate, ambiguous: &HashSet<MobId>,
+) -> Option<[(MobId, i64, i64); 3]> {
+    let at_rate = |n: &Node| float(n, "edit_rate").and_then(Rate::from_avid) == Some(rate);
+    if !at_rate(effect) { return None; }
+    let picture = |n: &Node| {
+        let Value::List(tracks) = n.get("tracks")? else { return None };
+        let [Value::Node(track)] = tracks.as_slice() else { return None };
+        let node = ctx.deref(track.get("component"))?;
+        (int(track, "index") == Some(1) && int(node, "media_kind_id") == Some(KIND_PICTURE))
+            .then_some(node)
+    };
+    let clip = |n: &Node, span: i64| {
+        (n.class == *b"SCLP" && at_rate(n) && int(n, "media_kind_id") == Some(KIND_PICTURE)
+            && int(n, "track_id") == Some(1) && int(n, "length") == Some(span)
+            && null(n, "precomputed") && null(n, "param_list"))
+            .then(|| Some((mob_id(n)?, int(n, "start_time")?)))?
+    };
+    let valid_effect = |node: &Node, span| {
+        match (&node.class, node.get("effect_id").and_then(Value::as_str)) {
+            (b"SPED", Some("EFF_ADV_MOTION_CTL")) => true,
+            (b"TKFX", Some("EFF2_BLEND_RESIZE")) => Some(rate) == Rate::new(24, 1)
+                && picture(node).is_some_and(|input| resize_over_timewarp(ctx, node, input, span)),
+            _ => false,
+        }
+    };
+    if !valid_effect(effect, length) { return None; }
+    let (master_id, start) = clip(saved_render_clip(ctx, effect)?, length)?;
+    let master = ctx.mobs.get(&master_id)?;
+    let span = int(master, "length")?;
+    if int(master, "mob_type_id") != Some(MOB_MASTER)
+        || int(master, "usage_code") != Some(1) || !at_rate(master)
+        || start < 0 || start.checked_add(length)? > span
+    { return None; }
+    let (file_id, 0) = clip(picture(master)?, span)? else { return None };
+    let file = ctx.mobs.get(&file_id)?;
+    if int(file, "mob_type_id") != Some(MOB_SOURCE) || int(file, "usage_code") != Some(9)
+        || !at_rate(file) || int(file, "length") != Some(span)
+    { return None; }
+    let descriptor = ctx.deref(file.get("descriptor"))?;
+    if descriptor.class != *b"CDCI" || !at_rate(descriptor)
+        || int(descriptor, "length") != Some(span) || int(descriptor, "frame_layout") != Some(0)
+    { return None; }
+    let (origin_id, 0) = clip(picture(file)?, span)? else { return None };
+    let origin = ctx.mobs.get(&origin_id)?;
+    let saved = picture(origin)?;
+    if int(origin, "mob_type_id") != Some(MOB_SOURCE) || int(origin, "usage_code") != Some(14)
+        || !at_rate(origin) || int(origin, "length") != Some(span)
+        || !valid_effect(saved, span) || !at_rate(saved) || int(saved, "length") != Some(span)
+        || saved.get("effect_id") != effect.get("effect_id") || !null(saved, "precomputed")
+    { return None; }
+    let ids = [master_id, file_id, origin_id];
+    if ids.iter().enumerate().any(|(n, id)| ambiguous.contains(id) || ids[..n].contains(id)) {
+        return None;
+    }
+    Some([(master_id, start, length), (file_id, 0, span), (origin_id, 0, span)])
 }
 
 pub(super) fn master_picture_matches(ctx: &Ctx<'_>, input: &Node) -> bool {
@@ -223,6 +444,222 @@ fn point_with_scale(value: &Value, twice_frame: i64, scale: i64) -> Option<&Node
 
 fn no_properties(node: &Node) -> bool {
     matches!(node.get("pp"), Some(Value::List(props)) if props.is_empty())
+}
+
+// Recover a reduced slope that round-trips to the saved double. The native
+// span ratio describes source coverage, so it cannot supply the slope.
+fn positive_speed_ratio(speed: f64) -> Option<(i64, i64)> {
+    if !speed.is_finite() || speed <= 0.0 {
+        return None;
+    }
+    let mut remainder = speed;
+    let (mut previous, mut current) = ((0_i128, 1_i128), (1_i128, 0_i128));
+    for _ in 0..64 {
+        let whole = remainder.floor();
+        if !whole.is_finite() || whole >= i64::MAX as f64 {
+            return None;
+        }
+        let next = (whole as i128 * current.0 + previous.0,
+                    whole as i128 * current.1 + previous.1);
+        let ratio = (i64::try_from(next.0).ok()?, i64::try_from(next.1).ok()?);
+        if ratio.0 > 0 && ratio.0 as f64 / ratio.1 as f64 == speed {
+            return Some(ratio);
+        }
+        (previous, current) = (current, next);
+        remainder = (remainder - whole).recip();
+    }
+    None
+}
+
+#[test]
+fn nested_speed_recovers_reduced_slope_from_saved_double() {
+    for (num, den) in [(1, 4), (4, 5), (5, 4), (5, 2), (1, 3), (1, 11), (1247, 1000)] {
+        assert_eq!(positive_speed_ratio(num as f64 / den as f64), Some((num, den)));
+    }
+    for speed in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+        assert_eq!(positive_speed_ratio(speed), None);
+    }
+}
+
+/// These are saved controls in the untrimmed motion owner's clock. The frame
+/// span ratio alone does not establish the rendered sampling.
+pub(super) fn observe_subclip_motion(
+    ctx: &Ctx<'_>, effect: &Node, trim_start: i64, trim_length: i64, ambiguous: &HashSet<MobId>,
+    rate: Rate, allow_other_speeds: bool,
+) -> Option<SourceSubclipMotion> {
+    let advanced = match effect.get("effect_id")?.as_str()? {
+        "EFF_TIMEWARP.MOTION_CTL" => false,
+        "EFF_ADV_MOTION_CTL" => true,
+        _ => return None,
+    };
+    let length = int(effect, "length").filter(|&length| length > 0)?;
+    let Value::List(span) = effect.get("speed_ratio")? else { return None };
+    let [Value::Int(num), Value::Int(den)] = span.as_slice() else { return None };
+    let input = direct_input(ctx, effect)?;
+    let curve_rate = float(effect, "edit_rate")?;
+    if *num <= 0 || *den <= 0 || effect.class != *b"SPED"
+        || Rate::from_avid(curve_rate) != Some(rate)
+        || float(input, "edit_rate").and_then(Rate::from_avid) != Some(rate)
+        || int(effect, "media_kind_id") != Some(KIND_PICTURE)
+        || int(input, "media_kind_id") != Some(KIND_PICTURE)
+        || !null(effect, "source_param_list") || !null(effect, "precomputed")
+    {
+        return None;
+    }
+    let params = ctx.deref(effect.get("param_list")).filter(|n| n.class == *b"PRLS")?;
+    let Value::RefList(items) = params.get("items")? else { return None };
+    if !(2..=4).contains(&items.len()) {
+        return None;
+    }
+    let mut speed = None;
+    let mut position = None;
+    let mut auxiliary = None;
+    let mut editable = None;
+    let mut distinct_aux = true;
+    for item in items {
+        let item = ctx.deref(Some(item))?;
+        let slot = match uuid(item)?.as_str() {
+            SPEED => &mut speed,
+            POSITION => &mut position,
+            AUXILIARY => {
+                distinct_aux &= auxiliary.replace(item).is_none();
+                continue;
+            }
+            EDITABLE_POSITION => {
+                distinct_aux &= editable.replace(item).is_none();
+                continue;
+            }
+            _ => return None,
+        };
+        if slot.replace(curve(ctx, item, 2, length, curve_rate, 1)?).is_some() {
+            return None;
+        }
+    }
+    let speed = speed.filter(|node| int(node, "interp_kind") == Some(6))?;
+    let position = position.filter(|node| int(node, "interp_kind") == Some(3))?;
+    let [speed] = points(speed)? else { return None };
+    let [first, last] = points(position)? else { return None };
+    let Value::Node(speed) = speed else { return None };
+    let Value::List(key_frame) = speed.get("offset")? else { return None };
+    let [Value::Int(key_num), Value::Int(key_den)] = key_frame.as_slice() else { return None };
+    if *key_den <= 0 || int(speed, "timescale") != Some(1) {
+        return None;
+    }
+    let speed_props = speed.get("pp");
+    let speed = float(speed, "value").filter(|v| v.is_finite() && *v > 0.0)?;
+    let first = point(first, 0).filter(|node| no_properties(node))?;
+    let last = point(last, length.checked_mul(2)?).filter(|node| no_properties(node))?;
+    let start = float(first, "value")?;
+    let end = float(last, "value")?;
+    if start != 0.0 || !end.is_finite() || end != speed * length as f64 {
+        return None;
+    }
+    let attrs = borrowed_attrs(ctx, effect);
+    let render_mode = unique_attribute(attrs, "_SFX_RENDER")?.as_int()?;
+    let graph_mode = if attrs.iter().any(|(key, _)| key == "_MFX_GRAPH_ENABLED") {
+        Some(unique_attribute(attrs, "_MFX_GRAPH_ENABLED")?.as_int()?)
+    } else {
+        None
+    };
+    let Value::Bool(new_source_calculation) = effect.get("new_source_calculation")? else { return None };
+    let phase_offset = int(effect, "phase_offset")?;
+    let offset_adjust = float(effect, "offset_adjust").filter(|v| v.is_finite())?;
+    let ignore_render_setting = unique_attribute(attrs, "_SFX_IGNORE_RENDER_SETTING")?.as_int()?;
+    let input_mob = mob_id(input)?;
+    let input_start = int(input, "start_time").filter(|&start| start >= 0)?;
+    let input_length = int(input, "length").filter(|&length| length > 0)?;
+    let sampled_input_frames = (|| {
+        // Native same-rate Speed graphs select floor(frame * speed) in the
+        // motion owner's clock. Retain the fraction lost by the first sample.
+        let (rate_num, rate_den) = positive_speed_ratio(speed)?;
+        let double_speed = (rate_num, rate_den) == (2, 1);
+        if !double_speed && !allow_other_speeds {
+            return None;
+        }
+        if advanced || (*key_num, *key_den) != (0, 1)
+            || phase_offset != 0 || offset_adjust != 0.0 || !new_source_calculation
+            || render_mode != 2 || ignore_render_setting != 0 || graph_mode != Some(1)
+            || int(effect, "mc_mode") != Some(0) || int(effect, "num_scalars") != Some(0)
+            || !distinct_aux || ambiguous.contains(&input_mob)
+            || !["_MFX_INPUT_FORMAT", "_MFX_OUTPUT_FORMAT"].iter().all(|name|
+                unique_attribute(attrs, name).and_then(Value::as_int) == Some(2))
+            || unique_attribute(attrs, "_NEW_SHAPE_REFERENCE_FRAME").and_then(Value::as_int) != Some(1)
+            || attrs.iter().any(|(name, value)| match name.as_str() {
+                "_MIXMATCH_MOTIONADAPTER" => value.as_int() != Some(0),
+                "_MFX_VIEW_SPD_TOP" | "_MFX_VIEW_SPD_BOTTOM" | "_TMP_CRM" |
+                "_MFX_INPUT_FORMAT" | "_MFX_OUTPUT_FORMAT" | "_SFX_RENDER" |
+                "_SFX_IGNORE_RENDER_SETTING" | "_NEW_SHAPE_REFERENCE_FRAME" |
+                "_MFX_GRAPH_ENABLED" => false,
+                _ => true,
+            })
+        {
+            return None;
+        }
+        let Some(Value::List(props)) = speed_props else { return None };
+        for (code, expected) in [(14, 0.0), (6, 0.0), (8, 0.0)] {
+            let mut matches = props.iter().filter_map(|prop| match prop {
+                Value::Node(prop) if int(prop, "code") == Some(code) => Some(prop),
+                _ => None,
+            });
+            let prop = matches.next()?;
+            if int(prop, "type") != Some(2) || float(prop, "value") != Some(expected) || matches.next().is_some() {
+                return None;
+            }
+        }
+        let aux = curve(ctx, auxiliary?, 1, length, curve_rate, 1)?;
+        let [aux_point] = points(aux)? else { return None };
+        let aux_point = point(aux_point, 0)?;
+        let editable = curve(ctx, editable?, 2, length, curve_rate, 2)?;
+        if int(aux, "interp_kind") != Some(2) || !no_properties(aux_point)
+            || int(aux_point, "value") != Some(0) || int(editable, "interp_kind") != Some(6)
+        {
+            return None;
+        }
+        let trim_end = trim_start.checked_add(trim_length)?;
+        if trim_start < 0 || trim_length <= 0 || trim_end > length {
+            return None;
+        }
+        let (rate_num_wide, rate_den_wide) = (i128::from(rate_num), i128::from(rate_den));
+        if !double_speed && (i128::from(input_length) <= i128::from(length - 1) * rate_num_wide / rate_den_wide
+            || i128::from(*num) * i128::from(input_length) != i128::from(*den) * i128::from(length))
+        {
+            return None;
+        }
+        let first = i128::from(trim_start) * rate_num_wide;
+        let last = i64::try_from(i128::from(trim_end - 1) * rate_num_wide / rate_den_wide).ok()?;
+        let master = ctx.mobs.get(&input_mob)?;
+        let last = (last < input_length).then_some(input_start.checked_add(last)?)?;
+        if float(master, "edit_rate").and_then(Rate::from_avid) != Some(rate) || last >= int(master, "length")? {
+            return None;
+        }
+        Some(SourceSubclipSampling {
+            first: input_start.checked_add(i64::try_from(first / rate_den_wide).ok()?)?,
+            last,
+            ratio: (rate_num, rate_den),
+            phase: i64::try_from(first % rate_den_wide).ok()?,
+        })
+    })();
+    Some(SourceSubclipMotion {
+        input_mob,
+        input_track: int(input, "track_id").filter(|&track| track > 0)?,
+        input_start,
+        input_length,
+        length,
+        advanced,
+        span_ratio: (*num, *den),
+        speed,
+        speed_key_frame: (*key_num, *key_den),
+        position: [start, end],
+        phase_offset,
+        offset_adjust,
+        render_mode,
+        ignore_render_setting,
+        new_source_calculation: *new_source_calculation,
+        graph_mode,
+        sampled_input_frames,
+        sampled_picture_master: None,
+        sampled_picture_file: None,
+    })
 }
 
 /// The three 50-frame constant controls with native picture references (AVB-0010).
@@ -704,4 +1141,110 @@ pub(super) fn visible_frames(
         return Some(None);
     }
     (visible.last() == Some(&(length - 1))).then_some(Some(visible))
+}
+
+/// A different duration can reuse the saved forward map when the explicit
+/// progressive render settings agree with the calibrated two-key profile.
+/// Keep inherited settings and offset/phase edits outside this route.
+pub(super) fn visible_linear_ramp(
+    ctx: &Ctx<'_>, effect: &Node, input: &Node, ratio: (i64, i64),
+    budget: &SharedBudget,
+) -> Option<Vec<i64>> {
+    let length = int(effect, "length")?;
+    let source_length = int(input, "length")?;
+    if length == FRAMES || !(3..=MAX_SAVED_PICTURE_FRAMES).contains(&length)
+        || ratio.0 <= 0 || ratio.1 <= 0 || source_length <= 0
+        || i128::from(length) * i128::from(ratio.1) != i128::from(source_length) * i128::from(ratio.0)
+        || float(effect, "edit_rate") != Some(24.0)
+        || int(effect, "media_kind_id") != Some(KIND_PICTURE)
+        || int(effect, "mc_mode") != Some(0) || int(effect, "num_scalars") != Some(0)
+        || int(effect, "phase_offset") != Some(0) || float(effect, "offset_adjust") != Some(0.0)
+        || effect.get("new_source_calculation") != Some(&Value::Bool(true))
+        || !null(effect, "source_param_list") || !null(effect, "precomputed")
+        || float(input, "edit_rate") != Some(24.0)
+        || int(input, "media_kind_id") != Some(KIND_PICTURE)
+    {
+        return None;
+    }
+    saved_settings(ctx, effect)?;
+    let Value::RefList(items) = ctx.deref(effect.get("param_list"))?.get("items")? else {
+        return None;
+    };
+    if items.len() != 3 { return None; }
+    let mut controls = [None; 3];
+    for entry in items {
+        let item = ctx.deref(Some(entry))?;
+        let (index, value_type, interpolation) = match uuid(item)?.as_str() {
+            SPEED => (0, 2, 3),
+            POSITION => (1, 2, 3),
+            AUXILIARY => (2, 1, 2),
+            _ => return None,
+        };
+        let track = curve(ctx, item, value_type, length, 24.0, 1)?;
+        if int(track, "interp_kind") != Some(interpolation)
+            || controls[index].replace(points(track)?).is_some()
+        {
+            return None;
+        }
+    }
+    let [start, end] = controls[0]? else { return None; };
+    let speed = |raw, frame, first| {
+        let node = point(raw, frame * 2)?;
+        let Value::List(properties) = node.get("pp")? else { return None; };
+        let mut seen = HashSet::new();
+        for p in properties {
+            let Value::Node(p) = p else { return None; };
+            let code = int(p, "code")?;
+            if !seen.insert(code) { return None; }
+            let known = match code {
+                5 | 7 => int(p, "type") == Some(2)
+                    && float(p, "value").is_some_and(|v| v.is_finite() &&
+                        v.abs() <= length as f64 && if code == 5 { v < 0.0 } else { v > 0.0 }),
+                6 | 8 => int(p, "type") == Some(2) && float(p, "value") == Some(0.0),
+                9 => int(p, "type") == Some(1) && int(p, "value") == Some(1),
+                14 if first => int(p, "type") == Some(2) && float(p, "value") == Some(0.0),
+                _ => false,
+            };
+            if !known { return None; }
+        }
+        if seen.len() != if first { 6 } else { 5 } { return None; }
+        float(node, "value").filter(|v| (0.5..=2.0).contains(v))
+    };
+    let first_speed = speed(start, 0, true)?;
+    let last_speed = speed(end, length - 1, false)?;
+    if first_speed == last_speed { return None; }
+    let [aux] = controls[2]? else { return None; };
+    let aux = point(aux, 0)?;
+    if !no_properties(aux) || int(aux, "value") != Some(0) { return None; }
+    let samples = controls[1]?;
+    if samples.len() != (2 * length + 1) as usize { return None; }
+    let mut frames = Vec::new();
+    if !reserve(budget, &mut frames, length as usize) { return None; }
+    let (mut previous, mut previous_step) = (0.0, first_speed / 2.0);
+    let direction = (last_speed - first_speed).signum();
+    for (index, raw) in samples.iter().enumerate() {
+        let node = point(raw, index as i64)?;
+        let value = float(node, "value")?;
+        if !no_properties(node) || !value.is_finite() || (index == 0 && value != 0.0) {
+            return None;
+        }
+        if index > 0 {
+            let step = value - previous;
+            if !(0.25 - FLOAT_NOISE..=1.0 + FLOAT_NOISE).contains(&step)
+                || direction * (step - previous_step) < -FLOAT_NOISE
+                || (index >= samples.len() - 2 && (step - last_speed / 2.0).abs() > FLOAT_NOISE)
+            {
+                return None;
+            }
+            previous_step = step;
+        }
+        if index % 2 == 0 && index / 2 < length as usize {
+            if index > 0 && (value - value.round()).abs() <= FLOAT_NOISE { return None; }
+            let frame = value.floor() as i64;
+            if !(0..source_length).contains(&frame) { return None; }
+            frames.push(frame);
+        }
+        previous = value;
+    }
+    (frames.last() == Some(&(source_length - 1))).then_some(frames)
 }

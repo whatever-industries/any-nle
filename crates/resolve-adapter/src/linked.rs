@@ -291,11 +291,8 @@ fn ratio(s: &Json) -> Result<Rational> {
 }
 
 pub(crate) fn extent(count: i64, time_base: Rational) -> Result<Rational> {
-    Rational::new(
-        i128::from(count) * i128::from(time_base.num()),
-        i128::from(time_base.den()),
-    )
-    .ok_or_else(|| "physical media duration overflow".into())
+    anynle_media_verification::stream_duration(count, time_base)
+        .ok_or_else(|| "physical media duration overflow".into())
 }
 
 pub(crate) fn non_drop_24(frames: i64) -> String {

@@ -298,7 +298,7 @@ impl Project {
         self.add_track_item_ref(track, &item_object_id, "ClipItems")?;
         let placed = self.push_track_item(TrackItemData::new(element, subclip, clip, track));
         self.track_mut(track).clips.push(placed);
-        self.grow_source_duration(sequence)?;
+        self.grow_source_duration_from_item(placed)?;
         Ok(placed)
     }
 

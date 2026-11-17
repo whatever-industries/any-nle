@@ -341,7 +341,7 @@ fn apply_corner_pin_at(
     Ok(())
 }
 
-fn append_component(project: &mut Project, chain: NodeId, component: NodeId) -> Result<()> {
+pub(super) fn append_component(project: &mut Project, chain: NodeId, component: NodeId) -> Result<()> {
     let Some(inner) = project.doc.tree.child_by_tag(chain, "ComponentChain") else {
         return value("component chain has no ComponentChain core");
     };

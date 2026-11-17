@@ -4,7 +4,7 @@ use super::mono::GainPaths;
 use super::receipts::{obj, text};
 use super::source::{free_space, id_value, pcm_essence_bytes, stamp};
 use super::validation::timecode;
-use super::{Input, Job, Plan, R};
+use super::{Input, Job, LtRangePictures, Plan, R};
 use graph::json::Value;
 use prproj::convert::model::{ticks_per_unit, Fraction, Model, TICKS_PER_SECOND as TPS};
 use prproj::convert::prepared::PreparedProjectInput;
@@ -41,6 +41,7 @@ pub(crate) struct NativeMediaPreparation<'input, 'graph> {
     pub model: &'input Model,
     pub writer_input: Option<&'input mut PreparedProjectInput>,
     pub gain: &'input GainPaths<'graph>,
+    pub managed_pictures: LtRangePictures,
 }
 
 impl NativeMediaPreparation<'_, '_> {
@@ -62,6 +63,7 @@ impl NativeMediaPreparation<'_, '_> {
     ) -> Result<Plan, PrepareIssue> {
         let plan = Plan::prepare_media_review(
             self.model, directory, media_roots, project, graph, ffmpeg, ffprobe, true, self.gain,
+            self.managed_pictures,
         )?;
         if let Some(input) = self.writer_input {
             plan.attach_mono(input)?;
@@ -214,7 +216,7 @@ impl Plan {
         ffprobe: &Path,
         allow_mov: bool,
     ) -> R<Self> {
-        Self::prepare_media_review(model, directory, media_roots, project, graph, ffmpeg, ffprobe, allow_mov, &HashMap::new())
+        Self::prepare_media_review(model, directory, media_roots, project, graph, ffmpeg, ffprobe, allow_mov, &HashMap::new(), HashMap::new())
             .map_err(PrepareIssue::into_message)
     }
 
@@ -228,6 +230,7 @@ impl Plan {
         ffprobe: &Path,
         allow_mov: bool,
         gain_paths: &GainPaths<'_>,
+        mut managed_pictures: LtRangePictures,
     ) -> Result<Self, PrepareIssue> {
         let (parent, destination) = validate_destination(directory, media_roots, project, graph)
             .map_err(PrepareIssue::Destination)?;
@@ -341,6 +344,10 @@ impl Plan {
                 Some(timecode(video.start, video.rate, drop)?)
             };
             let expected_op = if freeze { "060e2b34040101020d01020110000000" } else { OP_ATOM };
+            let avid_lt_picture = video.codec == "apcs" && clip.audio.is_empty()
+                && source_id.picture_essence_coding == Some(avid_reader::mxf::PRORES_422_LT_CODING)
+                && source_id.file_tracks == [(24, 1, video.duration / ticks_per_unit(video.rate))]
+                && source_id.file_packages.len() == 1;
             let mut recipe = Vec::new();
             let mut audio: Vec<_> = clip.audio.iter().collect();
             if audio.iter().any(|a| a.bits != audio[0].bits) {
@@ -356,6 +363,8 @@ impl Plan {
                 .chain(audio.iter().map(|a| a.path.as_str()))
                 .enumerate()
             {
+                let accepts_op = |op: &str| op == expected_op
+                    || (at == 0 && avid_lt_picture && op == super::backend::AVID_PRORES_LT_ATOM);
                 let path = fs::canonicalize(original).map_err(|e| format!("{original}: {e}"))?;
                 if path.to_str().is_none()
                     || original
@@ -372,7 +381,7 @@ impl Plan {
                 } else {
                     let before = stamp(&path)?;
                     let p = probe(ffprobe, &path)?;
-                    if p.op != expected_op || p.streams.len() != 1 {
+                    if !accepts_op(&p.op) || p.streams.len() != 1 {
                         return Err(format!(
                             "{}: unqualified OP-Atom operational-pattern variant or stream layout",
                             path.display()
@@ -395,8 +404,11 @@ impl Plan {
                     i
                 };
                 let input = &plan.inputs[index];
-                if input.probe.op != expected_op || (freeze && !input.probe.references.is_empty()) {
+                if !accepts_op(&input.probe.op) || (freeze && !input.probe.references.is_empty()) {
                     return Err("conflicting or unqualified source operational pattern".into());
+                }
+                if input.probe.op == super::backend::AVID_PRORES_LT_ATOM {
+                    super::backend::verify_stream_package(&input.probe, &source_id.file_packages)?;
                 }
                 let stream = &input.probe.streams[0];
                 if stream.ticks != video.duration {
@@ -480,14 +492,36 @@ impl Plan {
                     }
                 }
             }
-            let picture = &plan.inputs[recipe[0]].probe.streams[0];
-            if freeze || picture.ticks as i128 != picture.packets as i128 * ticks_per_unit(video.rate) as i128
+            let i = recipe[0];
+            let input = &plan.inputs[i];
+            let picture = &input.probe.streams[0];
+            let native_lt = avid_lt_picture && input.probe.op == super::backend::AVID_PRORES_LT_ATOM;
+            // A broken index may make the demuxer report the expected count by
+            // shifting or dropping packets. Native LT still needs index proof.
+            if freeze || native_lt
+                || picture.ticks as i128 != picture.packets as i128 * ticks_per_unit(video.rate) as i128
             {
-                if mov && !freeze { return Err("ProRes packet/span mismatch: no DNx terminal-packet exception applies".into()); }
-                let i = recipe[0];
-                let input = &plan.inputs[i];
                 let terminal = if freeze {
                     super::terminal::Terminal::qualify_freeze(&input.path, &input.probe, ffprobe)
+                } else if native_lt {
+                    // Only reuse a proof from the same preflight and backend.
+                    // Execution still independently verifies the packet boundary.
+                    match managed_pictures.remove(&input.path).filter(|p| p.ffprobe == ffprobe) {
+                        Some(verified) => {
+                            if verified.stamp != input.stamp
+                                || source_id.file_packages != [verified.package.as_str()]
+                                || input.probe.stream_indices != [verified.stream]
+                                || picture.ticks != verified.terminal.frames * ticks_per_unit(Fraction::new(24, 1))
+                                || picture.packets != verified.terminal.frames + i64::from(verified.terminal.bytes > 0)
+                            {
+                                return Err("input changed since Color Adapter picture verification".into());
+                            }
+                            Ok(verified.terminal)
+                        }
+                        None => super::terminal::Terminal::qualify_lt(&input.path, &input.probe, ffprobe),
+                    }
+                } else if mov {
+                    return Err("ProRes packet/span mismatch: no DNx terminal-packet exception applies".into());
                 } else {
                     super::terminal::Terminal::qualify(&input.path, &input.probe, ffprobe, video.rate)
                         .map_err(|e| format!("DNx packet count does not match the declared picture span; terminal/extra packets are not qualified for automatic removal: {e}"))
@@ -495,7 +529,9 @@ impl Plan {
                 if input.stamp != stamp(&input.path)? {
                     return Err("input changed during terminal packet validation".into());
                 }
-                plan.inputs[i].terminal = Some(terminal);
+                if terminal.bytes > 0 {
+                    plan.inputs[i].terminal = Some(terminal);
+                }
             }
             for i in &recipe {
                 if let Some(prior) = owners.insert(*i, recipe.clone()) {

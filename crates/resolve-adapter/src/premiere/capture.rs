@@ -1,0 +1,701 @@
+//! Premiere 27 linked-original media capture into graph/2. This input
+//! profile is independent of the media a particular destination can write.
+mod physical;
+mod saved;
+
+use super::{
+    components, markers, metadata, premiere_path, read_project, select_sequence,
+    source_capture::{owning_bin, source_clock, source_receipt, source_sequence, GraphCapture},
+    ticks, MAX_EDITS,
+};
+use crate::Result;
+use graph::{
+    source::{
+        OriginalStream, SourceClock, SourceGraph, SourceItem, SourceItemMedia, SourceMedia,
+        SourceTrack,
+    },
+    GroupedAudio, Loss, Placement, Rational, Sidecar, StreamKind, Value,
+};
+use metadata::leaf;
+use physical::Physical;
+use prproj::{
+    build::time::TICKS_PER_SECOND,
+    model::{ItemId, Project, TrackItemId},
+    xml::NodeId,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
+
+/// Read one saved straight-cut sequence, verifying the linked originals and
+/// resolving every occurrence's file-relative ranges and physical selectors.
+pub fn read_premiere_media_graph(
+    path: &Path,
+    selector: &str,
+    ffprobe: &Path,
+) -> Result<SourceGraph> {
+    let path = premiere_path(path)?;
+    let before = physical::file_state(&path)?;
+    let (project, _) = read_project(&path)?;
+    if !components::is_current_project(&project)? {
+        return Err("linked media capture requires a current Premiere project".into());
+    }
+    let sequence = select_sequence(&project, selector)?;
+    let id = project
+        .sequence_id(sequence)
+        .ok_or("Premiere sequence lacks ObjectUID")?;
+    let panel = project
+        .sequence_item(sequence)
+        .ok_or("Premiere sequence panel owner is missing")?;
+    let root = project
+        .root_item()
+        .ok_or("Premiere project root is absent")?;
+    let data = project.sequence(sequence);
+    let frame_ticks = data
+        .timebase
+        .filter(|&n| n > 0)
+        .ok_or("missing Premiere sequence clock")?;
+    let rate = Rational::new(TICKS_PER_SECOND.into(), frame_ticks.into())
+        .ok_or("invalid sequence rate")?;
+    let base = physical::display_base(rate)?;
+    let drop = match (
+        rate.num(),
+        rate.den(),
+        project.video_display_format(sequence)?,
+    ) {
+        (24, 1, Some(100))
+        | (24000, 1001, Some(110))
+        | (25, 1, Some(101))
+        | (30000, 1001, Some(103)) => false,
+        (30000, 1001, Some(102)) => true,
+        _ => return Err("Premiere sequence display clock contradicts its frame rate".into()),
+    };
+    let zero = project.zero_point(sequence)?.ticks;
+    if zero < 0 || zero % frame_ticks != 0 {
+        return Err("Premiere sequence origin is off-frame".into());
+    }
+    let origin = u64::try_from(zero / frame_ticks)?;
+    if origin >= u64::from(base) * 86400 - if drop { 2592 } else { 0 } {
+        return Err("Premiere sequence origin is outside one day".into());
+    }
+    let clock = source_clock(
+        origin,
+        rate,
+        base,
+        drop,
+        &id,
+        "MZ.ZeroPoint",
+        "Premiere sequence ticks",
+    );
+    let mut out = source_sequence(
+        id.clone(),
+        project.sequence_name(sequence),
+        Some(
+            data.frame_size
+                .ok_or("Premiere timeline raster is missing")?,
+        ),
+        clock,
+    );
+    let GraphCapture {
+        mut graph,
+        folder_ids: mut folders,
+        sequence_bin,
+    } = GraphCapture::new(&project, &path, root, panel)?;
+    graph.sidecars.push(source_receipt(
+        id.clone(),
+        &graph.bins[sequence_bin].id,
+        frame_ticks,
+        zero,
+        [],
+    ));
+    graph.sidecars.push(Sidecar {
+        adapter: "premiere.media_capture".into(),
+        object: id.clone(),
+        data: Value::Str("linked media, exact edit clocks and channel selection; mixer and appearance require separate preparation".into()),
+    });
+
+    let mut files = HashMap::new();
+    let mut items = HashMap::new();
+    let mut component_budget = components::Budget::default();
+    let mut track_state = metadata::TrackStateCapture::default();
+    for (kind, tracks) in [
+        (StreamKind::Video, &data.video_tracks),
+        (StreamKind::Audio, &data.audio_tracks),
+    ] {
+        let mut seen = HashSet::new();
+        for &track_id in tracks {
+            let track = project.track(track_id);
+            if !track.transitions.is_empty() {
+                return Err(format!(
+                    "{id}: transition timing is outside Premiere linked media capture"
+                )
+                .into());
+            }
+            let index = track
+                .index
+                .checked_add(1)
+                .filter(|n| *n > 0)
+                .ok_or("invalid Premiere track index")?;
+            if !seen.insert(index) {
+                return Err("duplicate Premiere track index".into());
+            }
+            metadata::capture_track_state(
+                &project.doc.tree,
+                track.element,
+                kind,
+                index,
+                &id,
+                &mut track_state,
+            )?;
+            let mut declaration = SourceTrack::new(kind, index, None);
+            declaration.name = project
+                .doc
+                .tree
+                .findtext(
+                    track.element,
+                    "ClipTrack/Track/Node/Properties/MZ.TrackName",
+                )?
+                .filter(|name| !name.is_empty());
+            declaration.empty = track.clips.is_empty();
+            out.tracks.push(declaration);
+            let mut intervals = Vec::with_capacity(track.clips.len());
+            for &clip in &track.clips {
+                if out.placements.len() + out.disabled_placements.len() == MAX_EDITS {
+                    return Err("Premiere sequence exceeds edit limit".into());
+                }
+                let native = project.track_item(clip);
+                let object = project
+                    .doc
+                    .tree
+                    .get(native.element, "ObjectID")
+                    .ok_or("Premiere edit lacks ObjectID")?;
+                let occurrence = format!("premiere:edit:{object}");
+                let source = project
+                    .track_item_source(clip)
+                    .ok_or("unresolved Premiere source item")?;
+                if let std::collections::hash_map::Entry::Vacant(entry) = items.entry(source) {
+                    if graph.items.len() == 256 {
+                        return Err("Premiere sequence exceeds linked media limit".into());
+                    }
+                    let saved_path = Path::new(
+                        project
+                            .item_media_path(source)
+                            .ok_or("Premiere original locator is missing")?,
+                    );
+                    if !saved_path.is_absolute() {
+                        return Err("Premiere original requires an absolute saved path".into());
+                    }
+                    let canonical = fs::canonicalize(saved_path).map_err(|error| {
+                        format!("{occurrence}: {}: {error}", saved_path.display())
+                    })?;
+                    if let std::collections::hash_map::Entry::Vacant(file) =
+                        files.entry(canonical.clone())
+                    {
+                        file.insert(physical::inspect(&canonical, ffprobe).map_err(|error| {
+                            format!("{occurrence}: {}: {error}", saved_path.display())
+                        })?);
+                    }
+                    let bin = owning_bin(&project, source, &mut folders, &mut graph.bins)?;
+                    let item = capture_item(
+                        &project,
+                        source,
+                        saved_path,
+                        &canonical,
+                        &files[&canonical],
+                        bin,
+                        &mut graph,
+                    )
+                    .map_err(|error| format!("{occurrence}: {}: {error}", saved_path.display()))?;
+                    entry.insert(item);
+                }
+                let item = &items[&source];
+                let placement = placement(
+                    &project,
+                    clip,
+                    kind,
+                    index,
+                    item,
+                    &files[&item.path],
+                    rate,
+                    frame_ticks,
+                    &occurrence,
+                    &mut graph,
+                )
+                .map_err(|error| format!("{occurrence}: {error}"))?;
+                if let Some(saved) =
+                    components::capture(&project, clip, kind, &occurrence, &mut component_budget)?
+                {
+                    graph.sidecars.push(saved);
+                }
+                if !native.components.is_empty()
+                    || !native.selection_components.is_empty()
+                    || project.doc.tree.find1(native.element, "Panner").is_some()
+                {
+                    graph.losses.push(Loss {
+                        object: occurrence,
+                        aspect: "premiere.appearance_or_mix".into(),
+                        reason: "Clip processing needs separate destination preparation; this capture verifies the underlying linked edit".into(),
+                    });
+                }
+                if project.is_disabled(clip)? {
+                    out.disabled_placements.push(placement);
+                } else {
+                    let start = project.start(clip)?.ticks;
+                    intervals.push((start, project.end(clip)?.ticks));
+                    out.placements.push(placement);
+                }
+            }
+            intervals.sort_unstable();
+            if intervals.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+                return Err(
+                    format!("{id}: overlapping Premiere clips on {kind:?} track {index}").into(),
+                );
+            }
+        }
+    }
+    if out.placements.is_empty() && out.disabled_placements.is_empty() {
+        return Err("Premiere sequence has no linked media edits".into());
+    }
+    if !project.caption_tracks(sequence).is_empty() {
+        return Err("Premiere captions require separate text preparation".into());
+    }
+    markers::capture(
+        &project.doc.tree,
+        &data.markers,
+        &mut out,
+        &mut graph.sidecars,
+        &mut graph.losses,
+    );
+    for (adapter, rows) in [
+        (crate::track_state::PREMIERE_ADAPTER, track_state.mapped),
+        (metadata::SYNC_LOCK_LOSS, track_state.sync_unlocked),
+    ] {
+        if !rows.is_empty() {
+            graph.sidecars.push(Sidecar {
+                adapter: adapter.into(),
+                object: id.clone(),
+                data: Value::Arr(rows),
+            });
+        }
+    }
+    graph.losses.extend(track_state.losses);
+    graph.sequences.push(out);
+    graph.validate()?;
+    if physical::file_state(&path)? != before {
+        return Err("Premiere project changed during capture".into());
+    }
+    for item in items.values() {
+        if fs::canonicalize(&item.saved_path)? != item.path {
+            return Err(format!(
+                "Premiere linked locator changed during capture: {}",
+                item.saved_path.display()
+            )
+            .into());
+        }
+    }
+    for (path, physical) in files {
+        if physical::file_state(&path)? != physical.state {
+            return Err(format!(
+                "Premiere linked original changed during capture: {}",
+                path.display()
+            )
+            .into());
+        }
+    }
+    Ok(graph)
+}
+
+struct Item {
+    id: String,
+    saved_path: PathBuf,
+    path: PathBuf,
+    primary: NodeId,
+    bindings: saved::ItemBindings,
+}
+
+fn capture_item(
+    project: &Project,
+    item: ItemId,
+    saved_path: &Path,
+    path: &Path,
+    physical: &Physical,
+    bin: usize,
+    graph: &mut SourceGraph,
+) -> Result<Item> {
+    let tree = &project.doc.tree;
+    let panel = project.item(item);
+    let uid = tree
+        .get(panel.element, "ObjectUID")
+        .ok_or("Premiere source item lacks ObjectUID")?;
+    let id = format!("premiere:item:{uid}");
+    let master = panel.master.ok_or("Premiere source has no saved master")?;
+    let primary = project
+        .media_element(item)?
+        .ok_or("Premiere source has no primary Media")?;
+    saved::check_media(project, primary, primary, saved_path)?;
+    let bindings = saved::ItemBindings::read(project, master, primary, saved_path, physical)?;
+    let clock = original_clock(tree, primary, physical, &id)?;
+    let tape = metadata::capture(project, item, primary, &id, None, graph)?;
+    if let (Some(material), Some(file)) = (&physical.package, &physical.file_package) {
+        graph.sidecars.push(Sidecar {
+            adapter: "premiere.op1a_identity".into(),
+            object: id.clone(),
+            data: Value::Obj(vec![
+                ("material_package_umid".into(), Value::Str(material.clone())),
+                ("file_package_umid".into(), Value::Str(file.clone())),
+            ]),
+        });
+    }
+    let resolved = path.to_str().ok_or("invalid Premiere original path")?;
+    let locator = saved_path.to_str().ok_or("invalid saved Premiere path")?;
+    let mut item_media = Vec::new();
+    let mut audio_label = 0;
+    for stream in physical.video.iter().chain(&physical.audio) {
+        for channel in 0..stream.channels.unwrap_or(1) {
+            let media_id = format!("{id}/media/{}/{}", stream.index, channel);
+            let kind = stream.kind();
+            let logical = (kind == StreamKind::Audio).then(|| {
+                audio_label += 1;
+                audio_label
+            });
+            if logical
+                .is_some_and(|label| !bindings.groups.iter().any(|group| group.contains(&label)))
+                || kind == StreamKind::Video && !bindings.has_picture()
+            {
+                continue;
+            }
+            let clock = (kind == StreamKind::Video).then(|| clock.clone()).flatten();
+            graph.media.push(SourceMedia {
+                id: media_id.clone(),
+                kind,
+                locations: vec![resolved.into()],
+                codec: Some(stream.codec.clone()),
+                frame_size: stream.size,
+                rate: stream.rate,
+                sample_rate: stream.channels.map(|_| 48000),
+                bits: stream.bits,
+                duration: stream.duration,
+                start: clock.as_ref().and_then(SourceClock::exact_start),
+                clock,
+                stream: logical,
+                online: Some(true),
+                original: Some(OriginalStream {
+                    saved_locators: vec![locator.into()],
+                    container: physical.container.into(),
+                    stream_index: stream.index,
+                    channel_index: stream.channels.map(|_| channel),
+                    channels: stream.channels,
+                    time_base: stream.time_base,
+                    start_pts: 0,
+                    duration_ts: stream.count,
+                    sample_representation: logical.map(|_| {
+                        match stream.bits {
+                            Some(16) => "pcm16",
+                            Some(24) => "pcm24",
+                            _ => "aac",
+                        }
+                        .into()
+                    }),
+                }),
+            });
+            item_media.push(SourceItemMedia {
+                media: media_id,
+                gain_db: 0.0,
+                source_offset: Some(Rational::ZERO),
+            });
+        }
+    }
+    if !bindings.groups.is_empty() {
+        graph.sidecars.push(Sidecar {
+            adapter: "premiere.audio_groups".into(),
+            object: id.clone(),
+            data: Value::Arr(
+                bindings
+                    .groups
+                    .iter()
+                    .map(|group| Value::Arr(group.iter().copied().map(Value::Int).collect()))
+                    .collect(),
+            ),
+        });
+    }
+    graph.bins[bin].items.push(id.clone());
+    graph.items.push(SourceItem {
+        id: id.clone(),
+        name: project.item_name(item),
+        media: item_media,
+        umid: physical.package.clone(),
+        tape,
+        rate: physical.video.as_ref().and_then(|v| v.rate),
+        color_rgb16: None,
+        stream_groups: bindings
+            .groups
+            .iter()
+            .filter(|g| g.len() > 1)
+            .cloned()
+            .collect(),
+        markers: vec![],
+    });
+    Ok(Item {
+        id,
+        saved_path: saved_path.into(),
+        path: path.into(),
+        primary,
+        bindings,
+    })
+}
+
+fn original_clock(
+    tree: &prproj::xml::Tree,
+    media: NodeId,
+    physical: &Physical,
+    id: &str,
+) -> Result<Option<SourceClock>> {
+    let start = leaf(tree, media, "Start")?
+        .map(str::parse::<i64>)
+        .transpose()?
+        .unwrap_or(0);
+    let alternate = match leaf(tree, media, "UseAlternateStart")? {
+        None | Some("false") => None,
+        Some("true") => Some(
+            leaf(tree, media, "AlternateStart")?
+                .ok_or("missing saved source timecode")?
+                .parse::<i64>()?,
+        ),
+        _ => return Err("invalid saved source timecode flag".into()),
+    };
+    let Some(timecode) = &physical.timecode else {
+        if alternate.unwrap_or(start) != 0 || start != 0 {
+            return Err(
+                "nonzero saved Premiere source origin has no corroborating file clock".into(),
+            );
+        }
+        return Ok(None);
+    };
+    let rate = physical
+        .video
+        .as_ref()
+        .and_then(|v| v.rate)
+        .ok_or("file timecode lacks a picture clock")?;
+    let base = physical::display_base(rate)?;
+    let (count, drop) = parse_timecode(timecode, base)?;
+    let native = source_clock(
+        count,
+        rate,
+        base,
+        drop,
+        id,
+        if physical.container == "mxf" {
+            "MXF package timecode"
+        } else {
+            "QuickTime tmcd"
+        },
+        "Premiere linked original",
+    );
+    let expected = native
+        .exact_start()
+        .ok_or("physical source timecode cannot be represented")?;
+    if ticks(alternate.unwrap_or(start))? != expected || start != 0 && ticks(start)? != expected {
+        return Err("saved Premiere source timecode contradicts the original".into());
+    }
+    Ok(Some(native))
+}
+
+fn parse_timecode(label: &str, base: u16) -> Result<(u64, bool)> {
+    let bytes = label.as_bytes();
+    if bytes.len() != 11 || bytes[2] != b':' || bytes[5] != b':' || !matches!(bytes[8], b':' | b';')
+    {
+        return Err("invalid physical source timecode label".into());
+    }
+    let parts = [0, 3, 6, 9].map(|i| {
+        let pair = &bytes[i..i + 2];
+        pair.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| u64::from((pair[0] - b'0') * 10 + (pair[1] - b'0')))
+    });
+    let [Some(h), Some(m), Some(s), Some(f)] = parts else {
+        return Err("invalid physical source timecode fields".into());
+    };
+    let drop = bytes[8] == b';';
+    if h >= 24
+        || m >= 60
+        || s >= 60
+        || f >= u64::from(base)
+        || drop && (base != 30 || m % 10 != 0 && s == 0 && f < 2)
+    {
+        return Err("physical source timecode is outside its display clock".into());
+    }
+    let minutes = 60 * h + m;
+    let nominal = (60 * minutes + s) * u64::from(base) + f;
+    Ok((
+        nominal
+            - if drop {
+                2 * (minutes - minutes / 10)
+            } else {
+                0
+            },
+        drop,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn placement(
+    project: &Project,
+    clip: TrackItemId,
+    kind: StreamKind,
+    index: i64,
+    item: &Item,
+    physical: &Physical,
+    rate: Rational,
+    frame_ticks: i64,
+    occurrence: &str,
+    graph: &mut SourceGraph,
+) -> Result<Placement> {
+    let native = project.track_item(clip);
+    if project.speed(clip)? != 1.0
+        || project.is_speed_reversed(clip)?
+        || native.components.iter().any(|&c| {
+            project
+                .component_match_name(c)
+                .to_ascii_lowercase()
+                .contains("remap")
+        })
+    {
+        return Err("retiming is outside Premiere linked media capture".into());
+    }
+    let start = project.start(clip)?.ticks;
+    let end = project.end(clip)?.ticks;
+    let a = project.in_point(clip)?.ticks;
+    let b = project.out_point(clip)?.ticks;
+    let span = end
+        .checked_sub(start)
+        .ok_or("Premiere edit duration overflow")?;
+    if start < 0 || a < 0 || span <= 0 || b.checked_sub(a) != Some(span) {
+        return Err("Premiere source and record ranges disagree".into());
+    }
+    let source_in = ticks(a)?;
+    let mut duration = ticks(span)?;
+    let mut mono = Vec::new();
+    let mut grouped_audio = Vec::new();
+    if kind == StreamKind::Video {
+        item.bindings.video(project, native.clip)?;
+        let picture = physical
+            .video
+            .as_ref()
+            .ok_or("Premiere video edit lacks an original picture stream")?;
+        if picture.rate != Some(rate)
+            || [a, b, start, end].iter().any(|v| v % frame_ticks != 0)
+            || ticks(b)? > picture.duration
+        {
+            return Err(
+                "Premiere picture edit has unsupported timing or exceeds the original".into(),
+            );
+        }
+    } else {
+        let selectors = item.bindings.audio(
+            project,
+            native.clip,
+            native.subclip,
+            item.primary,
+            &item.saved_path,
+            physical,
+        )?;
+        let channels: Vec<_> = physical
+            .audio
+            .iter()
+            .flat_map(|s| std::iter::repeat_n(s, s.channels.unwrap_or_default() as usize))
+            .collect();
+        for &label in &selectors {
+            let audio = channels[(label - 1) as usize];
+            if ticks(b)? > audio.duration {
+                // Native Premiere can extend a linked A/V item to the end of the
+                // final frame when PCM/AAC physically ends a fraction of a sample
+                // earlier. Keep the saved edit end and the verified playable tail.
+                if !physical
+                    .video
+                    .as_ref()
+                    .is_some_and(|v| ticks(b).ok() == Some(v.duration))
+                    || !saved::extent_within_sample(b, audio.count)
+                {
+                    return Err("Premiere audio trim exceeds its original playable extent".into());
+                }
+                let playable = audio
+                    .duration
+                    .checked_sub(source_in)
+                    .filter(|r| r.num() > 0)
+                    .ok_or("Premiere audio edit contains no playable samples")?;
+                duration = duration.min(playable);
+            }
+        }
+        if duration != ticks(span)? {
+            graph.sidecars.push(Sidecar {
+                adapter: "premiere.saved_audio_tail".into(),
+                object: occurrence.into(),
+                data: Value::Obj(vec![
+                    ("saved_record_end_ticks".into(), Value::Int(end)),
+                    ("saved_source_out_ticks".into(), Value::Int(b)),
+                ]),
+            });
+            graph.losses.push(Loss {
+                object: occurrence.into(), aspect: "premiere.subsample_tail".into(),
+                reason: "Saved audio end extends less than one sample past the linked original at picture EOF; graph placement ends at the exact playable sample".into(),
+            });
+        }
+        if selectors.len() == 1 {
+            mono = selectors;
+        } else {
+            grouped_audio.push(GroupedAudio {
+                track: index,
+                streams: selectors,
+                gain_db: None,
+                pans: vec![],
+            });
+        }
+    }
+    Ok(Placement {
+        id: occurrence.into(),
+        item: item.id.clone(),
+        record_start: ticks(start)?,
+        source_in,
+        duration,
+        video_track: (kind == StreamKind::Video).then_some(index),
+        audio_tracks: if mono.is_empty() { vec![] } else { vec![index] },
+        audio_streams: mono,
+        grouped_audio,
+        gain_db: 0.0,
+        volume_db: None,
+        volume_keys: vec![],
+        track_gains_db: vec![],
+        track_pans: vec![],
+        speed: None,
+        frame_map: None,
+        transform: None,
+        effects: vec![],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_timecode_counts_drop_frame_numbers_exactly() {
+        assert_eq!(parse_timecode("00:00:59;20", 30).unwrap(), (1790, true));
+        assert_eq!(parse_timecode("00:01:00;02", 30).unwrap(), (1800, true));
+        assert_eq!(parse_timecode("01:00:00;00", 30).unwrap(), (107892, true));
+        assert_eq!(parse_timecode("00:01:00:00", 30).unwrap(), (1800, false));
+        assert!(parse_timecode("00:01:00;01", 30).is_err());
+        assert!(parse_timecode("00:00:00;00", 25).is_err());
+    }
+
+    #[test]
+    fn saved_audio_rounding_cannot_cover_a_missing_whole_sample() {
+        let frame_ticks = TICKS_PER_SECOND / 30_000 * 1001;
+        assert!(saved::extent_within_sample(48 * frame_ticks, 76876));
+        assert!(saved::extent_within_sample(48 * frame_ticks, 76877));
+        assert!(!saved::extent_within_sample(48 * frame_ticks, 76875));
+        let sample_ticks = TICKS_PER_SECOND / 48000;
+        assert!(!saved::extent_within_sample(10 * sample_ticks, 9));
+    }
+}

@@ -1,6 +1,6 @@
 //! Internal qualification harness for multi-timeline linked projects.
 use anynle_resolve_adapter::{linked, publish_linked_with_templates, turnover::Templates};
-use graph::{source::SourceGraph, MAX_GRAPH_BYTES};
+use graph::source::{SourceGraph, MAX_SOURCE_GRAPH_BYTES};
 use std::{ffi::OsString, path::Path};
 
 mod support;
@@ -34,7 +34,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => return Err("usage: resolve-linked-probe GRAPH SPEC MONO-LAYOUT.drp RATE-PROFILE.drp FFPROBE OUTPUT.drp [ATOM-TEMPLATE.drp [GROUP-TEMPLATE.drp]] [--fairlight TWO-BUS.drp] [--nested NEST-TEMPLATE.drp]".into()),
     };
-    let graph = SourceGraph::from_json_text(&read(Path::new(graph), MAX_GRAPH_BYTES)?)?;
+    let graph = SourceGraph::from_json_text(&read(Path::new(graph), MAX_SOURCE_GRAPH_BYTES)?)?;
     let spec = serde_json::from_str(&read(Path::new(spec), 2 << 20)?)?;
     let project = linked::prepare(&graph, spec, Path::new(probe))?;
     let published = publish_linked_with_templates(

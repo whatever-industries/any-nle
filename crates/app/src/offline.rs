@@ -7,11 +7,15 @@ use std::fs::{self, File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
-pub(crate) fn paths(graph: &SourceGraph) -> HashSet<&str> {
+pub(crate) fn paths<'a>(graph: &'a SourceGraph, omitted: &HashSet<&str>) -> HashSet<&'a str> {
+    let retained = (!omitted.is_empty()).then(|| graph.items.iter()
+        .filter(|item| !omitted.contains(item.id.as_str()))
+        .flat_map(|item| item.media.iter().map(|binding| binding.media.as_str()))
+        .collect::<HashSet<_>>());
     graph
         .media
         .iter()
-        .filter(|m| m.online == Some(false))
+        .filter(|m| m.online == Some(false) && retained.as_ref().is_none_or(|ids| ids.contains(m.id.as_str())))
         .flat_map(|m| m.locations.iter().map(String::as_str))
         .collect()
 }
@@ -77,17 +81,26 @@ fn string(value: &Value, name: &str) -> Option<String> {
     }
 }
 
-fn entries(graph: &SourceGraph) -> Vec<Entry> {
+fn entries(graph: &SourceGraph, omitted: &HashSet<&str>) -> Vec<Entry> {
     let media: BTreeMap<_, _> = graph
         .media
         .iter()
         .filter(|m| m.online == Some(false))
         .map(|m| (m.id.as_str(), m))
         .collect();
+    if media.is_empty() {
+        return Vec::new();
+    }
+    let sidecars: BTreeMap<_, _> = graph.sidecars.iter()
+        .filter(|s| matches!(s.adapter.as_str(), "avid.source" | "avid"))
+        .map(|s| ((s.adapter.as_str(), s.object.as_str()), &s.data)).collect();
     let items: BTreeMap<_, _> = graph.items.iter().map(|i| (i.id.as_str(), i)).collect();
     let mut result = Vec::new();
     for bin in &graph.bins {
         for id in &bin.items {
+            if omitted.contains(id.as_str()) {
+                continue;
+            }
             let Some(item) = items.get(id.as_str()) else {
                 continue;
             };
@@ -95,7 +108,7 @@ fn entries(graph: &SourceGraph) -> Vec<Entry> {
                 let Some(m) = media.get(track.media.as_str()) else {
                     continue;
                 };
-                let facts = graph.sidecar("avid.source", &m.id);
+                let facts = sidecars.get(&("avid.source", m.id.as_str())).copied();
                 let text = |name| match facts.and_then(|v| v.get(name)) {
                     Some(Value::Str(s)) => Some(s.clone()),
                     _ => None,
@@ -105,7 +118,7 @@ fn entries(graph: &SourceGraph) -> Vec<Entry> {
                     _ => None,
                 };
                 let original = m.original.as_ref();
-                let metadata = graph.sidecar("avid", id);
+                let metadata = sidecars.get(&("avid", id.as_str())).copied();
                 let source_filename = original
                     .and_then(|o| o.saved_locators.first())
                     .and_then(|path| path.rsplit(['/', '\\']).next())
@@ -171,8 +184,8 @@ fn entries(graph: &SourceGraph) -> Vec<Entry> {
     result
 }
 
-pub(crate) fn review_notes(graph: &SourceGraph) -> Vec<ReportNote> {
-    entries(graph)
+pub(crate) fn review_notes(graph: &SourceGraph, omitted: &HashSet<&str>) -> Vec<ReportNote> {
+    entries(graph, omitted)
         .into_iter()
         .map(|e| ReportNote {
             severity: "warning".into(),
@@ -205,8 +218,9 @@ struct Report {
 pub(crate) fn report(
     graph: &SourceGraph,
     output: &Path,
+    omitted: &HashSet<&str>,
 ) -> Result<Option<(PathBuf, String)>, String> {
-    let offline = entries(graph);
+    let offline = entries(graph, omitted);
     if offline.is_empty() {
         return Ok(None);
     }

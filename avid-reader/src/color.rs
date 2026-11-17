@@ -23,6 +23,8 @@ pub enum ParamValue {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ColorCorrection {
     pub params: Vec<(String, ParamValue)>,
+    /// An enabled, exact Master Gain 150 or Contrast +30 parameter in a static list.
+    pub measured_static_tone: bool,
 }
 
 pub fn file_order_hex(u: &Uuid) -> String {
@@ -185,6 +187,7 @@ mod tests {
                 ("6c30edfaef0cd346a32132f0f19e0069".into(), ParamValue::Float(177.78)),
                 ("065d3b3b00000000000000000000000".into(), ParamValue::Int(5)),
             ],
+            ..Default::default()
         };
         let i = cc.interpret();
         assert_eq!(i.saturation, Some(205.56));

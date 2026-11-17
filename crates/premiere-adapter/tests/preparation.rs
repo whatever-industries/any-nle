@@ -1430,6 +1430,46 @@ fn avid_drop_frame_tc1_uses_the_saved_frame_count() {
 }
 
 #[test]
+fn avid_25_fps_tc1_changes_only_the_absolute_sequence_origin() {
+    let mut g = fixture();
+    let rate = q(25);
+    let seq = &mut g.sequences[0];
+    seq.rate = rate;
+    let sequence_id = seq.id.clone();
+    g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == sequence_id)
+        .unwrap().data = v(vec![("compatibility_start", Value::Str("3600".into()))]);
+    let baseline = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let mut expected = baseline.model.sequences[0].clone();
+    let count = 93_079; // 01:02:03:04 at 25 fps.
+    let clock = SourceClock {
+        effective_count: count,
+        rate,
+        display_base: 25,
+        drop: false,
+        provenance: SourceClockProvenance {
+            origin_count: count,
+            source_offset: 0,
+            source_rate: rate,
+            source_package: sequence_id,
+            timecode_track: "TC1/0".into(),
+            route: "direct sequence TC1".into(),
+        },
+    };
+    g.sequences[0].start = clock.exact_start();
+    g.sequences[0].clock = Some(clock);
+    let saved = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let corrected = prepare(&saved, &options(), ClockProfile::LegacyImport).unwrap();
+    expected.start = 945_742_210_560_000;
+    assert_eq!(corrected.model.sequences[0], expected);
+    assert_eq!(corrected.ownership, baseline.ownership);
+    assert!(corrected.diagnostics.iter().any(|s| s.contains("qualified 25 clock")));
+
+    g.sequences[0].clock.as_mut().unwrap().display_base = 24;
+    let fallback = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(fallback.model.sequences, baseline.model.sequences);
+}
+
+#[test]
 fn ordinary_avid_dissolve_preserves_an_asymmetric_cut() {
     let mut g = two_edits();
     let t = &mut g.sequences[0].transitions[0];
@@ -1633,6 +1673,73 @@ fn ordered_picture_chain_projects_reflection_on_the_correct_side_of_motion() {
     assert!(prepared.losses.iter().any(|l| l.object == id && l.reason.contains("more than one Motion")));
     let (seq, event) = prepared.ownership[&id];
     assert!(prepared.model.sequences[seq].events[event].transform.is_none());
+}
+
+#[test]
+fn spectramatte_under_static_warp_keeps_key_color_and_drops_unqualified_overlays() {
+    use prproj::convert::prepared::PictureEffect;
+    let mut graph = fixture();
+    let rate = Q::new(24_000, 1001).unwrap();
+    let media = graph.media.iter_mut().find(|m| m.kind == StreamKind::Video).unwrap();
+    media.rate = Some(rate);
+    media.duration = Q::new(240 * 1001, 24_000).unwrap();
+    let sequence = &mut graph.sequences[0];
+    sequence.rate = rate;
+    sequence.placements.retain(|p| p.video_track.is_some());
+    sequence.tracks.push(SourceTrack::new(StreamKind::Video, 2, None));
+    let placement = &mut sequence.placements[0];
+    let id = placement.id.clone();
+    placement.video_track = Some(2);
+    placement.duration = Q::new(48 * 1001, 24_000).unwrap();
+    placement.record_start = Q::ZERO;
+    placement.source_in = Q::ZERO;
+    placement.transform = None;
+    sequence.markers.clear();
+    let pair = |a, b| Value::Arr(vec![Value::Float(a), Value::Float(b)]);
+    let keyer = |rgb: [i64; 3], square_pixels| v(vec![
+        ("kind", Value::Str("avid.spectramatte".into())),
+        ("params", v(vec![
+            ("key_rgb8", Value::Arr(rgb.map(Value::Int).into())),
+            ("square_pixels_verified", Value::Bool(square_pixels)),
+            ("saved_progress_end_frame", Value::Int(47)),
+        ])),
+    ]);
+    let warp = v(vec![
+        ("kind", Value::Str("avid.warp_static".into())),
+        ("params", v(vec![])),
+        ("transform", v(vec![
+            ("position", pair(-0.1, 0.0)),
+            ("scale", pair(125.0, 125.0)),
+            ("rotation", Value::Float(0.0)),
+            ("anchor", pair(0.0, 0.0)),
+            ("crop", Value::Arr([Value::Float(0.0), Value::Float(0.0), Value::Float(0.0), Value::Float(0.0)].into())),
+        ])),
+    ]);
+
+    for (stages, qualified) in [
+        (vec![keyer([20, 180, 100], true), warp.clone()], true),
+        (vec![warp.clone(), keyer([20, 180, 100], true)], false),
+        (vec![keyer([20, 180, 100], false), warp.clone()], false),
+        (vec![keyer([20, 180, 200], true), warp], false),
+    ] {
+        graph.sequences[0].placements[0].effects = vec![graph::Effect {
+            kind: graph::picture_chain::KIND.into(),
+            params: v(vec![("stages", Value::Arr(stages))]),
+        }];
+        let saved = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+        let prepared = prepare(&saved, &options(), ClockProfile::LegacyImport).unwrap();
+        if qualified {
+            let [effect] = prepared.picture_effects.as_slice() else { panic!("expected editable key") };
+            assert_eq!(effect.effect, PictureEffect::UltraKey { rgb: [20, 180, 100] });
+            let transform = prepared.model.sequences[effect.sequence].events[effect.event].transform.as_ref().unwrap();
+            assert_eq!(transform.scale, (125.0, 125.0));
+            assert!(prepared.losses.iter().any(|l| l.object == id && l.aspect == "picture_effect_approximation"));
+        } else {
+            assert!(prepared.picture_effects.is_empty());
+            assert!(!prepared.ownership.contains_key(&id));
+            assert!(prepared.losses.iter().any(|l| l.object == id && l.reason.contains("Omitted SpectraMatte overlay")));
+        }
+    }
 }
 
 #[test]
@@ -1911,6 +2018,55 @@ fn ambiguous_and_retimed_transition_refusals_are_named() {
         .unwrap()
         .0
         .contains("retimed_transition_endpoint"));
+}
+
+#[test]
+fn dissolve_at_gain_gap_keeps_both_channels_of_the_surviving_edit() {
+    let mut g = two_edits();
+    let seq = &mut g.sequences[0];
+    seq.placements.remove(0);
+    let p = &mut seq.placements[0];
+    p.video_track = None;
+    p.audio_tracks.clear();
+    p.audio_streams.clear();
+    p.grouped_audio = vec![graph::GroupedAudio {
+        track: 1, streams: vec![1, 2], gain_db: Some(-3.0), pans: vec![Some(-100.0), Some(100.0)],
+    }];
+    let t = &mut seq.transitions[0];
+    t.kind = StreamKind::Audio;
+    t.style = "avid.BLEND_AUDIO_DISSOLVE".into();
+    t.outgoing.placements.clear();
+    t.outgoing.reason = Some("native owner includes an unresolved source branch".into());
+    seq.markers.push(SourceMarker {
+        name: "AudioSuite Gain omitted · A1".into(),
+        comment: "unavailable".into(), user: String::new(), color: None,
+        start: Some(Q::ZERO), duration: t.cut, track: None,
+        owner: MarkerOwner::Sequence, owner_occurrence: "omitted-gain".into(),
+        owner_local: Some(Q::ZERO), owner_rate: Some(seq.rate),
+        binding: SourceBinding { placements: vec![], reason: None },
+        source: None, inherited: false,
+    });
+    let receipt = g.sidecars.iter_mut().find(|p| p.object == seq.id && p.adapter == "avid.source").unwrap();
+    let Value::Obj(fields) = &mut receipt.data else { unreachable!() };
+    fields.push(("native_transitions".into(), Value::Arr(vec![v(vec![
+        ("id", Value::Str(t.id.clone())),
+        ("gain_gap_edges", Value::Arr(vec![Value::Str("omitted-gain".into()), Value::Null])),
+    ])])));
+    let mut g = SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap();
+    let prepared = prepare(&g, &options(), ClockProfile::LegacyImport).unwrap();
+    let seq = &prepared.model.sequences[0];
+    let [edit] = seq.events.as_slice() else { panic!("expected one surviving edit"); };
+    let hz = prproj::convert::model::TICKS_PER_SECOND;
+    assert_eq!((edit.record_start, edit.source_in, edit.duration), (7 * hz / 2, 3 * hz / 2, 7 * hz / 2));
+    assert!(seq.audio_crossfades.is_empty());
+    assert_eq!(edit.stereo[0].channels, [1, 2]);
+    assert_eq!(edit.stereo[0].gain_db, Some(-3.0));
+    assert_eq!(edit.stereo[0].pans, [Some(-100.0), Some(100.0)]);
+    assert!(prepared.losses.iter().any(|loss| loss.aspect == "transition_cut"));
+
+    g.sequences[0].markers[0].duration = q(3);
+    assert!(prepare(&g, &options(), ClockProfile::LegacyImport).err().unwrap().0
+        .contains("range marker disagrees with the saved cut"));
 }
 #[test]
 fn unknown_offsets_are_not_zero_and_absolute_maps_are_not_offset_twice() {
@@ -2237,6 +2393,134 @@ fn unresolved_native_transition_cannot_disappear_behind_a_loss() {
         .0
         .contains("unresolved_transition_topology"));
     assert_eq!(g.to_json_text().unwrap(), before);
+}
+
+#[test]
+fn linked_preparation_omits_a_dissolve_only_when_the_unresolved_span_is_empty() {
+    let mut g = two_edits();
+    let sequence = &mut g.sequences[0];
+    let mut transition = sequence.transitions.pop().unwrap();
+    transition.style = "avid.EFF2_BLEND_DISSOLVE".into();
+    transition.outgoing = SourceBinding {
+        placements: vec![], reason: Some("native owner produced no source placements".into()),
+    };
+    transition.incoming = SourceBinding {
+        placements: vec![], reason: Some("one or more native endpoints were not portable".into()),
+    };
+    sequence.transitions.clear();
+    sequence.transitions.push(transition.clone());
+    assert!(premiere_adapter::prepare_linked_originals(&g, &options(), ClockProfile::LegacyImport, true)
+        .err().unwrap().0.contains("unresolved_transition_topology"));
+
+    let sequence = &mut g.sequences[0];
+    sequence.placements.clear();
+    sequence.markers.clear();
+    let out = premiere_adapter::prepare_linked_originals(&g, &options(), ClockProfile::LegacyImport, true).unwrap();
+    assert!(out.input.sequences[0].audio_crossfades.is_empty());
+    assert!(out.input.video_dissolves.is_empty());
+    assert!(out.losses.iter().any(|l| l.object == transition.id && l.aspect == "transition_omitted"));
+    assert_eq!(g.sequences[0].transitions, vec![transition]);
+}
+
+fn add_unqualified_offline_master(g: &mut SourceGraph) -> String {
+    let mut unused = g.items[0].clone();
+    unused.id = "clip:unused-offline".into();
+    unused.name = "Unused offline".into();
+    for binding in &mut unused.media {
+        let mut offline = g.media.iter().find(|m| m.id == binding.media).unwrap().clone();
+        offline.id.push_str(":offline");
+        offline.online = Some(false);
+        binding.media = offline.id.clone();
+        g.media.push(offline);
+    }
+    g.bins[0].items.push(unused.id.clone());
+    let id = unused.id.clone();
+    g.items.push(unused);
+    id
+}
+
+#[test]
+fn spooled_linked_preparation_omits_offline_managed_masters_and_marks_exact_gaps() {
+    let mut g = fixture();
+    let offline = add_unqualified_offline_master(&mut g);
+    let out = premiere_adapter::prepare_linked_originals(
+        &g, &options(), ClockProfile::LegacyImport, true,
+    ).unwrap();
+    assert_eq!(out.input.clips.len(), 1);
+    assert!(!out.input.bins[0].clips.iter().any(|id| id == "unused-offline"));
+    assert!(out.losses.iter().any(|l| l.object == offline && l.aspect == "omitted_offline_bin_item"));
+    let edit = &mut g.sequences[0].placements[0];
+    edit.item = offline;
+    let omitted = edit.id.clone();
+    let range = (edit.record_start, edit.duration);
+    let out = premiere_adapter::prepare_linked_originals(
+        &g, &options(), ClockProfile::LegacyImport, true,
+    ).unwrap();
+    let marker = out.input.sequences[0].markers.iter()
+        .find(|m| m.name == "Media omitted · V1").unwrap();
+    let ticks = prproj::convert::model::TICKS_PER_SECOND;
+    assert_eq!((Some(marker.start), Some(marker.duration)), (range.0.to_units(ticks), range.1.to_units(ticks)));
+    assert!(out.losses.iter().any(|l| l.object == omitted && l.aspect == "media_gap"));
+    assert!(premiere_adapter::prepare_linked_originals(
+        &g, &options(), ClockProfile::LegacyImport, false,
+    ).err().unwrap().0.contains("offline managed clips require"));
+
+    let mut overlap = g.sequences[0].placements[0].clone();
+    overlap.id = "overlap".into();
+    overlap.item = g.items[0].id.clone();
+    g.sequences[0].placements.push(overlap);
+    let out = premiere_adapter::prepare_linked_originals(
+        &g, &options(), ClockProfile::LegacyImport, true,
+    ).unwrap();
+    assert!(!out.input.sequences[0].markers.iter().any(|m| m.name == "Media omitted · V1"));
+    assert!(out.ownership.contains_key("overlap"));
+    assert!(out.losses.iter().any(|l| l.object == omitted && l.aspect == "offline_edit_omitted"));
+}
+
+#[test]
+fn spooled_linked_preparation_keeps_the_saved_cut_beside_an_offline_endpoint() {
+    let mut g = two_edits();
+    let offline = add_unqualified_offline_master(&mut g);
+    let sequence = &mut g.sequences[0];
+    sequence.placements[1].item = offline;
+    sequence.transitions[0].style = "avid.EFF2_BLEND_DISSOLVE".into();
+    let transition = sequence.transitions[0].id.clone();
+    let cut = sequence.transitions[0].cut;
+    let out = premiere_adapter::prepare_linked_originals(
+        &g, &options(), ClockProfile::LegacyImport, true,
+    ).unwrap();
+    let ticks = prproj::convert::model::TICKS_PER_SECOND;
+    let sequence = &out.input.sequences[0];
+    let [event] = sequence.events.as_slice() else { panic!("expected only the surviving edit") };
+    assert_eq!(Some(event.record_start + event.duration), cut.to_units(ticks));
+    let [gap] = sequence.markers.as_slice() else { panic!("expected one offline gap") };
+    assert_eq!(Some(gap.start), cut.to_units(ticks));
+    assert_eq!(Some(gap.start + gap.duration), q(7).to_units(ticks));
+    assert!(out.input.video_dissolves.is_empty());
+    assert!(out.losses.iter().any(|l| l.object == transition && l.aspect == "transition_omitted"));
+}
+
+#[test]
+fn linked_preparation_reports_a_group_without_camera_media_or_bound_edits() {
+    let mut g = fixture();
+    let id = "multicam:offline".to_string();
+    g.bins[0].items.push(id.clone());
+    g.multicams.push(Multicam {
+        id: id.clone(), name: "Offline cameras".into(), rate: Some(Q::integer(24)),
+        duration: Some(Q::integer(1)), lanes: vec![], reason: Some("Camera routes unavailable".into()),
+    });
+    g.multicam_uses.push(MulticamUse {
+        id: "multicam:offline-use".into(), sequence: g.sequences[0].id.clone(),
+        candidates: vec![id.clone()], kind: StreamKind::Audio, lane: Some(1), track: 1,
+        selected: None, record_start: None, duration: None, source_in: None,
+        binding: SourceBinding { placements: vec![], reason: Some("No portable edit".into()) },
+        reason: Some("Unresolved native range".into()),
+    });
+    let out = premiere_adapter::prepare_linked_originals(&g, &options(), ClockProfile::LegacyImport, true).unwrap();
+    assert!(out.input.multicams.is_empty());
+    assert!(out.losses.iter().any(|l| l.object == id && l.aspect == "group_omitted"));
+    assert!(out.losses.iter().any(|l| l.object == "multicam:offline-use" && l.aspect == "group_use_omitted"));
+    assert!(!out.input.sequences[0].events.is_empty());
 }
 
 #[test]

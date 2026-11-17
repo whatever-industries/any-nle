@@ -1,15 +1,19 @@
 //! Direct Avid source adapter. No destination model or writer participates in extraction.
-//! Source facts and graph construction each have a 64 MiB accounted budget; these are
+//! Source facts and graph construction have separate accounted budgets. Both are
 //! distinct from the encoded graph ceiling and are not peak-RSS guarantees.
 mod effects;
+mod effect_fallback;
 pub mod index;
 pub mod original;
 pub mod proxy;
 mod revision;
 mod sequence;
+mod spool;
+mod pcm_prefix;
 mod multicam;
 pub mod managed_multistream;
 mod subclips;
+mod unused;
 use avid_reader::{
     extract::{self, AvidMarker, Essence, KIND_PICTURE, KIND_SOUND},
     io::MobId,
@@ -56,15 +60,27 @@ pub struct ReadResult {
     pub ambiguous_managed_packages: Vec<String>,
     pub missing_native_picture: bool,
     pub missing_managed_audio: Vec<String>,
+    pub unused_proof_issue: Option<String>,
     pub files_scanned: usize,
+    receipt_spool: Option<spool::ReceiptSpool>,
+}
+
+impl ReadResult {
+    pub fn receipt_spool_stats(&self) -> Option<(usize, usize, u64)> {
+        self.receipt_spool.as_ref().map(|spool| (spool.records, spool.losses, spool.bytes))
+    }
+
+    pub fn take_receipt_spool(&mut self) -> Result<Option<std::fs::File>, String> {
+        self.receipt_spool.take().map(spool::ReceiptSpool::into_reader).transpose()
+    }
 }
 
 /// The stage at which a controlled source read stopped. Keep the diagnostic
 /// text separate so a caller can select a recovery action without parsing it.
 pub enum SourceReadIssue {
     Bin(String),
-    OriginalLocator(String),
-    MissingOriginal(String),
+    OriginalLocator { message: String, bin: usize },
+    MissingOriginal { message: String, bin: usize },
     OriginalMedia(String),
     MediaScan(String),
     SourceFacts(String),
@@ -74,8 +90,8 @@ impl SourceReadIssue {
     pub fn into_message(self) -> String {
         match self {
             Self::Bin(message)
-            | Self::OriginalLocator(message)
-            | Self::MissingOriginal(message)
+            | Self::OriginalLocator { message, .. }
+            | Self::MissingOriginal { message, .. }
             | Self::OriginalMedia(message)
             | Self::MediaScan(message)
             | Self::SourceFacts(message) => message,
@@ -121,15 +137,32 @@ pub fn read_managed(
     ffprobe: &Path,
     link_managed_op1a: bool,
 ) -> Result<ReadResult, String> {
-    let facts =
-        av::extract_source_paths(inputs, av::SourceLimits::default()).map_err(|e| e.to_string())?;
+    read_managed_for_linking(inputs, media_roots, project, bin_names, ffprobe, link_managed_op1a, false)
+}
+
+pub fn read_managed_for_linking(
+    inputs: &[av::SourceInput], media_roots: &[PathBuf], project: &str, bin_names: &[String],
+    ffprobe: &Path, link_managed_op1a: bool, link_dry_gain: bool,
+) -> Result<ReadResult, String> {
+    let mut references = link_dry_gain.then(unused::References::default);
+    let mut facts = if let Some(references) = &mut references {
+        av::extract_source_paths_inspected(inputs, av::SourceLimits::default(),
+            &mut |_, _| Ok(()), &mut |file| references.observe(file, &mut || Ok(())))
+    } else {
+        av::extract_source_paths(inputs, av::SourceLimits::default())
+    }.map_err(|e| e.to_string())?;
+    let originals = original::OriginalIndex {
+        allow_media_gaps: link_dry_gain, references, ..Default::default()
+    };
     resolve_media_and_build(
-        &facts,
+        &mut facts,
         media_roots,
         project,
         bin_names,
-        original::OriginalIndex::default(),
-        &original::OriginalOptions { ffprobe: ffprobe.into(), link_managed_op1a, ..Default::default() },
+        originals,
+        &original::OriginalOptions { ffprobe: ffprobe.into(), link_managed_op1a, link_dry_gain, ..Default::default() },
+        None,
+        &mut |_| Ok(()),
         &mut || Ok(()),
     )
     .map_err(SourceReadIssue::into_message)
@@ -194,40 +227,82 @@ pub fn read_with_originals_for_review(
     before: &mut dyn FnMut(usize, &std::path::Path) -> Result<(), String>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<ReadResult, SourceReadIssue> {
-    read_with_media_policy(inputs, media_roots, project, bin_names, options, false, before, check)
+    read_with_media_policy(inputs, media_roots, project, bin_names, options, false, false, before, check)
 }
 
 pub fn read_with_media_policy(
     inputs: &[av::SourceInput], media_roots: &[PathBuf], project: &str, bin_names: &[String],
-    options: &original::OriginalOptions, allow_offline: bool,
+    options: &original::OriginalOptions, allow_offline: bool, skip_unused: bool,
     before: &mut dyn FnMut(usize, &Path) -> Result<(), String>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<ReadResult, SourceReadIssue> {
-    let facts = av::extract_source_paths_observed(inputs, av::SourceLimits::default(), before)
-        .map_err(|e| SourceReadIssue::Bin(e.to_string()))?;
-    let originals = if allow_offline {
-        original::OriginalIndex::scan_allow_offline(&facts, options, check)?
+    read_with_media_policy_spooled(inputs, media_roots, project, bin_names, options, allow_offline,
+        skip_unused, false, &mut |event| match event {
+            SourceProgress::ReadingBin { index, path } => before(index, path),
+            _ => Ok(()),
+        }, check)
+}
+
+/// Source preparation checkpoints for a job's progress display.
+pub enum SourceProgress<'a> {
+    ReadingBin { index: usize, path: &'a Path },
+    ResolvingMedia,
+    BuildingTimelines { completed: usize, total: usize },
+    ValidatingGraph,
+}
+
+pub fn read_with_media_policy_spooled(
+    inputs: &[av::SourceInput], media_roots: &[PathBuf], project: &str, bin_names: &[String],
+    options: &original::OriginalOptions, allow_offline: bool, skip_unused: bool, disk_receipts: bool,
+    observe: &mut dyn FnMut(SourceProgress<'_>) -> Result<(), String>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<ReadResult, SourceReadIssue> {
+    let mut before = |index, path: &Path| observe(SourceProgress::ReadingBin { index, path });
+    let mut references = skip_unused.then(unused::References::default);
+    let mut facts = if let Some(references) = &mut references {
+        av::extract_source_paths_inspected(inputs, av::SourceLimits::default(), &mut before,
+            &mut |file| references.observe(file, check))
     } else {
-        original::OriginalIndex::scan_for_review(&facts, options, check)?
-    };
+        av::extract_source_paths_observed(inputs, av::SourceLimits::default(), &mut before)
+    }.map_err(|e| SourceReadIssue::Bin(e.to_string()))?;
+    observe(SourceProgress::ResolvingMedia).map_err(SourceReadIssue::SourceFacts)?;
+    let mut originals = original::OriginalIndex::scan_for_review_with_policy(
+        &facts, options, allow_offline, references.as_ref(), check).map_err(|issue| {
+        let Some(reason) = references.as_ref().and_then(unused::References::incomplete) else {
+            return issue;
+        };
+        let explain = |message| format!("{message}\nSkip unused clips is unavailable for this selection: {reason}.");
+        match issue {
+            SourceReadIssue::MissingOriginal { message, bin } => SourceReadIssue::MissingOriginal { message: explain(message), bin },
+            SourceReadIssue::OriginalLocator { message, bin } => SourceReadIssue::OriginalLocator { message: explain(message), bin },
+            other => other,
+        }
+    })?;
+    originals.references = references;
+    let spool = disk_receipts.then(spool::ReceiptSpool::new).transpose()
+        .map_err(SourceReadIssue::SourceFacts)?;
     resolve_media_and_build(
-        &facts,
+        &mut facts,
         media_roots,
         project,
         bin_names,
         originals,
         options,
+        spool,
+        observe,
         check,
     )
 }
 
 fn resolve_media_and_build(
-    facts: &av::SourceProject,
+    facts: &mut av::SourceProject,
     media_roots: &[PathBuf],
     project: &str,
     bin_names: &[String],
     mut originals: original::OriginalIndex,
     options: &original::OriginalOptions,
+    receipt_spool: Option<spool::ReceiptSpool>,
+    observe: &mut dyn FnMut(SourceProgress<'_>) -> Result<(), String>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<ReadResult, SourceReadIssue> {
     // Tracks qualified against linked originals do not need native MXF headers.
@@ -237,13 +312,16 @@ fn resolve_media_and_build(
         .iter()
         .flat_map(|m| {
             m.master.tracks.iter().enumerate().filter_map(|(i, t)| {
-                (linked_tracks.is_empty() || !linked_tracks.contains_key(&(m.id.clone(), i)))
+                (!originals.omitted_unused.contains_key(&m.id)
+                    && !originals.omitted_media.contains_key(&m.id)
+                    && (linked_tracks.is_empty() || !linked_tracks.contains_key(&(m.id.clone(), i))))
                     .then(|| t.file_mob.umid_hex())
             })
         })
         .collect();
     let index = index::MediaIndex::scan_controlled(media_roots, &wanted, check)
         .map_err(SourceReadIssue::MediaScan)?;
+    originals.resolve_legacy_mxf(facts, &index, options, check)?;
     if options.attach_avid_proxies {
         originals.select_avid_proxies(facts, options, &index, check)?;
     }
@@ -251,9 +329,31 @@ fn resolve_media_and_build(
         managed_multistream::bind(facts, &index, &mut originals, &options.ffprobe, check)?;
     }
     let motion_mxf =
-        verify_motion_mxf(facts, &index, &options.ffprobe, check).map_err(SourceReadIssue::MediaScan)?;
-    build_selected(facts, &index, project, bin_names, &originals, &motion_mxf)
-        .map_err(SourceReadIssue::SourceFacts)
+        verify_motion_mxf(facts, &index, &options.ffprobe, options.link_dry_gain, check)
+            .map_err(SourceReadIssue::MediaScan)?;
+    let graph = if receipt_spool.is_some() {
+        validate_rates(facts).map_err(SourceReadIssue::SourceFacts)?;
+        let sequences = std::mem::take(&mut facts.sequences);
+        build_working_graph(facts, sequences, &index, project, bin_names, &originals, &motion_mxf, receipt_spool, observe, check)
+    } else {
+        build_working_graph(facts, &facts.sequences, &index, project, bin_names, &originals, &motion_mxf, None, observe, check)
+    };
+    graph
+        .map_err(|error| {
+            if originals.omitted_media.is_empty() {
+                return SourceReadIssue::SourceFacts(error);
+            }
+            // The completed graph owns the full report on success. Keep a
+            // bounded preview useful when construction cannot finish.
+            let count = originals.omitted_media.len();
+            let mut message = format!("{error}\nMedia fallback identified {count} bin clip omissions before construction.");
+            for source in facts.masters.iter().filter(|s| originals.omitted_media.contains_key(&s.id)).take(8) {
+                use std::fmt::Write;
+                let reason = &originals.omitted_media[&source.id];
+                let _ = write!(message, "\n{:?} · {}: {}", source.master.name, source.id, reason);
+            }
+            SourceReadIssue::SourceFacts(message)
+        })
 }
 
 /// Bounded entry point also permits byte-free synthetic source-fact tests.
@@ -276,26 +376,32 @@ pub fn build(
 #[derive(Default)]
 struct MotionMxf<'a> {
     picture: HashMap<&'a std::path::Path, Option<(Rational, Rational)>>,
-    pcm16: HashMap<&'a std::path::Path, Rational>,
+    pcm_audio: HashMap<&'a std::path::Path, (i64, Rational)>,
+    pcm_prefix: HashSet<(MobId, i64)>,
+    fallbacks: effect_fallback::Verified,
 }
 
 fn verify_motion_mxf<'a>(
     facts: &av::SourceProject,
     index: &'a index::MediaIndex,
     ffprobe: &std::path::Path,
+    link_dry_gain: bool,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<MotionMxf<'a>, String> {
     let masters: HashSet<_> = facts.sequences.iter().flat_map(|seq| &seq.events)
         .filter(|e| e.saved_timewarp.is_some()
             || e.event.picture.as_ref().is_some_and(|p| p.corner_pin.is_some())
-            || e.picture_extension.is_some_and(av::PictureExtension::requires_square_pixels)
+            || e.picture_extension.as_deref().is_some_and(av::PictureExtension::requires_square_pixels)
             || e.picture_chain.iter().any(|stage| match stage {
                 av::PictureStage::Extension(effect) => effect.requires_square_pixels(),
                 av::PictureStage::Static(effect) => effect.corner_pin.is_some(),
+                av::PictureStage::SpectraMatte { .. } => true,
             }))
         .map(|e| e.event.master).collect();
     let mut probed = HashSet::new();
     let mut verified = MotionMxf::default();
+    verified.fallbacks = effect_fallback::verify(facts, index, ffprobe, link_dry_gain, check)?;
+    verified.pcm_prefix = pcm_prefix::verify(facts, index, ffprobe, check)?;
     for master in facts.masters.iter().filter(|m| masters.contains(&m.master.mob_id)) {
         for track in master.master.tracks.iter().filter(|t| t.kind == KIND_PICTURE) {
             let Some(path) = index.files.get(&track.file_mob.umid_hex()).map(|p| p.as_path()) else { continue; };
@@ -309,51 +415,74 @@ fn verify_motion_mxf<'a>(
     }
     let managed_audio: HashSet<_> = facts.sequences.iter().flat_map(|seq| &seq.events)
         .filter(|e| e.event.kind == KIND_SOUND && e.motion_adapter_phase.is_some())
-        .map(|e| e.event.master).collect();
-    for master in facts.masters.iter().filter(|m| managed_audio.contains(&m.master.mob_id)) {
-        let [track] = master.master.tracks.as_slice() else { continue };
-        if master.rate != Rate::new(24, 1) || track.kind != KIND_SOUND || track.index != 1
-            || !matches!(&track.essence, Some(Essence::Sound {
-                sample_rate: 48_000.0, bits: 16, channels: 1,
-            }))
-            || master.offsets.as_slice() != [Observed::Known(0)]
-        {
-            continue;
-        }
-        let package = track.file_mob.umid_hex();
-        let Some(path) = index.files.get(&package).map(|p| p.as_path()) else { continue };
-        if !probed.insert(path) { continue; }
-        let id = index.identity(path)?;
-        if id.file_packages != [package] || id.file_essence_tracks != 1
-            || id.file_tracks != [(48_000, 1, track.length)]
-            || !id.qualified_file_clock().is_some_and(|clock|
-                clock.rate == (24, 1) && !clock.drop && clock.source_offset == 0)
-        {
-            continue;
-        }
-        check()?;
-        if let Ok(probe) = original::probe_offline_atom(path, ffprobe) {
-            let ul = probe.get("format").and_then(|f| f.get("tags"))
-                .and_then(|tags| original::text(tags, "operational_pattern_ul"));
-            let Some(Value::Arr(streams)) = probe.get("streams") else { continue };
-            let [pcm] = streams.as_slice() else { continue };
-            if ul.as_deref() == Some("060e2b34.04010102.0d010201.10010000")
-                && original::text(pcm, "codec_type").as_deref() == Some("audio")
-                && original::text(pcm, "codec_name").as_deref() == Some("pcm_s16le")
-                && original::text(pcm, "time_base").as_deref() == Some("1/48000")
-                && original::number(pcm, "channels") == Some(1)
-                && original::number(pcm, "start_pts") == Some(0)
-                && original::number(pcm, "duration_ts") == Some(track.length)
-                && original::complete_mono_pcm16_packets(path, ffprobe, track.length)
+        .map(|e| (e.event.master, e.event.master_track)).collect();
+    for master in &facts.masters {
+        let tracks = &master.master.tracks;
+        for (ordinal, track) in tracks.iter().enumerate() {
+            if track.kind != KIND_SOUND || !managed_audio.contains(&(master.master.mob_id, track.index))
+                || master.offsets.get(ordinal) != Some(&Observed::Known(0))
             {
-                let extent = Rational::new(i128::from(track.length), 48_000)
-                    .ok_or("managed Motion Adapter duration overflow")?;
-                verified.pcm16.insert(path, extent);
+                continue;
+            }
+            let Some(Essence::Sound { sample_rate: 48_000.0, bits, channels: 1 }) = track.essence else { continue };
+            let (clock_rate, codec) = match bits {
+                16 if master.rate == Rate::new(24, 1) && track.index == 1 && tracks.len() == 1 =>
+                    ((24, 1), "pcm_s16le"),
+                24 if master.rate == Rate::new(24_000, 1001)
+                    && matches!(track.index, 1 | 2)
+                    && tracks.iter().filter(|t| t.kind == KIND_PICTURE).count() <= 1
+                    && tracks.iter().filter(|t| t.kind == KIND_SOUND).all(|t| {
+                        matches!(t.index, 1 | 2) && matches!(t.essence,
+                            Some(Essence::Sound { sample_rate: 48_000.0, bits: 24, channels: 1 }))
+                    })
+                    && tracks.iter().filter(|t| t.kind == KIND_SOUND).count() <= 2 =>
+                    ((24_000, 1001), "pcm_s24le"),
+                _ => continue,
+            };
+            let package = track.file_mob.umid_hex();
+            let Some(path) = index.files.get(&package).map(|p| p.as_path()) else { continue };
+            if !probed.insert(path) { continue; }
+            let id = index.identity(path)?;
+            if id.file_packages != [package] || id.file_essence_tracks != 1
+                || id.file_tracks != [(48_000, 1, track.length)]
+                || !id.qualified_file_clock().is_some_and(|clock|
+                    clock.rate == clock_rate && !clock.drop && (bits == 24 || clock.source_offset == 0))
+            {
+                continue;
+            }
+            check()?;
+            if let Ok(probe) = original::probe_offline_atom(path, ffprobe) {
+                let ul = probe.get("format").and_then(|f| f.get("tags"))
+                    .and_then(|tags| original::text(tags, "operational_pattern_ul"));
+                let Some(Value::Arr(streams)) = probe.get("streams") else { continue };
+                let expected_ul = match bits {
+                    16 if streams.len() == 1 => "060e2b34.04010102.0d010201.10010000",
+                    24 => "060e2b34.04010102.0d010201.10030000",
+                    _ => continue,
+                };
+                let mut audio = streams.iter().filter(|s| original::text(s, "codec_type").as_deref() != Some("data"));
+                let Some(pcm) = audio.next() else { continue };
+                if audio.next().is_none()
+                    && ul.as_deref() == Some(expected_ul)
+                    && original::text(pcm, "codec_type").as_deref() == Some("audio")
+                    && original::text(pcm, "codec_name").as_deref() == Some(codec)
+                    && original::text(pcm, "time_base").as_deref() == Some("1/48000")
+                    && original::number(pcm, "channels") == Some(1)
+                    && original::number(pcm, "start_pts") == Some(0)
+                    && original::number(pcm, "duration_ts") == Some(track.length)
+                    && original::complete_mono_pcm_packets(path, ffprobe, track.length, bits / 8)
+                {
+                    let extent = Rational::new(i128::from(track.length), 48_000)
+                        .ok_or("managed Motion Adapter duration overflow")?;
+                    verified.pcm_audio.insert(path, (bits, extent));
+                }
             }
         }
     }
     Ok(verified)
 }
+
+type MediaOmissions<'a> = HashMap<MobId, Vec<(&'a av::SourceMaster, std::borrow::Cow<'a, str>)>>;
 
 fn build_selected(
     facts: &av::SourceProject,
@@ -363,11 +492,33 @@ fn build_selected(
     originals: &original::OriginalIndex,
     motion_mxf: &MotionMxf,
 ) -> Result<ReadResult, String> {
+    build_working_graph(facts, &facts.sequences, index, project, bin_names, originals, motion_mxf, None, &mut |_| Ok(()), &mut || Ok(()))
+}
+
+fn build_working_graph(
+    facts: &av::SourceProject,
+    sequences: impl IntoIterator<Item = impl std::borrow::Borrow<av::SourceSequence>, IntoIter: ExactSizeIterator>,
+    index: &index::MediaIndex,
+    project: &str,
+    bin_names: &[String],
+    originals: &original::OriginalIndex,
+    motion_mxf: &MotionMxf,
+    receipt_spool: Option<spool::ReceiptSpool>,
+    observe: &mut dyn FnMut(SourceProgress<'_>) -> Result<(), String>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<ReadResult, String> {
     validate_rates(facts)?;
     if facts.accounted_bytes > av::MAX_SOURCE_FACT_BYTES {
-        return Err("source facts exceed 64 MiB".into());
+        return Err(format!(
+            "source facts exceed {} MiB accounted budget",
+            av::MAX_SOURCE_FACT_BYTES >> 20
+        ));
     }
-    let mut budget = Budget::default();
+    let mut budget = if receipt_spool.is_some() {
+        Budget { used: 0, limit: MAX_SPOOLED_GRAPH_WORKING_BYTES }
+    } else {
+        Budget::default()
+    };
     budget.charge(size_of::<SourceGraph>() + project.len())?;
     // Report strings are owned too; reserve escaped names before formatting.
     for skipped in &facts.skipped {
@@ -394,7 +545,9 @@ fn build_selected(
         original_inputs: originals.original_inputs.clone(),
         proxy_bindings: Vec::new(),
         has_unresolved_original_links: facts.masters.iter().any(|source| {
-            source.master.tracks.iter().zip(&source.originals).enumerate().any(|(i, (track, original))| {
+            !originals.omitted_unused.contains_key(&source.id)
+                && !originals.omitted_media.contains_key(&source.id)
+                && source.master.tracks.iter().zip(&source.originals).enumerate().any(|(i, (track, original))| {
                 original.is_some()
                     && !index.files.contains_key(&track.file_mob.umid_hex())
                     && !originals.tracks.contains_key(&(source.id.clone(), i))
@@ -424,7 +577,10 @@ fn build_selected(
         ambiguous_managed_packages: vec![],
         missing_native_picture: false,
         missing_managed_audio: vec![],
+        unused_proof_issue: originals.references.as_ref().and_then(unused::References::incomplete)
+            .map(|reason| format!("Skip unused clips is unavailable for this selection: {reason}.")),
         files_scanned: index.files_scanned,
+        receipt_spool,
     };
     for (i, name) in bin_names.iter().enumerate() {
         budget.charge(size_of::<Bin>() + name.len() + 32)?;
@@ -494,8 +650,29 @@ fn build_selected(
         out.scan_issues.push(format!("{}: {e}", p.display()));
     }
     let mut copies: HashMap<avid_reader::io::MobId, Vec<(usize, usize)>> = HashMap::new();
+    let mut missing_pcm_prefix = HashSet::new();
+    let mut omitted_media = MediaOmissions::new();
     let mut source_masters = Vec::new();
+    for input in &motion_mxf.fallbacks.inputs {
+        budget.charge(size_of::<av::SourceInput>() + input.path.as_os_str().len() + input.revision.len())?;
+        out.original_inputs.push(input.clone());
+    }
     for (n, source) in facts.masters.iter().enumerate() {
+        if motion_mxf.fallbacks.omitted_caches.contains(&source.master.mob_id) {
+            continue;
+        }
+        if let Some(reason) = originals.omitted_unused.get(&source.id) {
+            retain_unresolved_master(source, reason, true, &mut out, &mut budget)?;
+            continue;
+        }
+        if let Some(reason) = originals.omitted_media.get(&source.id) {
+            retain_master_receipt(source, reason, "omitted_media_masters", &mut out, &mut budget)?;
+            loss(&mut out, &mut budget, &format!("bin:{}", source.master.bin), "media_bin_omission",
+                format!("Omitted {:?}, bin item {}. {reason}", source.master.name, source.id))?;
+            budget.charge(96)?;
+            omitted_media.entry(source.master.mob_id).or_default().push((source, reason.as_str().into()));
+            continue;
+        }
         let id = format!("clip:clip-{}", n + 1);
         let checkpoint = (
             out.graph.media.len(),
@@ -504,6 +681,7 @@ fn build_selected(
             budget.used,
         );
         let missing_audio_before = out.missing_managed_audio.len();
+        let diagnostics_before = out.diagnostics.len();
         match master(source, index, &id, &mut out, &mut budget, originals, motion_mxf) {
             Ok(item) => {
                 let bin = out
@@ -522,10 +700,16 @@ fn build_selected(
                 source_masters.push(source);
             }
             Err(e) => {
+                let unavailable = matches!(e, MasterError::MissingPicture(_) | MasterError::Unavailable(_))
+                    && source.imported_audio.is_none()
+                    && (source.pcm_prefix.is_some() || source.originals.iter().all(Option::is_none))
+                    && index.ambiguous.is_empty() && index.unreadable.is_empty();
+                let omit = unavailable && originals.references.as_ref().is_some_and(|refs| refs.can_omit(source));
+                let gap = unavailable && originals.allow_media_gaps && !omit;
                 let e = match e {
-                    MasterError::Unsupported(e) => e,
+                    MasterError::Unsupported(e) | MasterError::Unavailable(e) => e,
                     MasterError::MissingPicture(e) => {
-                        out.missing_native_picture = true;
+                        out.missing_native_picture |= !omit && !gap;
                         e
                     }
                     MasterError::Budget(e) => return Err(e),
@@ -534,10 +718,29 @@ fn build_selected(
                 out.graph.sidecars.truncate(checkpoint.1);
                 out.graph.losses.truncate(checkpoint.2);
                 budget.used = checkpoint.3;
+                if omit {
+                    out.missing_managed_audio.truncate(missing_audio_before);
+                    out.diagnostics.truncate(diagnostics_before);
+                    retain_unresolved_master(source, &e, true, &mut out, &mut budget)?;
+                    continue;
+                }
+                if gap {
+                    out.missing_managed_audio.truncate(missing_audio_before);
+                    out.diagnostics.truncate(diagnostics_before);
+                    retain_master_receipt(source, &e, "omitted_media_masters", &mut out, &mut budget)?;
+                    loss(&mut out, &mut budget, &format!("bin:{}", source.master.bin), "media_bin_omission",
+                        format!("Omitted {:?}, bin item {}. {e}", source.master.name, source.id))?;
+                    budget.charge(96 + e.len())?;
+                    omitted_media.entry(source.master.mob_id).or_default().push((source, e.into()));
+                    continue;
+                }
+                if source.pcm_prefix.is_some() && missing_pcm_prefix.insert(source.master.mob_id) {
+                    budget.charge(2 * size_of::<MobId>())?;
+                }
                 for message in &out.missing_managed_audio[missing_audio_before..] {
                     budget.charge(message.capacity() + size_of::<String>())?;
                 }
-                retain_unresolved_master(source, &e, &mut out, &mut budget)?;
+                retain_unresolved_master(source, &e, false, &mut out, &mut budget)?;
                 out.diagnostics
                     .push(format!("{:?}: skipped ({e})", source.master.name));
             }
@@ -561,27 +764,75 @@ fn build_selected(
             let mut raster = None;
             let mut motion_picture = None;
             let mut square_pixels = false;
+            let mut fitted_png = false;
+            let mut strip_tiff = false;
             let mut timewarp_picture = None;
             let mut motion_audio = HashMap::new();
-            let mut managed_motion_audio = None;
+            let mut managed_motion_audio = HashMap::new();
             let mut same_rate_aac = HashMap::new();
+            let mut mp3_timing = HashMap::new();
+            let mut dry_audio = HashSet::new();
+            let mut linked_audio_render = None;
+            let mut subclip_pcm = HashMap::new();
             for im in &i.media {
                 let m = media_by_id[im.media.as_str()];
                 if m.kind == StreamKind::Audio {
                     if let Some(n) = m.stream {
                         audio.insert(n);
-                        if m.online == Some(true) && m.original.is_none() && n == 1
-                            && i.media.len() == 1 && i.stream_groups.is_empty()
+                        if let Some(master) = source_masters.get(index) {
+                            if let Some((render, path)) = motion_mxf.fallbacks.audio_renders.get(&master.master.mob_id) {
+                                if n == 1 && m.online == Some(true) && m.original.is_none()
+                                    && im.source_offset == Some(Rational::ZERO)
+                                    && m.locations.first().is_some_and(|p| Path::new(p) == path)
+                                {
+                                    linked_audio_render = Some(*render);
+                                }
+                            }
+                            if let Some((_, path)) = motion_mxf.fallbacks.dry_audio.get(&(master.master.mob_id, n)) {
+                                if m.online == Some(true) && m.original.is_none()
+                                    && im.source_offset == Some(Rational::ZERO)
+                                    && m.locations.first().is_some_and(|p| Path::new(p) == path)
+                                {
+                                    dry_audio.insert(n);
+                                }
+                            }
+                            if m.online == Some(true) && im.source_offset == Some(Rational::ZERO)
+                                && m.sample_rate == Some(48_000) && m.bits == Some(24)
+                            {
+                                let linked_wave = m.original.as_ref().is_some_and(|o| {
+                                    o.container == "wav" && o.channels == Some(1)
+                                        && o.channel_index == Some(0)
+                                        && o.sample_representation.as_deref() == Some("pcm24")
+                                });
+                                let managed = motion_mxf.fallbacks.dry_subclip
+                                    .get(&(master.master.mob_id, n)).is_some_and(|(extent, path)| {
+                                        m.original.is_none() && *extent == m.duration
+                                            && m.locations.first().is_some_and(|p| Path::new(p) == path)
+                                    });
+                                if linked_wave || managed {
+                                    subclip_pcm.insert(n, m.duration);
+                                }
+                            }
+                        }
+                        if m.online == Some(true) && m.original.is_none() && i.stream_groups.is_empty()
                             && im.source_offset == Some(Rational::ZERO)
-                            && m.bits == Some(16) && m.sample_rate == Some(48_000)
-                            && m.locations.first().and_then(|p| motion_mxf.pcm16.get(std::path::Path::new(p)))
-                                == Some(&m.duration)
+                            && m.sample_rate == Some(48_000)
                         {
-                            managed_motion_audio = Some(m.duration);
+                            if let Some(&(bits, duration)) = m.locations.first()
+                                .and_then(|p| motion_mxf.pcm_audio.get(Path::new(p)))
+                                .filter(|&&(bits, duration)| m.bits == Some(bits) && m.duration == duration)
+                            {
+                                if bits == 24 || (n == 1 && i.media.len() == 1) {
+                                    managed_motion_audio.insert(n, (bits, duration));
+                                }
+                            }
                         }
                     }
                 } else {
                     raster = m.frame_size;
+                    fitted_png = raster == Some((1536, 1024))
+                        && m.original.as_ref().is_some_and(|o| o.container == "png");
+                    strip_tiff = m.original.as_ref().is_some_and(|o| o.container == "tiff");
                     let verified = m.locations.first()
                         .and_then(|p| motion_mxf.picture.get(std::path::Path::new(p)));
                     square_pixels = m.original.is_some() || verified.is_some();
@@ -609,6 +860,15 @@ fn build_selected(
                         if selected.same_rate_aac_origin {
                             same_rate_aac.insert(track.index, selected.duration);
                         }
+                        if let Some((delay_samples, sample_rate)) =
+                            selected.mp3_delay_samples.zip(selected.sample_rate)
+                        {
+                            mp3_timing.insert(track.index, sequence::Mp3Timing {
+                                delay_samples,
+                                sample_rate,
+                                extent: selected.duration,
+                            });
+                        }
                         if let Some(origin) = selected.motion_audio_origin {
                             if matches!(master.offsets.get(ordinal), Some(Observed::Known(0))) {
                                 motion_audio.insert(track.index, (origin, selected.duration));
@@ -618,37 +878,93 @@ fn build_selected(
                 }
             }
             sequence::ItemRoutes {
-                audio, raster, square_pixels, motion_picture, motion_audio, managed_motion_audio, same_rate_aac,
+                audio, raster, square_pixels, fitted_png, strip_tiff, motion_picture, motion_audio, managed_motion_audio, same_rate_aac, mp3_timing, dry_audio, linked_audio_render,
+                pcm_prefix: source_masters.get(index).and_then(|source| source.pcm_prefix),
+                subclip_pcm,
                 timewarp_picture: timewarp_picture.filter(|_| square_pixels),
             }
         })
         .collect();
-    for seq in &facts.sequences {
+    let timelines = sequences.into_iter();
+    let total = timelines.len();
+    for (completed, seq) in timelines.enumerate() {
+        let seq = seq.borrow();
+        check()?;
+        if completed % 32 == 0 {
+            observe(SourceProgress::BuildingTimelines { completed, total })?;
+        }
         let before = out.graph.sequences.len();
-        sequence::append(seq, &copies, &item_routes, &multicams, &mut out, &mut budget)?;
+        let first_sidecar = out.graph.sidecars.len();
+        let first_loss = out.graph.losses.len();
+        let first_use = out.graph.multicam_uses.len();
+        let first_diagnostic = out.diagnostics.len();
+        let retained = budget.used;
+        sequence::append(seq, &copies, &item_routes, &multicams, &motion_mxf.fallbacks,
+            &missing_pcm_prefix, &omitted_media, &mut out, &mut budget)
+            .map_err(|e| match out.receipt_spool.as_ref() {
+                Some(spool) => format!("{e}; graph staged {} receipts ({} bytes) before timeline {:?}; {} working bytes retained",
+                    spool.records, spool.bytes, seq.info.name, retained),
+                None => e,
+            })?;
         if out.graph.sequences.len() > before {
+            if let Some(spool) = out.receipt_spool.as_mut() {
+                let timeline = &out.graph.sequences[before];
+                let sidecars = &mut out.graph.sidecars[first_sidecar..];
+                let native_png = spool.compact_timeline(&timeline.id, timeline.rate, sidecars)?;
+                for diagnostic in out.graph.losses.extract_if(first_loss.., |loss| {
+                    matches!(loss.aspect.as_str(), "media_gap" | "source_route_timing")
+                        || (!native_png && loss.aspect == "source_route")
+                }) {
+                    spool.archive_loss(&diagnostic.object, &diagnostic.aspect, diagnostic.reason)?;
+                }
+                budget.used = retained;
+                spool::charge_timeline(&mut budget, timeline, sidecars, &out.graph.losses[first_loss..],
+                    &out.graph.multicam_uses[first_use..], &out.diagnostics[first_diagnostic..])?;
+            }
             budget.charge(size_of::<(String, usize)>() + seq.id.len() + 32)?;
             if out.sequence_bins.insert(seq.id.clone(), seq.info.bin).is_some() {
                 return Err("duplicate saved Avid sequence identity".into());
             }
         }
     }
+    if total > 0 {
+        observe(SourceProgress::BuildingTimelines { completed: total, total })?;
+    }
+    observe(SourceProgress::ValidatingGraph)?;
     out.graph.validate().map_err(|e| e.to_string())?;
-    out.graph.encoded_len().map_err(|e| e.to_string())?;
+    if let Some(spool) = out.receipt_spool.as_mut() {
+        spool.finish()?;
+    } else {
+        out.graph.encoded_len().map_err(|e| e.to_string())?;
+    }
     Ok(out)
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy)]
 struct Budget {
     used: usize,
+    limit: usize,
 }
+// Native receipts retain owned object keys and values. Give that representation
+// room above the encoded graph ceiling without changing input or JSON limits.
+const MAX_GRAPH_CONSTRUCTION_BYTES: usize = 768 << 20;
+// Whole-project preparation accounts only for the shared index, projected
+// graph, and current timeline scratch. Full native receipts are on disk.
+const MAX_SPOOLED_GRAPH_WORKING_BYTES: usize = 2 << 30;
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self { used: 0, limit: MAX_GRAPH_CONSTRUCTION_BYTES }
+    }
+}
+
 impl Budget {
     fn charge(&mut self, n: usize) -> Result<(), String> {
         self.used = self
             .used
             .checked_add(n)
-            .filter(|n| *n <= av::MAX_SOURCE_FACT_BYTES)
-            .ok_or("source graph construction exceeds 64 MiB accounted budget")?;
+            .filter(|n| *n <= self.limit)
+            .ok_or_else(|| format!("source graph construction exceeds {} MiB accounted budget", self.limit >> 20))?;
         Ok(())
     }
     fn value(&mut self, v: &Value) -> Result<(), String> {
@@ -791,7 +1107,7 @@ fn output_mix(m: &extract::MasterOutputMix, budget: &mut Budget) -> Result<Value
         M::Bytes(v) => v.len().checked_mul(2).ok_or("mix payload overflow")?,
         _ => 0,
     };
-    let mut reservation = Budget { used: budget.used };
+    let mut reservation = *budget;
     reservation.charge(payload.checked_add(512).ok_or("mix payload overflow")?)?;
     let (kind, raw) = match m {
         M::Absent => ("absent", Value::Null),
@@ -813,6 +1129,20 @@ fn output_mix(m: &extract::MasterOutputMix, budget: &mut Budget) -> Result<Value
 fn rational(r: Rate) -> Rational {
     Rational::new(r.num as i128, r.den as i128).expect("positive reduced i64 source rate")
 }
+
+fn color_range_receipt(range: av::SourceColorRange) -> Value {
+    let direction = match range {
+        av::SourceColorRange::VideoToFull => "video_to_full",
+        av::SourceColorRange::FullToVideo => "full_to_video",
+    };
+    obj(vec![
+        ("direction", s(direction)),
+        ("bit_depth", Value::Int(av::SourceColorRange::BIT_DEPTH)),
+        ("video_black", Value::Int(av::SourceColorRange::VIDEO_BLACK)),
+        ("video_white", Value::Int(av::SourceColorRange::VIDEO_WHITE)),
+    ])
+}
+
 fn source_input_transforms(
     source: &av::SourceMaster,
     budget: &Budget,
@@ -820,23 +1150,35 @@ fn source_input_transforms(
     if source.input_transforms.is_empty() {
         return Ok(None);
     }
-    let mut reservation = Budget { used: budget.used };
+    let mut reservation = *budget;
     for transform in &source.input_transforms {
         let text = match &transform.value {
             Observed::Known(text) | Observed::Unresolved(text) => text,
         };
-        reservation.charge(text.len() + 512)?;
+        let range_cost = if matches!(&transform.value, Observed::Known(text)
+            if av::SourceColorRange::from_saved_xml(text).is_some()) {
+            512
+        } else {
+            0
+        };
+        reservation.charge(text.len() + 512 + range_cost)?;
     }
     Ok(Some(Value::Arr(source.input_transforms.iter().map(|transform| {
         let (key, text) = match &transform.value {
             Observed::Known(text) => ("text", text),
             Observed::Unresolved(reason) => ("reason", reason),
         };
-        obj(vec![
+        let mut facts = vec![
             ("track", Value::Int(transform.track)),
             ("owner_mob", s(transform.file_mob.urn())),
             (key, s(text)),
-        ])
+        ];
+        if let Observed::Known(text) = &transform.value {
+            if let Some(range) = av::SourceColorRange::from_saved_xml(text) {
+                facts.push(("linear_range", color_range_receipt(range)));
+            }
+        }
+        obj(facts)
     }).collect())))
 }
 fn time(n: i64, r: Rate) -> Result<Rational, String> {
@@ -864,6 +1206,11 @@ fn loss(
     reason: impl Into<String>,
 ) -> Result<(), String> {
     let reason = reason.into();
+    if matches!(aspect, "media_bin_omission" | "unused_bin_item") {
+        if let Some(spool) = out.receipt_spool.as_mut() {
+            return spool.archive_loss(id, aspect, reason);
+        }
+    }
     budget.charge(size_of::<Loss>() + id.len() + aspect.len() + reason.len())?;
     out.graph.losses.push(Loss {
         object: id.into(),
@@ -936,12 +1283,33 @@ fn append_bin_receipt(
 fn retain_unresolved_master(
     source: &av::SourceMaster,
     reason: &str,
+    omitted_unused: bool,
+    out: &mut ReadResult,
+    budget: &mut Budget,
+) -> Result<(), String> {
+    let key = if omitted_unused { "omitted_unused_masters" } else { "unresolved_masters" };
+    retain_master_receipt(source, reason, key, out, budget)?;
+    if omitted_unused {
+        return loss(out, budget, &format!("bin:{}", source.master.bin), "unused_bin_item", format!(
+            "Skipped {:?}, bin item {}. No saved editorial reference uses it. {reason}",
+            source.master.name, source.id));
+    }
+    loss(out, budget, &format!("bin:{}", source.master.bin), "source_master",
+        format!("{}: {reason}; native master facts retained on bin", source.id))
+}
+
+fn retain_master_receipt(
+    source: &av::SourceMaster,
+    reason: &str,
+    key: &str,
     out: &mut ReadResult,
     budget: &mut Budget,
 ) -> Result<(), String> {
     let m = &source.master;
+    let retain_locators = key == "omitted_media_masters"
+        || (key == "omitted_unused_masters" && original::legacy_mxf::saved_sibling_directory(source).is_some());
     // Guard all potentially large cloned payloads before building an opaque receipt.
-    let mut reservation = Budget { used: budget.used };
+    let mut reservation = *budget;
     reservation.charge(
         m.name.len()
             + source.id.len()
@@ -950,6 +1318,11 @@ fn retain_unresolved_master(
     )?;
     for (k, v) in &m.columns {
         reservation.charge(k.len() + v.len() + size_of::<(String, Value)>())?;
+    }
+    if retain_locators {
+        for path in source.originals.iter().flatten().flat_map(|track| &track.locators) {
+            reservation.charge(path.len() + size_of::<Value>())?;
+        }
     }
     for (_, _, mk) in &m.markers {
         reserve_marker(mk, &mut reservation)?;
@@ -1038,7 +1411,7 @@ fn retain_unresolved_master(
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
-                        obj(vec![
+                        let mut fields = vec![
                             ("kind", Value::Int(t.kind)),
                             ("index", Value::Int(t.index)),
                             ("file_package", s(t.file_mob.umid_hex())),
@@ -1052,7 +1425,12 @@ fn retain_unresolved_master(
                             ("gain_db", t.gain_db.map(raw_float).unwrap_or(Value::Null)),
                             ("pan_raw", t.pan_raw.map(Value::Int).unwrap_or(Value::Null)),
                             ("descriptor", descriptor(&t.essence)),
-                        ])
+                        ];
+                        if let Some(raw) = source.originals.get(i).and_then(Option::as_ref).filter(|_| retain_locators) {
+                            fields.push(("saved_locators", Value::Arr(raw.locators.iter().map(s).collect())));
+                            fields.push(("saved_file_track", raw.file_track.map(Value::Int).unwrap_or(Value::Null)));
+                        }
+                        obj(fields)
                     })
                     .collect(),
             ),
@@ -1079,17 +1457,16 @@ fn retain_unresolved_master(
     if let Some(managed) = &source.managed_multistream {
         raw.push(("managed_multistream", managed_multistream::saved_facts(managed, budget)?));
     }
-    append_bin_receipt(out, budget, m.bin, "unresolved_masters", obj(raw))?;
-    loss(
-        out,
-        budget,
-        &format!("bin:{}", m.bin),
-        "source_master",
-        format!(
-            "{}: {reason}; native master facts retained on bin",
-            source.id
-        ),
-    )
+    if let Some(prefix) = source.pcm_prefix {
+        raw.push(("pcm_prefix", pcm_prefix_fact(prefix)));
+    }
+    if matches!(key, "omitted_media_masters" | "omitted_unused_masters") {
+        if let Some(spool) = out.receipt_spool.as_mut() {
+            let owner = &out.graph.bins.get(m.bin).ok_or("native fact references unknown bin")?.id;
+            return spool.archive(owner, &obj(vec![(key, obj(raw))]));
+        }
+    }
+    append_bin_receipt(out, budget, m.bin, key, obj(raw))
 }
 fn clock(v: Option<(u64, u16, bool)>) -> Value {
     v.map(|(n, b, d)| {
@@ -1238,6 +1615,7 @@ fn descriptor(e: &Option<Essence>) -> Value {
 enum MasterError {
     Unsupported(String),
     MissingPicture(String),
+    Unavailable(String),
     Budget(String),
 }
 impl From<&str> for MasterError {
@@ -1250,6 +1628,38 @@ impl From<String> for MasterError {
         Self::Unsupported(e)
     }
 }
+
+fn unsupported_managed_track_rate(source: &av::SourceMaster, track_index: usize) -> MasterError {
+    let saved = &source.master;
+    let track = &saved.tracks[track_index];
+    let rate = track.edit_rate;
+    let message = format!("unsupported edit rate {rate}");
+    // A regular managed master can have a coherent saved picture rate which
+    // has no supported exact clock. Only the existing unused-reference proof
+    // can omit it. A contradictory track or a malformed value stays an error.
+    if source.rate.is_none() && source.managed_multistream.is_none()
+        && (1.0..=240.0).contains(&rate) && rate == saved.edit_rate
+        && saved.length > 0 && track_index == 0 && track.index == 1
+        && track.kind == KIND_PICTURE && matches!(track.essence, Some(Essence::Picture { .. }))
+        && track.length == saved.length
+        && (1..=3).contains(&saved.tracks.len())
+        && source.offsets.len() == saved.tracks.len()
+        && source.offsets.iter().all(|offset| *offset == Observed::Known(0))
+        && saved.tracks.iter().enumerate().all(|(index, other)| {
+            other.clip_length == saved.length
+                && (index == 0 || (other.kind == KIND_SOUND && other.index == index as i64
+                    && other.edit_rate == 48_000.0 && other.length > 0
+                    && matches!(other.essence, Some(Essence::Sound {
+                        sample_rate: 48_000.0, bits: 16 | 24, channels: 1,
+                    }))))
+        })
+    {
+        MasterError::Unavailable(message)
+    } else {
+        MasterError::Unsupported(message)
+    }
+}
+
 fn offline_managed(
     source: &av::SourceMaster, index: usize, item: &str, audio_index: usize,
     video: &mut bool, labels: &mut HashSet<i64>, out: &mut ReadResult, budget: &mut Budget,
@@ -1258,7 +1668,8 @@ fn offline_managed(
     let rate = Rate::from_avid(track.edit_rate).ok_or("offline descriptor rate is unresolved".to_string())?;
     let clock = source.file_clocks.get(index).and_then(Option::as_ref)
         .filter(|c| (c.rate.num, c.rate.den, c.base, c.drop) == (24_000, 1001, 24, false))
-        .ok_or_else(|| format!("offline managed track {} requires a saved 23.976 non-drop file clock", track.index))?;
+        .ok_or_else(|| MasterError::Unavailable(format!(
+            "offline managed track {} requires a saved 23.976 non-drop file clock", track.index)))?;
     if source.offsets.get(index) != Some(&Observed::Known(0))
         || source.rendered_freeze || source.rendered_gain.is_some()
         || track.length <= 0 || clock.file_track != track.index
@@ -1279,7 +1690,8 @@ fn offline_managed(
             labels.insert(track.index);
             (format!("{item}:audio:{audio_index}"), StreamKind::Audio, None, None, Some(48000), Some(24), Some(track.index))
         }
-        _ => return Err("offline managed descriptor is outside the 1080p23.976 DNx/PCM24 profile".to_string().into()),
+        _ => return Err(MasterError::Unavailable(
+            "offline managed descriptor is outside the 1080p23.976 DNx/PCM24 profile".into())),
     };
     let package = track.file_mob.umid_hex();
     let suffix = if kind == StreamKind::Video { "V1".to_owned() } else { format!("A{}", track.index) };
@@ -1312,6 +1724,14 @@ fn offline_managed(
     })
 }
 
+fn pcm_prefix_fact(prefix: av::SourcePcmPrefix) -> Value {
+    obj(vec![
+        ("end", s(Rational::new(i128::from(prefix.frames), 24).unwrap())),
+        ("tail_package", s(prefix.tail_package.umid_hex())),
+        ("physical_pcm_samples", Value::Int((prefix.frames + 1) * 2000)),
+    ])
+}
+
 fn master(
     source: &av::SourceMaster,
     index: &index::MediaIndex,
@@ -1322,6 +1742,23 @@ fn master(
     motion_mxf: &MotionMxf,
 ) -> Result<SourceItem, MasterError> {
     let m = &source.master;
+    if let Some(prefix) = source.pcm_prefix {
+        for track in m.tracks.iter().filter(|t| t.kind == KIND_SOUND) {
+            if !motion_mxf.pcm_prefix.contains(&(track.file_mob, track.length)) {
+                let reason = format!("PCM prefix A{} requires verified mono MXF package {}",
+                    track.index, track.file_mob.umid_hex());
+                out.missing_managed_audio.push(format!("{:?}: {reason}", m.name));
+                if !index.files.contains_key(&track.file_mob.umid_hex()) {
+                    return Err(MasterError::Unavailable(reason));
+                }
+                return Err(reason.into());
+            }
+        }
+        sidecar(out, budget, "avid.pcm_prefix", id, pcm_prefix_fact(prefix)).map_err(MasterError::Budget)?;
+        loss(out, budget, id, "stitched_audio_tail",
+            "The linked audio represents the verified PCM section. The final MPEG audio frame is outside the translated range.")
+            .map_err(MasterError::Budget)?;
+    }
     budget
         .charge(size_of::<SourceItem>() + id.len() + m.name.len() + source.id.len())
         .map_err(MasterError::Budget)?;
@@ -1364,12 +1801,13 @@ fn master(
     }
     let mut raw_tracks = vec![];
     let mut audio_ordinal = 0;
+    let mut reported_mp3_extent = false;
     for (tindex, t) in m.tracks.iter().enumerate() {
         let audio_index = audio_ordinal;
         if t.kind == KIND_SOUND {
             audio_ordinal += 1;
         }
-        if let Some(verified) = originals.managed_op1a.get(&source.id) {
+        if let Some(verified) = originals.managed_op1a.get(&source.id).filter(|_| source.pcm_prefix.is_none()) {
             let media = managed_multistream::add_media(source, t, id, audio_index, verified, index, out, budget)?;
             video |= t.kind == KIND_PICTURE;
             if t.kind == KIND_SOUND {
@@ -1387,7 +1825,7 @@ fn master(
             ]));
             continue;
         }
-        if let Some(selected) = originals.tracks.get(&(source.id.clone(), tindex)) {
+        if let Some(selected) = originals.tracks.get(&(source.id.clone(), tindex)).filter(|_| source.pcm_prefix.is_none()) {
             let stream_id = if selected.kind == StreamKind::Video {
                 if video {
                     return Err("more than one original picture track".into());
@@ -1461,7 +1899,19 @@ fn master(
                 ]);
                 None
             };
-            let original_clock = if selected.online && selected.kind == StreamKind::Video
+            let original_clock = if let ("apch", Some(Observed::Known(count)), Some(rate), Some(saved)) =
+                (selected.codec.as_str(), &selected.embedded_mov_timecode, selected.rate, &m.start)
+            {
+                let effective_count = u64::try_from(*count).map_err(|_| "negative linked MOV timecode")?;
+                Some(SourceClock {
+                    effective_count, rate, display_base: saved.fps as u16, drop: saved.drop,
+                    provenance: SourceClockProvenance {
+                        origin_count: effective_count, source_offset: 0, source_rate: rate,
+                        source_package: t.file_mob.umid_hex(), timecode_track: "TC1".into(),
+                        route: graph::source::AVID_LINKED_MOV_TIMECODE.into(),
+                    },
+                })
+            } else if selected.online && selected.kind == StreamKind::Video
                 && selected.codec == "avc1" && selected.rate == Some(Rational::integer(24))
                 && selected.stream.container == "mov" && m.tracks.len() == 1
                 && offset == Some(Rational::ZERO)
@@ -1491,7 +1941,7 @@ fn master(
             let source_clock = source_clock.or(original_clock);
             if let Some(timecode) = &selected.embedded_mov_timecode {
                 let mut witness = vec![("observation", observed(timecode))];
-                if let Observed::Known(count) = timecode {
+                if let ("avc1", Observed::Known(count)) = (selected.codec.as_str(), timecode) {
                     witness.extend([
                         ("label", s(tc(*count, 24))),
                         ("rate", s("24")),
@@ -1507,6 +1957,16 @@ fn master(
             if selected.same_rate_aac_origin {
                 native_original.push(("same_rate_aac_file_track_start", Value::Int(1)));
                 native_original.push(("verified_aac_priming_samples", Value::Int(1024)));
+            }
+            if let Some(delay) = selected.mp3_delay_samples {
+                native_original.push(("gapless_presentation_delay_samples", Value::Int(delay)));
+                native_original.push(("avid_descriptor_samples", Value::Int(t.length)));
+                if !reported_mp3_extent {
+                    loss(out, budget, id, "mp3_source_presentation",
+                        "Fresh insertion uses the linked MP3's gapless playable extent. Avid's saved source also counts the leading MPEG Info frame and encoder delay.")
+                        .map_err(MasterError::Budget)?;
+                    reported_mp3_extent = true;
+                }
             }
             sidecar(
                 out,
@@ -1557,8 +2017,13 @@ fn master(
             continue;
         }
         let rate = Rate::from_avid(t.edit_rate)
-            .ok_or_else(|| format!("unsupported edit rate {}", t.edit_rate))?;
+            .ok_or_else(|| unsupported_managed_track_rate(source, tindex))?;
         let Some(path) = index.files.get(&t.file_mob.umid_hex()) else {
+            if source.pcm_prefix.is_some() && t.kind == KIND_PICTURE {
+                loss(out, budget, id, "media", "The picture sibling is offline. The verified PCM section remains linked.")
+                    .map_err(MasterError::Budget)?;
+                continue;
+            }
             if originals.allow_offline {
                 let media = offline_managed(source, tindex, id, audio_index, &mut video, &mut labels,
                     out, budget)?;
@@ -1700,6 +2165,10 @@ fn master(
             }
             _ => time(t.length, rate)?,
         };
+        let duration = match source.pcm_prefix {
+            Some(prefix) if t.kind == KIND_SOUND => time(prefix.frames, Rate::new(24, 1).unwrap())?,
+            _ => duration,
+        };
         // The optional clock lives inline in the media record; precharge its owned
         // provenance payload before the reader creates the qualified owned witness.
         if let Some(q) = identity.qualified_file_clocks.first() {
@@ -1761,12 +2230,7 @@ fn master(
             }
             _ => Rational::ZERO,
         };
-        sidecar(
-            out,
-            budget,
-            "avid.source",
-            &stream_id,
-            obj(vec![
+        let mut native = vec![
                 ("legacy_clock", clock(legacy)),
                 ("legacy_start", s(legacy_start)),
                 (
@@ -1795,9 +2259,16 @@ fn master(
                         .map(|v| s(v.iter().map(|b| format!("{b:02X}")).collect::<String>()))
                         .unwrap_or(Value::Null),
                 ),
-            ]),
-        )
-        .map_err(MasterError::Budget)?;
+        ];
+        if originals.legacy_mxf.contains_key(&source.id) {
+            let raw = source.originals[tindex].as_ref().expect("verified legacy MXF track");
+            for path in &raw.locators {
+                budget.charge(path.len() + size_of::<Value>()).map_err(MasterError::Budget)?;
+            }
+            native.push(("saved_locators", Value::Arr(raw.locators.iter().map(s).collect())));
+            native.push(("saved_file_track", raw.file_track.map(Value::Int).unwrap_or(Value::Null)));
+        }
+        sidecar(out, budget, "avid.source", &stream_id, obj(native)).map_err(MasterError::Budget)?;
         let media = SourceMedia {
             id: stream_id.clone(),
             kind: stream_kind,
@@ -1844,11 +2315,8 @@ fn master(
         ]));
     }
     if item.media.is_empty() {
-        return Err(
-            "no media found for any clip track; clip and its edits left out"
-                .to_string()
-                .into(),
-        );
+        return Err(MasterError::Unavailable(
+            "no media found for any clip track; clip and its edits left out".into()));
     }
     for (a, b) in &m.stereo_pairs {
         if labels.contains(a) && labels.contains(b) {
@@ -1859,11 +2327,18 @@ fn master(
         } else if (*a, *b) == (1, 2) && labels.contains(a)
             && !originals.tracks.contains_key(&(source.id.clone(), 0))
             && matches!(m.tracks.as_slice(), [track] if index.files.get(&track.file_mob.umid_hex())
-                .is_some_and(|path| motion_mxf.pcm16.contains_key(path.as_path())))
+                .is_some_and(|path| matches!(motion_mxf.pcm_audio.get(path.as_path()), Some((16, _)))))
         {
             loss(out, budget, id, "audio_group",
                 "Saved stereo declaration has only its authored A1 track. The verified mono PCM file remains mono.")
                 .map_err(MasterError::Budget)?;
+        } else if originals.allow_media_gaps && *a > 0 && *b > 0 && a != b
+            && labels.contains(a) != labels.contains(b)
+        {
+            loss(out, budget, id, "audio_group", format!(
+                "{:?}: stereo A{a}/A{b} is missing a channel. Kept the independently available mono source.",
+                m.name
+            )).map_err(MasterError::Budget)?;
         } else {
             out.audio_group_issues.push(format!(
                 "{:?}: stereo A{a}/A{b} missing a channel; available media remains mono",

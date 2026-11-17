@@ -1,6 +1,7 @@
 //! Typed writer input. Original files are never represented as PCM OP-Atom model/1 clips.
 use super::model::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClipMetadata {
@@ -27,6 +28,7 @@ pub struct OriginalVideo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SampleRepresentation {
     Aac,
+    Mp3,
     Pcm16,
     Pcm24,
 }
@@ -54,8 +56,59 @@ pub struct OriginalClip {
     pub container: String,
     pub video: Option<OriginalVideo>,
     pub audio: Option<OriginalAudio>,
+    /// Resolve the two mono physical streams independently. Their Premiere
+    /// stream ordinals are 0 and 1, each with channel index zero.
+    pub separate_mono_streams: bool,
     pub channels: Vec<OriginalChannel>,
     pub groups: Vec<Vec<i64>>,
+}
+impl OriginalClip {
+    pub fn is_same_rate_linked_pcm(&self) -> bool {
+        self.proxy_path.is_none()
+            && self.audio.as_ref().zip(self.video.as_ref()).is_some_and(|(a, v)| {
+                let delta = a.duration.abs_diff(v.duration);
+                matches!(a.representation, SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24)
+                    && a.channels == 2 && a.sample_rate == 48_000
+                    && delta < ticks_per_unit(Fraction::new(48_000, 1)) as u64
+                    && is_25_or_2997(v.rate)
+                    && match self.container.as_str() {
+                        "mov" => matches!(v.codec.as_str(), "avc1" | "apch") && a.duration <= v.duration,
+                        "mxf" => v.codec == "AVdn" && (v.width, v.height) == (1920, 1080)
+                            && a.duration >= v.duration
+                            && std::path::Path::new(&self.path).extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("mxf")),
+                        _ => false,
+                    }
+            })
+    }
+
+    pub fn is_uhd_avc_pcm_mp4(&self) -> bool {
+        self.container == "mov" && self.proxy_path.is_none()
+            && std::path::Path::new(&self.path).extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
+            && self.audio.as_ref().zip(self.video.as_ref()).is_some_and(|(a, v)| {
+                matches!(a.representation, SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24)
+                    && a.channels == 2 && a.sample_rate == 48_000 && a.duration == v.duration
+                    && v.codec == "avc1" && (v.width, v.height) == (3840, 2160)
+                    && v.rate == Fraction::new(24_000, 1001)
+            })
+    }
+
+    pub fn is_wide_avc_pcm24_mov(&self) -> bool {
+        self.container == "mov" && self.proxy_path.is_none()
+            && std::path::Path::new(&self.path).extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+            && self.audio.as_ref().zip(self.video.as_ref()).is_some_and(|(a, v)| {
+                a.representation == SampleRepresentation::Pcm24
+                    && a.channels == 2 && a.sample_rate == 48_000 && a.duration == v.duration
+                    && v.codec == "avc1" && (v.width, v.height) == (2048, 858)
+                    && v.rate == Fraction::new(24, 1)
+            })
+    }
+}
+
+fn is_25_or_2997(rate: Fraction) -> bool {
+    matches!((rate.num, rate.den), (25, 1) | (30_000, 1001))
 }
 fn automatic_adapter_span(c: &OriginalClip, sequence_rate: Fraction) -> Option<(i128, i128)> {
     let video = c.video.as_ref()?;
@@ -228,8 +281,12 @@ pub struct PreparedProjectInput {
     pub audio_pans: Vec<PreparedAudioPan>,
     pub audio_mixers: BTreeMap<usize, PreparedAudioMixer>,
     pub track_states: BTreeMap<usize, Vec<PreparedTrackState>>,
+    /// Same-rate linked 29.97 sequences with an exact non-drop source TC1.
+    pub non_drop_sequences: HashSet<usize>,
     pub picture_effects: Vec<PreparedPictureEffect>,
     pub source_luts: Vec<PreparedSourceLut>,
+    /// Occurrences whose linked picture was verified as Rec.709 video range.
+    pub extended_sdr_grades: HashSet<(usize, usize)>,
     /// A label on one placed clip, independent of its source item.
     pub edit_labels: Vec<PreparedEditLabel>,
     /// Verified single-lane edits to write using the native Enable switch.
@@ -345,32 +402,72 @@ pub struct PreparedConstantSpeed {
 impl PreparedConstantSpeed {
     pub(super) fn raw_trim(self, seq: &Sequence, event: &Event, clip: &Clip) -> Option<(i64, i64)> {
         let video = clip.video.as_ref()?;
-        let rate = Fraction::new(24, 1);
-        let frame = ticks_per_unit(rate);
-        let (saved, source_frames) = match self.ratio {
-            (1, 2) => ((2, 1), 25),
-            (2, 1) => ((50, 99), 99),
-            (-1, 1) => ((-1, 1), 50),
-            _ => return None,
-        };
-        if seq.rate != rate || video.rate != rate || video.codec != "AVdn"
-            || (seq.width, seq.height) != (1920, 1080)
-            || (video.width, video.height) != (1920, 1080)
-            || video.start != 0 || video.duration % frame != 0
-            || event.video_track.is_none() || !event.audio_tracks.is_empty() || !event.stereo.is_empty()
-            || event.time_remap.is_some() || event.speed_ratio != Some(saved)
-            || event.source_duration != Some(source_frames * frame) || event.duration != 50 * frame
-            || event.record_start < 0 || event.record_start % frame != 0
-            || event.source_in < 0 || event.source_in % frame != 0
+        let exact_forward = self.exact_forward(event);
+        if !(video.codec == "AVdn" || (exact_forward && self.ratio == (2, 1)
+            && video.codec == "apcs" && clip.audio.is_empty()))
+            || (!exact_forward && ((seq.width, seq.height) != (1920, 1080)
+                || (video.width, video.height) != (1920, 1080) || video.start != 0))
         {
             return None;
         }
-        let end = event.source_in.checked_add(source_frames * frame)?;
-        if end > video.duration {
+        self.picture_trim(seq, event, video.rate, video.duration)
+    }
+
+    pub(super) fn raw_original_trim(self, seq: &Sequence, event: &Event, clip: &OriginalClip) -> Option<(i64, i64)> {
+        let video = clip.video.as_ref()?;
+        if clip.proxy_path.is_some() || !matches!(clip.container.as_str(), "mov" | "mxf")
+            || !self.exact_forward(event)
+        {
+            return None;
+        }
+        self.picture_trim(seq, event, video.rate, video.duration)
+    }
+
+    fn exact_forward(self, event: &Event) -> bool {
+        let (num, den) = self.ratio;
+        num > 0 && den > 0 && event.speed_ratio == Some((den, num))
+    }
+
+    fn picture_trim(self, seq: &Sequence, event: &Event, rate: Fraction, duration: i64) -> Option<(i64, i64)> {
+        let frame = ticks_per_unit(rate);
+        let (num, den) = self.ratio;
+        let exact_forward_trim = self.exact_forward(event);
+        if frame <= 0 || seq.rate != rate || (!exact_forward_trim && rate != Fraction::new(24, 1))
+            || i128::from(frame) * i128::from(rate.num) != i128::from(TICKS_PER_SECOND) * i128::from(rate.den)
+        {
+            return None;
+        }
+        let (saved, source_span, record_span) = match self.ratio {
+            _ if exact_forward_trim => {
+                let scaled = i128::from(event.duration) * i128::from(num);
+                if scaled % i128::from(den) != 0 {
+                    return None;
+                }
+                ((den, num), i64::try_from(scaled / i128::from(den)).ok()?, event.duration)
+            }
+            (1, 2) => ((2, 1), 25 * frame, 50 * frame),
+            (2, 1) => ((50, 99), 99 * frame, 50 * frame),
+            (-1, 1) => ((-1, 1), 50 * frame, 50 * frame),
+            _ => return None,
+        };
+        let subframe_units = if exact_forward_trim { den } else { 1 };
+        if duration % frame != 0
+            || event.video_track.is_none() || !event.audio_tracks.is_empty() || !event.stereo.is_empty()
+            || event.time_remap.is_some() || event.speed_ratio != Some(saved)
+            || event.source_duration != Some(source_span) || event.duration != record_span
+            || record_span <= 0 || record_span % frame != 0
+            || event.record_start < 0 || event.record_start % frame != 0
+            || event.source_in < 0
+            || i128::from(event.source_in) * i128::from(subframe_units) % i128::from(frame) != 0
+        {
+            return None;
+        }
+        let end = event.source_in.checked_add(source_span)?;
+        if end > duration {
             return None;
         }
         Some(if self.ratio.0 < 0 {
-            (video.duration - end, video.duration - event.source_in)
+            (duration - end, duration - event.source_in)
         } else {
             (event.source_in, end)
         })
@@ -454,6 +551,20 @@ pub fn plain_picture_edit(edit: &Event) -> bool {
     edit.video_track.is_some_and(|track| track > 0) && edit.stereo.is_empty()
         && edit.speed_ratio.is_none() && edit.source_duration.is_none() && edit.time_remap.is_none()
         && edit.transform.is_none() && edit.matte.is_none() && edit.color_correction.is_none()
+}
+
+pub fn supported_extended_sdr_edit(sequence: &Sequence, event: &Event, clip: &PreparedClip) -> bool {
+    sequence.rate == Fraction::new(24, 1) && (sequence.width, sequence.height) == (1920, 1080)
+        && event.video_track == Some(1)
+        && event.audio_tracks.is_empty() && event.stereo.is_empty()
+        && event.speed_ratio.is_none() && event.source_duration.is_none() && event.time_remap.is_none()
+        && event.transform.is_none() && event.matte.is_none()
+        && event.color_correction.as_ref()
+            .and_then(super::avid_color::ExtendedSdrGrade::from_correction).is_some()
+        && matches!(clip, PreparedClip::Original(c) if c.container == "mov"
+            && c.proxy_path.is_none() && c.audio.is_none()
+            && c.video.as_ref().is_some_and(|v| v.codec == "apch" && v.rate == sequence.rate
+                && v.stream_index == 0 && (v.width, v.height) == (1920, 1080)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -615,6 +726,8 @@ pub enum PictureEffect {
     /// One horizontal reflection and one static pin, in source render order.
     CornerPinWithFlop { pin: CornerPin, flop_before_pin: bool },
     StaticMotion,
+    UltraKey { rgb: [u8; 3] },
+    VideoToFullRange,
     Resize([MotionKey; 2]),
     WarpRoll { keys: [WarpRollKey; 3], interpolation: WarpRollInterpolation },
     TrimmedWarp(TrimmedMotion),
@@ -651,16 +764,20 @@ pub struct PreparedPictureEffect {
     pub reflection_before_motion: [bool; 2],
 }
 
-/// An embedded 2×2×2 cube attached to one plain picture edit.
+/// An embedded cube attached to a qualified picture edit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedSourceLut {
     pub sequence: usize,
     pub event: usize,
     pub filename: String,
-    pub points: [(f64, f64, f64); 8],
+    pub edge: u32,
+    pub points: Arc<[(f64, f64, f64)]>,
 }
 
 impl PreparedSourceLut {
+    pub const FULL_EDGE: u32 = 33;
+    pub const MAX_FULL_GRID_EDITS: usize = 32;
+
     pub fn valid_filename(name: &str) -> bool {
         name.strip_suffix(".cube").is_some_and(|stem| !stem.is_empty())
             && name.len() <= 128
@@ -668,7 +785,9 @@ impl PreparedSourceLut {
     }
 }
 
-pub(super) fn validate_picture_effects(effects: &[PreparedPictureEffect], sequences: &[Sequence]) -> Result<(), ModelError> {
+pub(super) fn validate_picture_effects(
+    effects: &[PreparedPictureEffect], sequences: &[Sequence], speeds: &[PreparedConstantSpeed],
+) -> Result<(), ModelError> {
     let fail = |s: &str| ModelError(s.into());
     if effects.len() > MAX_ITEMS { return Err(fail("prepared picture effect count exceeds limit")); }
     let mut owners = HashSet::new();
@@ -700,6 +819,27 @@ pub(super) fn validate_picture_effects(effects: &[PreparedPictureEffect], sequen
                 && t.crop[0] + t.crop[2] < 1.0 && t.crop[1] + t.crop[3] < 1.0)
                 && event.matte.is_none() && event.color_correction.is_none()
                 && event.speed_ratio.is_none() && event.time_remap.is_none() => {}
+            PictureEffect::UltraKey { rgb: [r, g, b] } if g > r && g > b
+                && sequence.rate == Fraction::new(24_000, 1001)
+                && (sequence.width, sequence.height) == (1920, 1080)
+                && p.reflection_before_motion == [false; 2]
+                && event.transform.as_ref().is_some_and(|t| t.crop == [0.0; 4]
+                    && t.anchor == (0.0, 0.0) && t.rotation == 0.0
+                    && t.scale.0 == t.scale.1 && t.scale.0 > 0.0)
+                && event.matte.is_none() && event.color_correction.is_none()
+                && event.speed_ratio.is_none() && event.time_remap.is_none() => {}
+            PictureEffect::UltraKey { .. } => return Err(fail("Ultra Key needs a green key and one static 1080p23.976 Motion stage")),
+            PictureEffect::VideoToFullRange if sequence.rate == Fraction::new(24, 1)
+                && (sequence.width, sequence.height) == (1920, 1080)
+                && p.reflection_before_motion == [false; 2]
+                && event.transform.is_none() && event.matte.is_none() && event.color_correction.is_none()
+                && event.time_remap.is_none()
+                && (event.speed_ratio.is_none() || speeds.iter().any(|s|
+                    s.sequence == p.sequence && s.event == p.event
+                        && s.ratio.0 > 0 && s.ratio.1 > 0
+                        && event.speed_ratio == Some((s.ratio.1, s.ratio.0)))) => {}
+            PictureEffect::VideoToFullRange =>
+                return Err(fail("range expansion needs one plain 1080p24 picture edit")),
             PictureEffect::WarpRoll { keys, .. } => {
                 let frame = ticks_per_unit(Fraction::new(24, 1));
                 let end = event.source_in.checked_add(event.duration).and_then(|n| n.checked_sub(frame));
@@ -1119,8 +1259,10 @@ impl PreparedProjectInput {
             audio_pans: Vec::new(),
             audio_mixers: BTreeMap::new(),
             track_states: BTreeMap::new(),
+            non_drop_sequences: HashSet::new(),
             picture_effects: Vec::new(),
             source_luts: Vec::new(),
+            extended_sdr_grades: HashSet::new(),
             edit_labels: Vec::new(),
             disabled_edits: Default::default(),
             direct_dnxhr_origins: Default::default(),
@@ -1172,19 +1314,48 @@ impl PreparedProjectInput {
         Ok(model)
     }
     pub fn validate(&self) -> Result<(), ModelError> {
+        self.validate_with_budget(64)
+    }
+
+    /// A linked whole-project input comes from the bounded disk-backed graph
+    /// path and may retain more edits than a standalone prepared document.
+    pub fn validate_whole_project(&self) -> Result<(), ModelError> {
+        self.validate_with_budget(512)
+    }
+
+    fn validate_with_budget(&self, limit_mib: usize) -> Result<(), ModelError> {
+        let limit = limit_mib << 20;
+        if self.non_drop_sequences.iter().any(|&i| self.sequences.get(i)
+            .is_none_or(|s| s.rate != Fraction::new(30_000, 1001)))
+        {
+            return Err(ModelError("29.97 non-drop display has an incompatible sequence".into()));
+        }
         self.png_mattes.validate(self)?;
         let mut lut_owners = HashSet::new();
         let picture_effects: HashSet<_> = self.picture_effects.iter()
             .map(|effect| (effect.sequence, effect.event)).collect();
+        let mut full_grid_edits = 0;
         for lut in &self.source_luts {
             let key = (lut.sequence, lut.event);
+            let full_grid = lut.edge == PreparedSourceLut::FULL_EDGE;
+            full_grid_edits += usize::from(full_grid);
             let valid_edit = self.sequences.get(lut.sequence).is_some_and(|sequence|
                 sequence.rate == Fraction::new(24, 1) && (sequence.width, sequence.height) == (1920, 1080)
                 && sequence.events.get(lut.event).is_some_and(|event|
                     event.video_track == Some(1) && event.transform.is_none() && event.matte.is_none()
-                    && event.color_correction.is_none() && event.speed_ratio.is_none()
+                    && event.color_correction.is_none()
+                    && (if full_grid {
+                        event.speed_ratio == Some((1, 2))
+                            && self.constant_speeds.iter().any(|speed| {
+                                (speed.sequence, speed.event) == key && speed.ratio == (2, 1)
+                            })
+                    } else {
+                        event.speed_ratio.is_none()
+                    })
                     && event.time_remap.is_none()));
             if !valid_edit || !lut_owners.insert(key) || picture_effects.contains(&key)
+                || !(lut.edge == 2 || full_grid) || lut.points.len() != (lut.edge as usize).pow(3)
+                || full_grid_edits > PreparedSourceLut::MAX_FULL_GRID_EDITS
                 || !PreparedSourceLut::valid_filename(&lut.filename)
                 || lut.points.iter().any(|&(r, g, b)| [r, g, b].iter()
                     .any(|v| !(0.0..=1.0).contains(v)))
@@ -1192,17 +1363,31 @@ impl PreparedProjectInput {
                 return Err(ModelError("invalid prepared source LUT or unqualified picture stack".into()));
             }
         }
+        if !self.extended_sdr_grades.is_empty() {
+            let clips: HashMap<_, _> = self.clips.iter().map(|c| (c.id(), c)).collect();
+            for &key @ (sequence, event) in &self.extended_sdr_grades {
+                let valid = self.sequences.get(sequence).is_some_and(|s| {
+                    s.events.get(event).is_some_and(|e| clips.get(e.clip.as_str())
+                        .is_some_and(|c| supported_extended_sdr_edit(s, e, c)))
+                });
+                if self.options.bin_mode != "separate" || !valid
+                    || picture_effects.contains(&key) || lut_owners.contains(&key)
+                {
+                    return Err(ModelError("invalid extended SDR grade or unqualified picture stack".into()));
+                }
+            }
+        }
         if !self.constant_speeds.is_empty() {
-            let clips: HashMap<_, _> = self.clips.iter().filter_map(|c| match c {
-                PreparedClip::Legacy(c) => Some((c.id.as_str(), c)),
-                PreparedClip::Original(_) => None,
-            }).collect();
+            let clips: HashMap<_, _> = self.clips.iter().map(|clip| (clip.id(), clip)).collect();
             validate_constant_speeds(&self.constant_speeds, &self.options, &self.sequences,
-                |id, seq, event, speed| clips.get(id).is_some_and(|clip| speed.raw_trim(seq, event, clip).is_some()))?;
+                |id, seq, event, speed| clips.get(id).is_some_and(|clip| match clip {
+                    PreparedClip::Legacy(c) => speed.raw_trim(seq, event, c).is_some(),
+                    PreparedClip::Original(c) => speed.raw_original_trim(seq, event, c).is_some(),
+                }))?;
         }
         validate_texts(&self.texts, &self.sequences)?;
         validate_video_dissolves(&self.video_dissolves, &self.sequences)?;
-        validate_picture_effects(&self.picture_effects, &self.sequences)?;
+        validate_picture_effects(&self.picture_effects, &self.sequences, &self.constant_speeds)?;
         let fail = |s: &str| ModelError(s.into());
         for (&sequence, states) in &self.track_states {
             let seq = self.sequences.get(sequence).ok_or_else(|| fail("unknown sequence for track state"))?;
@@ -1269,13 +1454,13 @@ impl PreparedProjectInput {
         // Count every retained nested payload without allocating another text/value tree.
         // This conservative bounded representation is separate from peak RSS.
         use std::fmt::Write;
-        struct Counter(usize);
+        struct Counter(usize, usize);
         impl std::fmt::Write for Counter {
             fn write_str(&mut self, s: &str) -> std::fmt::Result {
                 self.0 = self
                     .0
                     .checked_add(s.len())
-                    .filter(|n| *n <= 64 << 20)
+                    .filter(|n| *n <= self.1)
                     .ok_or(std::fmt::Error)?;
                 Ok(())
             }
@@ -1285,9 +1470,10 @@ impl PreparedProjectInput {
                 + self.clips.capacity() * std::mem::size_of::<PreparedClip>()
                 + self.bins.capacity() * std::mem::size_of::<Bin>()
                 + self.sequences.capacity() * std::mem::size_of::<Sequence>(),
+            limit,
         );
         write!(&mut count, "{self:?}")
-            .map_err(|_| fail("prepared input payload exceeds 64 MiB"))?;
+            .map_err(|_| ModelError(format!("prepared input payload exceeds {limit_mib} MiB")))?;
         // Strict old validators validate legacy metadata/options and every legacy clip.
         let legacy: Model = Model {
             project_name: self.project_name.clone(),
@@ -1350,8 +1536,8 @@ impl PreparedProjectInput {
             budget = budget
                 .checked_add(clip_bytes(c))
                 .ok_or_else(|| fail("prepared input size overflow"))?;
-            if budget > 64 << 20 {
-                return Err(fail("prepared input exceeds 64 MiB"));
+            if budget > limit {
+                return Err(ModelError(format!("prepared input exceeds {limit_mib} MiB")));
             }
             match c {
                 PreparedClip::Original(c) => validate_original(c)?,
@@ -1481,12 +1667,14 @@ impl PreparedProjectInput {
                 }
             }
         }
+        let constant_speed_edits: HashSet<_> = self.constant_speeds.iter()
+            .map(|speed| (speed.sequence, speed.event)).collect();
         for (i, s) in self.sequences.iter().enumerate() {
             super::model::validate_sequence(s, &format!("prepared sequences[{i}]"))?;
             let mapped_picture_spans: HashSet<_> = s.events.iter().filter(|e| {
                 e.video_track.is_some() && e.time_remap.is_some()
             }).map(|e| (e.clip.as_str(), e.record_start, e.duration, e.source_in)).collect();
-            for e in &s.events {
+            for (event_index, e) in s.events.iter().enumerate() {
                 let c = clips
                     .get(e.clip.as_str())
                     .ok_or_else(|| fail("prepared event references unknown clip"))?;
@@ -1536,7 +1724,8 @@ impl PreparedProjectInput {
                     return Err(fail("prepared event range/grid mismatch"));
                 }
                 if let PreparedClip::Original(c) = c {
-                    if (e.speed_ratio.is_some() && !is_linked_prores_constant_speed(c, s, e))
+                    let exact_retime = constant_speed_edits.contains(&(i, event_index));
+                    if (e.speed_ratio.is_some() && !exact_retime && !is_linked_prores_constant_speed(c, s, e))
                         || e.time_remap.as_ref().is_some_and(|map| {
                         !is_automatic_adapter_picture(c, s, e, map)
                     }) {
@@ -1571,7 +1760,8 @@ impl PreparedProjectInput {
                         return Err(fail("original mono event requires a declared mono group"));
                     }
                     // Every selected physical stream must cover this range, not just the longest one.
-                    let end = e.source_in as i128 + e.duration as i128;
+                    let span = if exact_retime { e.source_duration.unwrap_or(e.duration) } else { e.duration };
+                    let end = i128::from(e.source_in) + i128::from(span);
                     if e.video_track.is_some() && e.time_remap.is_none()
                         && c.video.as_ref().is_none_or(|v| end > v.duration as i128)
                         || (!e.audio_tracks.is_empty() || !e.stereo.is_empty())
@@ -1650,19 +1840,45 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         c.video.is_some() || c.audio.is_some(),
         "original has no streams",
     )?;
+    if c.separate_mono_streams {
+        require(c.is_same_rate_linked_pcm()
+            && c.audio.as_ref().is_some_and(|a| a.representation == SampleRepresentation::Pcm24)
+            && c.video.as_ref().is_some_and(|v| matches!(v.codec.as_str(), "avc1" | "AVdn"))
+            && c.groups.as_slice() == [vec![1], vec![2]]
+            && c.channels.iter().all(|ch| ch.channel_index == ch.avid_track - 1),
+            "unqualified linked dual-mono stream mapping")?;
+    }
     require(
-        matches!(c.container.as_str(), "mov" | "wav"),
+        matches!(c.container.as_str(), "mov" | "wav" | "mp3" | "jpeg" | "png" | "tiff")
+            || c.container == "mxf" && c.is_same_rate_linked_pcm(),
         "unqualified original container",
     )?;
+    let suffix = std::path::Path::new(&c.path).extension().and_then(|ext|ext.to_str());
     if let Some(v) = &c.video {
-        let qualified_codec = v.codec == "avc1" || (v.codec == "apch"
+        let qualified_codec = v.codec == "avc1" || (v.codec == "hvc1" && is_25_or_2997(v.rate)
+            && (v.width, v.height) == (1920, 1080) && suffix.is_some_and(|s| s.eq_ignore_ascii_case("mp4")))
+            || (v.codec == "apch"
             && std::path::Path::new(&c.path).extension()
                 .and_then(|suffix| suffix.to_str())
                 .is_some_and(|suffix| suffix.eq_ignore_ascii_case("mov"))
-            && (c.audio.is_none() || c.proxy_path.is_some()) && v.width == 1920 && v.height == 1080
-            && (v.rate == Fraction::new(24, 1) || v.rate == Fraction::new(24000, 1001)));
+            && (c.audio.is_none() || c.proxy_path.is_some() || c.is_same_rate_linked_pcm())
+            && v.width == 1920 && v.height == 1080
+            && (v.rate == Fraction::new(24, 1) || v.rate == Fraction::new(24000, 1001) || is_25_or_2997(v.rate)));
+        let raster = (v.width, v.height);
+        let qualified_still = v.codec == c.container && c.audio.is_none()
+            && c.proxy_path.is_none() && v.rate == Fraction::new(24, 1)
+            && suffix.is_some_and(|s| match c.container.as_str() {
+                "jpeg" => raster == (1920, 1080)
+                    && (s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("jpeg")),
+                "png" => matches!(raster, (1920, 1080) | (1536, 1024))
+                    && s.eq_ignore_ascii_case("png"),
+                "tiff" => raster == (1920, 64)
+                    && (s.eq_ignore_ascii_case("tif") || s.eq_ignore_ascii_case("tiff")),
+                _ => false,
+            });
         require(
-            c.container == "mov" && qualified_codec && v.stream_index == 0,
+            v.stream_index == 0 && (c.container == "mov" && qualified_codec
+                || c.container == "mxf" && c.is_same_rate_linked_pcm() || qualified_still),
             "unqualified original picture stream/profile",
         )?;
         super::model::check_dimensions(v.width, v.height, "original video")?;
@@ -1717,8 +1933,14 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         require(
             match (&a.representation, c.container.as_str()) {
                 (SampleRepresentation::Aac, "mov") => a.channels == 2,
-                (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "mov") => c.proxy_path.is_some(),
+                (SampleRepresentation::Mp3, "mp3") => c.video.is_none() && c.proxy_path.is_none()
+                    && matches!(a.sample_rate, 44_100 | 48_000) && suffix.is_some_and(|s| s.eq_ignore_ascii_case("mp3")),
+                (SampleRepresentation::Pcm16, "mov") => c.proxy_path.is_some()
+                    || c.is_uhd_avc_pcm_mp4() || c.is_same_rate_linked_pcm(),
+                (SampleRepresentation::Pcm24, "mov") => c.proxy_path.is_some()
+                    || c.is_wide_avc_pcm24_mov() || c.is_uhd_avc_pcm_mp4() || c.is_same_rate_linked_pcm(),
                 (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "wav") => true,
+                (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "mxf") => c.is_same_rate_linked_pcm(),
                 _ => false,
             },
             "unqualified original sample representation",

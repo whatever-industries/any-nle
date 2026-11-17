@@ -1,6 +1,8 @@
 use super::*;
 use avid_reader::source as av;
+use sha2::{Digest, Sha256};
 mod disabled;
+mod nested_motion;
 
 fn portable_track_name(track: &av::SourceTrackName) -> Option<&str> {
     (!track.ambiguous && !track.name.chars().any(char::is_control))
@@ -56,14 +58,27 @@ fn binding(b: &av::Binding, map: &HashMap<String, String>) -> SourceBinding {
             .or_else(|| missing.then(|| "one or more native endpoints were not portable".into())),
     }
 }
+pub(super) struct Mp3Timing {
+    pub delay_samples: i64,
+    pub sample_rate: i64,
+    pub extent: Rational,
+}
+
 pub(super) struct ItemRoutes {
     pub audio: HashSet<i64>,
+    pub dry_audio: HashSet<i64>,
+    pub linked_audio_render: Option<(MobId, MobId)>,
+    pub subclip_pcm: HashMap<i64, Rational>,
     pub raster: Option<(i64, i64)>,
     pub square_pixels: bool,
+    pub fitted_png: bool,
+    pub strip_tiff: bool,
     pub motion_picture: Option<Rational>,
     pub motion_audio: HashMap<i64, (i64, Rational)>,
-    pub managed_motion_audio: Option<Rational>,
+    pub managed_motion_audio: HashMap<i64, (i64, Rational)>,
+    pub pcm_prefix: Option<av::SourcePcmPrefix>,
     pub same_rate_aac: HashMap<i64, Rational>,
+    pub mp3_timing: HashMap<i64, Mp3Timing>,
     pub timewarp_picture: Option<Rational>,
 }
 
@@ -81,28 +96,48 @@ fn adapter_audio_in_samples(
         + (i128::from(phase) * source % span) * source_unit / span
 }
 
+#[cfg(test)]
+#[test]
+fn managed_audio_adapter_sample_starts_survive_phase_wrap() {
+    let ratio = (1001, 1000);
+    for anchor in [204_i64, 1000, 1001, 1385, 1870, 2002] {
+        let source_frame = anchor * 1000 / 1001;
+        let expected_sample = i128::from(anchor) * 2000;
+        for phase in [anchor, anchor % 1001] {
+            assert_eq!(adapter_audio_in_samples(source_frame, phase, 0, ratio, 2002), expected_sample);
+        }
+    }
+}
+
 fn motion_timing(
     event: &av::SourceEvent, range: &av::QualifiedRange, phase: i64, item: &ItemRoutes,
     covering_picture: bool, p: &mut Placement, budget: &mut Budget,
-) -> Result<(i64, bool), String> {
+) -> Result<(i64, Option<i64>), String> {
     let span_ratio = av::Rate::automatic_adapter_span(range.source_rate, range.record_rate)
         .ok_or("requires a qualified automatic adapter rate pair")?;
     if event.event.combined.is_some()
-        || !event.event.via.is_empty() || event.volume_automation.is_some()
+        || !event.event.via.is_empty()
         || event.picture_extension.is_some() || event.event.picture.is_some()
         || !event.picture_chain.is_empty()
         || event.event.animatte.is_some() || event.event.color.is_some()
     { return Err("requires an unstacked automatic adapter".into()); }
     let source_end = time(range.source_in.checked_add(range.source_length)
         .ok_or("source extent overflow")?, range.source_rate)?;
-    if let Some(extent) = item.managed_motion_audio {
-        if span_ratio != (1000, 1001) || event.event.kind != KIND_SOUND
-            || event.event.master_track != 1 || source_end > extent
+    if let Some(&(bits, extent)) = item.managed_motion_audio.get(&event.event.master_track)
+        .filter(|_| event.event.kind == KIND_SOUND)
+    {
+        let unit = match (bits, span_ratio) {
+            (16, (1000, 1001)) if event.volume_automation.is_none() => 2000,
+            (24, (1001, 1000)) if range.length.checked_add(1) == Some(range.source_length)
+                && !matches!(event.volume_automation, Some(av::VolumeAutomation::Unsupported(_))) => 2002,
+            _ => return Err("requires a qualified managed mono PCM rate pair and Pan Volume envelope".into()),
+        };
+        if source_end > extent
             || event.pan_automation.is_some()
         {
-            return Err("requires a direct 24-to-23.976 mono PCM16 route with a verified source span".into());
+            return Err("requires a managed mono PCM route with verified source coverage and static pan".into());
         }
-        let first = adapter_audio_in_samples(range.source_in, phase, 0, span_ratio, 2000);
+        let first = adapter_audio_in_samples(range.source_in, phase, 0, span_ratio, unit);
         let start = Rational::new(first, 48_000).ok_or("managed audio origin overflow")?;
         if start.is_negative() || start.checked_add(p.duration).is_none_or(|end| end > extent) {
             return Err("managed PCM edit exceeds the verified file sample extent".into());
@@ -111,9 +146,14 @@ fn motion_timing(
         if event.motion_adapter_center_pan {
             p.track_pans = vec![Some(0.0)];
         }
-        return Ok((0, true));
+        return Ok((0, Some(bits)));
     }
-    let picture = item.motion_picture.ok_or("requires qualified linked picture or managed mono PCM16")?;
+    if event.volume_automation.is_some()
+        || (event.event.kind == KIND_SOUND && span_ratio == (1001, 1000) && range.source_length != range.length)
+    {
+        return Err("requires verified managed PCM24 for this source span or volume envelope".into());
+    }
+    let picture = item.motion_picture.ok_or("requires qualified linked picture or a supported managed mono PCM route")?;
     if item.motion_audio.len() != 2 { return Err("requires two proven linked mono lanes".into()); }
     if source_end > picture {
         return Err("saved source interval exceeds linked picture".into());
@@ -129,7 +169,7 @@ fn motion_timing(
             map.push(i64::try_from(f).map_err(|_|"adapter picture position overflow")?);
         }
         p.frame_map = Some(map);
-        return Ok((0, false));
+        return Ok((0, None));
     }
     let (origin, duration) = item.motion_audio.get(&event.event.master_track)
         .copied().ok_or("linked AAC file-track origin unresolved")?;
@@ -146,7 +186,7 @@ fn motion_timing(
     }
     p.source_in = start;
     p.duration = Rational::new(playable, 48_000).ok_or("adapter audio extent overflow")?;
-    Ok((tail as i64, false))
+    Ok((tail as i64, None))
 }
 
 fn apply_saved_timewarp(
@@ -156,6 +196,7 @@ fn apply_saved_timewarp(
     let rate = range.record_rate;
     let profile = match (rate.num, rate.den, range.length, range.source_length) {
         (24, 1, 48, 59) => range.source_in >= 0,
+        (24, 1, 3..=4096, _) if range.length != 48 => range.source_in >= 0,
         (24_000, 1001, 1666, 1666) => range.source_in == 0,
         _ => false,
     };
@@ -195,6 +236,50 @@ fn automatic_adapter_picture_and_sound_use_separate_native_clocks() {
     assert_eq!(start, 100_002);
     assert_eq!(1104 * 2000 - (2_306_304 - start), 1698);
 }
+fn subclip_motion_receipt(motion: &av::SourceSubclipMotion) -> Value {
+    let mut saved = vec![
+        ("effect_id", s(if motion.advanced { "EFF_ADV_MOTION_CTL" } else { "EFF_TIMEWARP.MOTION_CTL" })),
+        ("input_mob", s(motion.input_mob.urn())),
+        ("input_track", Value::Int(motion.input_track)),
+        ("input_start", Value::Int(motion.input_start)),
+        ("input_length", Value::Int(motion.input_length)),
+        ("length", Value::Int(motion.length)),
+        ("span_ratio", Value::Arr(vec![Value::Int(motion.span_ratio.0), Value::Int(motion.span_ratio.1)])),
+        ("speed", Value::Float(motion.speed)),
+        ("speed_key_frame", Value::Arr(vec![Value::Int(motion.speed_key_frame.0), Value::Int(motion.speed_key_frame.1)])),
+        ("position_start", Value::Float(motion.position[0])),
+        ("position_end", Value::Float(motion.position[1])),
+        ("phase_offset", Value::Int(motion.phase_offset)),
+        ("offset_adjust", Value::Float(motion.offset_adjust)),
+        ("render_mode", Value::Int(motion.render_mode)),
+        ("ignore_render_setting", Value::Int(motion.ignore_render_setting)),
+        ("new_source_calculation", Value::Bool(motion.new_source_calculation)),
+        ("graph_mode", motion.graph_mode.map_or(Value::Null, Value::Int)),
+    ];
+    if let Some(samples) = motion.sampled_input_frames {
+        let (num, den) = samples.ratio;
+        let mut cadence = vec![("first", Value::Int(samples.first)), ("last", Value::Int(samples.last))];
+        if den == 1 {
+            cadence.push(("step", Value::Int(num)));
+        } else {
+            cadence.push(("source_frames_per_record_frame", Value::Arr(vec![Value::Int(num), Value::Int(den)])));
+            cadence.push(("start_phase", Value::Arr(vec![Value::Int(samples.phase), Value::Int(den)])));
+        }
+        saved.push(("sampled_input_frames", obj(cadence)));
+    }
+    if let Some(file) = motion.sampled_picture_file {
+        saved.push(("sampled_picture_file", s(file.urn())));
+    }
+    if let Some(master) = &motion.sampled_picture_master {
+        saved.push(("sampled_picture_master", obj(vec![
+            ("mob", s(master.mob.urn())),
+            ("track", Value::Int(master.track)),
+            ("source_in", Value::Int(master.source_in)),
+        ])));
+    }
+    obj(saved)
+}
+
 fn extend_effect_issue<'a>(
     issue: &av::SourceIssue, fields: &mut Vec<(&str, Value)>,
     resolve_item: impl Fn(MobId) -> Option<&'a str>,
@@ -220,6 +305,33 @@ fn extend_effect_issue<'a>(
         match &adapter.picture_file {
             Observed::Known(mob) => facts.push(("picture_file", s(mob.urn()))),
             Observed::Unresolved(reason) => facts.push(("source_match_reason", s(reason))),
+        }
+        if let Some(range) = av::SourceColorRange::from_saved_xml(&adapter.transform) {
+            facts.push(("linear_range", super::color_range_receipt(range)));
+        }
+        if let Some(color) = adapter.wrapper_clip_color {
+            facts.push(("wrapper_clip_color_rgb16", Value::Arr(
+                color.into_iter().map(|value| Value::Int(i64::from(value))).collect(),
+            )));
+        }
+        if let Some((offset, length)) = adapter.managed_picture_span {
+            facts.push(("managed_picture_span", obj(vec![
+                ("offset", Value::Int(offset)),
+                ("length", Value::Int(length)),
+            ])));
+        }
+        if adapter.centered_still_fit {
+            facts.push(("centered_still_fit", Value::Bool(true)));
+        }
+        if let Some(master) = &adapter.subclip_master {
+            facts.push(("subclip_master", obj(vec![
+                ("mob", s(master.mob.urn())),
+                ("track", Value::Int(master.track)),
+                ("source_in", Value::Int(master.source_in)),
+            ])));
+        }
+        if let Some(motion) = &adapter.subclip_motion {
+            facts.push(("subclip_motion", subclip_motion_receipt(motion)));
         }
         fields.push(("color_adapter", obj(facts)));
     }
@@ -261,7 +373,7 @@ fn extend_effect_issue<'a>(
             av::SourcePictureProfile::PlainLayeredSubmaster => "plain_layered_submaster",
         })));
     }
-    if let Some(inputs) = issue.matte_inputs {
+    if let Some(inputs) = issue.matte_inputs.as_deref() {
         let reference = |input: Option<av::MatteInput>| input.map(|input| obj(vec![
             ("mob", s(input.mob.urn())),
             ("track", Value::Int(input.track)),
@@ -318,8 +430,81 @@ fn source_issue_receipt<'a>(
             fields.push(("neutral_picture_file", s(package.umid_hex())));
         }
     }
+    if let av::SourceIssueKind::Timewarp { length } = issue.issue_kind {
+        fields.extend([("timewarp", Value::Bool(true)), ("record_length", Value::Int(length))]);
+    }
+    if let av::SourceIssueKind::UntranslatedEffect { effect, length } = issue.issue_kind {
+        fields.extend([("effect", s(effect)), ("record_length", Value::Int(length))]);
+    }
+    if let Some(controls) = issue.timewarp.as_deref() {
+        fields.push(("timewarp_controls", timewarp_controls(controls)));
+        if let Some(owner) = &controls.resize_render_owner {
+            fields.push(("resize_render_owner", s(owner)));
+        }
+    }
+    if let Some(motion) = issue.nested_picture_motion.as_deref() {
+        fields.push(("nested_picture_motion", subclip_motion_receipt(motion)));
+    }
     extend_effect_issue(issue, &mut fields, resolve_item, color_placement);
     obj(fields)
+}
+
+fn timewarp_controls(controls: &av::SourceTimewarpControls) -> Value {
+    let integer = |v: Option<i64>| v.map_or(Value::Null, Value::Int);
+    let float = |v: Option<f64>| v.map_or(Value::Null, Value::Float);
+    let flag = |v: Option<bool>| v.map_or(Value::Null, Value::Bool);
+    let pair = |(num, den)| Value::Arr(vec![Value::Int(num), Value::Int(den)]);
+    let input = |input: &av::TimewarpInput| obj(vec![
+        ("mob", s(input.mob.urn())),
+        ("track", integer(input.track)),
+        ("start", integer(input.start)),
+        ("length", integer(input.length)),
+        ("rate", input.rate.map(|rate| s(rational(rate))).unwrap_or(Value::Null)),
+    ]);
+    let curves = controls.curves.iter().map(|curve| {
+        let points = match &curve.points {
+            Some(av::SourceTimewarpPoints::HalfFrameSamples { first, values }) => obj(vec![
+                ("first_half_frame", Value::Int(*first)),
+                ("values", Value::Arr(values.iter().copied().map(Value::Float).collect())),
+            ]),
+            Some(av::SourceTimewarpPoints::Keys(keys)) => Value::Arr(keys.iter().map(|key| {
+                obj(vec![
+                    ("time", pair(key.time)),
+                    ("timescale", Value::Int(key.timescale)),
+                    ("value", Value::Float(key.value)),
+                    ("handles", Value::Arr(key.handles.into_iter().map(float).collect())),
+                    ("anchor", float(key.anchor)),
+                    ("flags", integer(key.flags)),
+                ])
+            }).collect()),
+            None => Value::Null,
+        };
+        obj(vec![
+            ("parameter", s(curve.parameter.to_string())),
+            ("enabled", flag(curve.enabled)),
+            ("interpolation", integer(curve.interpolation)),
+            ("extrapolation", integer(curve.extrapolation)),
+            ("fields", integer(curve.fields)),
+            ("point_count", s(curve.point_count)),
+            ("points", points),
+        ])
+    }).collect();
+    obj(vec![
+        ("span_ratio", controls.span_ratio.map(pair).unwrap_or(Value::Null)),
+        ("phase_offset", integer(controls.phase_offset)),
+        ("offset_adjust", float(controls.offset_adjust)),
+        ("render_mode", integer(controls.render_mode)),
+        ("ignore_render_setting", integer(controls.ignore_render_setting)),
+        ("render_mode_name", opt_s(controls.explicit_fluid_motion())),
+        ("graph_mode", integer(controls.graph_mode)),
+        ("input_format", integer(controls.input_format)),
+        ("output_format", integer(controls.output_format)),
+        ("new_source_calculation", flag(controls.new_source_calculation)),
+        ("input", controls.input.as_ref().map(input).unwrap_or(Value::Null)),
+        ("precompute", controls.precompute.as_ref().map(input).unwrap_or(Value::Null)),
+        ("precompute_present", Value::Bool(controls.precompute_present)),
+        ("curves", Value::Arr(curves)),
+    ])
 }
 
 type ColorEventIndex<'a> = HashMap<(i64, i64), (usize, Option<&'a av::SourceEvent>)>;
@@ -354,9 +539,9 @@ fn source_color_events<'a>(
     Ok(events)
 }
 
-fn color_adapter_placement<'a>(
-    issue: &av::SourceIssue, events: &ColorEventIndex<'_>, placements: &'a HashMap<String, String>,
-) -> Option<&'a str> {
+fn color_adapter_event<'a>(
+    issue: &av::SourceIssue, events: &ColorEventIndex<'a>,
+) -> Option<&'a av::SourceEvent> {
     let adapter = issue.color_adapter.as_ref()?;
     let Observed::Known(_) = adapter.picture_file else { return None };
     let Observed::Known(start) = issue.record_start else { return None };
@@ -365,15 +550,116 @@ fn color_adapter_placement<'a>(
     };
     let (1, Some(event)) = events.get(&(issue.track, start))? else { return None };
     let range = event.range.as_ref()?;
+    let (master, master_track, source_in) = if let Some(master) = &adapter.subclip_master {
+        let [subclip, backing] = range.route.as_slice() else { return None };
+        let Observed::Known(backing_in) = backing.source_offset else { return None };
+        if subclip.mob != adapter.master || subclip.track != adapter.master_track
+            || subclip.source_offset != Observed::Known(adapter.source_in)
+            || subclip.length != Observed::Known(length)
+            || subclip.rate != Some(range.source_rate) || backing.rate != subclip.rate
+            || backing.mob != master.mob || backing.track != master.track
+            || backing_in.checked_add(adapter.source_in) != Some(master.source_in)
+        {
+            return None;
+        }
+        (master.mob, master.track, master.source_in)
+    } else {
+        (adapter.master, adapter.master_track, adapter.source_in)
+    };
     if !event.owner.strip_prefix(&issue.owner).is_some_and(|tail| tail.starts_with("/component/"))
-        || event.event.master != adapter.master || event.event.master_track != adapter.master_track
-        || range.source_in != adapter.source_in || range.length != length || range.source_length != length
+        || event.event.master != master || event.event.master_track != master_track
+        || range.source_in != source_in || range.length != length || range.source_length != length
         || Some(range.record_rate) != issue.record_rate || range.source_rate != range.record_rate
         || event.event.speed.is_some() || event.motion_adapter_phase.is_some() || event.saved_timewarp.is_some()
     {
         return None;
     }
-    placements.get(&event.id).map(String::as_str)
+    Some(event)
+}
+
+fn append_media_gap(
+    source: &av::SourceSequence,
+    sequence: &mut SourceSequence,
+    event: &av::SourceEvent,
+    master: &av::SourceMaster,
+    reason: &str,
+    unresolved: &mut Vec<Value>,
+    out: &mut ReadResult,
+    budget: &mut Budget,
+) -> Result<Option<(StreamKind, i64)>, String> {
+    let native = &event.event;
+    let lane = if native.kind == KIND_PICTURE { "V" } else { "A" };
+    let description = format!("{:?} · {lane}{} · {:?} · {}",
+        source.info.name, native.track, master.master.name, event.id);
+    let range = event.range.as_ref();
+    let facts = range.map(|r| obj(vec![
+        ("record_start", Value::Int(r.record_start)),
+        ("record_length", Value::Int(r.length)),
+        ("record_rate", s(rational(r.record_rate))),
+        ("source_in", Value::Int(r.source_in)),
+        ("source_length", Value::Int(r.source_length)),
+        ("source_rate", s(rational(r.source_rate))),
+        ("route", routes(&r.route)),
+    ])).unwrap_or(Value::Null);
+    budget.charge(event.id.len() + event.owner.len() + master.id.len() + reason.len() + 512)?;
+    unresolved.push(obj(vec![
+        ("occurrence", s(&event.id)), ("owner", s(&event.owner)),
+        ("omitted_master", s(&master.id)), ("master_track", Value::Int(native.master_track)),
+        ("track_kind", Value::Int(native.kind)), ("track", Value::Int(native.track)),
+        ("saved_range", facts), ("reason", s(reason)),
+    ]));
+    let Some((kind, range, end)) = kind(native.kind).zip(range)
+        .and_then(|(kind, r)| r.record_start.checked_add(r.length).map(|end| (kind, r, end)))
+        .filter(|(_, r, end)| native.track > 0 && native.combined.is_none()
+            && r.record_start >= 0 && r.length > 0 && *end <= source.info.length
+            && Some(r.record_rate) == source.rate)
+    else {
+        loss(out, budget, &sequence.id, UNQUALIFIED_ROUTE_TIMING,
+            format!("{description}: media gap requires one verified record span and lane. {reason}"))?;
+        return Ok(None);
+    };
+    let start = time(range.record_start, range.record_rate)?;
+    let duration = time(range.length, range.record_rate)?;
+    let end_time = time(end, range.record_rate)?;
+    let other_edit = source.events.iter().any(|other| {
+        other.id != event.id && other.event.kind == native.kind && other.event.track == native.track
+            && other.range.as_ref().is_none_or(|r| r.record_rate != range.record_rate
+                || r.record_start.checked_add(r.length).is_none_or(|last| r.record_start < end && last > range.record_start))
+    });
+    let overlaps_transition = source.transitions.iter().any(|t| {
+        if t.kind != native.kind || t.track != native.track { return false; }
+        match (&t.position, &t.length) {
+            (Observed::Known(at), Observed::Known(len)) if t.rate == Some(range.record_rate) =>
+                at.checked_add(*len).is_none_or(|last| *at < end && last > range.record_start),
+            _ => true,
+        }
+    });
+    let overlaps_placement = sequence.placements.iter().chain(&sequence.disabled_placements).any(|p| {
+        let same_lane = match kind {
+            StreamKind::Video => p.video_track == Some(native.track),
+            StreamKind::Audio => p.audio_tracks.contains(&native.track)
+                || p.grouped_audio.iter().any(|group| group.track == native.track),
+        };
+        same_lane && p.record_start < end_time
+            && p.record_start.checked_add(p.duration).is_none_or(|last| last > start)
+    });
+    if other_edit || overlaps_transition || overlaps_placement {
+        loss(out, budget, &sequence.id, UNQUALIFIED_ROUTE_TIMING,
+            format!("{description}: media gap overlaps an edit or transition. {reason}"))?;
+        return Ok(None);
+    }
+    let name = format!("Media omitted · {lane}{}", native.track);
+    let comment = format!("{description} at record frame {} for {} frames. {reason} This span is a gap.",
+        range.record_start, range.length);
+    budget.charge(size_of::<SourceMarker>() + name.len() + comment.len() + event.id.len() + 64)?;
+    sequence.markers.push(SourceMarker {
+        name, comment: comment.clone(), user: String::new(), color: None, start: Some(start), duration,
+        track: None, owner: MarkerOwner::Sequence, owner_occurrence: event.id.clone(),
+        owner_local: Some(start), owner_rate: Some(sequence.rate),
+        binding: SourceBinding { placements: vec![], reason: None }, source: None, inherited: false,
+    });
+    loss(out, budget, &sequence.id, "media_gap", comment)?;
+    Ok(Some((kind, native.track)))
 }
 
 pub(super) fn append(
@@ -381,6 +667,9 @@ pub(super) fn append(
     copies: &HashMap<avid_reader::io::MobId, Vec<(usize, usize)>>,
     item_routes: &[ItemRoutes],
     multicams: &super::multicam::Index<'_>,
+    fallbacks: &effect_fallback::Verified,
+    missing_pcm_prefix: &HashSet<avid_reader::io::MobId>,
+    omitted_media: &MediaOmissions<'_>,
     out: &mut ReadResult,
     budget: &mut Budget,
 ) -> Result<(), String> {
@@ -435,6 +724,9 @@ pub(super) fn append(
             if let Observed::Unresolved(reason) = &adapter.picture_file {
                 budget.charge(reason.len())?;
             }
+        }
+        if issue.nested_picture_motion.is_some() {
+            budget.charge(2048)?;
         }
     }
     for text in &source.info.problems {
@@ -535,7 +827,7 @@ pub(super) fn append(
             || !t.native_properties.is_empty()
             || t.native_properties_reason.is_some()
         {
-            let mut reservation = Budget { used: budget.used };
+            let mut reservation = *budget;
             reservation.charge(2048 + t.native_properties_reason.as_ref().map_or(0, String::len))?;
             for p in &t.native_properties { reservation.charge(1024 + p.scope.len() + p.name.len() + p.value.len())?; }
             sidecar(out, budget, "avid.text", &t.id, text_properties(t))?;
@@ -543,15 +835,28 @@ pub(super) fn append(
         seq.texts.push(text);
     }
     let mut map = HashMap::new();
+    let mut shifted_mp3_edits = HashSet::new();
     let mut groups: HashMap<usize, Vec<(usize, &av::SourceEvent)>> = HashMap::new();
     let mut original: HashMap<usize, HashSet<usize>> = HashMap::new();
     let mut unresolved = vec![];
+    let mut media_gaps = Vec::new();
     for event in &source.events {
         if let Some((g, ch)) = event.event.combined {
             original.entry(g).or_default().insert(ch);
         }
     }
     let mut derived_raster: Option<(i64, i64, i64, i64)> = None;
+    let color_events = source_color_events(source, budget)?;
+    let mut centered_stills = HashSet::new();
+    for issue in &source.unresolved {
+        if issue.color_adapter.as_ref().is_some_and(|a| a.centered_still_fit) {
+            if let Some(event) = color_adapter_event(issue, &color_events) {
+                budget.charge(64)?;
+                centered_stills.insert(event.id.as_str());
+            }
+        }
+    }
+    let mut uses_centered_still = false;
     let mut adapter_picture_spans = HashSet::new();
     for event in &source.events {
         if event.event.kind == KIND_PICTURE {
@@ -563,6 +868,15 @@ pub(super) fn append(
     }
     for event in &source.events {
         let e = &event.event;
+        if !copies.contains_key(&e.master) {
+            if let Some(omitted) = omitted_media.get(&e.master) {
+                let (master, reason) = omitted.iter()
+                    .find(|(m, _)| m.master.bin == source.info.bin).unwrap_or(&omitted[0]);
+                budget.charge(48)?;
+                media_gaps.push((event, *master, reason.as_ref()));
+                continue;
+            }
+        }
         let Some(range) = &event.range else {
             unresolved.push(obj(vec![
                 ("owner", s(&event.owner)),
@@ -573,17 +887,60 @@ pub(super) fn append(
             ]));
             continue;
         };
-        let timing_aspect = if event.motion_adapter_phase.is_some() || event.saved_timewarp.is_some() {
+        if event.subclip_center_pan_count > 0 {
+            let controls = match event.subclip_center_pan_count {
+                1 => "saved subclip pan needs".into(),
+                count => format!("{count} saved subclip pan controls need"),
+            };
+            loss(out, budget, id, "subclip_audio_mix",
+                format!("A{} at record frame {}, source A{}: {controls} separate mix validation. The timeline-level controls are preserved.",
+                    e.track, range.record_start, e.master_track))?;
+        }
+        let dry_alternative = fallbacks.alternative_gain_input(event);
+        let dry_equalizer = fallbacks.alternative_equalizer_input(event);
+        let (master, master_track, source_in) = dry_equalizer
+            .or_else(|| dry_alternative.map(|(mob, start)| (mob, 1, start)))
+            .unwrap_or((e.master, e.master_track, range.source_in));
+        let dry_gain_bypass = event.dry_gain_bypass || dry_alternative.is_some();
+        let equalizer = event.equalizer.as_deref();
+        let audiosuite = event.audiosuite.as_deref();
+        let eq_with_pitch = equalizer.is_some_and(|eq| eq.pitch.is_some());
+        let eq_label = if eq_with_pitch { "Avid Pitch II and legacy EQ" } else { "Avid legacy EQ" };
+        let rendered_equalizer = equalizer.and_then(|eq| eq.render).filter(|_| dry_equalizer.is_none());
+        let dry_audio = if dry_gain_bypass {
+            Some(("AudioSuite Gain", "gain_bypass", true))
+        } else {
+            equalizer.filter(|_| rendered_equalizer.is_none())
+                .map(|eq| ("Avid legacy EQ", "equalizer_bypass", eq.enabled))
+        };
+        let timing_aspect = if audiosuite.is_some() {
+            "audiosuite_unavailable"
+        } else if event.motion_adapter_phase.is_some() || event.saved_timewarp.is_some()
+            || dry_gain_bypass || event.gain_dry_input.is_some() {
             crate::UNQUALIFIED_ROUTE_TIMING
+        } else if equalizer.is_some() {
+            "equalizer_unavailable"
         } else { "source_route" };
-        let Some(candidates) = copies.get(&e.master) else {
-            loss(
-                out,
-                budget,
-                id,
-                timing_aspect,
-                format!("{}: master clip was not converted", event.id),
-            )?;
+        let Some(candidates) = copies.get(&master) else {
+            if e.kind == KIND_SOUND && missing_pcm_prefix.contains(&master) {
+                loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING, format!(
+                    "A{} at record frame {} for {} frames: the PCM section needs both verified mono MXF siblings",
+                    e.track, range.record_start, range.length
+                ))?;
+                continue;
+            }
+            let reason = if let Some(render) = audiosuite {
+                unavailable_audiosuite(render, e.track, range.record_start, range.length)
+            } else if rendered_equalizer.is_some() {
+                format!("{}: {eq_label} on A{} at record frame {} for {} frames needs its verified linked PCM24 cache. The audio edit is omitted.",
+                    event.id, e.track, range.record_start, range.length)
+            } else if equalizer.is_some() {
+                format!("{}: Avid legacy EQ on A{} at record frame {} for {} frames has no linked dry master. The audio edit is omitted.",
+                    event.id, e.track, range.record_start, range.length)
+            } else {
+                format!("{}: master clip was not converted", event.id)
+            };
+            loss(out, budget, id, timing_aspect, reason)?;
             continue;
         };
         let index = candidates
@@ -591,9 +948,52 @@ pub(super) fn append(
             .find(|(bin, _)| *bin == source.info.bin)
             .unwrap_or(&candidates[0])
             .1;
-        let item = &out.graph.items[index];
-        let stream = (e.kind == KIND_SOUND && item_routes[index].audio.contains(&e.master_track))
-            .then_some(e.master_track);
+        if let Some(render) = audiosuite {
+            if item_routes[index].linked_audio_render != Some((render.file, render.origin))
+                || !crate::effect_fallback::audio_render_matches(event, render.start, render.frames)
+            {
+                loss(out, budget, id, timing_aspect,
+                    unavailable_audiosuite(render, e.track, range.record_start, range.length))?;
+                continue;
+            }
+            loss(out, budget, &event.id, "audiosuite_render", format!(
+                "{} · A{} at record frame {} for {} frames: linked the verified Avid AudioSuite {} render. The plug-in controls are baked into the audio.",
+                source.info.name, e.track, range.record_start, range.length, render.name
+            ))?;
+        }
+        if let Some(render) = rendered_equalizer {
+            if item_routes[index].linked_audio_render != Some((render.file, render.origin))
+                || !crate::effect_fallback::equalizer_render_matches(event, render)
+            {
+                loss(out, budget, id, "equalizer_unavailable", format!(
+                    "{}: {eq_label} on A{} at record frame {} for {} frames needs its verified linked PCM24 cache. The audio edit is omitted.",
+                    event.id, e.track, range.record_start, range.length
+                ))?;
+                continue;
+            }
+            let render_label = if eq_with_pitch { "Avid Pitch II and EQ" } else { "Avid EQ" };
+            let controls = if eq_with_pitch { "Pitch II and EQ" } else { "EQ" };
+            loss(out, budget, &event.id, "equalizer_render", format!(
+                "{} · A{} at record frame {} for {} frames: linked the verified {render_label} render. The {controls} controls are unavailable for editing.",
+                source.info.name, e.track, range.record_start, range.length
+            ))?;
+        }
+        if let Some(prefix) = item_routes[index].pcm_prefix.filter(|_| e.kind == KIND_SOUND) {
+            let rate = av::Rate::new(24, 1).unwrap();
+            if range.source_rate != rate || range.record_rate != rate
+                || source_in < 0 || range.source_length != range.length
+                || source_in.checked_add(range.source_length).is_none_or(|end| end > prefix.frames)
+                || e.speed.is_some() || event.motion_adapter_phase.is_some()
+            {
+                loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING, format!(
+                    "A{} at record frame {} for {} frames: edit exceeds the verified PCM section or uses unsupported timing across the MPEG audio tail",
+                    e.track, range.record_start, range.length
+                ))?;
+                continue;
+            }
+        }
+        let stream = (e.kind == KIND_SOUND && item_routes[index].audio.contains(&master_track))
+            .then_some(master_track);
         if e.kind == KIND_SOUND && stream.is_none() {
             loss(
                 out,
@@ -607,6 +1007,28 @@ pub(super) fn append(
             )?;
             continue;
         }
+        if event.subclip_gain.is_some() {
+            let exact_rate = av::Rate::new(24, 1).unwrap();
+            let source_end = source_in.checked_add(range.source_length)
+                .and_then(|end| time(end, range.source_rate).ok());
+            let extent = item_routes[index].subclip_pcm.get(&master_track).copied();
+            let verified = e.kind == KIND_SOUND && e.combined.is_none() && e.speed.is_none()
+                && event.motion_adapter_phase.is_none() && source_in >= 0
+                && range.record_rate == exact_rate && range.source_rate == exact_rate
+                && range.source_length == range.length
+                && source_end.zip(extent).is_some_and(|(end, extent)| end <= extent);
+            if !verified {
+                loss(out, budget, id, "subclip_audio_mix", format!(
+                    "A{} at record frame {} for {} frames: the saved subclip gain needs a verified same-rate mono PCM24 source. The audio edit is omitted. Source occurrence {}.",
+                    e.track, range.record_start, range.length, event.id
+                ))?;
+                continue;
+            }
+            loss(out, budget, &event.id, "subclip_audio_mix", format!(
+                "A{} at record frame {} for {} frames: used the original PCM with the independent timeline gain and pan. Avid playback bypassed the subclip gain in the tested profile.",
+                e.track, range.record_start, range.length
+            ))?;
+        }
         if e.kind != KIND_SOUND && e.kind != KIND_PICTURE {
             loss(
                 out,
@@ -618,6 +1040,30 @@ pub(super) fn append(
             continue;
         }
         let raster = item_routes[index].raster;
+        if let Some((effect, aspect, enabled)) = dry_audio {
+            let source_end = source_in.checked_add(range.source_length)
+                .and_then(|n| time(n, range.source_rate).ok());
+            let extent = fallbacks.dry_audio.get(&(master, master_track)).map(|(extent, _)| extent);
+            if e.combined.is_some() || source_in < 0 || !item_routes[index].dry_audio.contains(&master_track)
+                || range.source_rate != range.record_rate || range.length != range.source_length
+                || source_end.zip(extent).is_none_or(|(end, extent)| end > *extent)
+            {
+                loss(out, budget, id, timing_aspect,
+                    format!("{}: {effect} dry input on A{} at record frame {} lacks verified sample coverage",
+                        event.id, e.track, range.record_start))?;
+                continue;
+            }
+            if enabled {
+                let reason = if dry_equalizer.is_some() {
+                    "the saved PCM24 cache is missing. Used the verified dry input."
+                } else {
+                    "used the verified dry input."
+                };
+                loss(out, budget, &event.id, aspect, format!(
+                    "{} · A{} at record frame {} for {} frames: {reason} {effect} processing is omitted.",
+                    source.info.name, e.track, range.record_start, range.length))?;
+            }
+        }
         if e.kind == KIND_PICTURE {
             let Some((w, h)) = raster else {
                 loss(
@@ -633,15 +1079,16 @@ pub(super) fn append(
                 continue;
             };
             let choice = (range.record_start, e.track, w, h);
-            if derived_raster.is_none_or(|old| choice < old) {
+            // The saved 64-row test pattern is a picture element on the canvas.
+            if !item_routes[index].strip_tiff && derived_raster.is_none_or(|old| choice < old) {
                 derived_raster = Some(choice);
             }
         }
         let mut p = Placement {
             id: event.id.clone(),
-            item: item.id.clone(),
+            item: out.graph.items[index].id.clone(),
             record_start: time(range.record_start, range.record_rate)?,
-            source_in: time(range.source_in, range.source_rate)?,
+            source_in: time(source_in, range.source_rate)?,
             duration: time(range.length, range.record_rate)?,
             video_track: (e.kind == KIND_PICTURE).then_some(e.track),
             audio_tracks: if e.kind == KIND_SOUND {
@@ -711,8 +1158,10 @@ pub(super) fn append(
                 ("native_record_frames", Value::Int(range.length)),
                 ("silent_audio_tail_samples", Value::Int(tail)),
             ];
-            if managed {
-                timing.push(("managed_pcm16", Value::Bool(true)));
+            match managed {
+                Some(16) => timing.push(("managed_pcm16", Value::Bool(true))),
+                Some(24) => timing.push(("managed_pcm24", Value::Bool(true))),
+                _ => {}
             }
             sidecar(out, budget, "avid.motion_adapter", &p.id, obj(timing))?;
         } else if e.kind == KIND_SOUND && item_routes[index].motion_audio.contains_key(&e.master_track) {
@@ -721,18 +1170,60 @@ pub(super) fn append(
             continue;
         }
         if e.kind == KIND_SOUND {
-            if let Some(&extent) = item_routes[index].same_rate_aac.get(&e.master_track) {
-                let rate = av::Rate::new(24, 1).unwrap();
+            if let Some(&Mp3Timing { delay_samples, sample_rate, extent }) =
+                item_routes[index].mp3_timing.get(&e.master_track)
+            {
+                let rate = av::Rate::new(25, 1).unwrap();
                 if range.source_rate != rate || range.record_rate != rate
+                    || range.source_length != range.length
+                    || e.speed.is_some() || !e.via.is_empty() || e.combined.is_some()
+                    || event.motion_adapter_phase.is_some()
+                {
+                    return Err(format!("{}: linked MP3 with encoder delay requires a straight 25 fps mono edit", p.id));
+                }
+                let saved_in = p.source_in;
+                let delay_time = Rational::new(-i128::from(delay_samples), sample_rate.into())
+                    .ok_or("MP3 sample clock is invalid")?;
+                p.source_in = saved_in.checked_add(delay_time).ok_or("MP3 source trim overflow")?;
+                if p.source_in.is_negative() || p.source_in.checked_add(p.duration).is_none_or(|end| end > extent) {
+                    return Err(format!(
+                        "{}: linked MP3 edit includes samples outside its gapless playable range after the {}-sample shift",
+                        p.id, delay_samples
+                    ));
+                }
+                sidecar(out, budget, "avid.mp3_presentation", &p.id, obj(vec![
+                    ("saved_source_in", s(saved_in)),
+                    ("delay_samples", Value::Int(delay_samples)),
+                    ("sample_rate", Value::Int(sample_rate)),
+                ]))?;
+                budget.charge(64)?;
+                shifted_mp3_edits.insert(event.id.as_str());
+            }
+            if let Some(&extent) = item_routes[index].same_rate_aac.get(&e.master_track) {
+                let rate = range.source_rate;
+                if !matches!((rate.num, rate.den), (24, 1) | (24_000, 1001) | (25, 1) | (30_000, 1001))
+                    || range.record_rate != rate
                     || e.speed.is_some() || !e.via.is_empty() || e.combined.is_some()
                     || event.motion_adapter_phase.is_some() || event.volume_automation.is_some()
                 {
-                    return Err(format!("{}: linked AAC origin requires a straight 24 fps mono edit", p.id));
+                    return Err(format!("{}: linked AAC origin requires a qualified straight same-rate mono edit", p.id));
                 }
                 let unshifted = p.source_in;
-                p.source_in = unshifted.checked_add(time(1, rate)?).ok_or("AAC source trim overflow")?;
-                if unshifted.is_negative() || p.source_in.checked_add(p.duration).is_none_or(|end| end > extent) {
+                let frame = time(1, rate)?;
+                p.source_in = unshifted.checked_add(frame).ok_or("AAC source trim overflow")?;
+                let end = p.source_in.checked_add(p.duration).ok_or("AAC source end overflows")?;
+                if unshifted.is_negative() || p.source_in >= extent {
                     return Err(format!("{}: linked AAC edit exceeds the playable audio after its one-frame source offset", p.id));
+                }
+                if end > extent {
+                    if !matches!((rate.num, rate.den), (24_000, 1001) | (25, 1))
+                        || end.checked_sub(frame) != Some(extent)
+                    {
+                        return Err(format!("{}: linked AAC edit exceeds the playable audio after its one-frame source offset", p.id));
+                    }
+                    p.duration = p.duration.checked_sub(frame).ok_or("AAC playable duration overflows")?;
+                    loss(out, budget, &p.id, "original_aac_tail",
+                        format!("A{}: the last record frame exceeds the linked file's playable audio after the saved one-frame offset. Premiere leaves this span silent. Avid can play part of the final AAC packet here.", e.track))?;
                 }
                 sidecar(out, budget, "avid.same_rate_aac", &p.id, obj(vec![
                     ("saved_source_in", s(unshifted)),
@@ -802,9 +1293,9 @@ pub(super) fn append(
             }
         } else if event.picture_chain.is_empty() {
             // Active curves in the qualified transforms supersede stale inline scalars.
-            let replace_static = event.picture_extension.is_some_and(av::PictureExtension::replaces_static_transform);
+            let replace_static = event.picture_extension.as_deref().is_some_and(av::PictureExtension::replaces_static_transform);
             effects::apply(e, !replace_static, raster, &mut p, out, budget)?;
-            if let Some(mut effect) = event.picture_extension {
+            if let Some(mut effect) = event.picture_extension.as_deref().copied() {
                 if effect.requires_square_pixels() && !item_routes[index].square_pixels {
                     effect = av::PictureExtension::Unsupported("Animated crop, Warp, or trimmed Resize requires verified square-pixel progressive geometry");
                 }
@@ -816,6 +1307,22 @@ pub(super) fn append(
         } else {
             effects::apply_picture_chain(&event.picture_chain, raster,
                 item_routes[index].square_pixels, &mut p, out, budget)?;
+        }
+        if e.kind == KIND_PICTURE && item_routes[index].fitted_png {
+            if e.track != 1 || !centered_stills.contains(event.id.as_str()) || !item_routes[index].square_pixels
+                || p.transform.is_some() || !p.effects.is_empty() || p.speed.is_some() || p.frame_map.is_some()
+            {
+                return Err(format!(
+                    "{} · V{} at record frame {}: linked 1536×1024 PNG needs a verified centered Avid still fit on V1",
+                    source.info.name, e.track, range.record_start,
+                ));
+            }
+            let scale = 100.0 * 1080.0 / 1024.0;
+            p.transform = Some(graph::Transform {
+                position: (0.0, 0.0), scale: (scale, scale), rotation: 0.0,
+                anchor: (0.0, 0.0), crop: [0.0; 4],
+            });
+            uses_centered_still = true;
         }
         let mut receipt = vec![
             ("owner", s(&event.owner)),
@@ -847,7 +1354,7 @@ pub(super) fn append(
             obj(vec![("stage", Value::Int(stage as i64)), ("effect_id", s(native_id))])
         };
         let reflections: Vec<_> = if event.picture_chain.is_empty() {
-            match event.picture_extension {
+            match event.picture_extension.as_deref().copied() {
                 Some(av::PictureExtension::Flip { native_id, .. }) => vec![reflection(0, native_id)],
                 _ => vec![],
             }
@@ -999,6 +1506,11 @@ pub(super) fn append(
         }
     }
     for t in &source.transitions {
+        if t.outgoing.placements.iter().chain(&t.incoming.placements)
+            .any(|p| shifted_mp3_edits.contains(p.as_str()))
+        {
+            return Err(format!("{}: transition on MP3 with encoder delay requires separate handle verification", t.id));
+        }
         let (
             Some(k),
             Some(r),
@@ -1110,9 +1622,30 @@ pub(super) fn append(
         )?;
         seq.markers.push(m);
     }
-    let compatibility_frame_size = derived_raster
-        .map(|(_, _, w, h)| (w, h))
-        .unwrap_or((1920, 1080));
+    for issue in &source.unresolved {
+        if let av::SourceIssueKind::Timewarp { length } = issue.issue_kind {
+            effect_fallback::prepare_timewarp(
+                issue, length, rate, source.info.bin, copies, fallbacks, &mut seq, out, budget,
+            )?;
+        }
+    }
+    let mut nested_motion_placements = HashMap::new();
+    for issue in &source.unresolved {
+        if let Some(placement) = nested_motion::prepare(issue, source, copies, &seq, out) {
+            budget.charge(size_of::<Placement>() + placement.id.len() + placement.item.len())?;
+            sidecar(out, budget, "avid.nested_motion", &placement.id, obj(vec![
+                ("owner", s(&issue.owner)),
+            ]))?;
+            nested_motion_placements.insert(issue.owner.as_str(), (issue, placement.id.clone()));
+            seq.placements.push(placement);
+        }
+    }
+    let compatibility_frame_size = if uses_centered_still {
+        seq.frame_size = Some((1920, 1080));
+        (1920, 1080)
+    } else {
+        derived_raster.map(|(_, _, w, h)| (w, h)).unwrap_or((1920, 1080))
+    };
     let mut tracks = HashSet::new();
     for p in &seq.placements {
         if let Some(v) = p.video_track {
@@ -1123,6 +1656,13 @@ pub(super) fn append(
         }
         for a in &p.grouped_audio {
             tracks.insert((StreamKind::Audio, a.track));
+        }
+    }
+    for (event, master, reason) in media_gaps {
+        if let Some(lane) = append_media_gap(source, &mut seq, event, master, reason,
+            &mut unresolved, out, budget)?
+        {
+            tracks.insert(lane);
         }
     }
     for t in &seq.transitions {
@@ -1152,9 +1692,12 @@ pub(super) fn append(
     }).collect::<Result<_, String>>()?;
     seq.tracks
         .sort_by_key(|t| (if t.kind == StreamKind::Video { 0 } else { 1 }, t.index));
-    let color_events = source_color_events(source, budget)?;
+    let mut cut_fallbacks = HashSet::new();
     for issue in &source.unresolved {
-        let color_placement = color_adapter_placement(issue, &color_events, &map);
+        let color_placement = color_adapter_event(issue, &color_events)
+            .and_then(|event| map.get(&event.id))
+            .or_else(|| nested_motion_placements.get(issue.owner.as_str()).map(|(_, id)| id))
+            .map(String::as_str);
         unresolved.push(source_issue_receipt(
             issue,
             |mob| source_master_copy(mob, source.info.bin, copies, &out.graph.items)
@@ -1162,6 +1705,11 @@ pub(super) fn append(
             color_placement,
         ));
         match issue.issue_kind {
+            av::SourceIssueKind::Timewarp { .. } => {}
+            av::SourceIssueKind::UntranslatedEffect { effect, length } => {
+                effect_fallback::prepare_effect_gap(issue, effect, length, rate,
+                    &source.transitions, &mut cut_fallbacks, &mut seq, out, budget)?;
+            }
             av::SourceIssueKind::RouteTiming => {
                 let lane = if issue.kind == KIND_PICTURE { "V" } else { "A" };
                 loss(out, budget, id, crate::UNQUALIFIED_ROUTE_TIMING,
@@ -1187,8 +1735,29 @@ pub(super) fn append(
                 } else {
                     "picture_effect"
                 };
+                let range = color_placement.and_then(|_| {
+                    let adapter = issue.color_adapter.as_ref()?;
+                    if adapter.centered_still_fit || adapter.subclip_motion.is_some() {
+                        return None;
+                    }
+                    av::SourceColorRange::from_saved_xml(&adapter.transform)
+                });
+                let reason = match range {
+                    Some(av::SourceColorRange::VideoToFull) =>
+                        "The Avid 10-bit video-to-full-range adjustment (64–940) is unapplied. The edit uses its linked picture at the destination's default levels.",
+                    Some(av::SourceColorRange::FullToVideo) =>
+                        "The Avid 10-bit full-to-video-range adjustment (64–940) is unapplied. The edit uses its linked picture at the destination's default levels.",
+                    None => &issue.reason,
+                };
+                let reason = match nested_motion_placements.get(issue.owner.as_str()) {
+                    Some((effect, _)) if effect.color_adapter.as_ref().and_then(|a| a.subclip_motion.as_ref())
+                        .is_some_and(|motion| motion.speed == 2.0) =>
+                        "Graph/2 retains the 200% picture timing. The Avid Color Adapter is unapplied.",
+                    Some(_) => "Graph/2 retains the constant-speed picture timing. The Avid Color Adapter is unapplied.",
+                    None => reason,
+                };
                 loss(out, budget, color_placement.unwrap_or(id), aspect,
-                    format!("V{} {position}: {}", issue.track, issue.reason))?;
+                    format!("V{} {position}: {reason}", issue.track))?;
             }
             av::SourceIssueKind::DisabledClip { length, .. } => {
                 let lane = if issue.kind == KIND_PICTURE { "V" } else { "A" };
@@ -1202,7 +1771,13 @@ pub(super) fn append(
                 ))?;
             }
             av::SourceIssueKind::Route => {
-                loss(out, budget, id, "source_route", issue.reason.clone())?;
+                let recovered = issue.nested_picture_motion.is_some()
+                    && nested_motion_placements.contains_key(issue.owner.as_str());
+                if !recovered && !nested_motion_placements.values().any(|(adapter, _)|
+                    nested_motion::replaces_route(issue, adapter))
+                {
+                    loss(out, budget, id, "source_route", issue.reason.clone())?;
+                }
             }
         }
     }
@@ -1306,6 +1881,13 @@ pub(super) fn append(
             if let Some(frames) = t.incoming_filler {
                 fields.push(("incoming_filler_frames", Value::Int(frames)));
             }
+            if cut_fallbacks.contains(&t.id) {
+                fields.push(("gain_gap_edges", Value::Arr(t.gain_gap_edges.iter().map(|edge| match edge {
+                    Some(av::GainGapEdge::Gain(owner)) => s(owner),
+                    Some(av::GainGapEdge::Filler) => Value::Bool(true),
+                    None => Value::Null,
+                }).collect())));
+            }
             obj(fields)
         })
         .collect();
@@ -1374,6 +1956,15 @@ pub(super) fn append(
     if !unresolved_names.is_empty() {
         sidecar(out, budget, "avid.track_names", id, Value::Arr(unresolved_names))?;
     }
+    let plain_layouts: Vec<_> = source.track_names.iter()
+        .filter(|track| track.plain_layout && !track.plain_empty && portable_track_name(track).is_some())
+        .map(|track| obj(vec![
+            ("kind", Value::Int(track.kind)),
+            ("track", Value::Int(track.label)),
+        ])).collect();
+    if !plain_layouts.is_empty() {
+        sidecar(out, budget, "avid.plain_track_layouts", id, Value::Arr(plain_layouts))?;
+    }
     for issue in &source.info.problems {
         out.diagnostics
             .push(format!("{:?}: {issue}", source.info.name));
@@ -1414,7 +2005,7 @@ fn sequence_marker_native(m: &av::SourceMarker) -> Value {
 fn reserve_controls(source: &av::SourceSequence, budget: &Budget) -> Result<(), String> {
     // Temporary reservation checks peak growth; the resulting owned values are
     // charged once by sidecar(), after construction. No shared payload is charged twice.
-    let mut reservation = Budget { used: budget.used };
+    let mut reservation = *budget;
     for e in &source.events {
         effects::reserve_receipt(e, &mut reservation)?;
         if let Some(automation) = &e.pan_automation {
@@ -1427,6 +2018,23 @@ fn reserve_controls(source: &av::SourceSequence, budget: &Budget) -> Result<(), 
     for t in &source.texts {
         reservation.charge(2048 + t.id.len() + t.content.as_ref().map_or(0, String::len) + t.reason.as_ref().map_or(0, String::len))?;
         for p in &t.native_properties {reservation.charge(1024+p.scope.len()+p.name.len()+p.value.len())?;}
+    }
+    for controls in source.unresolved.iter().filter_map(|issue| issue.timewarp.as_deref()) {
+        reservation.charge(4096 + controls.resize_render_owner.as_ref().map_or(0, String::len))?;
+        for curve in &controls.curves {
+            reservation.charge(2048)?;
+            let cost = match &curve.points {
+                Some(av::SourceTimewarpPoints::HalfFrameSamples { values, .. }) => values.len() * 32,
+                Some(av::SourceTimewarpPoints::Keys(keys)) => keys.len() * 1024,
+                None => 0,
+            };
+            reservation.charge(cost)?;
+        }
+    }
+    for adapter in source.unresolved.iter().filter_map(|issue| issue.color_adapter.as_ref()) {
+        if av::SourceColorRange::from_saved_xml(&adapter.transform).is_some() {
+            reservation.charge(512)?;
+        }
     }
     for u in &source.group_uses {
         reservation.charge(4096+u.id.len()+u.reason.as_ref().map_or(0,String::len)+u.binding.reason.as_ref().map_or(0,String::len))?;
@@ -1443,8 +2051,125 @@ fn group_use_native(u:&av::SourceGroupUse)->Value{obj(vec![
     ("alternatives",Value::Arr(u.alternatives.iter().copied().map(super::multicam::endpoint).collect())),
     ("binding",binding_receipt(&u.binding)),("reason",opt_s(u.reason.as_deref())),
 ])}
+fn equalizer_settings(eq: &av::SourceEqualizer) -> Vec<(&'static str, Value)> {
+    vec![
+        ("effect_id", s("EFF_AUDIO_EQMB")),
+        ("enabled", Value::Bool(eq.enabled)),
+        ("filter_name", s(&eq.filter_name)),
+        ("bands", Value::Arr(eq.bands.iter().map(|band| obj(vec![
+            ("type", Value::Int(band.filter_type)),
+            ("frequency_raw", Value::Int(band.frequency)),
+            ("gain_raw", Value::Int(band.gain)),
+            ("q_raw", Value::Int(band.q)),
+            ("enabled", Value::Bool(band.enabled)),
+        ])).collect())),
+    ]
+}
+
+fn unavailable_audiosuite(render: &av::SourceAudioSuiteRender, track: i64, start: i64, frames: i64) -> String {
+    format!("Avid AudioSuite {} on A{track} at record frame {start} for {frames} frames needs its verified linked PCM24 cache. The audio edit is omitted.", render.name)
+}
+
 fn native_controls(event: &av::SourceEvent) -> Value {
     let mut controls = effects::receipt(&event.event);
+    if let Some(&(master, start)) = event.gain_dry_input.as_deref() {
+        let Value::Obj(fields) = &mut controls else { unreachable!() };
+        fields.push(("gain_dry_input".into(), obj(vec![
+            ("master", s(master.urn())),
+            ("source_in", Value::Int(start)),
+        ])));
+    } else if event.dry_gain_bypass {
+        let Value::Obj(fields) = &mut controls else { unreachable!() };
+        fields.push(("audiosuite_gain".into(), Value::Bool(true)));
+    }
+    if let Some(eq) = event.equalizer.as_deref() {
+        let Value::Obj(fields) = &mut controls else { unreachable!() };
+        let mut saved = equalizer_settings(eq);
+        if let Some(pitch) = &eq.pitch {
+            saved.push(("pitch_ii", obj(vec![
+                ("master", s(pitch.master.urn())),
+                ("file", s(pitch.file.urn())),
+                ("origin", s(pitch.origin.urn())),
+                ("declared_samples", Value::Int(pitch.samples)),
+                ("chunk_bytes", Value::Int(pitch.pitch_chunk.len() as i64)),
+                ("chunk_sha256", s(hex::encode(Sha256::digest(pitch.pitch_chunk)))),
+            ])));
+        }
+        if let Some(render) = eq.render {
+            let mut dry_input = vec![
+                ("subclip", render.dry_subclip.map_or(Value::Null, |id| s(id.urn()))),
+                ("master", s(render.dry_master.urn())),
+                ("master_track", Value::Int(render.dry_master_track)),
+                ("file", s(render.dry_file.urn())),
+                ("track", Value::Int(render.dry_track)),
+                ("start_frame", Value::Int(render.dry_start)),
+            ];
+            if render.dry_wrapped_master {
+                dry_input.push(("master_usage", Value::Int(7)));
+            }
+            if let Some(gain) = render.input_gain {
+                dry_input.push(("level_q29", Value::Int(gain.level_q29.into())));
+                dry_input.push(("pan_set", Value::Bool(gain.pan_set)));
+            }
+            saved.push(("render", obj(vec![
+                ("master", s(event.event.master.urn())),
+                ("file", s(render.file.urn())),
+                ("origin", s(render.origin.urn())),
+                ("start_frame", Value::Int(render.start)),
+                ("duration_frames", Value::Int(render.frames)),
+                ("dry_input", obj(dry_input)),
+            ])));
+        }
+        fields.push(("legacy_eqmb".into(), obj(saved)));
+    }
+    if let Some(render) = event.audiosuite.as_deref() {
+        let Value::Obj(fields) = &mut controls else { unreachable!() };
+        let mut input = vec![
+            ("master", s(render.input_master.urn())),
+            ("master_track", Value::Int(render.input_track)),
+            ("file", s(render.input_file.urn())),
+            ("track", Value::Int(render.file_track)),
+            ("start_frame", Value::Int(render.input_start)),
+        ];
+        if let Some((id, track, start)) = render.input_subclip {
+            input.push(("subclip", obj(vec![
+                ("mob", s(id.urn())),
+                ("track", Value::Int(track)),
+                ("start_frame", Value::Int(start)),
+            ])));
+        }
+        fields.push(("audiosuite_render".into(), obj(vec![
+            ("name", s(&render.name)),
+            ("manufacturer_id", Value::Int(render.manufacturer_id.into())),
+            ("product_id", Value::Int(render.product_id.into())),
+            ("plugin_id", Value::Int(render.plugin_id.into())),
+            ("chunk_id", Value::Int(render.chunk_id.into())),
+            ("chunk_version", Value::Int(render.chunk_version)),
+            ("chunk_bytes", Value::Int(render.chunk.len() as i64)),
+            ("chunk_sha256", s(hex::encode(Sha256::digest(&render.chunk)))),
+            ("master", s(event.event.master.urn())),
+            ("file", s(render.file.urn())),
+            ("origin", s(render.origin.urn())),
+            ("start_frame", Value::Int(render.start)),
+            ("duration_frames", Value::Int(render.frames)),
+            ("padding_samples", Value::Int(render.padding_samples)),
+            ("input", obj(input)),
+        ])));
+    }
+    if event.subclip_center_pan_count > 0 || event.subclip_gain.is_some() {
+        let Value::Obj(fields) = &mut controls else { unreachable!() };
+        let explicit = event.subclip_gain;
+        let mut saved = vec![
+            ("level_set", Value::Bool(explicit.is_some())),
+            ("level_q29", Value::Int(explicit.map_or(1 << 29, |gain| i64::from(gain.level_q29)))),
+            ("pan_set", Value::Bool(explicit.is_none_or(|gain| gain.pan_set))),
+            ("pan", Value::Int(16_384)),
+        ];
+        if event.subclip_center_pan_count > 1 {
+            saved.push(("wrapper_count", Value::Int(event.subclip_center_pan_count.into())));
+        }
+        fields.push(("subclip_pvol".into(), obj(saved)));
+    }
     if event.plain_submaster {
         let Value::Obj(fields) = &mut controls else { unreachable!() };
         fields.push(("plain_submaster".into(), Value::Bool(true)));

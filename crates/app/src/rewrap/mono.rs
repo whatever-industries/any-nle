@@ -275,6 +275,7 @@ pub(super) fn writer_clip(clip: &Clip, output: &Path) -> R<OriginalClip> {
     let a = audio_clip(clip)?;
     let label = a.avid_track.unwrap();
     Ok(OriginalClip {
+        separate_mono_streams: false,
         proxy_path: None,
         metadata: ClipMetadata {
             id: clip.id.clone(),

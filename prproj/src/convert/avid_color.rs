@@ -7,6 +7,7 @@
 
 use super::colors::py_radians;
 use super::colors::py_pow;
+use super::model::ColorCorrection;
 use crate::error::{value, Result};
 
 pub const LEGAL_LOW: f64 = 16.0;
@@ -20,6 +21,66 @@ pub const SAMPLES: usize = 32;
 pub const KR: f64 = 0.2126;
 pub const KG: f64 = 0.7152;
 pub const KB: f64 = 0.0722;
+
+/// Isolated controls measured on both the Avid rail chart and the original color chart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExtendedSdrGrade {
+    Gain150,
+    Contrast30,
+}
+
+impl ExtendedSdrGrade {
+    pub(super) const EDGE: u32 = 65;
+    pub(super) const DOMAIN: [f32; 2] = [-1.125, 2.125];
+
+    pub fn from_correction(correction: &ColorCorrection) -> Option<Self> {
+        if !matches!(correction.saturation, None | Some(100.0))
+            || !correction.curves.is_empty()
+            || !correction.not_converted.is_empty()
+        {
+            return None;
+        }
+        match correction.tone.as_slice() {
+            [(name, 150.0)] if name == "gain" => Some(Self::Gain150),
+            [(name, 30.0)] if name == "contrast" => Some(Self::Contrast30),
+            _ => None,
+        }
+    }
+
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Gain150 => "Avid Gain 150 Rec709 SDR",
+            Self::Contrast30 => "Avid Contrast +30 Rec709 SDR",
+        }
+    }
+
+    pub(super) fn points(self) -> Vec<(f64, f64, f64)> {
+        let (slope, pivot) = match self {
+            Self::Gain150 => (1.5, 64.0),
+            Self::Contrast30 => (py_radians(58.5).tan(), 64.0 + 876.0 * CONTRAST_PIVOT),
+        };
+        let [lo, hi] = Self::DOMAIN.map(f64::from);
+        let coordinate = |i| lo + f64::from(i) * (hi - lo) / f64::from(Self::EDGE - 1);
+        let mut points = Vec::with_capacity((Self::EDGE as usize).pow(3));
+        for b in 0..Self::EDGE {
+            for g in 0..Self::EDGE {
+                for r in 0..Self::EDGE {
+                    let (r, g, b) = (coordinate(r), coordinate(g), coordinate(b));
+                    let y = KR * r + KG * g + KB * b;
+                    let cb = 512.0 + 896.0 * ((b - y) / (2.0 * (1.0 - KB)));
+                    let cr = 512.0 + 896.0 * ((r - y) / (2.0 * (1.0 - KR)));
+                    let limit = |x: f64, center: f64| (center + (x - center) * slope).clamp(4.0, 1019.0);
+                    let y = (limit(64.0 + 876.0 * y, pivot) - 64.0) / 876.0;
+                    let r = y + 2.0 * (1.0 - KR) * (limit(cr, 512.0) - 512.0) / 896.0;
+                    let b = y + 2.0 * (1.0 - KB) * (limit(cb, 512.0) - 512.0) / 896.0;
+                    let g = (y - KR * r - KB * b) / KG;
+                    points.push((r, g, b));
+                }
+            }
+        }
+        points
+    }
+}
 
 /// Python `dict[str, float]` (insertion order kept, keys unique): HSL tone values.
 pub type Tone = [(String, f64)];

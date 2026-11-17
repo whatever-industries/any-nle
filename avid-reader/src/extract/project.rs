@@ -12,8 +12,11 @@ mod volume;
 mod picture_extension;
 mod freeze;
 mod gain;
+mod equalizer;
+mod audiosuite;
+pub(super) mod pcm_prefix;
 mod submaster;
-pub(crate) use source_capture::{extract_source_paths, extract_source_files, extract_source_paths_observed};
+pub(crate) use source_capture::{extract_source_paths, extract_source_files, extract_source_paths_observed, extract_source_paths_inspected};
 
 #[derive(Debug)]
 pub struct ProjectReadError {
@@ -68,6 +71,7 @@ struct MobRoute {
     kind: Option<i64>,
     name: String,
     usage: Option<i64>,
+    refused_pcm_prefix: bool,
     tracks: Vec<RouteTrack>,
 }
 #[derive(Debug)]
@@ -93,6 +97,7 @@ enum RouteAction {
     Source { id: Option<MobId>, label: i64, start: i64,
         observed_label: Option<i64>, observed_start: Option<i64>, rate: Option<crate::source::Rate>, rate_present: bool },
     Selected { ordinal: usize, inner: Option<Arc<RouteAction>> },
+    SubclipPanVolume { inner: Arc<RouteAction>, gain: Option<crate::source::SourceSubclipGain> },
     Other(String),
 }
 // Memoization is confined to this bin: keys are transient node addresses, never
@@ -136,6 +141,12 @@ fn route_action(ctx: &Ctx<'_>, node: &Node, selector: bool, cache: &mut CompileC
             });
             RouteAction::Selected { ordinal, inner }
         }
+        b"PVOL" => volume::subclip_source(ctx, node)
+            .map(|(input, gain)| RouteAction::SubclipPanVolume {
+                inner: route_action(ctx, input, false, cache),
+                gain,
+            })
+            .unwrap_or_else(|| RouteAction::Other(node.class_str())),
         _ => RouteAction::Other(node.class_str()),
     });
     cache.actions.insert(key, value.clone());
@@ -176,6 +187,7 @@ fn route(ctx: &Ctx<'_>, mob: &Node, cache: &mut CompileCache) -> MobRoute {
             String::new()
         },
         usage: if composition { int(mob, "usage_code") } else { None },
+        refused_pcm_prefix: false,
         tracks: if composition {
             ctx.tracks(mob)
                 .into_iter()
@@ -256,8 +268,11 @@ fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture:
     };
     for (item_index, mob) in items.into_iter().enumerate() {
         if source.is_some_and(|source|source.failed()){break;}
+        let pcm_prefix = source.filter(|_| int(mob, "mob_type_id") == Some(MOB_MASTER))
+            .and_then(|_| pcm_prefix::inspect(&ctx, mob, &cache.ambiguous));
         if let Some(id) = mob_id(mob) {
-            let value=route(&ctx,mob,&mut cache);
+            let mut value=route(&ctx,mob,&mut cache);
+            value.refused_pcm_prefix = source.is_some() && pcm_prefix.is_none() && pcm_prefix::has_mpeg_tail(&ctx, mob);
             if let Some(source)=source{source.retain_route(&mut summary.routes,id,value);}
             else{summary.routes.push((id,value));}
             if source.is_some_and(|source|source.failed()){break;}
@@ -267,7 +282,7 @@ fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture:
         let name = named_mob.get("name").and_then(Value::as_str).unwrap_or("").to_string();
         match (int(mob, "mob_type_id"), int(mob, "usage_code")) {
             (Some(MOB_MASTER), _) => {
-                let result = master(&ctx, mob).map(|mut m| {
+                let result = master(&ctx, mob, pcm_prefix.as_ref()).map(|mut m| {
                     m.bin = bin;
                     if freeze.is_some() {
                         m.name.clone_from(&name);
@@ -279,7 +294,9 @@ fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture:
                     bin,
                     name,
                     source: source.map(|source| {
-                        let mut meta = source.master_meta(&ctx, mob, item_index, result.as_ref().ok(), &cache.ambiguous);
+                        let mut meta = source.master_meta(
+                            &ctx, mob, item_index, result.as_ref().ok(), &cache.ambiguous, pcm_prefix.as_ref(),
+                        );
                         meta.rendered_freeze = freeze.is_some();
                         meta
                     }),
@@ -451,7 +468,9 @@ impl PendingSequence {
                 }
                 Op::Color { before, value } => {
                     for e in &mut info.events[starts[before]..] {
-                        e.color = Some((*value).clone());
+                        let mut color = (*value).clone();
+                        color.measured_static_tone &= e.color.is_none();
+                        e.color = Some(color);
                     }
                 }
                 Op::Picture { before, value } => {
@@ -495,6 +514,70 @@ struct CompileWalk<'s, 'a> {
     track: i64,
     source: Option<&'s mut source_capture::Capture>,
 }
+
+// Track inserts have their own filler lanes. Only slot 1 carries the edit
+// program; treating the insert slots as alternate inputs drops the whole track.
+fn audio_track_program<'a>(
+    ctx: &Ctx<'a>,
+    container: &'a Node,
+    tracks: &[&'a Node],
+) -> Option<(&'a Node, Vec<&'a str>)> {
+    let matches_clock = |node: &Node| {
+        int(node, "media_kind_id") == Some(KIND_SOUND)
+            && float(node, "edit_rate") == float(container, "edit_rate")
+    };
+    let length = int(container, "length").filter(|&length| length > 0)?;
+    let program_length = |node: &Node| {
+        let Value::RefList(components) = node.get("components")? else { return None };
+        components.iter().try_fold(0i64, |total, reference| {
+            let component = ctx.deref(Some(reference))?;
+            let length = int(component, "length").filter(|&length| length >= 0)?;
+            if component.class == *b"TNFX" {
+                total.checked_sub(length).filter(|&start| start >= 0)
+            } else {
+                total.checked_add(length)
+            }
+        })
+    };
+    let input = |track: &'a Node, ordinal: usize| {
+        (int(track, "index") == i64::try_from(ordinal).ok())
+            .then(|| ctx.deref(track.get("component")))
+            .flatten()
+    };
+    let [first, inserts @ ..] = tracks else { return None };
+    if !(1..=2).contains(&inserts.len()) {
+        return None;
+    }
+    let program = input(first, 1)?;
+    if int(container, "info_is_reversed") != Some(0)
+        || float(container, "edit_rate").and_then(crate::source::Rate::from_avid).is_none()
+        || program.class != *b"SEQU" || !matches_clock(program) || program_length(program) != Some(length)
+    {
+        return None;
+    }
+    let mut effects = Vec::new();
+    for (index, track) in inserts.iter().enumerate() {
+        let effect = input(track, index + 2)?;
+        let identity = effect.get("effect_id")?.as_str()?.strip_prefix("audio.rtas.")?;
+        if effect.class != *b"TKFX" || !matches_clock(effect) || int(effect, "length") != Some(length)
+            || identity.is_empty() || identity.len() > 64
+            || !identity.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+        {
+            return None;
+        }
+        let plugin_tracks = ctx.tracks(effect);
+        let [effect_input] = plugin_tracks.as_slice() else { return None };
+        let filler = input(effect_input, 1)?;
+        if filler.class != *b"SEQU" || !matches_clock(filler)
+            || !ctx.is_empty(filler) || program_length(filler) != Some(length)
+        {
+            return None;
+        }
+        effects.push(identity);
+    }
+    Some((program, effects))
+}
+
 impl<'s, 'a> CompileWalk<'s, 'a> {
     fn push_op(&mut self, op: Op) {
         if let Some(source) = &mut self.source {
@@ -614,7 +697,11 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     return; // null reference (e.g. original-source end of chain)
                 }
                 if let Some(source) = &mut self.source {
-                    source.query(self.ops.len(), c, None, None);
+                    if self.kind == KIND_PICTURE && self.track == 1 && via.is_empty() {
+                        source.query_picture_subclip(ctx, self.ops.len(), c, &self.cache.ambiguous);
+                    } else {
+                        source.query(self.ops.len(), c, None, None);
+                    }
                     if source.failed() { return; }
                 }
                 self.push_op(Op::Source(Query {
@@ -651,7 +738,7 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                 };
                 if let Some(source) = &mut self.source {
                     if freeze::candidate(ctx, c, ratio) {
-                        if let Some((_, id)) = freeze::sequence_render(ctx, c, &self.cache.freezes)
+                        if let Some((_, id)) = freeze::sequence_render(ctx, c, &self.cache.freezes, &self.cache.ambiguous)
                             .filter(|(render, _)| self.kind == KIND_PICTURE && source.query_rendered_freeze(self.ops.len(), render))
                         {
                             self.push_op(Op::Source(Query {
@@ -659,7 +746,7 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                                 via: via.to_vec(), depth, kind: self.kind, track: self.track,
                             }));
                         } else {
-                            source.unresolved_motion(position, self.kind, self.track,
+                            source.unresolved_effect(c, position, self.kind, self.track, "Freeze Frame",
                                 "Avid Freeze Frame has no qualified full generated picture binding");
                         }
                         return;
@@ -681,7 +768,8 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                                 length, ratio,
                             });
                         } else {
-                            source.unresolved_motion_adapter(position, self.kind, self.track);
+                            source.unresolved_effect(c, position, self.kind, self.track, "Motion Adapter",
+                                "Avid Motion Adapter timing is not supported");
                         }
                         return;
                     }
@@ -693,12 +781,12 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                         let route = input.and_then(|n| Some((n, mob_id(n)?,
                             int(n, "track_id")?, int(n, "start_time")?, int(n, "length")?)));
                         let Some((input, id, label, offset, source_length)) = route else {
-                            source.unresolved_motion(position, self.kind, self.track,
-                                "Avid Timewarp picture input does not resolve to one direct source");
+                            source.unresolved_timewarp(ctx, c, position, self.kind, self.track,
+                                "Avid Timewarp picture input does not resolve to one direct source", &self.cache.ambiguous);
                             return;
                         };
                         if source.query_sampled_timewarp(ctx, self.ops.len(), c, input, ratio,
-                            position, self.kind, self.track, sparse)
+                            position, self.kind, self.track, sparse, &self.cache.ambiguous)
                         {
                             self.push_op(Op::Motion {
                                 query: Query { id, label, offset, length: source_length, record: position,
@@ -759,23 +847,91 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
             }
             b"ASPI" if self.source.is_some() && self.kind == KIND_SOUND && gain::candidate(c) => {
                 let source = self.source.as_mut().unwrap();
-                if let Some((render, id, origin)) = gain::binding(ctx, c, &self.cache.ambiguous)
-                    .filter(|(render, _, _)| source.query_rendered_gain(self.ops.len(), render))
+                if let Some((render, id, origin, dry)) = gain::binding(ctx, c, &self.cache.ambiguous)
+                    .filter(|(render, _, _, _)| source.query_single_audio_effect_input(self.ops.len(), render))
                 {
+                    source.retain_gain_input(self.ops.len(), dry);
                     self.cache.gain_renders.insert(id, origin);
                     self.push_op(Op::Source(Query {
                         id, label: int(render, "track_id").unwrap(), offset: 0,
                         length, record: position, via: via.to_vec(), depth,
                         kind: self.kind, track: self.track,
                     }));
+                } else if let Some(input) = gain::dry_input(ctx, c, length)
+                    .filter(|input| mob_id(input).is_some_and(|id| !self.cache.ambiguous.contains(&id)))
+                    .filter(|input| source.query_dry_gain(self.ops.len(), input))
+                {
+                    self.push_op(Op::Source(Query {
+                        id: mob_id(input).unwrap(), label: int(input, "track_id").unwrap(),
+                        offset: int(input, "start_time").unwrap(), length, record: position,
+                        via: via.to_vec(), depth, kind: self.kind, track: self.track,
+                    }));
                 } else {
-                    source.unresolved_motion(position, self.kind, self.track,
+                    source.unresolved_effect(c, position, self.kind, self.track, "AudioSuite Gain",
                         "AudioSuite Gain needs a matching full mono PCM24 render on a 24 fps edit");
+                }
+            }
+            b"ASPI" if self.source.is_some() && self.kind == KIND_SOUND => {
+                let source = self.source.as_mut().unwrap();
+                let cache = (self.info.audio_track_formats.last() == Some(&(self.track, 1)))
+                    .then(|| audiosuite::binding(ctx, c, length, &self.cache.ambiguous))
+                    .flatten()
+                    .and_then(|(clip, render)| {
+                        source.query_audiosuite(self.ops.len(), clip, render).then_some(clip)
+                    });
+                if let Some(clip) = cache {
+                    self.push_op(Op::Source(Query {
+                        id: mob_id(clip).unwrap(), label: 1, offset: int(clip, "start_time").unwrap(),
+                        length, record: position,
+                        via: via.to_vec(), depth, kind: self.kind, track: self.track,
+                    }));
+                } else {
+                    self.problem(position, format!("ASPI ({length} frames) not converted"));
+                }
+            }
+            b"EQMB" if self.source.is_some() && self.kind == KIND_SOUND => {
+                let source = self.source.as_mut().unwrap();
+                let admitted = (self.info.audio_track_formats.last() == Some(&(self.track, 1)))
+                    .then(|| {
+                        equalizer::rendered(ctx, c, length, &self.cache.ambiguous)
+                            .or_else(|| equalizer::rendered_pitch_stack(ctx, c, length, &self.cache.ambiguous))
+                            .or_else(|| equalizer::input(ctx, c, length))
+                    }).flatten()
+                    .filter(|(input, _)| mob_id(input).is_some_and(|id| !self.cache.ambiguous.contains(&id)))
+                    .and_then(|(input, equalizer)| {
+                        source.query_equalizer(self.ops.len(), input, equalizer).then_some(input)
+                    });
+                if let Some(input) = admitted {
+                    self.push_op(Op::Source(Query {
+                        id: mob_id(input).unwrap(), label: int(input, "track_id").unwrap(),
+                        offset: int(input, "start_time").unwrap(), length, record: position,
+                        via: via.to_vec(), depth, kind: self.kind, track: self.track,
+                    }));
+                } else {
+                    self.problem(position, format!(
+                        "Avid legacy EQ ({length} frames) needs a matching PCM24 render covering the saved range or an unrendered 24 fps mono input"
+                    ));
                 }
             }
             b"TKFX" | b"PVOL" => {
                 let effect = c.get("effect_id").and_then(Value::as_str).unwrap_or(c.type_name).to_string();
                 let tracks = ctx.tracks(c);
+                if self.kind == KIND_SOUND && effect == "EFF2_AUDIO_TRACK_EFFECT_CONTAINER" {
+                    if let Some(source) = &mut self.source {
+                        if depth == 0 && c.class == *b"TKFX" {
+                            if let Some((program, effects)) = audio_track_program(ctx, c, &tracks)
+                                .filter(|_| source.bind_audio_track_program())
+                            {
+                                self.component(program, position, via, depth + 1);
+                                for identity in effects {
+                                    self.problem(position, format!("audio track insert audio.rtas.{identity} not converted"));
+                                }
+                                return;
+                            }
+                        }
+                        return self.problem(position, "Avid audio track effect container program routing is unqualified".into());
+                    }
+                }
                 let mut inputs: Vec<&Node> = tracks.iter().filter_map(|t| ctx.deref(t.get("component"))).collect();
                 if self.kind == KIND_PICTURE && matches!(effect.as_str(), "EFF2_2DMATTE" | "EFF2_LUTSFX") {
                     if let Some(source) = &mut self.source {
@@ -909,12 +1065,33 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                             })
                             .clone();
                         let before = self.ops.len();
+                        if kind == PictureKind::Warp && self.source.as_ref().is_some_and(|s| s.direct_sequence_effect()) {
+                            if let Some((leaf, rate, stage)) = picture_extension::spectramatte_warp(ctx, c, length) {
+                                let mut warp = (*fx).clone();
+                                warp.compact_affine_warp = true;
+                                let warp = Arc::new(warp);
+                                self.component(leaf, position, via, depth + 1);
+                                self.push_op(Op::Picture { before, value: warp.clone() });
+                                self.push_op(Op::PictureChain { before, chain: picture_extension::OrderedChain {
+                                    position, length, rate, stages: vec![stage, crate::source::PictureStage::Static(warp)],
+                                } });
+                                return;
+                            }
+                        }
                         if kind == PictureKind::Warp {
                             if let Some(source) = &mut self.source {
                                 source.bind_group_warp_input(ctx, input);
                             }
                         }
+                        let first_issue = if kind == PictureKind::Resize && ctx.deref(c.get("precomputed")).is_some() {
+                            self.source.as_deref().and_then(source_capture::Capture::resize_render_probe)
+                        } else {
+                            None
+                        };
                         self.component(input, position, via, depth + 1);
+                        if let (Some(source), Some(first_issue)) = (&mut self.source, first_issue) {
+                            source.bind_resize_render(ctx, c, length, first_issue, &self.cache.ambiguous);
+                        }
                         self.push_op(Op::Picture { before, value: fx });
                         if self.source.is_some() {
                             let animated = match kind {
@@ -966,6 +1143,9 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                         }
                     }
                 }
+                if effect == picture_extension::SPECTRAMATTE_ID && self.kind == KIND_PICTURE {
+                    return self.problem(position, "SpectraMatte outside the qualified static Warp stack not converted".into());
+                }
                 if effect == "EFF2_AUDIO_CHANNEL_COMBINER" && self.kind == KIND_SOUND && inputs.len() > 1 {
                     // One multichannel edit: each input track is one channel, in order.
                     let group = self.info.combiner_count;
@@ -979,9 +1159,14 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                 }
                 match inputs.as_slice() {
                     [input] => {
+                        if effect == "EFF2_LUTSFX" && self.kind == KIND_PICTURE {
+                            if let Some(source) = &mut self.source {
+                                source.bind_freeze_under_color(ctx, c, input, length);
+                            }
+                        }
                         let plain_submaster = effect == submaster::EFFECT
                             && self.kind == KIND_PICTURE && self.track > 0
-                            && self.source.as_ref().is_some_and(|source| source.direct_submaster())
+                            && self.source.as_ref().is_some_and(|source| source.direct_sequence_effect())
                             && submaster::plain_input(ctx, c, length);
                         let before = self.ops.len();
                         let mut via = via.to_vec();
@@ -1204,6 +1389,7 @@ impl<'s> Resolver<'s> {
                             None => errors.push((at, format!("{} has no selected angle", label))),
                             _ => unreachable!("selected routes only compile sources or class names"),
                         },
+                        RouteAction::SubclipPanVolume { .. } => errors.push((at, format!("{} segment is PVOL (not converted)", label))),
                         RouteAction::Other(class) => errors.push((at, format!("{} segment is {} (not converted)", label, class))),
                     }
                 }
@@ -1401,6 +1587,7 @@ mod tests {
                 kind: Some(MOB_MASTER),
                 name: String::new(),
                 usage: None,
+                refused_pcm_prefix: false,
                 tracks: vec![],
             },
         );
@@ -1700,6 +1887,171 @@ mod tests {
     }
 
     #[test]
+    fn legacy_equalizer_requires_one_full_span_dry_input() {
+        let mut f = file();
+        let input = source(&mut f, id(2), KIND_SOUND, 1, 24, 24);
+        let Some(Object::Decoded(clip)) = &mut f.objects[input as usize] else { unreachable!() };
+        clip.put("edit_rate", Value::Float(24.0));
+        let master_index = mob(&mut f, id(2), "Dry input", MOB_MASTER, 0, &[]) as usize;
+        let Some(Object::Decoded(master)) = &mut f.objects[master_index] else { unreachable!() };
+        let rate = master.fields.iter_mut().find(|(name, _)| *name == "edit_rate").unwrap();
+        rate.1 = Value::Float(24.0);
+        let Some(Object::Decoded(master)) = &f.objects[master_index] else { unreachable!() };
+        let ctx = Ctx { file: &f, mobs: HashMap::from([(id(2), master)]) };
+        let mut track = node([0; 4], "Track");
+        track.put("index", Value::Int(1));
+        track.put("component", Value::Ref(input));
+        let mut band = node([0; 4], "EqualizerBand");
+        for (field, value) in [("type", 1), ("freq", 500_000), ("gain", -500), ("q", 670)] {
+            band.put(field, Value::Int(value));
+        }
+        band.put("enable", Value::Bool(true));
+        let mut eq = node(*b"EQMB", "EqualizerMultiBand");
+        eq.put("length", Value::Int(24));
+        eq.put("media_kind_id", Value::Int(KIND_SOUND));
+        eq.put("edit_rate", Value::Float(24.0));
+        eq.put("effect_id", Value::Str("EFF_AUDIO_EQMB".into()));
+        eq.put("info_is_reversed", Value::Int(0));
+        eq.put("effect_enable", Value::Bool(false));
+        eq.put("filter_name", Value::Str("Unknown".into()));
+        eq.put("bands", Value::List(vec![Value::Node(Box::new(band)); 3]));
+        eq.put("tracks", Value::List(vec![Value::Node(Box::new(track))]));
+        let (source, saved) = equalizer::input(&ctx, &eq, 24).unwrap();
+        assert_eq!(int(source, "start_time"), Some(24));
+        assert!(!saved.enabled);
+        assert_eq!(saved.bands[1].gain, -500);
+        assert!(equalizer::input(&ctx, &eq, 23).is_none());
+        eq.put("precomputed", Value::Ref(input));
+        assert!(equalizer::input(&ctx, &eq, 24).is_none());
+    }
+
+    #[test]
+    fn source_audio_track_inserts_keep_program_edits_and_refuse_a_second_program() {
+        let mut f = file();
+        let original = source(&mut f, id(2), KIND_SOUND, 1, 0, 100);
+        mob(&mut f, id(2), "Audio package", MOB_SOURCE, 0, &[]);
+        mob(&mut f, id(1), "Audio master", MOB_MASTER, 0, &[(1, original)]);
+        let first = source(&mut f, id(1), KIND_SOUND, 1, 7, 5);
+        let second = source(&mut f, id(1), KIND_SOUND, 1, 25, 7);
+        let program = segments(&mut f, KIND_SOUND, &[first, second]);
+        let mut filler = node(*b"FILL", "Filler");
+        filler.put("length", Value::Int(12));
+        filler.put("media_kind_id", Value::Int(KIND_SOUND));
+        let filler = add(&mut f, filler);
+        let empty = segments(&mut f, KIND_SOUND, &[filler]);
+        for index in [original, first, second, program, empty] {
+            let Object::Decoded(sequence) = f.objects[index as usize].as_mut().unwrap() else { unreachable!() };
+            sequence.put("edit_rate", Value::Float(25.0));
+        }
+        let effect = |f: &mut AvbFile, identity: &str, inputs: &[u32]| {
+            let mut effect = node(*b"TKFX", "TrackEffect");
+            effect.put("effect_id", Value::Str(identity.into()));
+            effect.put("media_kind_id", Value::Int(KIND_SOUND));
+            effect.put("edit_rate", Value::Float(25.0));
+            effect.put("length", Value::Int(12));
+            effect.put("info_is_reversed", Value::Int(0));
+            effect.put("tracks", Value::List(inputs.iter().enumerate().map(|(index, &input)| {
+                let mut track = node([0; 4], "Track");
+                track.put("index", Value::Int(index as i64 + 1));
+                track.put("component", Value::Ref(input));
+                Value::Node(Box::new(track))
+            }).collect()));
+            add(f, effect)
+        };
+        let container = "EFF2_AUDIO_TRACK_EFFECT_CONTAINER";
+        let plugin = effect(&mut f, "audio.rtas.1.2.3", &[empty]);
+        let other_plugin = effect(&mut f, "audio.rtas.4.5.6", &[empty]);
+        let unsafe_plugin = effect(&mut f, "audio.rtas.4.5.6", &[program]);
+        let qualified = effect(&mut f, container, &[program, plugin, other_plugin]);
+        let refused = effect(&mut f, container, &[program, unsafe_plugin]);
+        mob(&mut f, id(3), "Wrapped audio", MOB_COMPOSITION, 0, &[(3, qualified)]);
+        mob(&mut f, id(4), "Ambiguous audio", MOB_COMPOSITION, 0, &[(3, refused)]);
+
+        let out = source_project(&[f]);
+        let valid = &out.sequences[0];
+        assert_eq!(valid.events.iter().map(|edit| {
+            let edit = &edit.event;
+            (edit.track, edit.record_start, edit.source_in, edit.length)
+        }).collect::<Vec<_>>(), [(3, 0, 7, 5), (3, 5, 25, 7)], "{valid:?}");
+        assert_eq!(valid.info.problems, [
+            "A3 at frame 0: audio track insert audio.rtas.1.2.3 not converted",
+            "A3 at frame 0: audio track insert audio.rtas.4.5.6 not converted",
+        ]);
+        let invalid = &out.sequences[1];
+        assert!(invalid.events.is_empty());
+        assert_eq!(invalid.info.problems, [
+            "A3 at frame 0: Avid audio track effect container program routing is unqualified",
+        ]);
+    }
+
+    #[test]
+    fn source_legacy_titler_requires_matching_text_and_empty_picture_inputs() {
+        use crate::io::Uuid;
+        let mut f = file();
+        let make_title = |f: &mut AvbFile, second: &str, occupied: bool| {
+            let mut refs = Vec::new();
+            for (uuid, body) in [
+                (Uuid { data1: 0x80332d81, data2: 0xca77, data3: 0x4730,
+                    data4: [0xbe, 0xa8, 0xa8, 0xc6, 0x0e, 0x9b, 0x7f, 0xeb] }, "Title café\nLine 2"),
+                (Uuid { data1: 0x48eec481, data2: 0x4822, data3: 0x4530,
+                    data4: [0xa7, 0x31, 0x8b, 0x81, 0x8e, 0xcb, 0x7d, 0x25] }, second),
+            ] {
+                let mut value = node(*b"AVUP", "UserParameter");
+                value.put("uuid", Value::Uuid(Uuid { data1: 0x3319f04a, data2: 0xac69, data3: 0x4525,
+                    data4: [0xb9, 0xe8, 0x22, 0x06, 0x36, 0x2f, 0xd2, 0x33] }));
+                value.put("data", Value::Bytes(format!("{body}\0").into_bytes()));
+                let mut param = node(*b"PRIT", "ParameterItem");
+                param.put("uuid", Value::Uuid(uuid));
+                param.put("value", Value::Ref(add(f, value)));
+                param.put("control_track", Value::Ref(0));
+                refs.push(Value::Ref(add(f, param)));
+            }
+            let mut list = node(*b"PRLS", "ParameterList");
+            list.put("items", Value::RefList(refs));
+            let mut title = node(*b"TKFX", "TrackEffect");
+            title.put("effect_id", Value::Str("8BA34E51-D647-443E-BFB5-30DFCECE5415".into()));
+            title.put("media_kind_id", Value::Int(KIND_PICTURE));
+            title.put("length", Value::Int(12));
+            title.put("param_list", Value::Ref(add(f, list)));
+            let mut filler = node(*b"FILL", "Filler");
+            filler.put("media_kind_id", Value::Int(KIND_PICTURE));
+            filler.put("length", Value::Int(12));
+            let filler = add(f, filler);
+            let other = if occupied { source(f, id(90), KIND_PICTURE, 1, 0, 12) } else { filler };
+            let mut inputs = Vec::new();
+            for (ordinal, component) in [(1, filler), (2, other)] {
+                let mut track = node([0; 4], "Track");
+                track.put("index", Value::Int(ordinal));
+                track.put("component", Value::Ref(component));
+                inputs.push(Value::Node(Box::new(track)));
+            }
+            title.put("tracks", Value::List(inputs));
+            let title = add(f, title);
+            segments(f, KIND_PICTURE, &[title])
+        };
+        for (index, second, occupied) in [
+            (1, "Title café\nLine 2", false),
+            (2, "Contradictory", false),
+            (3, "Title café\nLine 2", true),
+        ] {
+            let track = make_title(&mut f, second, occupied);
+            mob(&mut f, id(index), "Synthetic Legacy Title", MOB_COMPOSITION, 0, &[(2, track)]);
+        }
+        let out = source_project(&[f]);
+        let valid = &out.sequences[0].texts[0];
+        assert_eq!(valid.content.as_deref(), Some("Title café\nLine 2"));
+        assert_eq!((valid.track, valid.record_start, valid.length), (2, Some(0), Some(12)));
+        assert_eq!(valid.native_properties_reason.as_deref(), Some("legacy Titler+ appearance is unqualified"));
+        for (sequence, reason) in [
+            (&out.sequences[1], "legacy Titler+ text carriers disagree"),
+            (&out.sequences[2], "legacy Titler+ input topology is unqualified"),
+        ] {
+            assert!(sequence.texts[0].content.is_none());
+            assert_eq!(sequence.texts[0].reason.as_deref(), Some(reason));
+        }
+    }
+
+    #[test]
     fn source_corner_pin_uses_full_image_edges_and_refuses_duplicate_controls() {
         use crate::io::Uuid;
         let mut file = file();
@@ -1831,7 +2183,7 @@ mod tests {
         // surviving media edit is insufficient evidence for an ordered chain.
         let [edit] = negative.events.as_slice() else { panic!("expected the surviving edit") };
         assert!(edit.picture_chain.is_empty());
-        assert!(matches!(edit.picture_extension, Some(PictureExtension::Unsupported(_))));
+        assert!(matches!(edit.picture_extension.as_deref(), Some(PictureExtension::Unsupported(_))));
     }
 
     fn timeline(f:&mut AvbFile,kind:i64,components:&[u32])->u32{
@@ -1900,6 +2252,13 @@ mod tests {
             (23.976, 1, 23.976, 99, 24, 0, 86400, false, false),
             (23.976, 1, 23.976, 100, 24, 1, 86400, false, false),
             (23.976, 1, 23.976, 100, 24, 0, 86400, true, false),
+            (25.0, 1, 25.0, 100, 25, 0, 93079, false, true),
+            (25.0, 1, 25.0, 100, 25, 0, 2159999, false, true),
+            (25.0, 1, 25.0, 100, 25, 0, 2160000, false, false),
+            (25.0, 1, 24.0, 100, 25, 0, 93079, false, false),
+            (25.0, 1, 25.0, 100, 24, 0, 93079, false, false),
+            (25.0, 1, 25.0, 100, 25, 1, 93079, false, false),
+            (25.0, 1, 25.0, 100, 25, 0, 93079, true, false),
             (29.97, 1, 29.97, 100, 30, 1, 1795, false, true),
             (29.97, 1, 29.97, 100, 30, 1, 2_589_407, false, true),
             (29.97, 1, 29.97, 100, 30, 1, 2_589_408, false, false),
@@ -2168,6 +2527,172 @@ mod tests {
         assert_eq!(seq.markers[0].binding.reason,None);
     }
     #[test]
+    fn subclip_pan_volume_keeps_same_rate_trim_and_outer_mix() {
+        let mut f = file();
+        let original = source(&mut f, id(90), KIND_SOUND, 6, 0, 100);
+        mob(&mut f, id(90), "Audio package", MOB_SOURCE, 0, &[]);
+        mob(&mut f, id(91), "Audio master", MOB_MASTER, 0, &[(6, original)]);
+        let mut attrs = node(*b"ATTR", "Attributes");
+        attrs.put("entries", Value::Attrs(vec![
+            ("_NEW_STYLE_CLIP_PAN".into(), Value::Int(1)),
+            ("_PAN_1_1".into(), Value::Int(32_768)),
+        ]));
+        let attrs = add(&mut f, attrs);
+        let pvol = |f: &mut AvbFile, input: u32, length, level, level_set, pan| {
+            let mut wrapper = node(*b"PVOL", "Pan Volume");
+            wrapper.put("effect_id", Value::Str("Audio Pan Volume".into()));
+            wrapper.put("media_kind_id", Value::Int(KIND_SOUND));
+            wrapper.put("edit_rate", Value::Float(25.0));
+            wrapper.put("length", Value::Int(length));
+            wrapper.put("num_scalars", Value::Int(0));
+            wrapper.put("mc_mode", Value::Int(0));
+            wrapper.put("info_is_reversed", Value::Int(0));
+            wrapper.put("pan", Value::Int(pan));
+            wrapper.put("pan_set", Value::Bool(true));
+            wrapper.put("level", Value::Int(level));
+            wrapper.put("level_set", Value::Bool(level_set));
+            wrapper.put("attributes", Value::Ref(attrs));
+            let mut track = node([0; 4], "Track");
+            track.put("index", Value::Int(1));
+            track.put("component", Value::Ref(input));
+            wrapper.put("tracks", Value::List(vec![Value::Node(Box::new(track))]));
+            add(f, wrapper)
+        };
+        for (index, inner_pan, input_rate) in [(1, 16_384, 25.0), (2, 0, 25.0), (3, 16_384, 24.0)] {
+            let input = source(&mut f, id(91), KIND_SOUND, 6, 17, 40);
+            let Object::Decoded(input_node) = f.objects[input as usize].as_mut().unwrap() else { unreachable!() };
+            input_node.put("edit_rate", Value::Float(input_rate));
+            let inner = pvol(&mut f, input, 40, 1 << 29, false, inner_pan);
+            mob(&mut f, id(index), "Sound subclip", MOB_COMPOSITION, 2, &[(4, inner)]);
+            let use_clip = source(&mut f, id(index), KIND_SOUND, 4, 5, 9);
+            let outer = pvol(&mut f, use_clip, 9, 1 << 28, true, 8_192);
+            let mut filler = node(*b"FILL", "Filler");
+            filler.put("length", Value::Int(3));
+            filler.put("media_kind_id", Value::Int(KIND_SOUND));
+            let filler = add(&mut f, filler);
+            let sequence = segments(&mut f, KIND_SOUND, &[filler, outer]);
+            mob(&mut f, id(index + 10), "Edited sound subclip", MOB_COMPOSITION, 0, &[(3, sequence)]);
+        }
+        for (index, nested_length, nested_pan) in [(4, 40, 16_384), (5, 13, 16_384), (6, 40, 0)] {
+            let backing = source(&mut f, id(91), KIND_SOUND, 6, 11, nested_length);
+            let Some(Object::Decoded(backing_node)) = &mut f.objects[backing as usize] else { unreachable!() };
+            backing_node.put("edit_rate", Value::Float(25.0));
+            let nested = pvol(&mut f, backing, nested_length, 1 << 29, false, nested_pan);
+            mob(&mut f, id(index + 20), "Backing subclip", MOB_COMPOSITION, 2, &[(2, nested)]);
+            let input = source(&mut f, id(index + 20), KIND_SOUND, 2, 6, 20);
+            let Some(Object::Decoded(input_node)) = &mut f.objects[input as usize] else { unreachable!() };
+            input_node.put("edit_rate", Value::Float(25.0));
+            let inner = pvol(&mut f, input, 20, 1 << 29, false, 16_384);
+            mob(&mut f, id(index), "Sound subclip", MOB_COMPOSITION, 2, &[(4, inner)]);
+            let use_clip = source(&mut f, id(index), KIND_SOUND, 4, 5, 9);
+            let outer = pvol(&mut f, use_clip, 9, 1 << 28, true, 8_192);
+            mob(&mut f, id(index + 10), "Edited nested sound subclip", MOB_COMPOSITION, 0, &[(3, outer)]);
+        }
+        for (index, input_label, lock, aaf_track) in [
+            (30, None, Some(0), None),
+            (31, None, Some(0), Some(6)),
+            (32, None, Some(0), Some(5)),
+            (33, None, None, None),
+            (34, Some(2), Some(0), None),
+        ] {
+            let input = source(&mut f, id(91), KIND_SOUND, 6, 17, 40);
+            let Some(Object::Decoded(input_node)) = &mut f.objects[input as usize] else { unreachable!() };
+            input_node.put("edit_rate", Value::Float(25.0));
+            let inner = pvol(&mut f, input, 40, 1 << 29, false, 16_384);
+            let mut slot = node([0; 4], "Track");
+            slot.put("component", Value::Ref(input));
+            if let Some(label) = input_label {
+                slot.put("index", Value::Int(label));
+            }
+            if let Some(lock) = lock {
+                slot.put("lock_number", Value::Int(lock));
+            }
+            let inner_attrs = aaf_track.map(|track| {
+                let mut attributes = node(*b"ATTR", "Attributes");
+                attributes.put("entries", Value::Attrs(vec![
+                    ("_NEW_STYLE_CLIP_PAN".into(), Value::Int(1)),
+                    ("_PAN_1_1".into(), Value::Int(32_768)),
+                    ("_SAVED_AAF_PHYSICAL_TRACK_NUMBER".into(), Value::Int(track)),
+                ]));
+                add(&mut f, attributes)
+            });
+            let Some(Object::Decoded(wrapper)) = &mut f.objects[inner as usize] else { unreachable!() };
+            wrapper.fields.retain(|(field, _)| *field != "tracks");
+            wrapper.put("tracks", Value::List(vec![Value::Node(Box::new(slot))]));
+            if let Some(inner_attrs) = inner_attrs {
+                wrapper.fields.retain(|(field, _)| *field != "attributes");
+                wrapper.put("attributes", Value::Ref(inner_attrs));
+            }
+            mob(&mut f, id(index), "Sound subclip with alternate slot", MOB_COMPOSITION, 2, &[(4, inner)]);
+            let use_clip = source(&mut f, id(index), KIND_SOUND, 4, 5, 9);
+            mob(&mut f, id(index + 10), "Edited sound subclip with alternate slot", MOB_COMPOSITION, 0, &[(3, use_clip)]);
+        }
+        let input = source(&mut f, id(91), KIND_SOUND, 6, 17, 40);
+        let Some(Object::Decoded(input_node)) = &mut f.objects[input as usize] else { unreachable!() };
+        input_node.put("edit_rate", Value::Float(25.0));
+        let inner = pvol(&mut f, input, 40, 1 << 28, true, 16_384);
+        mob(&mut f, id(50), "Sound subclip with explicit gain", MOB_COMPOSITION, 2, &[(4, inner)]);
+        let use_clip = source(&mut f, id(50), KIND_SOUND, 4, 5, 9);
+        mob(&mut f, id(51), "Edited sound subclip with explicit gain", MOB_COMPOSITION, 0, &[(3, use_clip)]);
+        let out = source_project(&[f]);
+        let [positive, different_pan, different_rate, nested, short_nested, different_nested_pan,
+            unlabelled, matching_aaf_track, mismatched_aaf_track, missing_lock, wrong_label,
+            explicit_gain] = out.sequences.as_slice()
+        else {
+            panic!("expected twelve synthetic sequences");
+        };
+        let [edit] = positive.events.as_slice() else { panic!("{positive:?}") };
+        assert_eq!(edit.subclip_center_pan_count, 1);
+        assert_eq!(edit.event.master, id(91));
+        assert_eq!((edit.event.track, edit.event.master_track), (3, 6));
+        assert_eq!(edit.event.edit_pan, Some(-50.0));
+        assert_eq!(edit.event.edit_gain_db, Some(20.0 * 0.5f64.log10()));
+        let range = edit.range.as_ref().unwrap();
+        assert_eq!((range.record_start, range.source_in, range.length), (3, 22, 9));
+        assert_eq!(range.route.len(), 2);
+        assert!(positive.unresolved.is_empty());
+        for rejected in [different_pan, different_rate] {
+            assert!(rejected.events.is_empty());
+            assert_eq!(rejected.unresolved[0].reason, "source composition branch is not qualified");
+        }
+        let [nested_edit] = nested.events.as_slice() else { panic!("{nested:?}") };
+        assert_eq!(nested_edit.subclip_center_pan_count, 2);
+        assert_eq!((nested_edit.event.master, nested_edit.event.master_track), (id(91), 6));
+        assert_eq!(nested_edit.event.edit_pan, edit.event.edit_pan);
+        assert_eq!(nested_edit.event.edit_gain_db, edit.event.edit_gain_db);
+        let nested_range = nested_edit.range.as_ref().unwrap();
+        assert_eq!((nested_range.record_start, nested_range.source_in, nested_range.length), (0, 22, 9));
+        assert_eq!(nested_range.route.len(), 3);
+        assert!(nested.unresolved.is_empty());
+        for rejected in [short_nested, different_nested_pan] {
+            assert!(rejected.events.is_empty());
+            assert_eq!(rejected.unresolved[0].reason,
+                "nested audio subclip range is not covered by one qualified Pan Volume input");
+        }
+        for accepted in [unlabelled, matching_aaf_track] {
+            let [edit] = accepted.events.as_slice() else { panic!("{accepted:?}") };
+            assert_eq!(edit.subclip_center_pan_count, 1);
+            assert_eq!((edit.event.master, edit.event.master_track), (id(91), 6));
+            let range = edit.range.as_ref().unwrap();
+            assert_eq!((range.record_start, range.source_in, range.length), (0, 22, 9));
+            assert!(accepted.unresolved.is_empty());
+        }
+        for rejected in [mismatched_aaf_track, missing_lock, wrong_label] {
+            assert!(rejected.events.is_empty(), "{rejected:?}");
+            assert_eq!(rejected.unresolved[0].reason, "source composition branch is not qualified");
+        }
+        let [edit] = explicit_gain.events.as_slice() else { panic!("{explicit_gain:?}") };
+        assert_eq!(edit.subclip_gain, Some(crate::source::SourceSubclipGain {
+            level_q29: 1 << 28, pan_set: true,
+        }));
+        let range = edit.range.as_ref().unwrap();
+        assert_eq!((range.source_in, range.length), (22, 9));
+        assert_eq!(range.route.len(), 2);
+        assert_eq!((range.route[1].mob, range.route[1].track), (id(91), 6));
+        assert!(explicit_gain.unresolved.is_empty());
+    }
+
+    #[test]
     fn source_subclips_preserve_saved_ranges_and_distinct_backing_references() {
         use crate::source::Observed;
         let mut f = file();
@@ -2403,7 +2928,7 @@ mod tests {
         assert_eq!(first.issue_kind, SourceIssueKind::MatteKey { length: Some(10) });
         assert_eq!(first.picture_profile, None);
         assert_eq!(first.record_start, Observed::Known(0));
-        let inputs = first.matte_inputs.unwrap();
+        let inputs = first.matte_inputs.as_deref().unwrap();
         assert_eq!(inputs.background, MatteBackground::Explicit);
         let fill = inputs.fill.unwrap();
         let matte = inputs.matte.unwrap();
@@ -2414,7 +2939,7 @@ mod tests {
         assert_eq!(import.locators, ["/Synthetic/alpha.png"]);
         assert_eq!(partial.issue_kind, first.issue_kind);
         assert_eq!(partial.record_start, Observed::Known(10));
-        let inputs = partial.matte_inputs.unwrap();
+        let inputs = partial.matte_inputs.as_deref().unwrap();
         assert!(inputs.fill.is_none() && inputs.matte.is_none());
         assert!(partial.matte_import.is_none());
         assert_ne!(first.owner, partial.owner);

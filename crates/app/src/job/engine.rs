@@ -119,11 +119,17 @@ pub struct PreparedJob {
     receipt: PathBuf,
     replay: PathBuf,
     offline_relink: Option<(PathBuf, String)>,
+    graph_debug: Option<(PathBuf, std::fs::File)>,
     aux_outputs: Vec<PathBuf>,
 }
 impl PreparedJob {
     pub fn review(&self) -> &Review {
         &self.review
+    }
+
+    /// Move the display names to a client that will browse the completion report.
+    pub fn take_review_subjects(&mut self) -> HashMap<String, String> {
+        std::mem::take(&mut self.review.subjects)
     }
 }
 
@@ -370,6 +376,7 @@ pub fn prepare_for_review(
     if spec.allow_offline_media && spec.mode == ClipMode::RewrapNative {
         return Err(ReviewBlocker::new(Rewrap, "Allow offline media requires Separate files, Grouped or Merged"));
     }
+    let linked = spec.mode != ClipMode::RewrapNative;
     if spec.proxy_rewrap_dir.is_some() && !spec.attach_avid_proxies {
         return Err(ReviewBlocker::new(Rewrap, "Proxy rewrap requires Attach Avid media as proxies. Creates new media."));
     }
@@ -473,13 +480,14 @@ pub fn prepare_for_review(
         .clone()
         .unwrap_or_else(|| names[0].clone());
     let read_source = |cb: &mut dyn FnMut(Progress)| {
-        avid_adapter::read_with_media_policy(
+        avid_adapter::read_with_media_policy_spooled(
             &inputs,
             &spec.media_roots,
             &project,
             &names,
             &avid_adapter::original::OriginalOptions {
                 link_managed_op1a: spec.mode == ClipMode::Separate,
+                link_dry_gain: spec.mode != ClipMode::RewrapNative,
                 root_mappings: spec
                     .path_mappings
                     .iter()
@@ -493,32 +501,59 @@ pub fn prepare_for_review(
                 attach_avid_proxies: spec.attach_avid_proxies,
                 proxy_rewrap_dir: spec.proxy_rewrap_dir.clone(),
                 ffmpeg: tools.ffmpeg.clone(),
+                allow_media_gaps: linked,
             },
             spec.allow_offline_media,
-            &mut |n, path| {
+            linked,
+            linked && spec.entire_project,
+            &mut |event| {
+                use avid_adapter::SourceProgress;
                 cancel.check()?;
-                cb(Progress {
-                    stage: "source".into(),
-                    current_bin: Some(path.into()),
-                    completed: n,
-                    total: bins.len(),
-                    message: format!("Reading bin {}/{}: {}", n + 1, bins.len(), path.display()),
-                });
+                match event {
+                    SourceProgress::ReadingBin { index, path } => cb(Progress {
+                        stage: "source".into(),
+                        current_bin: Some(path.into()),
+                        completed: index,
+                        total: bins.len(),
+                        message: format!("Reading bin {}/{}: {}", index + 1, bins.len(), path.display()),
+                    }),
+                    SourceProgress::ResolvingMedia => {
+                        progress(cb, "source media", "Checking saved media links and managed files");
+                    }
+                    SourceProgress::BuildingTimelines { completed, total } => cb(Progress {
+                        stage: "timelines".into(),
+                        current_bin: None,
+                        completed,
+                        total,
+                        message: format!("Building timelines ({completed}/{total} complete)"),
+                    }),
+                    SourceProgress::ValidatingGraph => {
+                        progress(cb, "graph", "Validating the source graph");
+                    }
+                }
                 Ok(())
             },
             &mut || cancel.check(),
         )
         .map_err(|issue| {
             use avid_adapter::SourceReadIssue;
-            let (kind, message) = match issue {
-                SourceReadIssue::Bin(m) => (ProjectSource, m),
-                SourceReadIssue::MissingOriginal(m) if spec.mode == ClipMode::RewrapNative => (RewrapMissingMedia, m),
-                SourceReadIssue::OriginalLocator(m) | SourceReadIssue::MissingOriginal(m) => (OriginalLocator, m),
-                SourceReadIssue::OriginalMedia(m) => (OriginalMedia, m),
-                SourceReadIssue::MediaScan(m) => (AvidMedia, m),
-                SourceReadIssue::SourceFacts(m) => (SourceContent, m),
+            let (kind, message, bin) = match issue {
+                SourceReadIssue::Bin(m) => (ProjectSource, m, None),
+                SourceReadIssue::MissingOriginal { message, bin } if spec.mode == ClipMode::RewrapNative => {
+                    (RewrapMissingMedia, message, Some(bin))
+                }
+                SourceReadIssue::OriginalLocator { message, bin } | SourceReadIssue::MissingOriginal { message, bin } => {
+                    (OriginalLocator, message, Some(bin))
+                }
+                SourceReadIssue::OriginalMedia(m) => (OriginalMedia, m, None),
+                SourceReadIssue::MediaScan(m) => (AvidMedia, m, None),
+                SourceReadIssue::SourceFacts(m) => (SourceContent, m, None),
             };
-            ReviewBlocker::new(kind, message)
+            let mut blocker = ReviewBlocker::new(kind, message);
+            if let Some(input) = bin.and_then(|index| inputs.get(index)) {
+                blocker.affected.push(format!("Avid bin {}", input.path.display()));
+            }
+            blocker
         })
     };
     let mut read = read_source(cb)?;
@@ -577,8 +612,20 @@ pub fn prepare_for_review(
     media_inputs.append(&mut matte.inputs);
     check_cancel()?;
     source_input::recheck_checked(&inputs, &mut || cancel.check()).map_err(blocker(Retry))?;
-    read.graph.encoded_len().map_err(|e| ReviewBlocker::new(SourceContent, e.to_string()))?;
+    let spool_stats = read.receipt_spool_stats();
+    if spool_stats.is_none() {
+        read.graph.encoded_len().map_err(|e| ReviewBlocker::new(SourceContent, e.to_string()))?;
+    }
     let mut notes = Vec::new();
+    if let Some((records, losses, bytes)) = spool_stats {
+        let message = format!("Staged {records} native receipt records on disk ({bytes} bytes).");
+        progress(cb, "graph", &message);
+        notes.push(note("info", "source graph", message, "Whole-project graph working memory."));
+        if losses > 0 {
+            notes.push(note("loss", "source graph", format!("{losses} source omissions recorded on disk."),
+                "The graph diagnostics file lists these occurrences and their reasons."));
+        }
+    }
     let proxy_bytes = avid_adapter::proxy::review(&read.proxy_bindings).map_err(blocker(ProxyMedia))?;
     if proxy_bytes > 0 {
         notes.push(note("warning","proxy preparation","Creates new media.",
@@ -620,6 +667,9 @@ pub fn prepare_for_review(
         let kind = if read.missing_native_picture { AvidMedia } else { SourceContent };
         let mut issue = ReviewBlocker::new(kind, "Selected content contains unresolved masters; exclude those bins or resolve their media before conversion");
         issue.affected = unresolved_masters(&read.graph);
+        if let Some(reason) = &read.unused_proof_issue {
+            issue.affected.insert(0, reason.clone());
+        }
         if look_up_camera_originals {
             let mut candidates = read.diagnostics.iter().filter(|note|
                 note.contains(avid_adapter::original::SOURCE_MEDIA_UNAVAILABLE));
@@ -642,10 +692,12 @@ pub fn prepare_for_review(
                 .join("; ")
         )));
     }
-    if let Some(issue) = sequence_timing_blocker(&read.graph) {
-        return Err(issue);
+    if !linked {
+        if let Some(issue) = sequence_timing_blocker(&read.graph) {
+            return Err(issue);
+        }
+        crate::offline::check_edit_routes(&read.graph).map_err(blocker(SourceContent))?;
     }
-    crate::offline::check_edit_routes(&read.graph).map_err(blocker(SourceContent))?;
     for l in policy.losses_source(&read.graph) {
         notes.push(note("loss", l.object, l.reason, l.aspect));
     }
@@ -658,9 +710,11 @@ pub fn prepare_for_review(
         &read.graph,
         &policy.to_options(),
         premiere_preparation::clock_profile(native),
+        native,
         &mut matte,
         &inputs,
         &tools.ffprobe,
+        spool_stats.is_some(),
         &mut || cancel.check(),
     )
     .map_err(blocker(SourceContent))?;
@@ -673,17 +727,21 @@ pub fn prepare_for_review(
             "Qualified source facts are retained separately from destination behavior.",
         ));
     }
+    let omitted_offline: HashSet<_> = prepared.losses.iter()
+        .filter(|loss| loss.aspect == "omitted_offline_bin_item")
+        .map(|loss| loss.object.as_str()).collect();
+    let offline_relink = crate::offline::report(&read.graph, &spec.output, &omitted_offline).map_err(blocker(ProjectOutput))?;
+    let offline_notes = crate::offline::review_notes(&read.graph, &omitted_offline);
+    let offline = crate::offline::paths(&read.graph, &omitted_offline);
     for l in prepared.losses {
         notes.push(note("loss", l.object, l.reason, l.aspect));
     }
     drop(prepared.ownership);
     let mut input = prepared.input;
-    let offline = crate::offline::paths(&read.graph);
-    let offline_relink = crate::offline::report(&read.graph, &spec.output).map_err(blocker(ProjectOutput))?;
     if let Some((path, _)) = &offline_relink {
         output::preflight(&spec.output, Some(path)).map_err(blocker(ProjectOutput))?;
     }
-    for clip in crate::offline::review_notes(&read.graph) {
+    for clip in offline_notes {
         notes.push(clip);
     }
     let mut originals = luts.pictures;
@@ -752,6 +810,7 @@ pub fn prepare_for_review(
             model: &model,
             writer_input: Some(&mut input),
             gain: &gain,
+            managed_pictures: luts.managed_pictures,
         };
         native_media.preflight().map_err(blocker(Rewrap))?;
         let roots = spec
@@ -793,10 +852,12 @@ pub fn prepare_for_review(
     let layout = if let Some(folder) = &spec.project_folder {
         let root = std::fs::canonicalize(folder)
             .map_err(|e| ReviewBlocker::new(ProjectSource, e.to_string()))?;
-        if input.bins.len() != bins.len() {
+        if read.graph.bins.len() != bins.len() || input.bins.len() < bins.len()
+            || input.bins.iter().zip(&read.graph.bins).any(|(a, b)| a.name != b.name)
+        {
             return Err(ReviewBlocker::new(ProjectSource, "Prepared bins do not match the selected source folders"));
         }
-        let parents = bins
+        let mut parents = bins
             .iter()
             .map(|p| {
                 let relative = p
@@ -816,6 +877,9 @@ pub fn prepare_for_review(
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| ReviewBlocker::new(ProjectSource, e))?;
+        // Destination-only bins (for example a stereo clip's timeline mono
+        // views) have no source folder. Keep them under the import root.
+        parents.resize(input.bins.len(), Vec::new());
         let seconds = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?
@@ -859,6 +923,14 @@ pub fn prepare_for_review(
     if let Some((path, _)) = &offline_relink {
         document.check_reserved_output(path).map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
     }
+    let graph_debug = if spool_stats.is_some_and(|(records, _, _)| records > 0) {
+        let path = sidecar(&spec.output, ".anynle-debug.jsonl").map_err(blocker(ProjectOutput))?;
+        output::preflight(&spec.output, Some(&path)).map_err(blocker(ProjectOutput))?;
+        document.check_reserved_output(&path).map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
+        let file = read.take_receipt_spool().map_err(blocker(SourceContent))?
+            .ok_or_else(|| ReviewBlocker::new(SourceContent, "Missing staged graph diagnostics"))?;
+        Some((path, file))
+    } else { None };
     if let Some(p) = &media {
         document
             .check_reserved_output(p.directory())
@@ -909,6 +981,7 @@ pub fn prepare_for_review(
         receipt,
         replay,
         offline_relink,
+        graph_debug,
         aux_outputs: vec![],
     })
 }
@@ -974,15 +1047,17 @@ fn write_json<T: serde::Serialize>(
     value: &T,
     owned: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
-    use std::io::Write;
-    let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    let mut file = std::fs::OpenOptions::new()
+    use std::io::{BufWriter, Write};
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     owned.push(path.to_owned());
-    file.write_all(text.as_bytes())
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    serde_json::to_writer_pretty(&mut writer, value)
+        .map_err(|e| format!("Partial receipt retained at {}: {e}", path.display()))?;
+    writer.flush()
         .map_err(|e| format!("Partial receipt retained at {}: {e}", path.display()))
 }
 
@@ -1013,6 +1088,9 @@ pub fn execute(
         cancel.check()?;
         check_paths(&job.spec, &job.receipt, &job.replay)?;
         if let Some((path, _)) = &job.offline_relink {
+            output::preflight(&job.spec.output, Some(path))?;
+        }
+        if let Some((path, _)) = &job.graph_debug {
             output::preflight(&job.spec.output, Some(path))?;
         }
         job.document.recheck_outputs().map_err(|e| e.to_string())?;
@@ -1066,6 +1144,21 @@ pub fn execute(
             phase = "offline relink report";
             output::write_relink_report(path, text, &mut job.aux_outputs)?;
         }
+        if let Some((path, file)) = &mut job.graph_debug {
+            phase = "graph diagnostics publication";
+            output::write_graph_debug(path, file, &mut job.aux_outputs, |written, total| {
+                let percent = if total == 0 { 100 } else {
+                    (u128::from(written) * 100 / u128::from(total)) as usize
+                };
+                cb(Progress {
+                    stage: "diagnostics".into(),
+                    current_bin: None,
+                    completed: percent,
+                    total: 100,
+                    message: format!("Saving conversion diagnostics ({percent}%)"),
+                });
+            })?;
+        }
         if let Some(p) = &job.media {
             phase = "media completion receipt";
             p.record_project_with_mode(
@@ -1095,7 +1188,7 @@ pub fn execute(
         output: published.then(|| job.spec.output.clone()),
         retained_paths: retain(&job),
         receipt: None,
-        report: job.review.notes.clone(),
+        report: std::mem::take(&mut job.review.notes),
         message: match outcome {
             Ok(()) => {
                 "Project published. Application checks remain separate from conversion.".into()
@@ -1367,6 +1460,7 @@ mod tests {
             originals: vec![],
             proxy_bindings: vec![],
             offline_relink: None,
+            graph_debug: None,
             aux_outputs: vec![],
         }
     }
@@ -1395,8 +1489,14 @@ mod tests {
         for d in &notes {
             job.review.notes.push(note("info", "writer", d.clone(), "Writer preparation report."));
         }
+        job.review.subjects.insert("writer".into(), "Synthetic writer".into());
+        let subjects = job.take_review_subjects();
+        assert_eq!(subjects["writer"], "Synthetic writer");
+        assert!(job.review().subjects.is_empty());
+        let report_buffer = job.review().notes.as_ptr();
         let done = execute(job, &CancelToken::default(), &mut |_| {});
         assert_eq!(done.status, CompletionStatus::Complete);
+        assert_eq!(done.report.as_ptr(), report_buffer);
         assert!(done.report.iter().all(|n| n.object != "publication"));
         assert_eq!(
             done.report.iter().filter(|n| n.object == "writer").map(|n| &n.message).collect::<Vec<_>>(),
@@ -1505,6 +1605,40 @@ mod tests {
         assert!(persisted.report.iter().any(|note| {
             note.severity == "error" && note.object == "offline relink report"
         }));
+    }
+
+    #[test]
+    fn graph_diagnostics_report_progress_and_preserve_an_incumbent_file() {
+        for collision in [false, true] {
+            let scratch = Scratch::new();
+            let mut job = prepared(&scratch.0);
+            let source = scratch.0.join("staged.jsonl");
+            let diagnostics = sidecar(&job.spec.output, ".anynle-debug.jsonl").unwrap();
+            let bytes = b"{\"owner\":\"sequence:1\",\"data\":{}}\n";
+            std::fs::write(&source, bytes).unwrap();
+            job.graph_debug = Some((diagnostics.clone(), std::fs::File::open(&source).unwrap()));
+            let mut progress = Vec::new();
+            let done = execute(job, &CancelToken::default(), &mut |event| {
+                if event.stage == "publication" && collision {
+                    std::fs::write(&diagnostics, b"incumbent").unwrap();
+                }
+                if event.stage == "diagnostics" {
+                    progress.push((event.completed, event.total));
+                }
+            });
+            assert!(done.output.unwrap().is_file());
+            if collision {
+                assert!(progress.is_empty());
+                assert_eq!(done.status, CompletionStatus::Failed);
+                assert!(!done.retained_paths.contains(&diagnostics));
+                assert_eq!(std::fs::read(&diagnostics).unwrap(), b"incumbent");
+            } else {
+                assert_eq!(progress, [(0, 100), (100, 100)]);
+                assert_eq!(done.status, CompletionStatus::Complete);
+                assert!(done.retained_paths.contains(&diagnostics));
+                assert_eq!(std::fs::read(&diagnostics).unwrap(), bytes);
+            }
+        }
     }
 
     #[test]

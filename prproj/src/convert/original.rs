@@ -43,6 +43,12 @@ pub fn add_item(
         .map(|v| ticks_per_unit(v.rate))
         .unwrap_or_else(|| ticks_per_unit(Fraction::new(c.audio.as_ref().unwrap().sample_rate, 1)));
     let source_start = c.video.as_ref().map_or(0, |v| v.source_start);
+    let still = match c.container.as_str() {
+        "jpeg" => m::still_profile(".jpg"),
+        "png" => m::still_profile(".png"),
+        "tiff" => m::still_profile(".tif"),
+        _ => None,
+    };
     let label = if c.video.is_some() {
         if c.audio.is_some() {
             (m::AV_LABEL_INDEX, m::AV_LABEL_COLOR)
@@ -56,20 +62,25 @@ pub fn add_item(
     if let Some(a) = &c.audio {
         let sample = match a.representation {
             SampleRepresentation::Aac => Some(m::AAC_SAMPLE_TYPE),
+            SampleRepresentation::Mp3 => m::compressed_sample_type(".mp3"),
             SampleRepresentation::Pcm16 => Some("3"),
             SampleRepresentation::Pcm24 => None,
         };
         let e = m::new_audio_stream(
             &mut project.doc.tree,
             ticks_per_unit(Fraction::new(a.sample_rate, 1)),
-            &m::audio_channel_layout(a.channels as u32),
+            &m::audio_channel_layout(if c.separate_mono_streams { 1 } else { a.channels as u32 }),
             a.duration,
             sample,
         );
         audio_stream = Some(project.register(e)?);
     }
     let uid = ids.uuid4().to_string();
-    let e = if let Some(v) = &c.video {
+    let e = if let (Some(v), Some(profile)) = (&c.video, still) {
+        let e = m::new_video_stream(&mut project.doc.tree, v.width, v.height, frame_rate, profile);
+        let stream = project.register(e)?;
+        m::new_media(&mut project.doc.tree, ids, &uid, &stream, &c.path, &dir, &state)
+    } else if let Some(v) = &c.video {
         let e = m::new_movie_video_stream(
             &mut project.doc.tree,
             v.width,
@@ -80,6 +91,14 @@ pub fn add_item(
             &v.codec,
             0,
         )?;
+        if c.container == "mxf" {
+            // Premiere's native DNxHR OP1a import identifies these YCbCr
+            // values as display-referred BT.709 with a valid range.
+            let tree = &mut project.doc.tree;
+            let color = tree.find1(e, "OriginalColorSpace")
+                .ok_or_else(|| Error::Value("linked MXF color field is absent".into()))?;
+            tree.set_text(color, Some(r#"{"baseColorProfile":{"colorProfileName":"BT.709,32f,Display-Referred"},"baseProfileType":1,"colorSpaceMetadata":{"dataRangeInfoValid":1}}"#));
+        }
         let stream = project.register(e)?;
         m::new_movie_media(
             &mut project.doc.tree,
@@ -184,7 +203,9 @@ pub fn add_item(
     let e = m::new_markers_collection(&mut project.doc.tree, &state);
     let markers = project.register(e)?;
     let format = if let Some(v) = &c.video {
-        super::rewrap::display_format(v.rate, false)
+        let verified_drop = v.codec == "apch" && v.rate == Fraction::new(30_000, 1001)
+            && c.metadata.time_display == Some(102);
+        super::rewrap::display_format(v.rate, verified_drop)
             .ok_or_else(|| Error::NotImplemented("original picture time display".into()))?
             .to_string()
     } else {
@@ -214,7 +235,11 @@ pub fn add_item(
     let mut chains = Vec::new();
     let mut vectors = Vec::new();
     if let Some(v) = &c.video {
-        let e = m::new_movie_media_source(&mut project.doc.tree, &uid, v.duration);
+        let e = if still.is_some() {
+            m::new_media_source(&mut project.doc.tree, &uid)
+        } else {
+            m::new_movie_media_source(&mut project.doc.tree, &uid, v.duration)
+        };
         if let Some(uid) = &proxy {
             let content = project
                 .doc
@@ -228,19 +253,36 @@ pub fn add_item(
             append_child(&mut project.doc.tree, content, reference, None);
         }
         let source = project.register(e)?;
-        let e = m::new_movie_template_clip(
-            &mut project.doc.tree,
-            ids,
-            &markers,
-            &source,
-            label.0,
-            label.1,
-        );
+        let e = if still.is_some() {
+            m::new_template_clip(&mut project.doc.tree, ids, &markers, &source, label.0, label.1, v.duration)
+        } else {
+            m::new_movie_template_clip(&mut project.doc.tree, ids, &markers, &source, label.0, label.1)
+        };
         clips.push(project.register(e)?);
     }
     if let Some(a) = &c.audio {
         let source_node = m::new_audio_media_source(&mut project.doc.tree, &uid, a.duration);
         let source = project.register(source_node)?;
+        let second_source = if c.separate_mono_streams {
+            let sample_rate = ticks_per_unit(Fraction::new(a.sample_rate, 1));
+            let stream = m::new_audio_stream(&mut project.doc.tree, sample_rate,
+                &m::audio_channel_layout(1), a.duration, None);
+            let stream_id = project.register(stream)?;
+            let sibling_uid = ids.uuid4().to_string();
+            let tree = &mut project.doc.tree;
+            let file_key = tree.find1(media, "FileKey")
+                .and_then(|n| tree.text(n))
+                .ok_or_else(|| Error::Value("linked original FileKey is absent".into()))?.to_owned();
+            let hash = tree.find1(media, "ModificationState")
+                .and_then(|n| tree[n].get("BinaryHash"))
+                .ok_or_else(|| Error::Value("linked original modification hash is absent".into()))?.to_owned();
+            let e = m::new_audio_media(tree, &sibling_uid, &stream_id, &c.path, &dir, &state,
+                sample_rate, &file_key, &hash, 1);
+            let sibling = project.register_uid(e, &sibling_uid)?;
+            project.imported_media.push(sibling);
+            let second = m::new_audio_media_source(&mut project.doc.tree, &sibling_uid, a.duration);
+            Some(project.register(second)?)
+        } else { None };
         let mut proxy_refs = Vec::new();
         if let Some(uid) = &proxy {
             for channel in 0..a.channels {
@@ -275,9 +317,11 @@ pub fn add_item(
             }
         }
         for (group, g) in c.groups.iter().enumerate() {
+            let group_source = if group == 1 { second_source.as_ref().unwrap_or(&source) } else { &source };
+            let physical_channels = if c.separate_mono_streams { 1 } else { a.channels };
             let mut secondary = Vec::new();
-            for n in 0..a.channels {
-                let e = m::new_secondary_content(&mut project.doc.tree, &source, n);
+            for n in 0..physical_channels {
+                let e = m::new_secondary_content(&mut project.doc.tree, group_source, n);
                 secondary.push(project.register(e)?);
             }
             let refs: Vec<_> = secondary.iter().map(String::as_str).collect();
@@ -285,11 +329,11 @@ pub fn add_item(
                 &mut project.doc.tree,
                 ids,
                 &markers,
-                &source,
+                group_source,
                 &refs,
                 label.0,
                 label.1,
-                &m::audio_channel_layout(a.channels as u32),
+                &m::audio_channel_layout(physical_channels as u32),
             );
             let gain = c
                 .channels
@@ -307,7 +351,7 @@ pub fn add_item(
                 let e = m::new_channel_serializer(
                     &mut project.doc.tree,
                     group as i64,
-                    channel.channel_index,
+                    if c.separate_mono_streams { 0 } else { channel.channel_index },
                 );
                 members.push(project.register(e)?);
             }

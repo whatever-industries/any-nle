@@ -36,6 +36,7 @@ pub(crate) const USAGE: &str = "usage:
       Convert Avid bins to a Premiere project. Prints what was converted, the reader's problems
       and every loss. --graph saves the qualified source anynle.graph/2 (Premiere route).
       --link-originals: Resolve qualified saved file links alongside direct Avid media; --media is optional for original-only bins.
+      Linked conversions report omitted edits and mark verified missing spans.
       --prefer-source-media: Try Avid Source File / Source Path for managed clips before linking their managed media. Implies --link-originals.
       --attach-avid-proxies: Attach matching Avid MXF by package identity. Implies --prefer-source-media.
       --rewrap-avid-proxies EXISTING_DIR: Creates new media when stereo requires it.
@@ -366,19 +367,22 @@ fn read_avid_source(a: &Args, link_managed_op1a: bool) -> Result<AvidRead, Strin
         .collect();
     let project = a.project.clone().unwrap_or_else(|| names[0].clone());
     let roots: Vec<PathBuf> = a.media.iter().map(PathBuf::from).collect();
+    let link_dry_gain = a.to.as_deref() == Some("premiere") && !a.wants_rewrap();
     let result = if a.link_originals || a.allow_offline_media {
         let tools = crate::backend_bundle::resolve(a.ffmpeg.as_deref(), a.ffprobe.as_deref(), a.proxy_rewrap_dir.is_some())?;
         avid_adapter::read_with_media_policy(
             &inputs, &roots, &project, &names,
             &avid_adapter::original::OriginalOptions {
                 link_managed_op1a,
+                link_dry_gain,
                 root_mappings: a.original_mappings.clone(),
                 ffprobe: tools.ffprobe,
                 prefer_source_media: a.prefer_source_media,
                 attach_avid_proxies: a.attach_avid_proxies,
                 proxy_rewrap_dir: a.proxy_rewrap_dir.clone(),
                 ffmpeg: tools.ffmpeg,
-            }, a.allow_offline_media, &mut |_, _| Ok(()), &mut || Ok(()),
+                allow_media_gaps: link_dry_gain,
+            }, a.allow_offline_media, link_dry_gain, &mut |_, _| Ok(()), &mut || Ok(()),
         ).map_err(avid_adapter::SourceReadIssue::into_message)?
     } else {
         let ffprobe = if link_managed_op1a {
@@ -389,7 +393,9 @@ fn read_avid_source(a: &Args, link_managed_op1a: bool) -> Result<AvidRead, Strin
         } else {
             a.ffprobe.clone().unwrap_or_else(|| PathBuf::from("ffprobe"))
         };
-        avid_adapter::read_managed(&inputs, &roots, &project, &names, &ffprobe, link_managed_op1a)?
+        avid_adapter::read_managed_for_linking(
+            &inputs, &roots, &project, &names, &ffprobe, link_managed_op1a, link_dry_gain,
+        )?
     };
     source_input::recheck(&inputs)?;
     // Enforce the encoded ceiling before any conversion outputs, even without a snapshot.
@@ -567,10 +573,12 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     let AvidRead { result, inputs, .. } = read;
     let avid_adapter::ReadResult { graph, mut original_inputs, proxy_bindings, .. } = result;
     original_inputs.append(&mut matte.inputs);
-    if let Some(issue) = crate::job::sequence_timing_blocker(&graph) {
-        return Err(issue.cli_summary());
+    if a.wants_rewrap() {
+        if let Some(issue) = crate::job::sequence_timing_blocker(&graph) {
+            return Err(issue.cli_summary());
+        }
+        crate::offline::check_edit_routes(&graph)?;
     }
-    crate::offline::check_edit_routes(&graph)?;
     let gain = rewrap::gain_paths(&graph);
     if !gain.is_empty() && !a.rewrap_media {
         return Err("AudioSuite Gain requires --rewrap-media and --rewrap-native-master to copy the saved render to WAV".into());
@@ -599,8 +607,13 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             && loss.aspect != avid_adapter::PAN_AUTOMATION_LOSS && matte.keeps_loss(loss))
         .cloned().collect();
     let clock = premiere_preparation::clock_profile(a.wants_rewrap());
-    let has_source_lut = !a.wants_rewrap() && policy.bin_mode == BinMode::Separate
-        && crate::source_luts::has_candidates(&graph);
+    let color_media = if a.rewrap_media {
+        crate::source_luts::ColorMedia::Rewrap
+    } else {
+        crate::source_luts::ColorMedia::Linked
+    };
+    let has_source_lut = (!a.wants_rewrap() || a.rewrap_media) && policy.bin_mode == BinMode::Separate
+        && crate::source_luts::has_candidates(&graph, color_media);
     let typed_link = has_matte || typed_disabled || typed_pan || typed_track_names
         || a.link_originals || a.allow_offline_media || has_source_lut;
     let editable_groups = !graph.multicams.is_empty() || !graph.multicam_uses.is_empty();
@@ -614,18 +627,20 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     let use_typed = typed_link || linked_structures || has_managed_op1a
         || !gain.is_empty() || editable_groups || premiere_adapter::has_avid_filler_fade(&graph);
     let mut lut_pictures = Vec::new();
+    let mut managed_lt_pictures = rewrap::LtRangePictures::new();
     let (mut destination, preparation_notes, mut bridge_losses) = if use_typed {
-        let ffprobe = if has_source_lut {
+        let ffprobe = if has_source_lut || a.link_originals || a.allow_offline_media {
             crate::backend_bundle::resolve(None, a.ffprobe.as_deref(), false)?.ffprobe
         } else {
             PathBuf::new()
         };
         let (p, mut luts) = premiere_preparation::prepare_typed(
-            &graph, &policy.to_options(), clock, &mut matte, &inputs, &ffprobe, &mut || Ok(()),
+            &graph, &policy.to_options(), clock, a.rewrap_media, &mut matte, &inputs, &ffprobe, false, &mut || Ok(()),
         )?;
         source_losses.retain(|loss| luts.keeps_loss(loss));
         original_inputs.append(&mut luts.inputs);
         lut_pictures = luts.pictures;
+        managed_lt_pictures = luts.managed_pictures;
         let media = p.input.build_native_media_model().map_err(|e| e.to_string())?;
         (DirectPremiereInput::Typed { input: p.input, media }, p.diagnostics, p.losses)
     } else {
@@ -652,6 +667,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         model,
         writer_input: typed,
         gain: &gain,
+        managed_pictures: managed_lt_pictures,
     });
     if let Some(native) = &native_media {
         native.preflight()?;
@@ -688,8 +704,8 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         Some(s) => Box::new(SeededUuids::new(s)),
         None => Box::new(RandomUuids::new()),
     };
-    let offline = crate::offline::paths(&graph);
-    let offline_relink = crate::offline::report(&graph, &output)?;
+    let offline = crate::offline::paths(&graph, &Default::default());
+    let offline_relink = crate::offline::report(&graph, &output, &Default::default())?;
     if let Some((path, _)) = &offline_relink {
         output::preflight(&output, Some(path))?;
         if let Some(snapshot) = &a.graph_out {
@@ -929,20 +945,20 @@ pub(crate) fn colours(path: &str, a: &Args) -> Result<(), String> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .map_err(|e| format!("{path}: {e}"))?
-        .take(graph::MAX_GRAPH_BYTES as u64 + 1)
+        .take(graph::source::MAX_SOURCE_GRAPH_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{path}: {e}"))?;
-    if bytes.len() > graph::MAX_GRAPH_BYTES {
-        return Err("graph exceeds 64 MiB".into());
+    if bytes.len() > graph::source::MAX_SOURCE_GRAPH_BYTES {
+        return Err("source graph exceeds 256 MiB".into());
     }
     let text = String::from_utf8(bytes).map_err(|e| format!("{path}: {e}"))?;
-    if text.len() > graph::MAX_GRAPH_BYTES {
-        return Err("graph exceeds 64 MiB".into());
-    }
     let value = graph::json::parse(&text).map_err(|e| format!("{path}: {e}"))?;
     let policy = policy(a)?;
     let preview = match value.get("schema") {
         Some(graph::Value::Str(schema)) if schema == graph::SCHEMA => {
+            if text.len() > graph::MAX_GRAPH_BYTES {
+                return Err("graph/1 exceeds 64 MiB".into());
+            }
             policy.colour_preview(&Graph::from_json(&value).map_err(|e| e.to_string())?)
         }
         Some(graph::Value::Str(schema)) if schema == graph::source::SCHEMA => policy
@@ -998,8 +1014,18 @@ pub(crate) fn main() -> ExitCode {
                 let mut progress=|p:crate::job::Progress|eprintln!("{}: {}",p.stage,p.message);
                 let prepared=crate::job::prepare(spec,&cancel,&mut progress)?;
                 let done=crate::job::execute(prepared,&cancel,&mut progress);
-                println!("{}",serde_json::to_string_pretty(&done).map_err(|e|e.to_string())?);
-                if done.status==crate::job::CompletionStatus::Complete {Ok(())}else{Err(done.message)}
+                use std::io::{BufWriter, Write};
+                let mut stdout = BufWriter::with_capacity(64 * 1024, std::io::stdout().lock());
+                let write_error = |e| format!("Could not write the completion report to stdout: {e}");
+                let printed = serde_json::to_writer_pretty(&mut stdout, &done)
+                    .map_err(|e| write_error(e.to_string()))
+                    .and_then(|_| stdout.write_all(b"\n").and_then(|_| stdout.flush())
+                        .map_err(|e| write_error(e.to_string())));
+                match (done.status, printed) {
+                    (crate::job::CompletionStatus::Complete, result) => result,
+                    (_, Ok(())) => Err(done.message),
+                    (_, Err(e)) => Err(format!("{}\n{e}", done.message)),
+                }
             })
         },
         "policy" => {

@@ -78,7 +78,7 @@ pub(super) fn candidate(ctx: &Ctx<'_>, effect: &Node, ratio: (i64, i64)) -> bool
             })
 }
 
-fn controls(ctx: &Ctx<'_>, effect: &Node) -> Option<()> {
+fn controls(ctx: &Ctx<'_>, effect: &Node, length: i64) -> Option<()> {
     let Value::RefList(items) = ctx.deref(effect.get("param_list"))?.get("items")? else {
         return None;
     };
@@ -94,7 +94,7 @@ fn controls(ctx: &Ctx<'_>, effect: &Node) -> Option<()> {
         let id = id.to_string();
         let (value_type, mode, offsets): (i64, i64, &[i64]) = match id.as_str() {
             "8d56827c-847e-11d5-935a-50f857c10000" => (2, 6, &[0]),
-            "8d56827d-847e-11d5-935a-50f857c10000" => (2, 3, &[0, FRAMES]),
+            "8d56827d-847e-11d5-935a-50f857c10000" => (2, 3, &[0, length]),
             "8d568283-847e-11d5-935a-50f857c10000" => (1, 2, &[0]),
             _ => return None,
         };
@@ -116,7 +116,7 @@ fn controls(ctx: &Ctx<'_>, effect: &Node) -> Option<()> {
             || item.get("contribs_to_sig") != Some(&Value::Bool(true))
             || int(item, "value_type") != Some(value_type)
             || curve.class != *b"PRCL"
-            || !span(curve, FRAMES)
+            || !span(curve, length)
             || int(curve, "interp_kind") != Some(mode)
             || int(curve, "value_type") != Some(value_type)
             || int(curve, "extrap_kind") != Some(1)
@@ -141,11 +141,11 @@ fn controls(ctx: &Ctx<'_>, effect: &Node) -> Option<()> {
     Some(())
 }
 
-fn selected(ctx: &Ctx<'_>, effect: &Node) -> Option<(MobId, i64)> {
+fn selected(ctx: &Ctx<'_>, effect: &Node, length: i64) -> Option<(MobId, i64)> {
     if effect.class != *b"SPED"
-        || !span(effect, FRAMES)
+        || !span(effect, length)
         || effect.get("effect_id").and_then(Value::as_str) != Some("EFF_ADV_MOTION_CTL")
-        || effect.get("speed_ratio") != Some(&Value::List(vec![Value::Int(FRAMES), Value::Int(1)]))
+        || effect.get("speed_ratio") != Some(&Value::List(vec![Value::Int(length), Value::Int(1)]))
         || int(effect, "media_kind_id") != Some(KIND_PICTURE)
         || int(effect, "phase_offset") != Some(0)
         || float(effect, "offset_adjust") != Some(0.0)
@@ -166,7 +166,7 @@ fn selected(ctx: &Ctx<'_>, effect: &Node) -> Option<(MobId, i64)> {
             return None;
         }
     }
-    controls(ctx, effect)?;
+    controls(ctx, effect, length)?;
     let clip = source_capture::timewarp_input(ctx, effect)?;
     let start = int(clip, "start_time")?;
     (start >= 0).then_some((source_clip(clip, 1, start)?, start))
@@ -185,7 +185,7 @@ pub(super) fn binding(
     }
     let owner = mob_id(owner)?;
     let effect = picture(ctx, ctx.mobs.get(&owner)?)?;
-    let (input, selected_frame) = selected(ctx, effect)?;
+    let (input, selected_frame) = selected(ctx, effect, FRAMES)?;
     let rendered_id = source_clip(ctx.deref(effect.get("precomputed"))?, FRAMES, 0)?;
     let rendered = ctx.mobs.get(&rendered_id)?;
     if int(rendered, "mob_type_id") != Some(MOB_MASTER)
@@ -251,18 +251,59 @@ pub(super) fn sequence_render<'a>(
     ctx: &Ctx<'a>,
     effect: &Node,
     bindings: &HashMap<MobId, Freeze>,
+    ambiguous: &HashSet<MobId>,
 ) -> Option<(&'a Node, MobId)> {
+    let length = int(effect, "length").filter(|n| (2..=FRAMES).contains(n))?;
     let link = match_ref(ctx, effect)?;
     if int(link, "position") != Some(0) {
         return None;
     }
     let precomputed = ctx.deref(effect.get("precomputed"))?;
-    let id = source_clip(precomputed, FRAMES, 0)?;
+    let id = source_clip(precomputed, length, 0)?;
     let binding = bindings.get(&id)?;
-    if mob_id(link) != Some(binding.owner)
-        || selected(ctx, effect)? != (binding.input, binding.selected)
+    if mob_id(link) != Some(binding.owner) {
+        return None;
+    }
+    let saved = (binding.input, binding.selected);
+    let active = selected(ctx, effect, length)?;
+    if active != saved && (length == FRAMES
+        || subclip_picture_frame(ctx, active, ambiguous)? != subclip_picture_frame(ctx, saved, ambiguous)?)
     {
         return None;
     }
     Some((precomputed, id))
+}
+
+fn subclip_picture_frame(
+    ctx: &Ctx<'_>, (id, frame): (MobId, i64), ambiguous: &HashSet<MobId>,
+) -> Option<(MobId, i64)> {
+    let subclip = ctx.mobs.get(&id)?;
+    if ambiguous.contains(&id) || int(subclip, "mob_type_id") != Some(MOB_COMPOSITION)
+        || int(subclip, "usage_code") != Some(2)
+        || float(subclip, "edit_rate") != Some(24.0)
+        || !(0..int(subclip, "length")?).contains(&frame)
+    {
+        return None;
+    }
+    let mut tracks = ctx.tracks(subclip).into_iter().filter_map(|track| {
+        let input = ctx.deref(track.get("component"))?;
+        (int(input, "media_kind_id") == Some(KIND_PICTURE)).then_some((track, input))
+    });
+    let (track, input) = tracks.next()?;
+    if tracks.next().is_some() || int(track, "index") != Some(1)
+        || !matches!(int(track, "start_pos"), None | Some(0))
+        || !matches!(track.get("filler_proxy"), None | Some(Value::Null | Value::Ref(0)))
+    {
+        return None;
+    }
+    let length = int(input, "length").filter(|n| *n > frame)?;
+    let start = int(input, "start_time").filter(|n| *n >= 0)?;
+    let master = source_clip(input, length, start)?;
+    let master_node = ctx.mobs.get(&master)?;
+    let selected = start.checked_add(frame)?;
+    (master != id && !ambiguous.contains(&master)
+        && int(master_node, "mob_type_id") == Some(MOB_MASTER)
+        && float(master_node, "edit_rate") == Some(24.0)
+        && selected < int(master_node, "length")?)
+        .then_some((master, selected))
 }

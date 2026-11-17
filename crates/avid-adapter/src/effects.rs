@@ -171,6 +171,17 @@ pub(super) fn apply_picture_chain(
     let mut losses = Vec::new();
     for stage in chain {
         let (effect, transform) = match stage {
+            PictureStage::SpectraMatte { rgb, progress_end } => (
+                Effect {
+                    kind: "avid.spectramatte".into(),
+                    params: obj(vec![
+                        ("key_rgb8", Value::Arr(rgb.iter().map(|&v| Value::Int(i64::from(v))).collect())),
+                        ("saved_progress_end_frame", Value::Int(*progress_end)),
+                        ("square_pixels_verified", Value::Bool(square_pixels)),
+                    ]),
+                },
+                None,
+            ),
             PictureStage::Static(picture) if picture.corner_pin.is_some() => {
                 let pin = picture.corner_pin.unwrap();
                 if !square_pixels || raster != Some((1920, 1080)) {
@@ -500,7 +511,7 @@ pub(super) fn apply(
 ) -> Result<(), String> {
     if let Some(cc) = &event.color {
         let it = cc.interpret();
-        let params = obj(vec![
+        let mut controls = vec![
             (
                 "saturation",
                 it.saturation.map(Value::Float).unwrap_or(Value::Null),
@@ -534,7 +545,11 @@ pub(super) fn apply(
                         .collect(),
                 ),
             ),
-        ]);
+        ];
+        if cc.measured_static_tone {
+            controls.push(("measured_static_tone", Value::Bool(true)));
+        }
+        let params = obj(controls);
         budget.value(&params)?;
         p.effects.push(Effect {
             kind: "avid.color_correction".into(),

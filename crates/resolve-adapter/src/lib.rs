@@ -36,7 +36,7 @@ pub use media::{
     verify_binding, verify_group_binding, BindingSpec, StreamSelector, VerifiedBinding,
 };
 pub use prepare::{prepare, PreparedResolve};
-pub use premiere::{list_premiere_sequences, prepare_premiere_turnover};
+pub use premiere::{list_premiere_sequences, prepare_premiere_turnover, read_premiere_media_graph};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const RATE: f64 = 24000.0 / 1001.0;

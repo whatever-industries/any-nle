@@ -1,12 +1,12 @@
 //! Verified relocation of saved original media in the qualified native profiles.
 mod premiere;
 
-use crate::{media::probe_json, source::relink as resolve, Published, Result};
+use crate::{media::{probe_json, stamp, FileStamp}, source::relink as resolve, Published, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fs::{self, File, Metadata},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
@@ -178,28 +178,6 @@ fn verify_project(input: &Path, expected: &str) -> Result<()> {
         return Err("input project SHA-256 differs from the trusted manifest".into());
     }
     Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct FileStamp {
-    bytes: u64,
-    modified: std::time::SystemTime,
-    #[cfg(unix)]
-    identity: (u64, u64, i64, i64),
-}
-
-fn stamp(meta: Metadata) -> Result<FileStamp> {
-    if !meta.is_file() {
-        return Err("expected a regular media file".into());
-    }
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
-    Ok(FileStamp {
-        bytes: meta.len(),
-        modified: meta.modified()?,
-        #[cfg(unix)]
-        identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
-    })
 }
 
 fn media_stamp(path: &str) -> Result<FileStamp> {

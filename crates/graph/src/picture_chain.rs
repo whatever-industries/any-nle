@@ -193,7 +193,7 @@ impl<'a> Chain<'a> {
     }
 }
 
-fn read_transform(v: &Value) -> Result<Transform, Error> {
+pub fn read_transform(v: &Value) -> Result<Transform, Error> {
     let Value::Obj(fields) = v else {
         return Err(Error::Malformed);
     };

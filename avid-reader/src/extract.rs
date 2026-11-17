@@ -6,7 +6,7 @@
 //! - custom/user columns = the _USER attribute set (AVB-0006).
 //! Aux TC (BCOL-010) and Source File (BCOL-083) carriers are provisional (Avid queue Q-0001).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::color::{file_order_hex, ColorCorrection, ParamValue};
 use crate::file::AvbFile;
@@ -128,7 +128,7 @@ impl MasterOutputMix {
         // Check before making another owned copy. The overall source-facts budget
         // additionally accounts for records and all retained payload capacity.
         let bytes = match value { Value::Str(v) => v.len(), Value::Bytes(v) => v.len(), _ => 0 };
-        if bytes > crate::source::MAX_SOURCE_FACT_BYTES {
+        if bytes > 64 << 20 {
             return Err("_AUDIO_OUTPUT_FORMAT exceeds source-facts budget".into());
         }
         Ok(match value {
@@ -493,6 +493,29 @@ pub fn extract(file: &AvbFile) -> BinContents {
     extract_project(&[file])
 }
 
+/// Read master facts and count the bin items the legacy inventory flags,
+/// without compiling or resolving timeline edits.
+pub fn inventory_masters(file: &AvbFile) -> (Vec<MasterClip>, usize) {
+    let items = bin_items(file);
+    let ctx = Ctx {
+        file,
+        mobs: items.iter().filter_map(|&mob| mob_id(mob).map(|id| (id, mob))).collect(),
+    };
+    let mut masters = Vec::new();
+    let mut skipped = 0;
+    for mob in items {
+        match (int(mob, "mob_type_id"), int(mob, "usage_code")) {
+            (Some(MOB_MASTER), _) => match master(&ctx, mob, None) {
+                Ok(clip) => masters.push(clip),
+                Err(_) => skipped += 1,
+            },
+            (Some(MOB_SOURCE), _) | (Some(MOB_COMPOSITION), Some(0)) => {}
+            _ => skipped += 1,
+        }
+    }
+    (masters, skipped)
+}
+
 fn bin_items(file: &AvbFile) -> Vec<&Node> {
     let root = match file.root() {
         Some(r) if &r.class == b"ABIN" => r,
@@ -520,7 +543,7 @@ fn source_directory(locator: &str) -> Option<&str> {
     Some(&locator[..=separator])
 }
 
-fn master(ctx: &Ctx, mob: &Node) -> Result<MasterClip, String> {
+fn master<'a>(ctx: &Ctx<'a>, mob: &'a Node, prefix: Option<&project::pcm_prefix::Binding<'a>>) -> Result<MasterClip, String> {
     let name = mob.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     let id = mob_id(mob).ok_or("master clip has no mob ID")?;
     let attrs = ctx.attrs(mob);
@@ -573,7 +596,10 @@ fn master(ctx: &Ctx, mob: &Node) -> Result<MasterClip, String> {
         let mut found = Vec::new();
         ctx.component_markers(component, 0, 0, &mut found);
         markers.extend(found.into_iter().map(|m| (kind, index, m)));
-        let clip = ctx.only_source_clip(track).map_err(|e| format!("track {}: {}", index, e))?;
+        let clip = match prefix.and_then(|p| p.clip(kind, index)) {
+            Some(clip) => clip,
+            None => ctx.only_source_clip(track).map_err(|e| format!("track {}: {}", index, e))?,
+        };
         let file_mob_id = mob_id(clip).ok_or_else(|| format!("track {}: source clip has no mob ID", index))?;
         let file_mob = *ctx
             .mobs
@@ -726,11 +752,19 @@ fn color_params(ctx: &Ctx, effect: &Node) -> ColorCorrection {
     let mut out = ColorCorrection::default();
     let Some(list) = ctx.deref(effect.get("param_list")) else { return out };
     let Some(Value::RefList(items)) = list.get("items") else { return out };
-    for item in items.iter().filter_map(|r| ctx.deref(Some(r))) {
-        if &item.class != b"PRIT" {
+    let mut static_list = effect.get("effect_id").and_then(Value::as_str) == Some("EFF2_RGB_COLOR_CORRECTION");
+    let mut seen = HashSet::new();
+    let mut measured = 0;
+    for reference in items {
+        let Some(item) = ctx.deref(Some(reference)).filter(|item| &item.class == b"PRIT") else {
+            static_list = false;
             continue;
-        }
-        let Some(Value::Uuid(u)) = item.get("uuid") else { continue };
+        };
+        let Some(Value::Uuid(u)) = item.get("uuid") else {
+            static_list = false;
+            continue;
+        };
+        let id = file_order_hex(u);
         let value = match item.get("value") {
             Some(Value::Int(i)) => ParamValue::Int(*i),
             Some(Value::Float(f)) => ParamValue::Float(*f),
@@ -743,8 +777,24 @@ fn color_params(ctx: &Ctx, effect: &Node) -> ColorCorrection {
             },
             _ => ParamValue::Other,
         };
-        out.params.push((file_order_hex(u), value));
+        if static_list {
+            let control = item.get("control_track");
+            // Native Color Correction also saves an empty structural curve.
+            let static_control = matches!(control, Some(Value::Null | Value::Ref(0)))
+                || (id == "ea10d291ceb6954abf31522c9c23f30a" && ctx.deref(control)
+                    .is_some_and(|curve| &curve.class == b"PRCL"
+                        && matches!(curve.get("control_points"), Some(Value::List(points)) if points.is_empty())));
+            static_list = seen.insert(*u) && static_control;
+            if item.get("enable") == Some(&Value::Bool(true)) && matches!((id.as_str(), &value),
+                ("6c30edfaef0cd346a32132f0f19e0069", ParamValue::Float(150.0))
+                | ("d55210f9c3685845970a894366d3c41a", ParamValue::Float(30.0)))
+            {
+                measured += 1;
+            }
+        }
+        out.params.push((id, value));
     }
+    out.measured_static_tone = static_list && measured == 1;
     out
 }
 

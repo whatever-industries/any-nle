@@ -2,6 +2,7 @@
 use super::{BinEntry, CancelToken, EffectCapability, EffectMode, Inventory, JobSpec, Progress};
 use avid_reader::bin_nav::BinNavigator;
 use avid_reader::file::{AvbFile, Object};
+use avid_reader::io::MobId;
 use avid_reader::objects::{Node, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -115,9 +116,9 @@ struct Routes {
     roots: BTreeSet<String>,
     incomplete: bool,
 }
-fn mob_id(n: &Node) -> Option<String> {
+fn mob_id(n: &Node) -> Option<MobId> {
     match n.get("mob_id") {
-        Some(Value::MobId(id)) => Some(id.urn()),
+        Some(Value::MobId(id)) => Some(*id),
         _ => None,
     }
 }
@@ -147,7 +148,7 @@ fn source_refs(
         };
         if n.class == *b"SCLP" {
             if let Some(id) = mob_id(n) {
-                refs.insert(id);
+                refs.insert(id.urn());
             }
             continue;
         }
@@ -308,15 +309,19 @@ pub fn inventory(
         .filter(|(_, p)| spec.entire_project || selected_paths.contains(*p))
         .map(|(i, _)| i)
         .collect::<BTreeSet<_>>();
+    // Every eligible bin is already included in whole-project mode.
+    // Source routing still runs during Review.
+    let collect_dependencies = spec.include_dependencies && !spec.entire_project;
     let mut inv = Inventory::default();
     let mut routes = Routes::default();
     let mut visits = 0;
     let mut fact_bytes = 0;
-    let (mut native, mut originals, mut effects, mut media) = (
-        HashSet::new(),
+    // A file package can occur with and without a saved original locator.
+    // Record whether any occurrence is native alongside the unique package ID.
+    let (mut originals, mut effects, mut media) = (
         HashSet::new(),
         BTreeMap::<String, usize>::new(),
-        HashSet::new(),
+        HashMap::<MobId, bool>::new(),
     );
     for (bin, path) in paths.iter().enumerate() {
         cancel.check()?;
@@ -350,39 +355,43 @@ pub fn inventory(
             sequences: sequences.len(),
             dependency: false,
         });
-        for master in &masters {
-            if let Some(id) = mob_id(master.mob) {
-                charge(&mut fact_bytes, 256 + id.len())?;
-                routes.masters.entry(id).or_default().insert(bin);
+        if collect_dependencies {
+            for master in &masters {
+                if let Some(id) = mob_id(master.mob) {
+                    let id = id.urn();
+                    charge(&mut fact_bytes, 256 + id.len())?;
+                    routes.masters.entry(id).or_default().insert(bin);
+                }
             }
-        }
-        if selected.contains(&bin) {
-            for seq in &sequences {
-                if let Some(id) = mob_id(seq.mob) {
-                    routes.roots.insert(id);
+            if selected.contains(&bin) {
+                for seq in &sequences {
+                    if let Some(id) = mob_id(seq.mob) {
+                        routes.roots.insert(id.urn());
+                    }
+                }
+            }
+            for (index, obj) in file.objects.iter().enumerate() {
+                cancel.check()?;
+                let Some(Object::Decoded(node)) = obj else {
+                    continue;
+                };
+                if node.class == *b"CMPO" && node.get("mob_type_id").and_then(Value::as_int) == Some(1)
+                {
+                    if let Some(id) = mob_id(node) {
+                        let id = id.urn();
+                        let (refs, incomplete) = source_refs(&file, index as u32, &mut visits, cancel)?;
+                        charge(
+                            &mut fact_bytes,
+                            256 + id.len() + refs.iter().map(|s| 128 + s.len()).sum::<usize>(),
+                        )?;
+                        routes.incomplete |= incomplete;
+                        routes.refs.entry(id).or_default().extend(refs);
+                    }
                 }
             }
         }
-        for (index, obj) in file.objects.iter().enumerate() {
-            cancel.check()?;
-            let Some(Object::Decoded(node)) = obj else {
-                continue;
-            };
-            if node.class == *b"CMPO" && node.get("mob_type_id").and_then(Value::as_int) == Some(1)
-            {
-                if let Some(id) = mob_id(node) {
-                    let (refs, incomplete) = source_refs(&file, index as u32, &mut visits, cancel)?;
-                    charge(
-                        &mut fact_bytes,
-                        256 + id.len() + refs.iter().map(|s| 128 + s.len()).sum::<usize>(),
-                    )?;
-                    routes.incomplete |= incomplete;
-                    routes.refs.entry(id).or_default().extend(refs);
-                }
-            }
-        }
         if selected.contains(&bin) {
-            let contents = avid_reader::extract::extract(&file);
+            let (masters, skipped) = avid_reader::extract::inventory_masters(&file);
             let mob_nodes = file
                 .objects
                 .iter()
@@ -391,7 +400,7 @@ pub fn inventory(
                     _ => None,
                 })
                 .collect::<HashMap<_, _>>();
-            for master in &contents.masters {
+            for master in &masters {
                 if let Some(rgb) = master.color {
                     let hex = prproj::convert::colors::rgb16_hex(rgb);
                     if !inv.clip_colors.contains(&hex) {
@@ -406,22 +415,27 @@ pub fn inventory(
                     }
                 }
                 for track in &master.tracks {
-                    let id = track.file_mob.urn();
-                    if media.insert(id.clone()) {
-                        charge(&mut fact_bytes, 128 + id.len())?;
-                    }
+                    let id = track.file_mob;
                     let locator = mob_nodes
                         .get(&id)
                         .and_then(|n| n.get("descriptor"))
                         .and_then(Value::as_index)
                         .and_then(|i| file.node(i))
                         .and_then(|d| original_locator(&file, d));
+                    let is_native = locator.is_none();
+                    match media.entry(id) {
+                        std::collections::hash_map::Entry::Occupied(mut prior) => {
+                            *prior.get_mut() |= is_native;
+                        }
+                        std::collections::hash_map::Entry::Vacant(new) => {
+                            charge(&mut fact_bytes, 2 * (std::mem::size_of::<(MobId, bool)>() + 1))?;
+                            new.insert(is_native);
+                        }
+                    }
                     if let Some(p) = locator {
                         if originals.insert(p.clone()) {
                             charge(&mut fact_bytes, 128 + p.len())?;
                         }
-                    } else {
-                        native.insert(id);
                     }
                 }
             }
@@ -443,8 +457,8 @@ pub fn inventory(
                     *effects.entry(key.into()).or_default() += 1;
                 }
             }
-            if !contents.skipped.is_empty() {
-                inv.notes.push(format!("{}: {} bin items need source-interpretation review; counts include stored bin entries.",relative_name(path),contents.skipped.len()));
+            if skipped > 0 {
+                inv.notes.push(format!("{}: {skipped} bin items need source-interpretation review; counts include stored bin entries.", relative_name(path)));
             }
         }
         crate::source_input::recheck_checked(&pins, &mut || cancel.check())?;
@@ -452,7 +466,7 @@ pub fn inventory(
             .push((path.clone(), pins[0].revision.clone()));
         // file and all borrowed nodes are dropped here, before opening the next bin.
     }
-    if spec.include_dependencies {
+    if collect_dependencies {
         let (dependencies, unresolved) = dependency_bins(&routes, &selected);
         for i in dependencies {
             inv.bins[i].dependency = true;
@@ -465,7 +479,7 @@ pub fn inventory(
         }
     }
     inv.total_media = media.len();
-    inv.native_media = native.len();
+    inv.native_media = media.values().filter(|&&is_native| is_native).count();
     inv.ume_originals = originals.len();
     inv.found_media = 0;
     inv.effects = effects.into_iter().map(|(k, n)| effect(&k, n)).collect();
@@ -668,6 +682,10 @@ mod tests {
         assert!(inv.notes.iter().any(|n| n == PRESENCE_PENDING));
         assert_eq!(inv.found_media, 0);
         assert_eq!(progress.last().unwrap().completed, 2);
+        let entire = JobSpec { entire_project: true, bins: vec![], ..spec.clone() };
+        let whole = inventory(&entire, &CancelToken::default(), &mut |_| {}).unwrap();
+        assert!(whole.bins.iter().all(|bin| !bin.dependency));
+        assert_eq!(selected_paths(&entire, &whole).unwrap(), selected_paths(&spec, &inv).unwrap());
         assert_eq!(
             before,
             [std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap()]

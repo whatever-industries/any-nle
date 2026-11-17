@@ -238,7 +238,7 @@ mod tests {
     fn effect(kind: Kind, values: &[(&str, f64)]) -> PictureEffect {
         PictureEffect {
             kind,
-            params: ColorCorrection { params: values.iter().map(|(p, v)| (format!("{}{}", p, SUFFIX), ParamValue::Float(*v))).collect() },
+            params: ColorCorrection { params: values.iter().map(|(p, v)| (format!("{}{}", p, SUFFIX), ParamValue::Float(*v))).collect(), ..Default::default() },
             corner_pin: None,
             compact_affine_warp: false,
         }

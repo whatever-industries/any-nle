@@ -464,7 +464,7 @@ The reader admits single-disk ZIP32 archives with up to 1,024 members and
 name index to catch exact duplicate members. No member is extracted. The
 expanded archive, XML node/depth counts, per-field decoded bytes and
 aggregate decoded blobs are bounded. The graph writer enforces the
-64 MiB encoded ceiling. Unsupported native objects receive scoped losses
+256 MiB graph/2 encoded ceiling. Unsupported native objects receive scoped losses
 when their owning sequence or bin is known. Broken required references,
 malformed encodings and unsupported project versions fail before output.
 

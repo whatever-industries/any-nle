@@ -204,7 +204,7 @@ fn edit_label_fields(tree: &Tree, clip: NodeId) -> Result<(Option<&str>, Option<
     }
 }
 
-fn leaf<'a>(tree: &'a Tree, parent: NodeId, tag: &str) -> Result<Option<&'a str>> {
+pub(super) fn leaf<'a>(tree: &'a Tree, parent: NodeId, tag: &str) -> Result<Option<&'a str>> {
     let mut fields = tree
         .children(parent)
         .iter()
@@ -256,7 +256,7 @@ pub(super) fn capture(
     item: ItemId,
     media: NodeId,
     item_id: &str,
-    sha256: &str,
+    sha256: Option<&str>,
     graph: &mut SourceGraph,
 ) -> Result<Option<String>> {
     let tree = &project.doc.tree;
@@ -272,7 +272,10 @@ pub(super) fn capture(
             .ok_or("Premiere item metadata exceeds limit")?;
         Ok(Value::Str(value.into()))
     };
-    let mut identity = vec![("verified_sha256".into(), Value::Str(sha256.into()))];
+    let mut identity = Vec::new();
+    if let Some(sha256) = sha256 {
+        identity.push(("verified_sha256".into(), Value::Str(sha256.into())));
+    }
     let mut media_tape = false;
     for tag in [
         "FilePath",
@@ -360,7 +363,7 @@ pub(super) fn capture(
     if media_tape {
         omitted.push("media tape metadata");
     }
-    if !omitted.is_empty() {
+    if sha256.is_some() && !omitted.is_empty() {
         graph.losses.push(Loss {
             object: item_id.into(),
             aspect: LOSS.into(),

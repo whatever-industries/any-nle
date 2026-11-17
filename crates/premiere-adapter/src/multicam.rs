@@ -33,11 +33,37 @@ pub(super) fn prepare(
     clock: ClockProfile,
     diagnostics: &mut Vec<String>,
     losses: &mut Vec<Loss>,
+    best_effort: bool,
+    omitted_offline_items: &HashSet<&str>,
 ) -> R<()> {
     if g.multicams.is_empty() && g.multicam_uses.is_empty() {
         return Ok(());
     }
-    if g.multicams.len() > MAX_GROUPS || g.multicam_uses.len() > model::MAX_ITEMS {
+    let mut omitted = HashSet::new();
+    let mut missing_cameras = HashSet::new();
+    if best_effort {
+        let bound: HashSet<_> = g.multicam_uses.iter().filter(|usage| !usage.binding.placements.is_empty())
+            .flat_map(|usage| usage.candidates.iter().map(String::as_str)).collect();
+        for group in &g.multicams {
+            if group.lanes.iter().flat_map(|lane| &lane.alternatives)
+                .flat_map(|angle| &angle.pieces).filter_map(|piece| piece.item.as_deref())
+                .any(|id| omitted_offline_items.contains(id))
+            {
+                omitted.insert(group.id.as_str());
+                missing_cameras.insert(group.id.as_str());
+                loss(losses, &group.id, "group_omitted",
+                    format!("Omitted editable Group {:?} with an unqualified offline camera or audio source.", group.name));
+            } else if !bound.contains(group.id.as_str())
+                && !group.lanes.iter().flat_map(|lane| &lane.alternatives)
+                    .flat_map(|angle| &angle.pieces).any(|piece| piece.item.is_some())
+            {
+                omitted.insert(group.id.as_str());
+                loss(losses, &group.id, "group_omitted",
+                    format!("Omitted Group {:?} with no portable camera media or saved timeline binding.", group.name));
+            }
+        }
+    }
+    if g.multicams.len() - omitted.len() > MAX_GROUPS || g.multicam_uses.len() > model::MAX_ITEMS {
         return Err(refusal("project", "prepared group/use count exceeds limit"));
     }
     let direct = clock == ClockProfile::LegacyImport;
@@ -62,6 +88,9 @@ pub(super) fn prepare(
     let mut audio_lanes = Vec::new();
     let mut picture_order = Vec::new();
     for m in &g.multicams {
+        if omitted.contains(m.id.as_str()) {
+            continue;
+        }
         if m.reason.is_some() || m.rate.map(fraction) != Some(RATE) {
             return Err(refusal(
                 &m.id,
@@ -214,6 +243,28 @@ pub(super) fn prepare(
         && key(&s.data, "warp_picture_input").and_then(boolean) == Some(true))
         .map(|s| s.object.as_str()).collect();
     for u in &g.multicam_uses {
+        if let [group] = u.candidates.as_slice() {
+            if missing_cameras.contains(group.as_str()) {
+                let retained = u.binding.placements.iter().any(|id| ownership.contains_key(id));
+                loss(losses, &u.id, "group_use_omitted", if retained {
+                    "The editable Group is unavailable. Surviving selected media remains as ordinary timeline edits."
+                } else {
+                    "The editable Group is unavailable and no selected media survived."
+                });
+                continue;
+            }
+        }
+        if best_effort && u.binding.placements.is_empty()
+            && u.candidates.iter().all(|id| omitted.contains(id.as_str()))
+        {
+            let lane = if u.kind == StreamKind::Video { "V" } else { "A" };
+            let position = u.record_start.map_or_else(|| "at an unresolved record position".into(),
+                |at| format!("at {at} seconds"));
+            loss(losses, &u.id, "group_use_omitted",
+                format!("{} · {lane}{} {position}: no portable Group media or bound edit survived.",
+                    g.sequences[sequences[u.sequence.as_str()]].name, u.track));
+            continue;
+        }
         let [id] = u.candidates.as_slice() else {
             return Err(refusal(
                 &u.id,
@@ -357,7 +408,7 @@ pub(super) fn prepare(
         b.clips = source
             .items
             .iter()
-            .filter(|id| !known.contains(id.as_str()))
+            .filter(|id| !known.contains(id.as_str()) && !omitted_offline_items.contains(id.as_str()))
             .map(|id| clip_id(id))
             .collect();
     }

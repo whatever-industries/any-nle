@@ -178,6 +178,7 @@ fn qualify(
                 duration: Rational::new(samples.into(), 48000).unwrap(),
                 motion_audio_origin: None,
                 same_rate_aac_origin: false,
+                mp3_delay_samples: None,
                 column_timecode: None,
                 embedded_mov_timecode: None,
             })
@@ -256,6 +257,7 @@ fn qualify(
             duration,
             motion_audio_origin: None,
             same_rate_aac_origin: false,
+            mp3_delay_samples: None,
             column_timecode: Some(clock.clone()),
             embedded_mov_timecode: None,
         },
@@ -307,8 +309,11 @@ pub(super) fn select(
         }
     }
     for master in &facts.masters {
+        if out.omitted_unused.contains_key(&master.id) {
+            continue;
+        }
         check()?;
-        if master.originals.iter().any(Option::is_some) {
+        if master.pcm_prefix.is_some() || master.originals.iter().any(Option::is_some) {
             continue;
         }
         let candidate = (|| {
@@ -408,7 +413,7 @@ pub(super) fn select(
                     });
                 *used = used
                     .checked_add(cost)
-                    .filter(|n| *n <= av::MAX_SOURCE_FACT_BYTES)
+                    .filter(|n| *n <= super::MAX_ORIGINAL_INDEX_BYTES)
                     .ok_or("camera-original index exceeds 64 MiB")?;
                 let saved_path_note = if claim.mapped {
                     format!("; saved Avid locator {}", selected.stream.saved_locators[0])
@@ -472,7 +477,7 @@ pub(super) fn select(
         };
         *used = used
             .checked_add(note.len() + std::mem::size_of::<String>())
-            .filter(|n| *n <= av::MAX_SOURCE_FACT_BYTES)
+            .filter(|n| *n <= super::MAX_ORIGINAL_INDEX_BYTES)
             .ok_or("camera-original notes exceed 64 MiB")?;
         out.notes.push(note);
     }

@@ -115,10 +115,10 @@ fn read_graph(path: &Path) -> Result<SourceGraph> {
         }
         let file = File::open(path)?;
         let mut bytes = Vec::new();
-        file.take(graph::MAX_GRAPH_BYTES as u64 + 1)
+        file.take(graph::source::MAX_SOURCE_GRAPH_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > graph::MAX_GRAPH_BYTES {
-            return Err("saved graph exceeds 64 MiB".into());
+        if bytes.len() > graph::source::MAX_SOURCE_GRAPH_BYTES {
+            return Err("saved source graph exceeds 256 MiB".into());
         }
         Ok(SourceGraph::from_json_text(std::str::from_utf8(&bytes)?)?)
     } else {

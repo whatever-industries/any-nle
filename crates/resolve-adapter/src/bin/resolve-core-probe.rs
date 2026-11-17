@@ -10,7 +10,7 @@ enum MediaBinding {
     Op1a(BindingSpec),
     OpAtom(AtomBindingSpec),
 }
-use graph::{source::SourceGraph, MAX_GRAPH_BYTES};
+use graph::source::{SourceGraph, MAX_SOURCE_GRAPH_BYTES};
 use std::{ffi::OsString, path::Path};
 
 mod support;
@@ -24,7 +24,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if canvas != "1920x1080" {
         return Err("explicit 1920x1080 destination required".into());
     }
-    let graph = SourceGraph::from_json_text(&read(Path::new(graph), MAX_GRAPH_BYTES)?)?;
+    let graph = SourceGraph::from_json_text(&read(Path::new(graph), MAX_SOURCE_GRAPH_BYTES)?)?;
     let binding = match serde_json::from_str(&read(Path::new(binding), 32 << 10)?)? {
         MediaBinding::Op1a(spec) => verify_binding(spec, Path::new(ffprobe))?,
         MediaBinding::OpAtom(spec) => verify_atom_binding(spec, Path::new(ffprobe))?,

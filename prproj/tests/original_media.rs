@@ -37,6 +37,7 @@ fn original(shape: &str) -> OriginalClip {
         })
         .collect();
     OriginalClip {
+        separate_mono_streams: false,
         proxy_path: None,
         metadata: ClipMetadata {
             id: "original".into(),
@@ -111,8 +112,10 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         audio_pans: Vec::new(),
         audio_mixers: Default::default(),
         track_states: Default::default(),
+        non_drop_sequences: Default::default(),
         picture_effects: Vec::new(),
         source_luts: Vec::new(),
+        extended_sdr_grades: Default::default(),
         edit_labels: Vec::new(),
         disabled_edits: Default::default(),
         direct_dnxhr_origins: Default::default(),
@@ -134,6 +137,59 @@ fn xml(p: &PathBuf) -> String {
         .read_to_string(&mut s)
         .unwrap();
     s
+}
+
+#[test]
+fn linked_dual_mono_mov_writes_two_physical_audio_media_nodes() {
+    let mut clip = original("dualmono");
+    clip.separate_mono_streams = true;
+    clip.path = clip.path.replace(".mp4", ".mov");
+    clip.metadata.rate = Some(Fraction::new(25, 1));
+    clip.video.as_mut().unwrap().rate = Fraction::new(25, 1);
+    clip.audio.as_mut().unwrap().representation = SampleRepresentation::Pcm24;
+    let mut project = input(clip);
+    let scratch = Scratch::new();
+    let path = scratch.0.join("dual-mono.prproj");
+    prepare_typed_project(&project, &path, &mut SeededUuids::new("dual-mono"), &[], false)
+        .unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&path).unwrap();
+    let nodes = doc.tree.findall(doc.root, "Media").unwrap();
+    assert_eq!(nodes.len(), 2);
+    for (i, node) in nodes.iter().enumerate() {
+        assert_eq!(doc.tree.findtext(*node, "StreamNumber").unwrap().as_deref(), [None, Some("1")][i]);
+        let stream = doc.resolve(doc.tree.find1(*node, "AudioStream").unwrap()).unwrap();
+        assert_eq!(doc.tree.findtext(stream, "AudioChannelLayout").unwrap().as_deref(),
+            Some(r#"[{"channellabel":0}]"#));
+    }
+    assert_eq!(doc.tree.findtext(nodes[0], "FileKey").unwrap(),
+        doc.tree.findtext(nodes[1], "FileKey").unwrap());
+    let PreparedClip::Original(clip) = &mut project.clips[0] else { panic!("expected original clip"); };
+    clip.groups = vec![vec![1, 2]];
+    let invalid = scratch.0.join("invalid.prproj");
+    assert!(prepare_typed_project(&project, &invalid, &mut SeededUuids::new("invalid"), &[], false).is_err());
+    assert!(!invalid.exists());
+}
+
+#[test]
+fn linked_uhd_avc_pcm_mp4_admits_both_depths_at_the_exact_movie_clock() {
+    for depth in [SampleRepresentation::Pcm16, SampleRepresentation::Pcm24] {
+        let mut clip = original("movie");
+        let video = clip.video.as_mut().unwrap();
+        video.width = 3840;
+        video.height = 2160;
+        video.rate = Fraction::new(24_000, 1001);
+        video.duration = 48 * ticks_per_unit(video.rate);
+        let audio = clip.audio.as_mut().unwrap();
+        audio.duration = video.duration;
+        audio.representation = depth;
+        validate_original(&clip).unwrap();
+
+        let mut wrong_raster = clip.clone();
+        wrong_raster.video.as_mut().unwrap().height = 1080;
+        assert!(validate_original(&wrong_raster).is_err());
+        clip.audio.as_mut().unwrap().duration -= ticks_per_unit(Fraction::new(48_000, 1));
+        assert!(validate_original(&clip).is_err());
+    }
 }
 
 #[test]
@@ -165,6 +221,53 @@ fn linked_picture_media_carries_its_saved_reel_and_clock() {
     let (log, _) = log_and_after.split_once("</ClipLoggingInfo>").unwrap();
     assert!(log.contains("<TapeName>REEL_A_101</TapeName>"));
     assert!(log.contains(&format!("<MediaInPoint>{start}</MediaInPoint>")));
+}
+
+#[test]
+fn extended_sdr_grades_share_the_table_and_refuse_a_combined_grade() {
+    let scratch = Scratch::new();
+    let out = scratch.0.join("grades.prproj");
+    let invalid = scratch.0.join("invalid.prproj");
+    let mut project = input(original("prores_hq"));
+    let mut gain = event();
+    gain.audio_tracks.clear();
+    gain.stereo.clear();
+    gain.color_correction = Some(ColorCorrection {
+        tone: vec![("gain".into(), 150.0)],
+        ..Default::default()
+    });
+    let mut repeated = gain.clone();
+    repeated.record_start = gain.record_start + gain.duration;
+    project.sequences.push(sequence(vec![gain, repeated]));
+    project.extended_sdr_grades.extend([(0, 0), (0, 1)]);
+    let mut ids = SeededUuids::new("extended-sdr-grade");
+    prepare_typed_project(&project, &out, &mut ids, &[], false)
+        .unwrap().publish().unwrap();
+
+    let mut doc = prproj::xml::parse_prproj(&out).unwrap();
+    let tables: Vec<_> = doc.tree.iter_tag(doc.root, "ArbVideoComponentParam")
+        .filter(|&node| doc.tree.findtext(node, "Name").unwrap().as_deref() == Some("LUT Blob"))
+        .map(|node| doc.tree.find1(node, "StartKeyframeValue").unwrap())
+        .collect();
+    assert_eq!(tables.len(), 2);
+    assert_eq!(tables.iter().filter(|&&node| !doc.tree[node].text_or_empty().trim().is_empty()).count(), 1);
+    let a = doc.payload(tables[0]).unwrap().unwrap();
+    let b = doc.payload(tables[1]).unwrap().unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a.len(), 40 + 65_usize.pow(3) * 12);
+    assert_eq!(&a[..4], b"ITX3");
+    assert_eq!(&a[16..20], &(-1.125_f32).to_le_bytes());
+    assert_eq!(&a[28..32], &2.125_f32.to_le_bytes());
+    let assets = scratch.0.join("grades LUTs");
+    assert_eq!(std::fs::read_dir(&assets).unwrap().count(), 1);
+    assert!(std::fs::read_to_string(assets.join("Avid Gain 150 Rec709 SDR.cube")).unwrap()
+        .contains("DOMAIN_MIN -1.125 -1.125 -1.125\nDOMAIN_MAX 2.125 2.125 2.125\n"));
+
+    project.sequences[0].events[1].color_correction.as_mut().unwrap().tone
+        .push(("contrast".into(), 30.0));
+    assert!(prepare_typed_project(&project, &invalid, &mut ids, &[], false).is_err());
+    assert!(!invalid.exists());
+    assert!(!scratch.0.join("invalid LUTs").exists());
 }
 
 #[test]

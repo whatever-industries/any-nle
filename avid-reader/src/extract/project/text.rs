@@ -8,13 +8,19 @@ pub(super) use properties::properties;
 pub(super) const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_DATABASE_BYTES: usize = 1024 * 1024;
 const MAX_FONT_FACE_BYTES: usize = 255;
+const LEGACY_TITLER: &str = "8BA34E51-D647-443E-BFB5-30DFCECE5415";
+
+pub(super) fn is_legacy_titler(node: &Node) -> bool {
+    node.class == *b"TKFX" && node.get("effect_id").and_then(Value::as_str) == Some(LEGACY_TITLER)
+}
+
 pub(super) fn kind(node: &Node) -> Option<TextKind> {
     if node.class != *b"TKFX" {
         return None;
     }
     match node.get("effect_id").and_then(Value::as_str)? {
         "E4FE520A-B815-447F-A969-2D5E1C5F6C14" => Some(TextKind::SubCap),
-        "E4EEBB07-AFAA-4122-BFA8-0A838BB40A8C" => Some(TextKind::TitlerPlus),
+        "E4EEBB07-AFAA-4122-BFA8-0A838BB40A8C" | LEGACY_TITLER => Some(TextKind::TitlerPlus),
         _ => None,
     }
 }
@@ -24,6 +30,9 @@ pub(super) fn body<'a>(
     node: &Node,
     kind: TextKind,
 ) -> Result<&'a [u8], &'static str> {
+    if is_legacy_titler(node) {
+        return legacy_body(ctx, node);
+    }
     let (parameter, user_type) = match kind {
         TextKind::SubCap => (
             "961a0231335b514595e0317fddf547df",
@@ -34,7 +43,16 @@ pub(super) fn body<'a>(
             "aa2c2fc09372d611b4e40030658a6504",
         ),
     };
-    let mut found = None;
+    let [body] = exact_text_parameters(ctx, node, [(parameter, user_type)])?;
+    Ok(body)
+}
+
+fn exact_text_parameters<'a, const N: usize>(
+    ctx: &Ctx<'a>,
+    node: &Node,
+    carriers: [(&str, &str); N],
+) -> Result<[&'a [u8]; N], &'static str> {
+    let mut bodies = [None; N];
     for reference in parameter_items(ctx, node)? {
         let p = ctx
             .deref(Some(reference))
@@ -43,10 +61,11 @@ pub(super) fn body<'a>(
         let Some(Value::Uuid(id)) = p.get("uuid") else {
             return Err("text parameter identity missing");
         };
-        if file_order_hex(id) != parameter {
+        let identity = file_order_hex(id);
+        let Some(slot) = carriers.iter().position(|(parameter, _)| *parameter == identity) else {
             continue;
-        }
-        if found.is_some() {
+        };
+        if bodies[slot].is_some() {
             return Err("duplicate text content parameter");
         }
         if !matches!(
@@ -59,7 +78,7 @@ pub(super) fn body<'a>(
             .deref(p.get("value"))
             .filter(|n| n.class == *b"AVUP")
             .ok_or("text content is not AVUP")?;
-        if !matches!(v.get("uuid"), Some(Value::Uuid(u)) if file_order_hex(u) == user_type) {
+        if !matches!(v.get("uuid"), Some(Value::Uuid(u)) if file_order_hex(u) == carriers[slot].1) {
             return Err("unqualified text AVUP type");
         }
         let Some(Value::Bytes(bytes)) = v.get("data") else {
@@ -68,9 +87,50 @@ pub(super) fn body<'a>(
         if bytes.len() > MAX_DATABASE_BYTES {
             return Err("text database exceeds 1 MiB");
         }
-        found = Some(bytes.as_slice());
+        bodies[slot] = Some(bytes.as_slice());
     }
-    found.ok_or("text content parameter missing")
+    let mut result = [b"".as_slice(); N];
+    for (destination, bytes) in result.iter_mut().zip(bodies) {
+        *destination = bytes.ok_or("text content parameter missing")?;
+    }
+    Ok(result)
+}
+
+fn legacy_body<'a>(ctx: &Ctx<'a>, node: &Node) -> Result<&'a [u8], &'static str> {
+    // The retained standalone title has two empty picture inputs. Dropping a
+    // live input here would change the composite even if the text is readable.
+    let tracks = ctx.tracks(node);
+    let [background, foreground] = tracks.as_slice() else {
+        return Err("legacy Titler+ input topology is unqualified");
+    };
+    for (track, ordinal) in [(background, 1), (foreground, 2)] {
+        let empty_picture = ctx.deref(track.get("component")).is_some_and(|input| {
+            int(input, "media_kind_id") == Some(KIND_PICTURE) && ctx.is_empty(input)
+        });
+        if int(track, "index") != Some(ordinal) || !empty_picture {
+            return Err("legacy Titler+ input topology is unqualified");
+        }
+    }
+    let user = "4af0193369ac2545b9e82206362fd233";
+    let [text, copy] = exact_text_parameters(ctx, node, [
+        ("812d338077ca3047bea8a8c60e9b7feb", user),
+        ("81c4ee4822483045a7318b818ecb7d25", user),
+    ])?;
+    if text != copy {
+        return Err("legacy Titler+ text carriers disagree");
+    }
+    Ok(text)
+}
+
+pub(super) fn decode_legacy_titler(bytes: &[u8]) -> Result<String, &'static str> {
+    let text = bytes.strip_suffix(&[0])
+        .and_then(|text| std::str::from_utf8(text).ok())
+        .filter(|text| {
+            !text.is_empty() && text.len() <= MAX_TEXT_BYTES
+                && !text.chars().any(|c| c.is_control() && c != '\n')
+        })
+        .ok_or("legacy Titler+ text is empty, oversized, or lacks valid NUL-terminated UTF-8")?;
+    Ok(text.to_owned())
 }
 
 fn parameter_items<'a>(ctx: &Ctx<'a>, node: &Node) -> Result<&'a [Value], &'static str> {

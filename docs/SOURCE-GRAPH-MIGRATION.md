@@ -34,6 +34,254 @@ from a bounded native archive profile. Its saved Resolve clocks and channel
 selectors retain their own provenance. Product route qualification remains
 separate from the source adapter.
 
+## Skip unused bin clips that can’t link
+
+The linked Avid → Premiere job uses this fallback by default. The source
+adapter checks saved Mob references in the same decoded bins used for
+capture. The check covers alternate and hidden source branches and
+disallows omission when a reachable editorial component is opaque or
+its reference is incomplete. It also protects reusable clips that refer
+to a master when no timeline selects them. Failed links outside the
+omission profile retain their normal diagnostic. Qualified offline
+placeholders still take precedence.
+
+A regular managed picture master can also be omitted when its saved picture
+rate agrees with the master but has no supported exact clock. The route checks
+the full-span picture and up to two ordinary mono PCM siblings. The same
+dependency proof applies even if the MXFs are present. A referenced clip or a
+contradictory saved master and picture rate still blocks.
+
+The reader also recognizes a saved drive-like locator spelling on a bounded
+23.976 MXF bundle with one picture file and eight mono PCM24 siblings. A
+complete bundle has distinct package IDs and file names, one saved directory,
+matching descriptor extents and explicit file-track selectors. The saved
+spelling establishes no local filesystem root. Review searches the selected
+Avid media roots by package ID and verifies each single-essence MXF's clock,
+descriptor span, and physical stream before using the ordinary managed-media
+route. Graph/2 retains all saved locators and file selectors. Missing files
+may be omitted as a whole bundle when dependency checks prove the master
+unused. References, conflicting locators, or incorrect physical identities
+keep otherwise unresolved media visible as blockers.
+
+Each accepted omission retains a bin-owned `omitted_unused_masters`
+receipt and occurrence-specific `unused_bin_item` loss. The source list,
+input revisions, and media checks are revalidated by saved jobs.
+
+## Continue with omissions
+
+Linked Avid → Premiere conversions use best effort by default. Qualified
+media bindings and requested offline items take precedence. The linked
+reader can omit ordinary saved originals that are unavailable, a missing
+qualified legacy MXF bundle, wholly unavailable managed clips within the
+qualified source profile, and 4K AVC/PCM files with corroborated saved
+layout and extents that the writer does not support. It retains the saved
+bin facts under `omitted_media_masters` and reports the omitted bin
+occurrence without claiming the clip was unused.
+
+An omitted media edit gets a sequence range marker when its saved bounds,
+rate, and lane are exact and the range does not overlap another edit or
+transition on that lane. Its source selection and range remain in the
+source receipt. Other unsupported timing stays in the loss report, and
+the rest of the sequence can continue. Contradictory bindings, corrupt
+inputs, graph limits, and invalid project outputs still fail. The same
+default applies to older jobs.
+
+Linked Entire Project preparation can also omit a wholly offline
+managed master that cannot become a valid Premiere placeholder. It
+keeps the original graph facts and produces a range marker only on a
+verified vacant lane interval. An ordinary dissolve with a surviving
+endpoint can preserve the saved cut when both endpoint ranges prove
+its edges. Qualified offline items keep their relink entries.
+
+## Avid linked MP3 and stills
+
+The linked MP3 reader verifies the physical 44.1 or 48 kHz sample clock, decoded
+sample extent, and explicit channel selectors against the saved Avid descriptor.
+Its graph stream starts at file-relative sample zero. The native descriptor
+extent remains on its source receipt. For the qualified fresh 44.1 and 48 kHz
+MPGA stereo profiles, the reader verifies the leading MPEG `Info` frame and
+gapless decoder delay. Straight mono placements at 25 fps use gapless file
+time and retain the saved trim and physical sample clock in
+`avid.mp3_presentation`. The reader checks that the entire corrected edit is
+playable. Premiere preparation uses the gapless extent for the linked master.
+Premiere preparation reports the observed 44.1 kHz resampling difference by edit.
+
+For the qualified linked 1080p24 JPEG and PNG descriptors, the original stream
+describes one physical image. The media duration describes the saved Avid hold
+in whole frames. Premiere preparation writes a native still and preserves the
+saved hold and edit trims. The same split between physical image and editorial
+hold also applies to the bounded 1536×1024 RGB PNG profile. For a V1 edit with
+the saved centered, full-image spatial adapter, graph/2 carries the verified
+1920×1080 canvas and a uniform Motion scale of 105.46875%. The edit retains its
+native source color receipt. The imported PNG Matte Key path handles a
+different saved Avid relationship. [Linked format checks](ROADMAP.md#high-priority-linked-audio-and-stills)
+
+## Avid Gain and Timewarp fallbacks
+
+If Gain, an automatic Motion Adapter, or a generated Freeze Frame has
+no qualified translation, the reader can preserve its saved record
+interval on the occurrence receipt. The converter writes an exact
+sequence range marker when the effect is on a verified lane and clock
+and the interval is clear of competing edits. A Gain gap can share a
+boundary with a directly identified Avid audio dissolve. Graph/2
+retains the saved overlap, cut, and the unavailable endpoint's owner.
+Premiere places the gap edge at the cut, omits the dissolve, and
+trims the verified neighboring audio to that cut. An adjacent saved
+filler or second Gain gap needs no audio placement. The project report
+identifies the gap and the omitted dissolve. Unresolved adjacency,
+contradictory timing, and unsupported neighboring trim behavior
+remain blockers.
+
+Direct linked conversion can bypass one recognized AudioSuite Gain when the
+saved 24 fps mono route resolves through a direct master or subclip and its
+zero-offset managed PCM16 or PCM24 sibling covers the entire source range on
+the 48 kHz clock.
+The same placement carries independent edit gain, pan, automation and its
+transition relationships. The saved Gain binding and its dry input remain
+in graph/2 source receipts. The existing prepared-media route can still use
+the qualified processed Gain cache.
+
+The saved legacy Avid EQ (`EFF_AUDIO_EQMB`) can use the same managed
+PCM verification for an unrendered, full-span 24 fps mono input.
+Graph/2 retains the effect enable, filter name, and each band's raw
+type, frequency, gain, Q and enable on the source event. These fields
+remain in Avid's saved value space. Enabled EQ reports an edit-specific
+processing loss. Independent timeline gain and pan still apply.
+
+For a saved render of that effect on a same-rate mono edit, the linked
+Premiere path can use the saved PCM24 cache in place. The
+precompute's EQ values and dry file-relative input must agree with the
+sequence's EQ and source trim. The cache's master, file and origin
+packages and exact 48 kHz playable sample extent must all verify.
+When the edit uses a portion of a longer cache, graph/2 retains the
+cache's full length and the edit's in-point. Applying that in-point to
+the cache's saved dry input must yield the same file, channel and
+position as the sequence edit. A verified
+render retains the processed audio and independent timeline mix.
+Conversion reports the loss of an editable EQ. If the saved cache package
+is absent from the scanned media roots, direct linking can use the dry
+master lane and exact file range from the same verified source receipt.
+That lane must resolve to the saved file package with a zero offset and
+continuous, playable mono 48 kHz PCM. Conversion reports the missing cache
+and omitted EQ on the edit and preserves independent timeline mix controls.
+Ambiguous or mismatched caches remain explicit omissions.
+
+The dry input can also use one same-rate audio subclip. The verifier
+follows the selected sound track through the subclip and its master,
+accounts for leading filler, and permits qualified neutral Pan Volume
+wrappers. The resulting file package, saved channel label, and exact
+dry start must match the EQ precompute's copy. Graph/2 keeps those
+facts with the cache reference, including the dry master and its lane.
+A mismatched channel, one-frame slip, shortened input or nonneutral
+gain inside the subclip omits the EQ edit.
+
+A usage-7 master can supply the same dry binding when it has one sound
+track and a full-span neutral Pan Volume wrapper over a zero-offset
+PCM24 file. The saved precompute must independently identify the same
+neutral input and exact file range. Graph/2 records the master usage
+on that dry-input receipt.
+
+One same-rate mono PCM24 master with explicit static gain and centered
+pan also qualifies when the precompute copy has the same saved gain,
+channel and file-relative range. Both inputs must wrap one full-span
+sound clip with zero-length boundary fillers. The saved AAF slot must
+agree with the clip's track label. In the tested Avid profile, the EQ
+cache and rendered timeline both bypassed this master gain. Premiere
+links the cache and retains independent timeline gain and pan. Graph/2
+records the inner gain on the cache's source receipt. If that cache is
+missing, the edit remains an explicit omission. Other layered effects
+remain open.
+
+For the saved two-second mono Pitch II inside EQ case, the source event
+receipt records the exact edit range, file and channel, EQ controls,
+and both cache bindings. The live Pitch II settings must agree with
+the two saved copies. The receipt records the plug-in payload length
+and SHA-256. A derived Avid control with the same neutral subclip route
+verified a 96,000-sample outer EQ cache and a 96,002-sample inner Pitch
+II cache. The Avid export played the outer cache, including at both
+edit boundaries. Premiere direct linking verifies the outer file
+package and extent, links it once, and reports the loss of editable
+Pitch II and EQ controls. Premiere 27 rendered the complete control
+sample for sample after Save As and reopen with just the outer cache
+and the dry source online. If the outer cache is missing or fails
+verification, the affected span stays a gap.
+
+An unsupported sampled Timewarp has separate handling when its saved
+picture span and clock agree with the sequence and the span is clear of
+same-lane edits and transitions. A direct precompute must match the saved
+master, file and upstream origin package, with exact trim coverage in a
+qualified progressive 1080p picture stream. A saved precompute can name the
+clip directly or through a same-clock picture sequence containing only that
+clip and zero-length fillers. The saved clip in-point still determines the
+cache trim. If the cache is unavailable or
+fails verification, a sequence range marker names the affected lane and
+identifies the exact gap. The saved witness and the per-edit decision stay
+in the graph report. The editable sampled profiles retain their usual
+checks and contradictory or unresolved timing still blocks conversion.
+
+For an unresolved Timewarp, the sequence's `avid.source.unresolved` receipt
+also retains the saved span ratio, phase and offset, render override, graph
+selector, available input and precompute references, and bounded curve data.
+Half-frame samples retain their first saved sample index and values. Sparse
+keys retain their exact saved times, curve modes, and known key properties.
+Explicit FluidMotion and FluidMotion Draft overrides retain both their numeric
+value and the name confirmed in Avid's Motion Effect Editor.
+These observations are in the effect's own clock. A destination needs a
+qualified source route and sampling rule to use them as file-relative frames.
+
+For one full-span Resize over one sampled Timewarp, an exact saved render
+owned by the outer Resize can supply the composite. The decoded cache must
+trace to a Resize over Timewarp on the matching picture clock. The same
+master, file, origin, packet coverage, and overlap checks apply. The
+source receipt identifies the Resize separately from the inner Timewarp.
+
+The traditional 1080p24 Freeze Frame's 120-frame generated render can also
+supply a shorter edit from its start. Two distinct picture subclips qualify
+when their single picture routes reach the same master and source frame.
+The converter can keep this picture beneath the retained video-levels
+Color Adapter profile. It reports the omitted Color Adapter on the edit.
+
+### Standalone AudioSuite renders
+
+A same-rate 24 fps mono edit can use an AudioSuite PCM24 cache or
+a trimmed window within it. The timeline effect and the cache origin
+must have matching saved AAX plug-in identity and settings. The
+effect's input must agree with the copy's file-relative in-point plus
+the cache trim. Both select the same lane of one mono 48 kHz PCM file.
+Graph/2 retains the cache in-point and full length, input range, package
+bindings, plug-in IDs, and opaque chunk length and digest in the
+native event receipt.
+
+The timeline input can use one same-rate subclip. Its selected lane
+must resolve to the same file and channel, including the subclip
+offset. Graph/2 records the subclip identity, track and local in-point
+alongside the resolved input. The saved copy can address the file
+directly or through one full-span Pan Volume wrapper. For subclip
+inputs it can also use two such wrappers. Each wrapper must have
+verified unity gain and center pan. The verified render supplies playback.
+
+A direct master and its render copy can also carry a sequence inside
+the neutral Pan Volume wrapper. The sequence must contain one
+full-span sound clip between two zero-length fillers. The wrapper and
+sequence must agree on the saved AAF slot or on all three saved routing
+fields. Slot and channel must select the sound clip's saved track, and
+the qualified mono source slot is 1. The ordinary file, channel, and
+range checks still apply to both paths.
+
+Direct linking checks the MXF package chain, the complete playable
+PCM span, and a separate terminal packet containing exactly two zero
+samples. The playable range ends before that packet. Premiere 27 Save
+As and reopen matched the full-span Avid D-Verb and Pitch II Direct
+Out controls and two trimmed D-Verb controls sample for sample. The
+full-span and trimmed subclip D-Verb controls also matched exactly.
+One-wrapper D-Verb controls matched for both direct and subclip inputs.
+Two additional direct-master D-Verb controls with a saved sequence
+inside Pan Volume also matched exactly.
+The report names the baked plug-in by occurrence. An absent or
+invalid cache leaves a reported gap. Nested AudioSuite effects, stereo
+processing, and prepared-media rewrap remain separate qualification
+cases for this route.
+
 ## Avid source ColorAdapter ownership
 
 The physical picture source's saved input transform remains in the item's
@@ -47,9 +295,25 @@ range, the record names the picture file package and that placement.
 A missing or contradictory source match retains its reason and a null
 placement. A plain edit of the same master has no ColorAdapter record.
 
+The exact standalone 10-bit LinearLut lists also retain a `linear_range`
+record on each saved file or edit owner. It gives the direction, bit
+depth, and 64/940 video endpoints alongside the original XML. The
+full-to-video list requires Avid's saved `Inverted` flag. A stacked or
+unrecognized list retains its raw XML. The range receipt describes the
+saved instruction. The physical file's own color tags and whether the
+destination applies the instruction remain independent. Premiere's
+Separate files preparation can translate video-to-full scaling on a
+plain 1080p24 picture edit of the qualified picture-only ProRes HQ original
+with an editable ASC CDL. It uses per-channel slope (1023/876) and
+offset (-64/876) in Premiere's normalized video-level space. The
+master clip retains the linked original. A plain timeline occurrence
+of that master does not get an ASC CDL. The qualified edit can be on a
+higher picture lane alongside a separate video dissolve.
+An edit that is a transition endpoint still requires its own qualification.
+
 The source receipt leaves color-space and cube asset qualification to
-destination preparation. The conversion continues to report the omitted
-appearance. [Premiere comparison](ROADMAP.md#edit-fidelity-and-metadata)
+destination preparation. Unapplied transforms keep an occurrence loss.
+[Premiere comparison](ROADMAP.md#edit-fidelity-and-metadata)
 
 ## Avid timeline track declarations and names
 
@@ -65,6 +329,11 @@ The Avid name record retains ambiguous or unrepresentable text. Premiere
 preparation still accepts previously saved graphs with names in the
 `avid.track_names` sidecar. It reports conflicting rows for the same lane.
 Destination preparation decides which names and layouts it can write.
+The sequence's `avid.plain_track_layouts` receipt identifies named,
+direct picture lanes and explicitly saved mono audio lanes whose source
+contains edits. Premiere can preserve their names on empty output lanes
+when the edits are omitted. The source lane remains distinct from a
+filler-only declaration and the original omissions stay in the report.
 Graph/1 tracks and saved job formats keep their existing contracts.
 [Timeline track checks](SPLIT-EDIT-AUDIO-2026-11-06.md#timeline-track-names)
 
@@ -547,9 +816,9 @@ the exact old fallback rules to the retained **raw** legacy tuple: integer
 display-base conversion, zero for absent/drop/off-tick/overflowing legacy starts.
 It does not round graph/2's exact media start to imitate old output. Audio never
 acquires a clock from adjacent picture. For the sequence zero point only,
-preparation uses the qualified direct 23.976 non-drop TC1 when present. Other
-sequence origins retain their compatibility fallback. Diagnostics identify the
-clock interpretation.
+preparation can use qualified 23.976 or 25 fps non-drop TC1, 29.97 drop-frame
+TC1, or the qualified 24 fps Resolve archive clock. Other sequence origins use
+the compatibility fallback. Diagnostics identify the clock interpretation.
 
 Graph/2's optional typed `SourceClock` carries effective count, exact rate,
 display base, drop flag and typed resolution provenance. Validation checks exact
@@ -557,11 +826,10 @@ origin/offset arithmetic and its agreement with the portable start. Native count
 remain full u64 decimal strings on the wire; missing witnesses stay absent.
 Raw compatibility tuples remain separate from this witness.
 
-Sequence canvas is also optional. A clip's raster does not establish the native
-sequence canvas. Current Avid extraction leaves it unknown and preserves the exact
-old first-picture/default tuple solely as `compatibility_frame_size`. Both existing
-Premiere profiles explicitly consume that receipt; they do not promote the fallback
-to a source fact or silently apply a future corrected canvas.
+Sequence canvas is also optional. The centered still-fit profile verifies it from
+the saved Avid sequence format and the qualified adapter. For other Avid sequences
+the first-picture/default raster remains a `compatibility_frame_size` receipt.
+Premiere uses that receipt for existing compatibility behavior.
 
 `VerifiedRewrap` preserves the existing opt-in file-clock normalization at the
 picture rate, including base/drop/one-day/shared-source guards. The retained native
@@ -615,9 +883,12 @@ the graph's ability to represent source facts.
 | Limit | What it bounds |
 |---|---|
 | Existing AVB read/scan/nesting limits | Per-file decoding and traversal, independently of project summaries. |
-| 64 MiB accounted source-facts budget | Retained records, collection/reference slots and owned payload capacity during source construction. Shared payload is charged once and every reference slot separately. |
-| Additional adapter construction accounting | Native receipts, typed records and owned graph payload; refuses before retained growth. Conservative reservations can overcount released temporary work. |
-| 64 MiB encoded graph ceiling | Bounded streaming serialization, counted before caller output; no additional complete JSON value tree. |
+| 8 GiB accounted Avid source-facts budget on 64-bit builds | Project-wide retained records, collection/reference slots and owned payload capacity during source construction. Shared payload is charged once and every reference slot separately. The 32-bit reader keeps the 256 MiB bound. |
+| 768 MiB Avid adapter construction budget | Native receipts, typed records, and owned graph payload. Conservative reservations can overcount temporary work. The serialized graph has its own limit. |
+| 2 GiB linked Entire Project working graph budget | Shared graph and one timeline's construction scratch. The adapter drops consumed source timelines and reaccounts the retained view after each spill. |
+| 16 GiB private receipt spool | Complete native timeline receipts and detailed source omissions for linked Entire Project conversion. Each record retains the graph/2 per-record bound. |
+| 512 MiB linked whole-project prepared input allowance | Bounds the typed destination payload, separately from the Premiere document's allocations. Standalone typed preparation retains its 64 MiB allowance. |
+| 256 MiB encoded graph/2 ceiling | Bounded streaming serialization, counted before caller output; no additional complete JSON value tree. The legacy graph/1 reader retains its 64 MiB ceiling. |
 | Existing 16 MiB pretty-model JSON input boundary | Standalone/legacy model-file interfaces. It is not imposed by a new serializer on the direct source path. |
 | Existing writer field/count/track limits | What the current Premiere writer can represent. |
 
@@ -626,6 +897,25 @@ at a time still permits decoder/compiler temporaries. Source facts, graph, prepa
 model, document, assets and media-scan overhead must be measured together. The
 initial native comparison's high-water memory follows the existing MXF scan;
 referenced-only retained headers do not imply that header-reading temporaries vanish.
+
+Linked Entire Project jobs stage native timeline receipts and high-volume
+omissions in a temporary file. Only the receipt fields needed for native
+preparation stay in the working graph. The job still validates the shared
+media, bin, placement, clock, and ownership references. The 256 MiB graph/2
+limit remains on graph serialization; native preparation from the staged
+view does not serialize that view as a graph/2 export. Successful jobs
+copy detailed receipts to an exclusively created `.anynle-debug.jsonl`
+file beside the Premiere project. Each record names its owner and includes
+its native facts or loss. The temporary file is released on failure or
+cancellation. Source capture and Premiere's document builder have separate
+allocations beyond the graph working budget.
+
+While creating a new sequence, the Premiere writer accumulates the maximum
+source extent it would have published after each clip insertion and trim.
+It publishes the extent once per sequence, including any larger temporary
+extent inherited from a clip's default trim. This avoids repeatedly scanning
+all earlier edits and preserves the saved duration of the backing sequence
+sources.
 
 After preparation, the document tree is released and its encoded payload remains
 opaque. The app releases the typed writer model before media execution. LUTs retain

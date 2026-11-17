@@ -186,6 +186,30 @@ impl Project {
         let content = self.sequence_end(sequence)?.ticks;
         self.grow_source_duration_to(sequence, content)
     }
+
+    pub(crate) fn defer_sequence_extent(&mut self, sequence: SequenceId) {
+        debug_assert!(self.pending_sequence_extent.is_none());
+        self.pending_sequence_extent = Some((sequence, 0));
+    }
+
+    pub(crate) fn finish_sequence_extent(&mut self) -> Result<()> {
+        match self.pending_sequence_extent.take() {
+            Some((sequence, end)) => self.grow_source_duration_to(sequence, end),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn grow_source_duration_from_item(&mut self, item: TrackItemId) -> Result<()> {
+        let sequence = self.track(self.track_item(item).track).sequence;
+        if self.pending_sequence_extent.is_some_and(|(pending, _)| pending == sequence) {
+            // Preserve the largest end observed, including each default end
+            // before the writer replaces it with the edit's trimmed end.
+            let end = self.end(item)?.ticks;
+            self.grow_source_duration_to(sequence, end)
+        } else {
+            self.grow_source_duration(sequence)
+        }
+    }
     /// Set the backing extent of a prepared nested sequence to its final span.
     pub(crate) fn set_nested_source_duration(&mut self, sequence: SequenceId, duration: i64) -> Result<()> {
         let uid = self.sequence_id(sequence);
@@ -218,6 +242,12 @@ impl Project {
     /// Embedded captions are data-track items and are not in `sequence_clips`.
     /// Grow their backing sequence sources without inventing a picture edit.
     pub(crate) fn grow_source_duration_to(&mut self, sequence: SequenceId, content: i64) -> Result<()> {
+        if let Some((_, end)) = self.pending_sequence_extent.as_mut()
+            .filter(|(pending, _)| *pending == sequence)
+        {
+            *end = (*end).max(content);
+            return Ok(());
+        }
         if content == 0 {
             return Ok(());
         }

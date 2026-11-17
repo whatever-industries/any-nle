@@ -56,7 +56,7 @@ impl Project {
                 insert_leaf_before(&mut self.doc.tree, parent, "End", "Start", &text)?;
             }
         }
-        self.carry_sequence_length(item)
+        self.grow_source_duration_from_item(item)
     }
 
     /// `TrackItem.end = value`, then grows the sequence's source duration.
@@ -66,12 +66,7 @@ impl Project {
             return value_err("cannot set end: <ClipTrackItem/TrackItem/End> is absent and its creation anchor is not defined for this field");
         };
         self.doc.tree.set_text(e, Some(value.ticks.to_string()));
-        self.carry_sequence_length(item)
-    }
-
-    fn carry_sequence_length(&mut self, item: TrackItemId) -> Result<()> {
-        let sequence = self.track(self.track_item(item).track).sequence;
-        self.grow_source_duration(sequence)
+        self.grow_source_duration_from_item(item)
     }
 
     /// `TrackItem.speed`: `PlaybackSpeed`, 1.0 when elided.
