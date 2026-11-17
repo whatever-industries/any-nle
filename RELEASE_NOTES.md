@@ -1,30 +1,38 @@
-# Any NLE v0.1.0-alpha.3
+# Any NLE v0.1.0-alpha.4
 
-Any NLE can link supported Avid DNxHR LB OP-Atom media directly in
-Premiere Pro 27. Separate files, Grouped, and Merged keep the original
-1080p23.976 picture MXF and both mono PCM24/48 kHz audio MXFs in place.
+## Avid to Premiere Pro 27
 
-The internal Resolve conversion tools now preserve more editable controls.
-Resolve to Premiere supports scoped audio gain, pan, fades, and transitions,
-plus static crop and Linear position and scale on trimmed clips. Premiere
-to Resolve transfers sequence Comment markers, including names, notes, and
-duration. The converter reports marker color substitutions when the palettes
-differ. The Resolve routes are available through the internal tools.
+- Link qualified ProRes HQ and H.264 originals at matching source and sequence
+  rasters. Streaming picture checks verify long clips without collecting the
+  whole packet report in memory.
+- Transfer editable static Corner Pin, Linear Resize and 3D Warp motion and
+  crop, and the qualified three-key 3D Warp Z Rotation controls at 24, 23.976,
+  25, and 29.97 fps. Shelf maps to Hold. The qualified Bezier and Spline
+  curves retain editable zero-slope handles.
+- Preserve the saved cut when an unsupported fade or dissolve safely resolves
+  to an isolated edit against filler. The conversion report identifies the
+  omitted transition.
+
+## Review
+
+- Save a preflight report as JSON from a ready or blocked Review.
+- Search affected clips and packages in longer blocker lists. Review shows
+  conflicting media paths and opens the relevant media settings.
 
 ## Download
 
 | Platform |
 | --- |
-| [**Windows (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.3/Any.NLE_Windows_x64_v0.1.0-alpha.3.exe) |
-| [**Windows (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.3/Any.NLE_Windows_ARM_v0.1.0-alpha.3.exe) |
-| [**macOS (Apple Silicon)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.3/Any.NLE_macOS_ARM_v0.1.0-alpha.3.zip) |
-| [**macOS (Intel)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.3/Any.NLE_macOS_x64_v0.1.0-alpha.3.zip) |
-| [**Linux (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.3/Any.NLE_Linux_x64_v0.1.0-alpha.3.AppImage) |
-| [**Linux (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.3/Any.NLE_Linux_ARM_v0.1.0-alpha.3.AppImage) |
+| [**Windows (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.4/Any.NLE_Windows_x64_v0.1.0-alpha.4.exe) |
+| [**Windows (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.4/Any.NLE_Windows_ARM_v0.1.0-alpha.4.exe) |
+| [**macOS (Apple Silicon)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.4/Any.NLE_macOS_ARM_v0.1.0-alpha.4.zip) |
+| [**macOS (Intel)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.4/Any.NLE_macOS_x64_v0.1.0-alpha.4.zip) |
+| [**Linux (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.4/Any.NLE_Linux_x64_v0.1.0-alpha.4.AppImage) |
+| [**Linux (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.4/Any.NLE_Linux_ARM_v0.1.0-alpha.4.AppImage) |
 
 Each package includes the `any-nle` CLI, `any-nle-gui`, verified FFmpeg/ffprobe
 8.1, dependency notices, an SBOM and corresponding FFmpeg source. Separate
-provenance archives and [SHA256 checksums](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.3/SHA256SUMS) accompany the downloads.
+provenance archives and [SHA256 checksums](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.4/SHA256SUMS) accompany the downloads.
 
 macOS apps are ad hoc signed and verified, without Apple notarization. Windows
 installers are unsigned and install for the current user. Linux AppImages require
