@@ -61,6 +61,12 @@ rare, feature-specific exception when it was widely used and a current editor
 can still read, render, edit, or carry it forward. Record the current-version
 behavior, the practical value, and the tested limits before expanding scope.
 
+The Avid → Premiere app writes Project version 46 so Premiere 27 can open
+the generated projects directly. The same header is used by the internal
+Resolve → Premiere route.
+[Avid direct-open checks](SPLIT-EDIT-AUDIO-2026-11-06.md#open-avid-conversions-directly-in-premiere-27)
+· [Resolve direct-open checks](RESOLVE-SOURCE-READER.md#premiere-27-project-version)
+
 Titler+ Legacy and Lumetri are candidates for such exceptions where current
 editor behavior supports them. AMA links may also qualify when a current Avid
 build still resolves or carries the saved locator. Each exception covers its
@@ -1680,6 +1686,10 @@ AAF import to answer a specific readiness question for a common workflow.
   favored direct linking for an already supported original and API-first
   for the mixed and repeated-original batches. Standalone-first is the
   default and Review offers the Studio launch only for affected originals.
+  Review distinguishes an import in progress from a scratch project
+  with content left behind, with a recovery action for each.
+  Review and saved conversion commands reject occupied or invalid output
+  paths before probing originals or contacting the import worker.
   [Worker requirements and qualification](RESOLVE-TURNOVER-IMPLEMENTATION.md#automatic-native-media-import-fallback)
 
 ##### Next Premiere → Resolve milestones
@@ -1695,8 +1705,9 @@ AAF import to answer a specific readiness question for a common workflow.
    Premiere cameras, the A/B/A picture cuts and two separate mono outputs
    fixed to camera A through graph/2. Reopened Resolve renders confirm the
    picture and audio assignments, including fresh insertion in both
-   editors. A reference-audio switch retained camera A on the changed
-   edit and added short envelopes at the two cut edges. Capture preserves
+   editors. Review follows the backing sequence and checks both camera
+   originals as direct links. A reference-audio switch retained camera A on
+   the changed edit and added short envelopes at the two cut edges. Capture preserves
    the saved angle and physical source separately. A genuine per-angle
    Source Audio switch is pending a saved control that renders camera B
    on just one lane. A targeted AAF benchmark can measure editability
@@ -1714,11 +1725,16 @@ AAF import to answer a specific readiness question for a common workflow.
    is qualified for 23.976 picture on a 24 fps timeline.
    [Resolve write checks](RESOLVE-TURNOVER-IMPLEMENTATION.md#mixed-rate-native-comparison) ·
    [Premiere write checks](RESOLVE-SOURCE-READER.md#resolve-to-premiere-mixed-rate-frame-sampling)
+   The internal Premiere → Resolve route also carries bounded
+   forward piecewise Linear picture retiming through graph/2. The map
+   retains the editable keys and the selected source frame at each
+   record frame.
+   [Piecewise Linear retiming](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-piecewise-linear-picture-retiming)
    Expand the linked writer across verified profiles already captured by
-   the Premiere reader. The internal 1080p24 route can also use an already
-   active, dedicated Resolve worker to import a verified original when
-   standalone preparation cannot. The first profile covers picture-only
-   and embedded stereo PCM split to two mono lanes.
+   the Premiere reader. At 23.976, 24, 25 and 29.97, the internal 1080p
+   route can use the dedicated Studio worker when standalone preparation
+   cannot link a qualified original. The assisted profile covers picture
+   alone or stereo PCM16, PCM24 or AAC-LC split to two mono lanes.
    [Native import fallback](RESOLVE-TURNOVER-IMPLEMENTATION.md#automatic-native-media-import-fallback)
    Qualify moved originals and duplicate file names
    using verified paths, source timecode and explicit Tape Name → Reel
@@ -1729,13 +1745,41 @@ AAF import to answer a specific readiness question for a common workflow.
    region. Qualify wider channel layouts and their physical selectors.
    Extend Motion, crop and speed where the saved controls and reopened
    renders agree.
-5. **Native project and package replay.** Complete a fully Premiere-authored
-   ProRes/WAV project, then combine the qualified cases in a packaged trial
-   covering Review, CLI, wizard and saved jobs. Keep the public route behind
-   the [Resolve product gate](#resolve-product-exposure).
-6. **Editable nests.** Qualify a child sequence with a nonzero start and
-   a trimmed parent edit. Bind the child by identity and compare the
-   visible source ranges and audio after reopen.
+5. **Native project and package replay.** The native Premiere ProRes/WAV
+   control passed. A local macOS package replayed it alongside repeated
+   dissolves and crossfades, including a case that required explicit
+   approval. Wizard and internal CLI archives agreed and all three
+   projects matched their reopened Resolve controls.
+   [Packaged replay](RESOLVE-TURNOVER-IMPLEMENTATION.md#packaged-premiere-to-resolve-replay) ·
+   [Resolve product gate](#resolve-product-exposure)
+6. **Editable nests.** The internal 1080p24 picture-only route preserves
+   distinct same-named children, their nonzero starts, and trimmed parent
+   edits. Saved-job and graph/2 outputs match the reopened Resolve control.
+   A native edit to one child affected only that use. Review can omit
+   a precisely matched empty A1 companion with explicit approval.
+   The Resolve reader retains the saved audible companion's child,
+   trim, selector and static clip level in graph/2. Native reopen
+   confirmed the trim and picture. An editable clip adjustment
+   brought this control within 0.023 dB of Premiere. Playback used
+   tenths of a dB and retained Resolve's short edit-edge ramps.
+   Native 1080p24 nests with stereo PCM16 and PCM24 WAV children
+   matched the flat Resolve controls on both distinct channels
+   after reopen. Graph/2 captures the child WAV edit and the
+   parent's ordered mix outputs. The internal writer can export
+   a selected stereo WAV child as an editable V1 and stereo A1
+   timeline, with both channels matching the reopened control.
+   Matched V1/A1 stereo nests round-trip between native Resolve projects.
+   Internal Premiere → Resolve writes the same layout from a neutral
+   Standard stereo parent and one shared child. Two uses with independent
+   trims matched native Resolve picture and PCM after reopen.
+   Mono downmixes refuse, and the native Resolve edge ramps require
+   explicit Review approval per occurrence. An edited archive carries
+   rendered-audio and MXF package IDs on the unchanged pair. Compare a
+   metadata-only save with a rendered-media replacement before admitting
+   that payload. Processed mixes, wider nest layouts and effects on the
+   nest edit remain open.
+   [Picture nest checks](RESOLVE-TURNOVER-IMPLEMENTATION.md#editable-premiere-picture-nests) ·
+   [Audible nest checks](RESOLVE-TURNOVER-IMPLEMENTATION.md#audible-nested-audio)
 7. **Styled captions.** Build on plain editable subtitles. Verify font,
    size, position and line breaks on two adjacent cues, and report
    appearance losses where Resolve cannot reproduce the Premiere style.
@@ -1744,6 +1788,36 @@ AAF import to answer a specific readiness question for a common workflow.
    composition read-back qualify. Establish an install-independent
    Resolve LUT carrier for embedded Premiere clip LUTs.
    [Color Mode evidence](PREMIERE-27-COLOR-MODE.md)
+   - [ ] **Ordered clip-owned Color nodes.** Use pr2resolve's serial DRX
+         encoding as a reference for node IDs, connections and the active
+         clip version. Our writer already attaches a single qualified node
+         to that version. Keep source operation order and clip occurrence
+         ownership in graph/2, then qualify a bounded ordered chain from
+         Premiere 27 Color Mode. Start with two trimmed uses of the same
+         chart media, distinct grades, and a pair of operations whose order
+         changes the rendered image. After Resolve Save As and reopen,
+         verify each clip's active version, node order, editable controls
+         and chart output against Premiere. Upstream's Lumetri formulas
+         are approximate and its render check compares two Resolve paths.
+         Treat legacy Lumetri as a separate profile with its own source
+         render and appearance-loss evidence.
+         [Pinned DRX writer](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/pr2_native_grade.py) ·
+         [Upstream validation boundary](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md)
+9. **Offline linked DRP prototype.** Start with one same-rate 1080p24
+   straight-cut sequence with ProRes HQ MOV picture and separate 48 kHz
+   PCM16 or PCM24 WAV. Use the existing checks for available originals.
+   For missing files, carry the saved locator, source clock, playable
+   extent, channel assignments, and reel where available through graph/2.
+   Record those facts as saved and unverified. Write relinkable offline
+   Media Pool items with the standalone writer. Report incomplete or
+   contradictory descriptors by occurrence in Review.
+   Open both all-offline and mixed projects in Resolve. Verify the
+   proposed files at a moved root using the existing identity checks,
+   relink, then Save As, close, and reopen. Require the same cut bounds,
+   source timecode, and channel assignments as the online control.
+   Compare every decoded picture frame and both PCM lanes.
+   [pr2resolve offline reference](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/README_EN.md#prerequisites) ·
+   [Verified relink](VERIFIED-RELINK.md)
 
 Editable multicam, nests, caption styling and Color Mode each have native
 conversion acceptance cases. A linked AAF can measure release readiness
@@ -1805,13 +1879,13 @@ original media.
       and fresh insertion retain one stereo A1. All 80 picture frames and
       both PCM channels match the native controls.
       [Separate WAV qualification](RESOLVE-TURNOVER-IMPLEMENTATION.md#separate-stereo-wav-at-25-fps)
-- [ ] **Qualify a fully native Premiere 27 source project.** Author one
-      same-rate timeline with linked ProRes HQ MOV and PCM WAV, a nonzero
-      start, nonzero trims, and independent mono channel selections. Use the
-      [sequence inventory](RESOLVE-TURNOVER-IMPLEMENTATION.md#inputs-and-review)
-      to select its saved ObjectUID. After Resolve Save Project As and reopen,
-      compare clocks, trims, media selectors, picture, and isolated PCM.
-      Packaged exposure follows the [Resolve product gate](#resolve-product-exposure).
+- [x] **Qualify a fully native Premiere 27 source project.** A fresh 24 fps
+      timeline uses timecoded ProRes HQ, separate mono PCM16 and PCM24 WAVs,
+      and independent cut points on all three tracks. Saved-job and graph/2
+      replay agree. Resolve Save Project As and reopen retained both nonzero
+      clocks, all six edit ranges, and both mono assignments. All 48 picture
+      frames and both 96,000-sample PCM renders matched the Resolve control.
+      [Native project checks](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-authored-linked-prores-and-wav)
 - [x] **Capture and write an ordered Premiere project selection offline.**
       The internal 1080p24 manifest preserves two same-named timelines in
       distinct nested bins with their own starts and shared originals.
@@ -2087,6 +2161,11 @@ and plain captions.
 [Current profiles](RESOLVE-SOURCE-READER.md#editable-conversion-profiles)
 · [Resolve AAF export](https://documents.blackmagicdesign.com/UserManuals/DaVinciResolveReferenceManual.pdf?_v=1783666810000#page=4162)
 
+- [x] **Open generated Resolve conversions directly in Premiere 27.**
+      The ordinary and multicam writer paths emit Project version 46.
+      Premiere 27 opened both without an upgrade prompt. Reopened
+      transition and multicam saves matched their picture and isolated
+      audio controls. [Project version checks](RESOLVE-SOURCE-READER.md#premiere-27-project-version)
 - [x] **Preserve Resolve-authored 23.976 picture on a 24 fps timeline.**
       Graph/2 retains the native Nearest phase. The editable Premiere
       output matched all 1,075 frame selections on three reopened
@@ -2221,6 +2300,14 @@ and plain captions.
       renders matched their respective Premiere single-transition controls.
       Both transitions, five edit ranges, and original channel selections
       survived. [Combined transitions](RESOLVE-SOURCE-READER.md#resolve-to-premiere-combined-transitions-at-24-fps)
+- [x] **Reopen repeated and variable-length Resolve transitions in Premiere 27.**
+      The internal writer carries multiple nonoverlapping V1 dissolves and
+      A1 Constant Gain crossfades, including variable lengths and left
+      alignment at 24 fps. Save As and reopen retained all seven edit
+      ranges and the exact blend windows. Both isolated lanes matched the
+      repeated-transition control. In the variable-length case, the A1
+      difference was confined to the deliberately omitted Power window.
+      [Scope](RESOLVE-SOURCE-READER.md#repeated-and-variable-length-transitions)
 - [x] **Write editable static position, scale, and crop.** The internal
       23.976 Resolve → Premiere path preserves signed X/Y position,
       independent width and height, and four source-space crop edges.
@@ -2819,6 +2906,9 @@ Implemented fixes, tests and remaining native gates.
 - [ ] MDB/PMR media-database folder input (from the KB's findings, not Filmcraft code).
 
 ### Offline output and relink
+
+The [Premiere → Resolve milestones](#next-premiere--resolve-milestones)
+track the separate offline linked DRP prototype.
 
 - [x] **Allow offline media** defaults off in Separate files, Grouped, and
       Merged. Saved jobs and the direct CLI carry the same choice. Review
@@ -3861,11 +3951,18 @@ the **Creates new media.** notice.
       profiles. Static and two-key Linear Premiere Motion and static mono
       volume pass through the turnover job and match the retained Resolve
       renders after Save As and reopen. See the [Premiere → Resolve
-      checklist](#premiere--resolve) for later track-state, labels, caption
-      retiming and timeline mark results and the remaining grade work.
-      The upstream Lumetri formulas are approximations. Its native exporter
-      rejects nested sequences, so the editable multicam profile uses
-      saved Premiere references and the retained Resolve Group witness.
+      checklist](#premiere--resolve) for subsequent track state, labels,
+      captions, retiming, timeline marks, and color work. Upstream can
+      build a native project from saved metadata with originals offline.
+      It also offers FCP7 XML and an explicit Studio DRT/DRP path.
+      Positive piecewise retiming is implemented for a qualified profile.
+      Its ordered DRX nodes inform the
+      [Native Color Mode follow-up](#next-premiere--resolve-milestones).
+      Its native writer rejects Motion
+      animation, reverse and holds, transitions, and nested sequences.
+      Any NLE qualifies specific editable forms of those features and
+      verifies original-file frame extents and physical channel selectors.
+      [Pinned upstream overview](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/README.md#主要功能) ·
       [Pinned native format notes](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md)
 - [x] **drpkit** (MIT, `af3cedc0`). The source review covers Fairlight
       channel and bus tables, EQ and dynamics rows, built-in and insert FX

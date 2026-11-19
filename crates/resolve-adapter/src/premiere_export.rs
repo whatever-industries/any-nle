@@ -96,20 +96,13 @@ pub fn write_with_options(
             .map(|loss| loss.object.as_str())).collect();
     let mut transitions = Vec::new();
     let native_transitions = dissolve::prepare_all_native(&graph, sequence)?;
-    dissolve::require_single_per_lane(&native_transitions)?;
     for transition in native_transitions {
         let d = transition.prepared;
-        if d.duration != dissolve::LEGACY_DURATION || d.style == dissolve::Style::Power {
+        if d.style == dissolve::Style::Power {
             return Err(format!("Resolve transition {}: outside the qualified Premiere transition profile", d.id).into());
         }
         if d.audio() && mixer.mono_track_pans.is_some() {
             return Err(format!("Resolve transition {}: audio crossfade with track pan is unqualified", d.id).into());
-        }
-        if !d.audio() && sequence.rate == Rational::integer(24) && d.before != dissolve::LEGACY_DURATION / 2 {
-            return Err(format!(
-                "Resolve transition {}: 24 fps Premiere video dissolve requires centered alignment",
-                d.id
-            ).into());
         }
         let frame = Rational::new(sequence.rate.den().into(), sequence.rate.num().into())
             .and_then(|period| period.to_units(TICKS_PER_SECOND))
@@ -268,8 +261,10 @@ pub fn write_with_options(
         if sequence != other_sequence {
             return Err(refuse("endpoints resolved to different sequences").into());
         }
-        let before_cut = d.before * frame;
-        let duration = dissolve::LEGACY_DURATION * frame;
+        let before_cut = d.before.checked_mul(frame)
+            .ok_or_else(|| refuse("cut offset exceeds the Premiere tick clock"))?;
+        let duration = d.duration.checked_mul(frame)
+            .ok_or_else(|| refuse("duration exceeds the Premiere tick clock"))?;
         if d.audio() {
             if fades.iter().any(|fade| fade.track == 1) {
                 return Err(refuse("crossfade cannot share a lane with clip edge fades").into());

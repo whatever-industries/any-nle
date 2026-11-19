@@ -7,7 +7,7 @@ use prproj::convert::{
     model::Options,
     prepared::PreparedProjectInput,
     rewrap::MediaRelink,
-    writer::{self, DestinationBinLayout, PreparedProject, Report},
+    writer::{self, DestinationBinLayout, PreparedProject, Report, TypedMedia},
 };
 use prproj::UuidSource;
 use std::{collections::HashSet, path::Path};
@@ -63,14 +63,12 @@ pub(crate) fn prepare_document(
     layout: Option<&DestinationBinLayout>,
     offline: &HashSet<&str>,
 ) -> writer::Result<PreparedProject> {
-    if !offline.is_empty() {
-        return writer::prepare_offline_project(input, output, ids, layout, offline);
-    }
-    if let Some(layout) = layout {
-        writer::prepare_typed_project_with_layout(input, output, ids, bindings, native, layout)
+    let media = if offline.is_empty() {
+        TypedMedia::Bound { bindings, native_av: native }
     } else {
-        writer::prepare_typed_project(input, output, ids, bindings, native)
-    }
+        TypedMedia::Offline { paths: offline }
+    };
+    writer::prepare_typed_project_for_premiere_27(input, output, ids, media, layout)
 }
 
 pub(crate) fn timeline_subject(

@@ -37,6 +37,7 @@ use super::opatom::{add_audio_item, add_video_item, source_item_names, DirectDnx
 use super::placement::normalize_placement;
 use crate::build::fmt::{fmt_f, py_repr};
 use crate::build::sequence::{extra_formats, formats, linked_original_formats};
+use crate::build::skeleton::ProjectVersion;
 use crate::build::time::{floor_div, Time};
 use crate::error::Error;
 use crate::ids::UuidSource;
@@ -580,6 +581,7 @@ impl LegacyClips<'_> {fn values(&self)->impl Iterator<Item=&Clip>{self.order.ite
 impl std::ops::Index<&str> for LegacyClips<'_>{type Output=Clip;fn index(&self,id:&str)->&Clip{self.get(id).expect("validated legacy clip reference")}}
 struct WriterInput<'a> {
     options:&'a super::model::Options,
+    project_version: ProjectVersion,
     marker_provenance: Option<MarkerProvenance<'a>>,
     clips:LegacyClips<'a>,
     originals:HashMap<&'a str,&'a super::prepared::OriginalClip>,
@@ -2506,6 +2508,23 @@ pub struct Editorial<'a> {
 pub fn prepare_project_with_effects(model: &Model, editorial: Editorial<'_>,
     out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
     media: &[super::rewrap::MediaRelink], native_av: bool) -> Result<PreparedProject> {
+    prepare_project_with_effects_impl(model, editorial, out_path, ids, media, native_av, ProjectVersion::V45)
+}
+
+/// Prepare graph-derived legacy media for the current Premiere application.
+pub fn prepare_project_with_effects_for_premiere_27(
+    model: &Model, editorial: Editorial<'_>,
+    out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
+    media: &[super::rewrap::MediaRelink], native_av: bool,
+) -> Result<PreparedProject> {
+    prepare_project_with_effects_impl(model, editorial, out_path, ids, media, native_av, ProjectVersion::V46)
+}
+
+fn prepare_project_with_effects_impl(
+    model: &Model, editorial: Editorial<'_>,
+    out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
+    media: &[super::rewrap::MediaRelink], native_av: bool, project_version: ProjectVersion,
+) -> Result<PreparedProject> {
     super::model::validate_model(model)?;
     let Editorial { texts, video_dissolves, picture_effects, direct_dnxhr_origins, constant_speeds } = editorial;
     super::prepared::validate_texts(texts, &model.sequences)?;
@@ -2516,13 +2535,42 @@ pub fn prepare_project_with_effects(model: &Model, editorial: Editorial<'_>,
         })?;
     super::prepared::validate_constant_speeds(constant_speeds, &model.options, &model.sequences,
         |id, seq, event, speed| model.clips.get(id).is_some_and(|clip| speed.raw_trim(seq, event, clip).is_some()))?;
-    let view=WriterInput{options:&model.options,marker_provenance:None,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),timeline_marks:&BTreeMap::new(),non_drop_sequences:&HashSet::new(),picture_effects,source_luts:&[],extended_sdr_grades:&HashSet::new(),edit_labels:&[],frame_holds:&HashMap::new(),disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
+    let view=WriterInput{options:&model.options,project_version,marker_provenance:None,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),timeline_marks:&BTreeMap::new(),non_drop_sequences:&HashSet::new(),picture_effects,source_luts:&[],extended_sdr_grades:&HashSet::new(),edit_labels:&[],frame_holds:&HashMap::new(),disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
     prepare_view(&view,model,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new())
 }
 
 /// Validated typed input for mixed original-file and legacy media; model/1 remains strict.
 pub fn prepare_typed_project(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool)->Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new(), None)
+    prepare_typed_project_impl(input,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new(), None, ProjectVersion::V45)
+}
+
+pub enum TypedMedia<'a> {
+    Bound { bindings: &'a [super::rewrap::MediaRelink], native_av: bool },
+    Offline { paths: &'a HashSet<&'a str> },
+    VerifiedOp1a {
+        bindings: &'a [super::rewrap::MediaRelink],
+        clips: &'a HashSet<String>,
+        offline: &'a HashSet<&'a str>,
+    },
+}
+
+/// Prepare the selected media construction with Premiere 27's Project object version.
+pub fn prepare_typed_project_for_premiere_27(
+    input: &super::prepared::PreparedProjectInput,
+    out_path: impl AsRef<Path>,
+    ids: &mut dyn UuidSource,
+    media: TypedMedia<'_>,
+    layout: Option<&DestinationBinLayout>,
+) -> Result<PreparedProject> {
+    let no_offline = HashSet::new();
+    let no_op1a = HashSet::new();
+    let (bindings, native_av, offline, op1a) = match media {
+        TypedMedia::Bound { bindings, native_av } => (bindings, native_av, &no_offline, &no_op1a),
+        TypedMedia::Offline { paths } => (&[][..], false, paths, &no_op1a),
+        TypedMedia::VerifiedOp1a { bindings, clips, offline } => (bindings, false, offline, clips),
+    };
+    prepare_typed_project_impl(input, out_path, ids, bindings, native_av, layout,
+        offline, op1a, None, ProjectVersion::V46)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2541,26 +2589,26 @@ pub struct MarkerProvenance<'a> {
     pub original_colors: &'a HashMap<MarkerDataKey, u64>,
 }
 
-/// Prepare the internal Resolve-linked route with marker identities and provenance.
+/// Prepare the internal Resolve-linked Premiere 27 route with marker provenance.
 pub fn prepare_typed_project_with_marker_provenance(
     input: &super::prepared::PreparedProjectInput,
     out_path: impl AsRef<Path>,
     ids: &mut dyn UuidSource,
     provenance: MarkerProvenance<'_>,
 ) -> Result<PreparedProject> {
-    prepare_typed_project_impl(input, out_path, ids, &[], false, None, &HashSet::new(), &HashSet::new(), Some(provenance))
+    prepare_typed_project_impl(input, out_path, ids, &[], false, None, &HashSet::new(), &HashSet::new(), Some(provenance), ProjectVersion::V46)
 }
 
 /// Prepare selected source bins under one import root and their relative folder hierarchy.
 /// Layout validation completes before UUID allocation or project construction.
 pub fn prepare_typed_project_with_layout(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:&DestinationBinLayout)->Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,media,native_av,Some(layout),&HashSet::new(), &HashSet::new(), None)
+    prepare_typed_project_impl(input,out_path,ids,media,native_av,Some(layout),&HashSet::new(), &HashSet::new(), None, ProjectVersion::V45)
 }
 pub fn prepare_offline_project(
     input: &super::prepared::PreparedProjectInput, out_path: impl AsRef<Path>,
     ids: &mut dyn UuidSource, layout: Option<&DestinationBinLayout>, offline: &HashSet<&str>,
 ) -> Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,&[],false,layout,offline, &HashSet::new(), None)
+    prepare_typed_project_impl(input,out_path,ids,&[],false,layout,offline, &HashSet::new(), None, ProjectVersion::V45)
 }
 
 /// Use the validated OP1a bin master construction for selected in-place MXFs.
@@ -2570,10 +2618,10 @@ pub fn prepare_linked_op1a_project(
     ids: &mut dyn UuidSource, media: &[super::rewrap::MediaRelink],
     clips: &HashSet<String>, layout: Option<&DestinationBinLayout>, offline: &HashSet<&str>,
 ) -> Result<PreparedProject> {
-    prepare_typed_project_impl(input, out_path, ids, media, false, layout, offline, clips, None)
+    prepare_typed_project_impl(input, out_path, ids, media, false, layout, offline, clips, None, ProjectVersion::V45)
 }
 
-fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>,linked_op1a:&HashSet<String>,marker_provenance:Option<MarkerProvenance<'_>>)->Result<PreparedProject> {
+fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>,linked_op1a:&HashSet<String>,marker_provenance:Option<MarkerProvenance<'_>>,project_version:ProjectVersion)->Result<PreparedProject> {
     if let Some(layout) = layout { layout.validate(&input.bins)?; }
     if !native_av && layout.is_some() {
         input.validate_whole_project()?;
@@ -2602,7 +2650,7 @@ fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_p
             sequence
         }).collect();
     }
-    let view=WriterInput{options:&input.options,marker_provenance,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,timeline_marks:&input.timeline_marks,non_drop_sequences:&input.non_drop_sequences,picture_effects:&input.picture_effects,source_luts:&input.source_luts,extended_sdr_grades:&input.extended_sdr_grades,edit_labels:&input.edit_labels,frame_holds:&input.frame_holds,disabled_edits:&input.disabled_edits,direct_dnxhr_origins:&input.direct_dnxhr_origins,direct_dnxhd_pcm24:Some(&input.direct_dnxhd_pcm24),constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,autosync_bins:&input.autosync_bins,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,layered_submasters:&input.layered_submasters,png_mattes:&input.png_mattes};
+    let view=WriterInput{options:&input.options,project_version,marker_provenance,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,timeline_marks:&input.timeline_marks,non_drop_sequences:&input.non_drop_sequences,picture_effects:&input.picture_effects,source_luts:&input.source_luts,extended_sdr_grades:&input.extended_sdr_grades,edit_labels:&input.edit_labels,frame_holds:&input.frame_holds,disabled_edits:&input.disabled_edits,direct_dnxhr_origins:&input.direct_dnxhr_origins,direct_dnxhd_pcm24:Some(&input.direct_dnxhd_pcm24),constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,autosync_bins:&input.autosync_bins,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,layered_submasters:&input.layered_submasters,png_mattes:&input.png_mattes};
     prepare_view(&view,&legacy,out_path,ids,media,native_av,layout,offline,linked_op1a)
 }
 fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
@@ -2871,7 +2919,7 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         }
     }
     if !model.originals.is_empty() {report.notes.push("File-backed masters use explicit stream/channel mapping.".into());report.unverified.push("File-backed masters and mixed timelines require native Premiere open/save/reopen, channel/sample checks and User acceptance".into());}
-    let mut project = Project::new(ids)?;
+    let mut project = Project::new_with_version(model.project_version, ids)?;
     project.set_path(&out_path); // relative media paths are computed against the output location
     let Some(project_root) = project.root_item() else { return Err(other("project has no root item")) };
     let root = if let Some(layout) = layout { project.add_bin(project_root, &layout.root_name, ids)? } else { project_root };

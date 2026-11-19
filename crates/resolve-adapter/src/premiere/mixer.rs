@@ -3,7 +3,17 @@ use super::{components, controls};
 use crate::Result;
 use prproj::{model::Project, xml::NodeId};
 
-pub(super) fn read_mix_bus(project: &Project, sequence: NodeId, allow_gain: bool) -> Result<i32> {
+pub(super) enum MixBus {
+    Stereo,
+    MulticamBacking,
+}
+
+pub(super) fn read_mix_bus(
+    project: &Project,
+    sequence: NodeId,
+    layout: MixBus,
+    allow_gain: bool,
+) -> Result<i32> {
     let tree = &project.doc.tree;
     let mut buses = 0;
     let mut gain = 0;
@@ -13,18 +23,92 @@ pub(super) fn read_mix_bus(project: &Project, sequence: NodeId, allow_gain: bool
             continue;
         }
         buses += 1;
-        if tree.findtext(group, "NumAdaptiveChannels")?.as_deref() != Some("2") {
+        if components::field(tree, group, "NumAdaptiveChannels")? != Some("2") {
             return Err("expected a stereo Premiere mix bus".into());
         }
-        let master = tree
-            .find1(group, "MasterTrack")
-            .ok_or("missing Premiere mix bus")?;
-        gain = read_mixer(project, project.doc.resolve(master)?, allow_gain, false, false)?.tenths_db;
+        let [reference] = tree
+            .findall(group, "MasterTrack")?
+            .try_into()
+            .map_err(|_| "missing or ambiguous Premiere mix bus")?;
+        let master = project.doc.resolve(reference)?;
+        validate_mix_layout(project, master, &layout)?;
+        gain = read_mixer(project, master, allow_gain, false, false)?.tenths_db;
     }
     if buses != 1 {
         return Err("expected one Premiere audio track group".into());
     }
     Ok(gain)
+}
+
+fn validate_mix_layout(project: &Project, master: NodeId, layout: &MixBus) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct ChannelLabel {
+        channellabel: u32,
+    }
+
+    let tree = &project.doc.tree;
+    let invalid = match layout {
+        MixBus::Stereo => "expected a stereo Premiere mix bus",
+        MixBus::MulticamBacking => "unsupported Premiere multicam backing Mix bus layout",
+    };
+    let [audio] = tree
+        .findall(master, "AudioTrack")?
+        .try_into()
+        .map_err(|_| invalid)?;
+    let panner = read_panner(project, master)?;
+    let [component] = tree
+        .findall(panner, "PanProcessor/AudioComponent")?
+        .try_into()
+        .map_err(|_| invalid)?;
+    let channel_type = components::field(tree, audio, "ChannelType")?;
+    // NumAdaptiveChannels is also two on the qualified multicam backing bus.
+    // The saved mixer and panner identify the layout.
+    let expected = match layout {
+        MixBus::Stereo if matches!(channel_type, None | Some("1")) => "1",
+        MixBus::MulticamBacking if channel_type == Some("3") => "3",
+        _ => return Err(invalid.into()),
+    };
+    if tree.tag(master) != "AudioMixTrack"
+        || tree.tag(panner) != "DefaultPanProcessor"
+        || components::field(tree, panner, "DefaultPannerInputChannelType")? != Some(expected)
+        || components::field(tree, panner, "DefaultPannerOutputChannelType")? != Some(expected)
+        || components::field(tree, component, "ChannelType")? != Some(expected)
+    {
+        return Err(invalid.into());
+    }
+    let labels = components::field(tree, component, "AudioChannelLayout")?.ok_or(invalid)?;
+    let channels: Vec<ChannelLabel> = serde_json::from_str(labels).map_err(|_| invalid)?;
+    let expected: &[u32] = match layout {
+        MixBus::Stereo => &[100, 101],
+        MixBus::MulticamBacking => &[0; 32],
+    };
+    if !channels.iter().map(|channel| channel.channellabel).eq(expected.iter().copied()) {
+        return Err(invalid.into());
+    }
+    Ok(())
+}
+
+fn read_panner(project: &Project, track: NodeId) -> Result<NodeId> {
+    let panners = project.doc.tree.findall(track, "AudioTrack/Panner")?;
+    let [panner] = panners.as_slice() else {
+        return Err("missing or ambiguous Premiere panner".into());
+    };
+    Ok(project.doc.resolve(*panner)?)
+}
+
+pub(super) fn is_standard_stereo(project: &Project, track: NodeId) -> Result<bool> {
+    let tree = &project.doc.tree;
+    let [audio_track] = tree.findall(track, "AudioTrack")?.try_into()
+        .map_err(|_| "missing or ambiguous Premiere audio track")?;
+    let panner = read_panner(project, track)?;
+    let [component] = tree.findall(panner, "PanProcessor/AudioComponent")?.try_into()
+        .map_err(|_| "missing or ambiguous Premiere stereo panner component")?;
+    Ok(components::field(tree, audio_track, "ChannelType")?.is_none()
+        && tree.tag(panner) == "StereoToStereoPanProcessor"
+        && tree.get(panner, "ClassID") == Some("7bf86a01-efbe-11d5-abc4-c1ce2b1e9090")
+        && components::field(tree, component, "ChannelType")? == Some("1")
+        && components::field(tree, component, "AudioChannelLayout")?
+            == Some(r#"[{"channellabel":100},{"channellabel":101}]"#))
 }
 
 #[derive(Default)]
@@ -179,11 +263,7 @@ fn read_mixer(
             check_param(param, is_fader)?;
         }
     }
-    let panners = tree.findall(track, "AudioTrack/Panner")?;
-    let [panner] = panners.as_slice() else {
-        return Err("missing or ambiguous Premiere panner".into());
-    };
-    let panner = project.doc.resolve(*panner)?;
+    let panner = read_panner(project, track)?;
     let direct = multicam && tree.tag(panner) == "StereoTo16ChannelPanProcessor";
     if multicam && !direct {
         return Err("Premiere multicam strip lacks its direct output routing".into());
@@ -302,5 +382,59 @@ fn read_mono_track_pan(project: &Project, track: NodeId, panner: NodeId) -> Resu
             Ok(pan)
         }
         _ => Err(invalid().into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prproj::xml::{parser::parse_into, PremiereDocument, Tree};
+
+    fn two_channel_bus(channel_type: &str, panner_type: &str, labels: &str) -> Project {
+        let xml = format!(
+            r#"<PremiereData>
+  <Sequence ObjectUID="selection">
+    <TrackGroups><TrackGroup><Second ObjectRef="1"/></TrackGroup></TrackGroups>
+  </Sequence>
+  <AudioTrackGroup ObjectID="1">
+    <NumAdaptiveChannels>2</NumAdaptiveChannels><MasterTrack ObjectRef="2"/>
+  </AudioTrackGroup>
+  <AudioMixTrack ObjectID="2">
+    <AudioTrack>
+      {channel_type}
+      <Panner ObjectRef="3"/><ComponentOwner><Components ObjectRef="4"/></ComponentOwner>
+    </AudioTrack>
+  </AudioMixTrack>
+  <DefaultPanProcessor ObjectID="3">
+    <DefaultPannerInputChannelType>{panner_type}</DefaultPannerInputChannelType>
+    <DefaultPannerOutputChannelType>{panner_type}</DefaultPannerOutputChannelType>
+    <PanProcessor><AudioComponent>
+      <ChannelType>{panner_type}</ChannelType><AudioChannelLayout>{labels}</AudioChannelLayout>
+    </AudioComponent></PanProcessor>
+  </DefaultPanProcessor>
+  <AudioComponentChain ObjectID="4"><ComponentChain/></AudioComponentChain>
+</PremiereData>"#
+        );
+        let mut tree = Tree::new();
+        let root = parse_into(&mut tree, &xml).unwrap();
+        let document = PremiereDocument::new(tree, root, None).unwrap();
+        Project::from_document(document, "Synthetic.prproj").unwrap()
+    }
+
+    #[test]
+    fn two_channels_do_not_identify_a_stereo_mix_bus() {
+        const STEREO: &str = r#"[{"channellabel":100},{"channellabel":101}]"#;
+        const ADAPTIVE: &str = "<ChannelType>3</ChannelType>";
+        let adaptive_labels = format!("[{}]", [r#"{"channellabel":0}"#; 32].join(","));
+        let check = |project: Project, layout| {
+            let sequence = project.sequences()[0];
+            read_mix_bus(&project, project.sequence(sequence).element, layout, true)
+        };
+        assert_eq!(check(two_channel_bus("", "1", STEREO), MixBus::Stereo).unwrap(), 0);
+        assert!(check(two_channel_bus(ADAPTIVE, "3", &adaptive_labels), MixBus::Stereo).is_err());
+        assert!(check(two_channel_bus(ADAPTIVE, "1", STEREO), MixBus::Stereo).is_err());
+        assert!(check(two_channel_bus("", "3", STEREO), MixBus::Stereo).is_err());
+        assert!(check(two_channel_bus("", "1", "[]"), MixBus::Stereo).is_err());
+        assert_eq!(check(two_channel_bus(ADAPTIVE, "3", &adaptive_labels), MixBus::MulticamBacking).unwrap(), 0);
     }
 }

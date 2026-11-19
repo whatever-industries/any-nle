@@ -18,7 +18,7 @@ use prproj::{
         },
         prepared::PreparedProjectInput,
         rewrap::MediaRelink,
-        writer::prepare_typed_project,
+        writer::{prepare_typed_project_for_premiere_27, TypedMedia},
     },
     RandomUuids,
 };
@@ -236,7 +236,10 @@ pub(super) fn write(
         audio_cameras: vec![0, 0],
     });
     input.multicam_uses = uses;
-    let staged = prepare_typed_project(&input, output, &mut RandomUuids::new(), &bindings, true)?;
+    let staged = prepare_typed_project_for_premiere_27(
+        &input, output, &mut RandomUuids::new(),
+        TypedMedia::Bound { bindings: &bindings, native_av: true }, None,
+    )?;
     for camera in &prepared.cameras {
         camera.recheck()?;
     }

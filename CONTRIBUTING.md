@@ -10,6 +10,15 @@ Use Rust 1.95.0, the release toolchain, and Python 3.11 or later. Check
 `rustc --version` and `cargo --version` in the shell that will run the build.
 The release workflow lists the [Linux build dependencies](.github/workflows/release.yml).
 
+If Homebrew and Rustup are both installed, invoke Rustup explicitly so
+the acceptance runner and its subprocesses use the release toolchain.
+With a standard Rustup installation on macOS, run the public suite from
+the repository root.
+
+```sh
+"$HOME/.cargo/bin/rustup" run 1.95.0 python3 scripts/public_acceptance.py --output crates/target/public-checks
+```
+
 Run these commands from the repository root. The public test profile uses
 fixtures included in the clone and requires no editor installation.
 

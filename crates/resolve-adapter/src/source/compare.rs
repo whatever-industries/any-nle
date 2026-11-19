@@ -13,6 +13,7 @@ use crate::{
     dissolve,
     grade,
     input_scaling,
+    retime,
     timeline_marks::TimelineMarks,
     track_state::{self, TrackState},
     Result,
@@ -136,6 +137,7 @@ struct Timeline<'a> {
     receipts: HashMap<&'a str, &'a Value>,
     clip_labels: HashMap<&'a str, &'a Value>,
     input_sizing: HashMap<&'a str, &'a Value>,
+    linear_retime: HashMap<&'a str, &'a Value>,
     grades: HashMap<(&'a str, &'a str), &'a Value>,
     unknown_grades: HashSet<&'a str>,
     clip_plugins: HashMap<&'a str, &'a Value>,
@@ -227,6 +229,12 @@ impl<'a> Timeline<'a> {
                 .sidecars
                 .iter()
                 .filter(|s| s.adapter == input_scaling::RESOLVE && placements.contains(s.object.as_str()))
+                .map(|s| (s.object.as_str(), &s.data))
+                .collect(),
+            linear_retime: graph
+                .sidecars
+                .iter()
+                .filter(|s| s.adapter == retime::LINEAR_ADAPTER && placements.contains(s.object.as_str()))
                 .map(|s| (s.object.as_str(), &s.data))
                 .collect(),
             grades: graph.sidecars.iter()
@@ -773,6 +781,18 @@ fn compare_edits(
     diff.change("edit.speed", &context, speed(a), speed(b));
     if a.frame_map != b.frame_map {
         diff.change("edit.frame_map", &context, json!(a.frame_map), json!(b.frame_map));
+    }
+    if a.video_track.is_some() && b.video_track.is_some() {
+        let a = left.linear_retime.get(a.id.as_str()).copied();
+        let b = right.linear_retime.get(b.id.as_str()).copied();
+        if a != b {
+            diff.change(
+                "edit.linear_retime",
+                &context,
+                a.map_or(Json::Null, graph_value),
+                b.map_or(Json::Null, graph_value),
+            );
+        }
     }
     match (left.clip_label(a), right.clip_label(b)) {
         (Ok(a), Ok(b)) => diff.change("edit.clip_label", &context, a, b),

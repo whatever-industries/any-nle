@@ -29,6 +29,17 @@ found, **Locate Resolve Studio…** accepts an installed Resolve bundle.
 An application with an unconfirmed edition is checked through the live
 scripting connection. **Prepare project** rechecks the worker, verifies
 the links, and makes the report available before **Convert** publishes.
+Review and conversion check for an available `.drp` destination in an
+existing directory before opening the source or calling the media importer.
+Graph inspection can still run without a free destination. Publication
+checks the destination again and writes it exclusively.
+Review distinguishes an import in progress, a scratch render, and a
+scratch project that still contains media, bins, or timelines. A stopped
+import can leave its clip in the scratch project. Return that dedicated
+project to an empty state before checking again. Preparation also checks
+the worker when it claims it for an import, so a state change after Review
+can still prevent publication. The converter leaves existing scratch
+content in place.
 
 The assisted profile covers 1080p straight cuts at exact `24000/1001`,
 24, 25, and `30000/1001`. The original may be progressive square-pixel
@@ -38,7 +49,24 @@ Graph/2 owns the edit clocks, trims and selectors. Resolve supplies the
 Media Pool cache. The converter verifies file-relative picture and audio
 packet grids and checks the saved timecode, including its drop-frame flag.
 PCM and AAC use their physical playable sample extents independently of
-picture. The 29.97 audio edit still needs sample-aligned edit boundaries.
+picture. At 29.97, the linked writer preserves frame-aligned audio
+boundaries from a registered Resolve timeline when the imported original is
+1080p ProRes HQ with stereo 48 kHz PCM24. This includes cuts that fall
+between samples. Two native drop-frame timelines with nonzero trims and
+independent split points matched all 33 and 36 picture frames and both
+isolated PCM lanes after reopen. For Premiere sources with the same media
+profile, fractional source trims and a fractional timeline end are
+admitted when the saved timeline origin and every audio edit's record
+start fall on whole samples. The native controls matched source sample
+placement on both lanes across all five trim phases under that rule.
+A record cut between samples shifted Premiere's incoming audio by one
+sample relative to Resolve. An off-sample origin also changed the rendered
+length by one sample. Those cases stay outside the Premiere profile.
+Review identifies the timeline, audio lane, and offending origin or record
+start, with its exact sample position. At this rate, whole-sample positions
+occur at every fifth frame measured from timecode zero or the timeline
+origin, respectively.
+The verified playable extent still applies to each edit.
 When Premiere saves a different source raster from the timeline canvas,
 graph/2 retains the edit's input sizing policy. A native-size Premiere
 edit uses Resolve's editable Center Crop control. A saved fit policy
@@ -157,6 +185,56 @@ the source document. Reviewable omissions require
 failures still block publication. Each input project and media binding is
 checked again before exclusive publication.
 
+### Premiere-authored linked ProRes and WAV
+
+In an empty Premiere 27.0.0 build 88 project, import a picture-only
+1080p24 ProRes HQ MOV starting at `02:00:00:00` and two distinct mono
+48 kHz WAVs, one PCM16 and one PCM24. Create a 24 fps timeline with a
+stereo Mix bus, start it at `01:00:00:07`, and place two edits per track
+using these half-open frame ranges.
+
+| Track | Record ranges | Source ranges |
+| --- | --- | --- |
+| V1 | `[0, 24)`, `[24, 48)` | `[6, 30)`, `[49, 73)` |
+| A1 | `[0, 16)`, `[16, 48)` | `[9, 25)`, `[34, 66)` |
+| A2 | `[0, 20)`, `[20, 48)` | `[12, 32)`, `[40, 68)` |
+
+Premiere Save As and reopen retained all six ranges. The saved job
+selected the timeline by ObjectUID. Review and conversion counted three
+direct links, and replay from serialized graph/2 reproduced the saved
+timeline. Resolve Studio 21.2.0 build 00006 kept both nonzero clocks, all
+six ranges, all three online paths, and the separate mono selectors after
+Save Project As, close, reopen, and re-export.
+
+An independently assembled Resolve timeline matched all 48 decoded
+picture frames and all 96,000 PCM24 sample frames per isolated lane.
+The two lanes carried distinct signals. A Premiere control created from
+the picture clip with an eight-channel adaptive Mix bus was refused.
+
+### Packaged Premiere to Resolve replay
+
+A locally signed macOS arm64 package ran three saved jobs through
+the internal wizard with the bundled media probe. The jobs covered the
+native Premiere ProRes/WAV split edit, repeated V1 dissolves with A1
+Constant Gain fades, and the editable Constant Power approximation.
+Review and preparation left each destination absent. For Constant
+Power, Review named the +3 dB approximation and disabled Convert
+until it was approved. An occupied destination was refused and its
+bytes stayed intact.
+
+Each wizard output matched the same-revision internal turnover CLI
+and its retained Resolve reference. Resolve Studio 21.2.0 build 00006
+saved, reopened, and re-exported all three wizard outputs with their
+exact clocks, edits, original links, selectors, and transition windows.
+For each project all 48 decoded picture frames and both 96,000-sample
+PCM24 lane renders matched the corresponding Resolve controls. The
+Power comparison uses the native Resolve +3 dB fade as its audio reference.
+
+The trial used private, hash-pinned templates supplied by the saved jobs
+and the separate internal CLI probe. The packaged public CLI continues
+to refuse Resolve jobs. See the [product gate](ROADMAP.md#resolve-product-exposure)
+for the wider native scope and template redistribution review.
+
 ### Premiere project selections
 
 Use the internal `resolve-turnover-probe --premiere-project MANIFEST.json`
@@ -202,6 +280,169 @@ publication.
 The combined source fixtures were derived from a retained Premiere
 project. A fully native Premiere source for this combined multi-timeline
 case remains a separate check.
+
+### Editable Premiere picture nests
+
+The internal 1080p24 route follows a nested edit’s saved sequence
+reference and checks it against the child’s project item. Selecting
+a parent includes the referenced children. Graph/2 records each parent
+occurrence, exact child ID and clock, full child extent, and child-local
+trim in `premiere.nested_uses`. The linked writer uses the existing
+Resolve nesting template, with one shared media item for repeated
+uses of the same original.
+
+The Premiere 27.0.0 build 88 control has two children with the same
+name. They start at `02:00:00:03` and `03:00:00:13` and each runs
+30 frames. The parent starts at `01:00:00:07`. Its first nest uses
+child frames `[3, 13)` at record frame 3. The second uses child frames
+`[7, 19)` at record frame 13. A direct edit follows at frame 25.
+
+The saved job and the serialized graph replay both reopened in
+Resolve Studio 21.2.0 build 00006 with both child names, their distinct
+starts, and both trims intact. Each render matched the independently
+authored Resolve control on all 31 frames, including three leading
+black frames. Both editors selected the expected 28 original frames.
+Advancing the first child’s source In by one frame changed only its
+ten parent frames after reopen.
+
+The profile covers one level of picture-only V1 nests. Premiere can
+insert a stereo audio companion even when the child has no audio
+edits. Review can omit a companion on neutral A1 when its exact child
+reference, record range, and source trim agree with the picture.
+Graph/2 retains the companion’s occurrence ID and the saved job and
+graph replay both require approval for the omission. A native control
+confirmed digital silence across all 56,000 stereo sample frames.
+After reopen, both converted projects matched all 28 picture frames
+of the independently authored Resolve control.
+
+#### Audible nested audio
+
+A native Resolve control nests a child with one mono WAV edit into a
+stereo parent at the same start and trim as the saved Premiere 27
+control. After save, close and reopen, the audio companion still refers
+to the exact child, with child trim `[3, 13)` and record range `[0, 10)`.
+The flat Resolve control matches all 28 decoded picture frames. The
+native nest selects WAV samples `[10,000, 30,000)` on both output
+channels and is silent for the remaining 36,000 sample frames.
+
+Away from the edit edges, Resolve reproduced the WAV at −2.90 dB per
+channel in the native nest and at unity in the flat control. Premiere's
+reopened nest measured −6.02 dB per channel. The Resolve exports also
+had a different response at the edit edge. A matching trim and routing
+alone therefore leave an audible difference.
+
+The Resolve reader retains the audio occurrence in `resolve.nested_uses`
+even when the parent track layout has no destination mapping. The
+record carries the native track ID, child identity, trim, and any bounded
+saved selector. The selector describes the child mix. The destination
+mix remains unresolved for the mono child.
+
+A separate control changed only the parent audio clip's editable
+volume. Resolve reopened the exact values −3.123252, −3.16, −3.24,
+and +1.16 dB. The renders applied −3.1, −3.1, −3.2, and +1.1 dB
+respectively. These controls show tenths of a dB toward zero for this
+profile. Graph/2 retains the exact saved value as
+`saved_clip_volume_db` on the audio nest occurrence.
+
+The −3.1 dB adjustment left the interior 0.023 dB above Premiere.
+The neutral repeat matched the original Resolve export exactly.
+All four adjusted renders kept all 28 picture frames and the same
+audio trim and stereo routing. The approximately 72-sample native
+ramps still differed from Premiere at the two edit edges with both
+Inspector fades at zero.
+
+Two 1080p24 Resolve controls used independent stereo signals from
+48 kHz PCM16 and PCM24 WAV files. The child placed WAV frames
+`[2, 32)` and the parent used child frames `[3, 13)`. After save,
+close and reopen, the parent selected WAV samples `[10,000, 30,000)`
+in left/right order. For each bit depth, all 28 picture frames and
+all 56,000 stereo PCM frames matched a flat Resolve control byte
+for byte. Both Resolve paths had the same short edit-edge ramps.
+
+Graph/2 captures the child's standalone stereo WAV edit as grouped
+audio on A1. The parent receipt records `saved_child_mix_channels`
+as `[1, 2]` when the native stereo selector matches. This describes
+the child mix outputs. The child's WAV placement separately carries
+the physical file channels.
+
+The internal linked probe can now write a selected stereo WAV child
+as its own editable 1080p24 timeline. It uses a pinned native
+24 fps V1 and stereo A1 layout. The profile needs a verified standalone
+48 kHz PCM16 or PCM24 stereo WAV, a neutral mixer, and contiguous
+picture and audio spans of equal duration. The graph supplies the
+picture and audio trims independently.
+
+The reopened outputs retained the child start at `02:00:00:03`,
+picture frames `[6, 36)`, and WAV frames `[2, 32)`. Both bit-depth
+controls matched on all 30 picture frames and 60,000 stereo sample
+frames. The source channel order and native edge ramps matched the
+independently authored control and the original child.
+
+The linked probe also round-trips paired native Resolve stereo audio
+nests on a neutral 1080p24 parent with one shared child. Graph/2 retains
+the reciprocal picture/audio occurrence IDs, exact child reference, shared trim and
+ordered stereo mix outputs. The writer uses the pinned stereo layout
+and paired-nest templates and rebuilds both reciprocal links on the
+generated native IDs. Staged read-back checks each link and its owner.
+
+For standalone PCM16 and PCM24 WAV children, after save, close and
+reopen all 28 picture frames and 56,000 stereo sample frames matched
+the native parent controls. Advancing the child WAV trim by two frames
+shifted both live parent audio channels by 4,000 samples without
+changing the picture or the parent's trim.
+
+The audible profile covers one registered Resolve child, matched
+V1/A1 pairs and ordinary picture cuts elsewhere on the parent. Broken
+links, unqualified routing or mixer state, and mismatched trims refuse
+publication. Mono or processed child mixes and deeper chains require
+separate qualification.
+
+The internal Premiere → Resolve route also writes paired nests
+when Premiere saves an enabled Standard stereo A1 companion beside
+each matching V1 edit and the shared child has one standalone stereo WAV on
+Standard A1. Both mixers must be neutral. The reader verifies the
+actual saved track panners and the audio clip's ordered child refs.
+A stereo clip layout alone is insufficient. A control using mono
+tracks retained stereo clip labels but mixed the file channels together.
+That layout is refused.
+
+Premiere 27.0.0 build 88 saved and reopened both bit depths. The
+generated saved-job and graph/2 replay outputs reopened in Resolve
+Studio 21.2.0 build 00006 and matched the corresponding native Resolve
+controls on all 28 picture frames and all 56,000 stereo sample frames.
+Both editors selected the same original frames and samples. Outside
+Resolve's 72-sample edge ramps, the PCM16 source matched exactly.
+The PCM24 source differed by at most one PCM16 step in the Premiere
+reference export.
+
+Review reports the edge approximation on each parent audio occurrence.
+Both the saved-job and serialized-graph publication paths require
+explicit `--accept-losses` for it. The output keeps the original WAV,
+editable child, linked parent picture/audio pairs, and exact edit bounds.
+
+A repeated-use PCM24 fixture starts the parent at `01:00:00:07` and
+the child at `02:00:00:03`. Its parent selects child frames `[3, 13)`
+and `[15, 27)` on adjacent V1/A1 pairs. The Premiere saved job,
+Premiere graph replay and native Resolve graph replay each matched
+the reopened native Resolve control on all 28 decoded picture frames
+and 56,000 stereo sample frames. The two Premiere routes report
+separate edge approximations. The native route needs no edge approval.
+
+After reopen, advancing only the second trim by one frame moved both
+of its audio channels by 2,000 samples. The first pair retained its
+native links, trim, picture and samples. Resolve added rendered-media
+metadata to that first pair during the edit. Re-export of that changed
+archive through the converter remains unqualified.
+
+Both occurrences in the unchanged pair carry the same 660-byte
+`ImportExportMetadataBA` value. It contains two nonzero rendered-audio
+source Mob IDs, a source count of two, a 16-byte zeroed `RenderedExtents`
+value, and a nested MXF metadata record with tape, source, and master Mob
+IDs. The corresponding occurrences in the retained pre-edit archive have
+no payload. The edit and PCM comparison establishes that playback stayed
+correct in Resolve. To qualify replay, isolate a metadata-only save and a
+rendered-media replacement, then check the child references and source
+paths alongside the reopened picture and PCM in each case.
 
 ### Premiere AVC MOV and MP4
 
@@ -710,6 +951,13 @@ of a decibel from −6 through 0 dB. Mute is independent of track gain,
 clip volume, and the original channel selector. Mixer automation,
 contradictory saved values, and gains outside this profile block output.
 
+The reader checks the Mix track and its panner type and channel labels.
+The saved channel count of two can describe a stereo Mix or an adaptive
+Mix. A Premiere 27 save with two adaptive outputs refuses at the Mix
+boundary. A derived stereo project with only the Mix type changed to
+adaptive also refuses. The editable multicam backing sequence has its own
+adaptive Mix profile and retains its separately verified output matrix.
+
 The 23.976 control used a retained Premiere 27 save with its clip-edge
 transitions removed from a disposable copy. Resolve Studio 21.2.0 build
 00006 reopened it with A1 muted, track levels of −3 and −6 dB, and a
@@ -905,6 +1153,12 @@ physical output independently of the picture's saved SelectedTrackIndex.
 Resolve reuses the native two-camera Group and links both camera originals
 in place. Other track layouts, creative processing, and an audio angle
 switch need separate mappings.
+
+Review follows the multicam backing sequence to its two camera originals.
+It checks the saved file and mono references, physical OP1a streams,
+and camera duration. It counts each verified camera as a direct link and
+identifies its angle and locator in media errors. Prepare and Convert
+still use the existing digest checks.
 
 Premiere 27 build 88 saved, closed and reopened a three-cut picture
 control with independent fixed mono lanes and a qualified 01:00:00:00
@@ -1256,6 +1510,47 @@ reverse turnovers preserved their saved timeline facts.
 The same linked picture profile is qualified in the reverse conversion
 direction. Ramps and retimed audio remain separate.
 [Resolve to Premiere qualification](RESOLVE-SOURCE-READER.md#resolve-to-premiere-200-forward-picture-speed)
+
+## Premiere piecewise Linear picture retiming
+
+Premiere saves the clip's Time Remapping keys as pairs of retimed ticks
+and file-relative source seconds. The saved clip In is on the retimed
+axis. The map provides the actual source In. The selected source
+frames travel in the existing graph/2 `frame_map`. An edit-owned
+`picture.retime_linear` record keeps the whole-frame curve keys and
+the retimed In, so the writer can preserve editable speed changes.
+The original Premiere key records and trims remain on the edit in
+`premiere.time_remapping`. The turnover job and standalone Premiere
+source probe share that capture.
+
+The first profile covers picture-only V1 at 1920×1080 and exact 24 fps
+with linked, zero-origin ProRes HQ MOV and Frame Sampling. It requires
+increasing whole-frame keys on both axes, no curve handles, and
+coverage of the full edit. When Premiere ends the map at the exclusive
+file boundary, a unity-speed final segment lets the writer move the
+terminal key back one frame on both axes for Resolve. Off-grid source
+In, reverse segments, holds, effects on the retimed edit, and retimed
+audio are outside this profile. The writer verifies each key, the
+trim, and the sampled frames in the staged archive.
+[Pinned pr2resolve time-map reference](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/pr2_native_time.py)
+
+The numbered picture controls use a nonzero timeline start and a
+nonzero retimed In. The speed changes include 100% → 200% → 100%
+and fractional-speed segments at 50%, 60%, 150%, and 160%.
+The source controls were saved, closed, reopened, and rendered in
+Premiere 27.0.0 build 88. Resolve Studio 21.2.0 build 00006 retained
+the curves, trims, and links after save and reopen. Retime Controls
+exposed both speed points and all three segments on the 100% → 200% →
+100% edit.
+
+All four timelines also passed Save Project As, close, and reopen in a
+single Resolve project with one shared original. All 192 source-frame
+selections agreed with Premiere. Both standalone writer paths and the
+combined Save As project matched the separately encoded Resolve
+comparison renders on every decoded frame. Bezier handles, nonmonotone
+keys, off-grid keys, and a graph curve that contradicted its sampled
+frames all failed before publication. The retained half-speed,
+double-speed, and reverse controls passed their regression checks.
 
 ## Capture in graph/2
 

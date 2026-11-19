@@ -308,8 +308,23 @@ fn status_message(
             Action::Check,
         ),
         WorkerStatus::Busy => (
-            "The Resolve scratch project is busy or contains media. Check its state and try again."
+            "Another Resolve-assisted import is running. Wait for it to finish, then check again."
                 .into(),
+            Action::Check,
+        ),
+        WorkerStatus::Rendering => (
+            "The Resolve scratch project is rendering. Wait for the render to finish, then check again."
+                .into(),
+            Action::Check,
+        ),
+        WorkerStatus::ContainsContent(name) => (
+            format!(
+                "The scratch project “{name}” contains media, bins, or timelines. Return it to an empty state, then check again."
+            ),
+            Action::Check,
+        ),
+        WorkerStatus::Setup(instructions) => (
+            format!("{instructions} Then check again."),
             Action::Check,
         ),
         WorkerStatus::Unconfigured => (
@@ -577,8 +592,27 @@ mod tests {
                 .0
                 .contains("scratch")
         );
-        assert_eq!(status(3, true, true, WorkerStatus::Busy).1, Action::Check);
         assert_eq!(status(3, true, true, WorkerStatus::Ready).1, Action::None);
+    }
+
+    #[test]
+    fn scratch_worker_messages_offer_state_specific_recovery() {
+        for (state, instructions) in [
+            (WorkerStatus::Busy, "assisted import is running"),
+            (WorkerStatus::Rendering, "rendering"),
+            (
+                WorkerStatus::ContainsContent("Test worker".into()),
+                "“Test worker” contains media, bins, or timelines",
+            ),
+            (
+                WorkerStatus::Setup("Select the Media Pool root folder.".into()),
+                "Select the Media Pool root folder.",
+            ),
+        ] {
+            let (message, action) = status_message(1, 1, false, true, true, &state);
+            assert!(message.contains(instructions), "{message}");
+            assert_eq!(action, Action::Check);
+        }
     }
 
     #[test]

@@ -14,8 +14,10 @@ mod markers;
 pub(crate) use markers::{SEQUENCE_MARKER_DATA_ADAPTER, SOURCE_MARKER_DATA_ADAPTER};
 mod metadata;
 mod mixer;
+mod nesting;
 mod multicam;
 pub(crate) use multicam::CAMERA as MULTICAM_CAMERA;
+mod retime;
 mod source_capture;
 mod transitions;
 pub(crate) use metadata::{LABEL_LOSS as CLIP_LABEL_LOSS, LOSS as CLIP_METADATA_LOSS,
@@ -157,17 +159,22 @@ pub struct MediaLinkReview {
 pub(crate) fn review_media_links(path: &Path, selector: &str, ffprobe: &Path) -> Result<MediaLinkReview> {
     let path = premiere_path(path)?;
     let (project, _) = read_project(&path)?;
-    let sequence = project.sequence(select_sequence(&project, selector)?);
+    let sequence = select_sequence(&project, selector)?;
+    if let Some(item) = multicam::source(&project, sequence)? {
+        return multicam::review_links(&project, sequence, item, ffprobe);
+    }
+    let plan = nesting::discover(&project, vec![sequence])?;
+    let canvas = project.sequence(sequence).frame_size;
     let mut originals = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();
     let mut seen = HashSet::new();
     let mut review = MediaLinkReview::default();
-    for track in sequence.video_tracks.iter().chain(&sequence.audio_tracks) {
-        for &clip in &project.track(*track).clips {
+    for sequence in plan.sequences.iter().copied() {
+        for clip in project.sequence_clips(sequence) {
             let Some(item) = project.track_item_source(clip) else {
                 review.blockers.push("A Premiere edit has no saved source".into());
                 continue;
             };
-            if !seen.insert(item) {
+            if project.item(item).sequence_uid.is_some() || !seen.insert(item) {
                 continue;
             }
             let name = project.item_name(item);
@@ -187,7 +194,7 @@ pub(crate) fn review_media_links(path: &Path, selector: &str, ffprobe: &Path) ->
     }
     for (path, names) in originals {
         let label = format!("{} · {}", names.into_iter().collect::<Vec<_>>().join(", "), path.display());
-        match linked::review_original(&path, ffprobe, sequence.frame_size) {
+        match linked::review_original(&path, ffprobe, canvas) {
             Ok(false) => review.direct += 1,
             Ok(true) => review.assist.push(label),
             Err(error) => review.blockers.push(format!("{label}: {error}")),
@@ -270,8 +277,9 @@ fn prepare_selection(
         sampled_frame_count: 0,
     };
     let capture_components = components::is_current_project(&project)?;
-    for sequence in selection {
-        let result = capture_sequence(&project, sequence, ffprobe, capture_components, &mut capture, progress);
+    let mut nests = nesting::discover(&project, selection)?;
+    for sequence in nests.sequences.clone() {
+        let result = capture_sequence(&project, sequence, ffprobe, capture_components, &mut capture, &mut nests, progress);
         if exact {
             result.map_err(|e| format!("Premiere sequence {}: {e}", project.sequence_id(sequence).unwrap_or_default()))?;
         } else {
@@ -328,7 +336,7 @@ impl SelectionCapture {
             let mut candidate = GraphCapture::empty_graph(self.graph.graph.project.name.clone());
             let Ok((mut binding, _)) = bind(
                 project, item, media, saved, StreamKind::Video, record.rate, (1920, 1080),
-                ffprobe, 0, &mut candidate, &mut self.files,
+                ffprobe, 0, &mut candidate, &mut self.files, false,
             ) else { continue };
             if !candidate.losses.is_empty() {
                 continue;
@@ -362,13 +370,15 @@ fn capture_sequence(
     ffprobe: &Path,
     capture_components: bool,
     capture: &mut SelectionCapture,
+    nests: &mut nesting::Plan,
     progress: &mut dyn FnMut(usize, &Path),
 ) -> Result<()> {
     let id = project
         .sequence_id(sequence)
         .ok_or("Premiere sequence lacks ObjectUID")?;
     let data = project.sequence(sequence);
-    let bus_fader = mixer::read_mix_bus(project, data.element, capture_components)?;
+    let bus_fader =
+        mixer::read_mix_bus(project, data.element, mixer::MixBus::Stereo, capture_components)?;
     let frame_ticks = data
         .timebase
         .filter(|&n| n > 0)
@@ -458,6 +468,9 @@ fn capture_sequence(
         (StreamKind::Video, &data.video_tracks, if wide { 2 } else { 1 }),
         (StreamKind::Audio, &data.audio_tracks, if wide { 3 } else { 2 }),
     ] {
+        if kind == StreamKind::Audio && nests.omits_empty_audio(sequence) {
+            continue;
+        }
         let mut track_indexes = HashSet::new();
         for &track_id in tracks {
             let track = project.track(track_id);
@@ -521,6 +534,17 @@ fn capture_sequence(
                 let source = project
                     .track_item_source(clip)
                     .ok_or("unresolved Premiere source item")?;
+                if project.item(source).sequence_uid.is_some() {
+                    if !capture_components || bus_fader != 0 {
+                        return Err("Premiere nesting requires a current project with a neutral Mix bus".into());
+                    }
+                    graph.losses.push(Loss {
+                        object: id.clone(),
+                        aspect: "placement".into(),
+                        reason: format!("{placement_id}: {}", crate::nests::PREMIERE_LOSS),
+                    });
+                    continue;
+                }
                 let (item, verified) = match seen_items.entry(source) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -538,6 +562,7 @@ fn capture_sequence(
                         let previous_count = files.len();
                         let (binding, verified) = bind(
                             project, source, media, saved, kind, rate, canvas, ffprobe, bin, graph, files,
+                            nests.stereo_child(sequence),
                         )?;
                         if files.len() != previous_count {
                             progress(files.len(), &binding.path);
@@ -566,7 +591,8 @@ fn capture_sequence(
                 .map_err(|error| format!("{placement_id}: {error}"))?;
                 let stereo = channels == crate::stereo::STREAMS
                     && index == 1 && verified.is_some()
-                    && data.frame_size.is_some_and(|size| crate::stereo::clock(rate, size));
+                    && (nests.stereo_child(sequence)
+                        || data.frame_size.is_some_and(|size| crate::stereo::clock(rate, size)));
                 if kind == StreamKind::Audio && channels.len() != 1 && !stereo {
                     return Err(format!("{placement_id}: Premiere audio edit is not a qualified mono or stereo selection").into());
                 }
@@ -581,6 +607,8 @@ fn capture_sequence(
                 use crate::retime::PictureSpeed;
                 let native_speed = project.speed(clip)?;
                 let reversed = project.is_speed_reversed(clip)?;
+                let remap = retime::parameter(project, clip)
+                    .map_err(|error| format!("{placement_id}: {error}"))?;
                 let picture_speed = match (native_speed, reversed) {
                     (1.0, false) => None,
                     (0.5, false) if capture_components && kind == StreamKind::Video && rate == Rational::integer(24) => {
@@ -642,7 +670,7 @@ fn capture_sequence(
                 {
                     return Err(format!("{placement_id}: odd-length half-speed picture requires Premiere Frame Sampling").into());
                 }
-                let (source_in, source_out) = if let Some(mode) = picture_speed {
+                let (mut source_in, source_out) = if let Some(mode) = picture_speed {
                     let original = binding.streams.iter().find(|s| s.channel.is_none())
                         .and_then(|s| graph.media.iter().find(|m| m.id == s.media_id))
                         .filter(|m| m.kind == StreamKind::Video && m.codec.as_deref() == Some("prores"))
@@ -701,7 +729,32 @@ fn capture_sequence(
                     .and_then(|stream| graph.media.iter().find(|m| m.id == stream.media_id))
                     .and_then(|original| original.rate)
                     .and_then(|source_rate| mixed_rate::Cadence::between(source_rate, rate));
-                let frame_map = if let Some(cadence) = cadence {
+                let frame_map = if let Some(param) = remap {
+                    let unsupported = || format!("{placement_id}: Linear Time Remapping requires plain same-rate 1080p24 V1 with Frame Sampling");
+                    if !capture_components || kind != StreamKind::Video
+                        || !retime::plain_linear_picture(index, rate, Some((canvas.0.into(), canvas.1.into())), has_components)
+                        || speed.is_some() || hold.is_some() || !track.transitions.is_empty()
+                        || !retime::frame_sampling(project, clip)?
+                    {
+                        return Err(unsupported().into());
+                    }
+                    let original = binding.streams.iter().find(|stream| stream.channel.is_none())
+                        .and_then(|stream| graph.media.iter().find(|media| media.id == stream.media_id))
+                        .filter(|media| media.codec.as_deref() == Some("prores")
+                            && media.kind == StreamKind::Video && media.rate == Some(rate)
+                            && media.frame_size == Some((1920, 1080))
+                            && media.start.is_none_or(|start| start == Rational::ZERO))
+                        .filter(|_| binding.streams.len() == 1)
+                        .ok_or_else(unsupported)?;
+                    let extent = crate::prepare::frames_on(original.duration, rate)?;
+                    let (frames, receipts) = retime::capture(
+                        project, param, &placement_id, (source_in, source_out), extent,
+                        &mut component_budget, sampled_frame_count,
+                    ).map_err(|error| format!("{placement_id}: {error}"))?;
+                    source_in = frames[0].checked_mul(frame_ticks).ok_or("Premiere remap source In overflows")?;
+                    graph.sidecars.extend(receipts);
+                    Some(frames)
+                } else if let Some(cadence) = cadence {
                     if !capture_components || index != 1 || canvas != (1920, 1080) || has_components
                         || speed.is_some() || hold.is_some()
                         || project.time_interpolation_type(clip)? != prproj::model::enums::TimeInterpolationType::FrameSampling
@@ -835,7 +888,8 @@ fn capture_sequence(
             return Err("Premiere 25 fps standalone mono WAV requires stereo A1 and mono A2".into());
         }
         if track_indexes.len() != expected as usize
-            && !(kind == StreamKind::Audio && track_indexes.is_empty()) && !stereo_layout
+            && !(kind == StreamKind::Audio && (track_indexes.is_empty() || nests.stereo_parent(sequence)))
+            && !stereo_layout
         {
             return Err(if wide {
                 "Premiere wider layout requires two picture tracks and three nonempty mono lanes"
@@ -930,6 +984,15 @@ fn capture_sequence(
         }
     }
     let mut source_fields = Vec::new();
+    if let Some(length) = nests.length(sequence) {
+        if !capture_components || bus_fader != 0 {
+            return Err("Premiere nesting requires a current project with a neutral Mix bus".into());
+        }
+        source_fields.push((crate::nests::PREMIERE_LENGTH.into(), Value::Int(length)));
+    }
+    if let Some(receipt) = nests.source_facts(sequence, &id) {
+        graph.sidecars.push(receipt);
+    }
     if bus_fader != 0 {
         source_fields.push((
             crate::source::mixer::MAIN_BUS_LEVEL.into(),
@@ -1100,6 +1163,7 @@ fn bind(
     bin: usize,
     graph: &mut SourceGraph,
     files: &mut linked::FileProbes,
+    stereo_nest_child: bool,
 ) -> Result<(MediaSpec, Option<capture::VerifiedBinding>)> {
     let path = std::fs::canonicalize(saved)?;
     let tree = &project.doc.tree;
@@ -1156,9 +1220,9 @@ fn bind(
             )?;
         return Ok((spec, Some(binding)));
     }
-    if rate == Rational::integer(25)
-        && kind == StreamKind::Audio
-        && matches!(verified.profile, Profile::Wav { channels: 1 | 2, .. })
+    if kind == StreamKind::Audio
+        && (rate == Rational::integer(25) && matches!(verified.profile, Profile::Wav { channels: 1 | 2, .. })
+            || stereo_nest_child && matches!(verified.profile, Profile::Wav { channels: 2, .. }))
         && components::is_current_project(project)?
     {
         let binding = capture::VerifiedBinding::bind(project, item, saved, &mut spec, ffprobe, bin, graph)?;

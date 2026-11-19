@@ -7,6 +7,14 @@ import sys
 import tempfile
 
 
+READINESS_EXIT = {
+    "worker_busy": 3,
+    "worker_contains_content": 4,
+    "worker_setup": 5,
+    "worker_rendering": 6,
+}
+
+
 def connection(worker_name):
     try:
         import DaVinciResolveScript as api
@@ -32,22 +40,21 @@ def connection(worker_name):
         return "open_worker", worker_name, None
     pool = project.GetMediaPool()
     folder = pool.GetRootFolder()
-    if (
-        project.IsRenderingInProgress()
-        or project.GetTimelineCount()
-        or float(project.GetSetting("timelineFrameRate")) != 24
-        or folder.GetClipList()
-        or folder.GetSubFolderList()
-        or pool.GetCurrentFolder().GetUniqueId() != folder.GetUniqueId()
-    ):
-        return "worker_busy", worker_name, None
+    if project.IsRenderingInProgress():
+        return "worker_rendering", worker_name, None
+    if project.GetTimelineCount() or folder.GetClipList() or folder.GetSubFolderList():
+        return "worker_contains_content", worker_name, None
+    if float(project.GetSetting("timelineFrameRate")) != 24:
+        return "worker_setup", "Set the scratch project timeline rate to 24 fps.", None
+    if pool.GetCurrentFolder().GetUniqueId() != folder.GetUniqueId():
+        return "worker_setup", "Select the scratch project's Media Pool root folder.", None
     return "ready", "", (manager, project, pool)
 
 
 def import_original(worker_name, original, destination):
     state, _, worker = connection(worker_name)
     if state != "ready":
-        return 2
+        return READINESS_EXIT.get(state, 2)
     manager, project, pool = worker
     identity = project.GetUniqueId()
 
@@ -99,7 +106,7 @@ def main():
         try:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return 2
+            return READINESS_EXIT["worker_busy"]
         return import_original(worker_name, original, destination)
 
 

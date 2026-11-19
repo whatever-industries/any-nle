@@ -24,7 +24,7 @@ mod wav;
 mod xml;
 
 use crate::{
-    audio::Volume,
+    audio::{Envelope, Volume},
     Result,
 };
 use encoding::{extent, frame_rate, frames, hex_bytes, pb_bytes, qt, raster, rate, timecode, Blobs};
@@ -1429,7 +1429,10 @@ fn read_mixer_controls(
         .map(Mixer::decode)
         .transpose()?
         .flatten();
-    let stereo = out.placements.iter().any(crate::stereo::placement);
+    let stereo_nest = matches!(context.graph.sidecar(NESTS_ADAPTER, &out.id), Some(Value::Arr(rows))
+        if rows.iter().any(|row| nests::string(row, "track_kind") == Some("audio")
+            && nests::string(row, "profile") == Some(nests::STEREO_PROFILE)));
+    let stereo = stereo_nest || out.placements.iter().any(crate::stereo::placement);
     let flags_muted = track_flags.is_some_and(|flags| flags != [false; 2]);
     let track_state = crate::track_state::TrackState::prepare(&context.graph, out).ok().flatten();
     let Some(mixer) = mixer else {
@@ -1448,7 +1451,7 @@ fn read_mixer_controls(
         return Ok(MixerControls::default());
     };
     context.blobs.charge(mixer.decoded_bytes())?;
-    if stereo && mixer.neutral_stereo(&tracks) {
+    if stereo && mixer.neutral_stereo(out.rate, &tracks) {
         return Ok(MixerControls::default());
     }
     let metadata = if typed_mixer_profile && (track_state.is_some() || mixer.has_track_state()) {
@@ -1557,14 +1560,32 @@ fn read_tracks<'a>(
     default_input_fit: bool,
 ) -> Result<Option<[bool; 2]>> {
     let tracks = tracks(container)?;
-    let stereo_layout = crate::stereo::clock(grid.rate, grid.size)
-        && match tracks.as_slice() {
-            [(StreamKind::Video, _), (StreamKind::Audio, _)] => true,
-            [(StreamKind::Video, _), (StreamKind::Audio, _), (StreamKind::Audio, a2)] =>
-                a2.get("SubType")? == "1" && a2.get("Flags")? == "0"
-                    && a2.maybe("UserDefinedName")?.unwrap_or("").is_empty(),
-            _ => false,
-        };
+    let stereo_25 = crate::stereo::clock(grid.rate, grid.size);
+    let hd_24 = grid.rate == Rational::integer(24) && grid.size == (1920, 1080);
+    let mut stereo_nest = false;
+    let stereo_layout = match tracks.as_slice() {
+        [(StreamKind::Video, _), (StreamKind::Audio, a1)] => {
+            if hd_24 && a1.get("SubType")? == "0"
+                && a1.get("Flags")? == "0" && a1.maybe("UserDefinedName")?.unwrap_or("").is_empty()
+                && a1.maybe("FieldsBlob")? == Some(crate::captions::TRACK_FIELDS)
+            {
+                let items = a1.one("Items")?;
+                stereo_nest = !items.children.is_empty()
+                    && items.elements()?.try_fold(true, |all, entry| {
+                    let clip = entry.entry()?;
+                    Ok::<_, Box<dyn std::error::Error>>(all && clip.name == "Sm2TiAudioClip"
+                        && clip.maybe("MediaRef")?.is_some_and(|target| context.nested.contains_key(target)))
+                })?;
+                stereo_nest || wav::all_stereo_wav_edits(a1, &context.masters, grid.rate)?
+            } else {
+                stereo_25
+            }
+        }
+        [(StreamKind::Video, _), (StreamKind::Audio, _), (StreamKind::Audio, a2)] if stereo_25 =>
+            a2.get("SubType")? == "1" && a2.get("Flags")? == "0"
+                && a2.maybe("UserDefinedName")?.unwrap_or("").is_empty(),
+        _ => false,
+    };
     let track_flags = match tracks.as_slice() {
         [(StreamKind::Video, v), (StreamKind::Audio, a1), (StreamKind::Audio, a2)]
             if matches!(v.get("Flags")?, "0" | "1" | "2" | "3") && a1.get("SubType")? == "1" && a2.get("SubType")? == "1" =>
@@ -1680,7 +1701,17 @@ fn read_tracks<'a>(
                 title::capture(&mut context.graph, out, node, grid, index, &mut context.blobs)?;
                 continue;
             }
-            if !supported || !ordinary_item(node, kind, &out.id, &mut context.graph)? {
+            // A nested audio reference still identifies its child and trim when
+            // the parent track has no qualified channel layout.
+            let saved_audio_nest = !supported
+                && kind == StreamKind::Audio
+                && node.name == "Sm2TiAudioClip"
+                && node
+                    .maybe("MediaRef")?
+                    .is_some_and(|target| context.nested.contains_key(target));
+            if (!supported && !saved_audio_nest)
+                || !ordinary_item(node, kind, &out.id, &mut context.graph)?
+            {
                 continue;
             }
             if context.inspect_drt {
@@ -1776,28 +1807,46 @@ fn read_tracks<'a>(
             } else if let Some(&(child, class)) = context.nested.get(target) {
                 let edit = grid.edit(node, false)?;
                 let child_grid = Grid::read(child)?;
-                let plain = kind == StreamKind::Video && index == 1
+                let audio = kind == StreamKind::Audio;
+                let neutral = index == 1
                     && grid.rate == Rational::integer(24) && child_grid.rate == grid.rate
                     && child_grid.length > 0
                     && child_grid.size == grid.size
-                    && node.maybe("FieldsBlob")? == Some(nests::ITEM_FIELDS)
                     && node.maybe("MediaStartTime")?.and_then(|v| v.parse::<f64>().ok()) == Some(child_grid.origin as f64 / 24.0)
                     && node.maybe("MediaFrameRate")? == Some("00000000000038400000000000000000")
                     && node.maybe("MediaTimemapBA")?.is_some_and(|v| nests::identity_map(v, child_grid.length))
                     && node.maybe("MixedFrameRateAlignment")? == Some("0")
-                    && node.maybe("CurrentSelectorIdx")? == Some("0")
                     && node.maybe("WasDisbanded")? == Some("false")
                     && node.maybe("IsForceConformed")? == Some("true")
-                    && node.maybe("IsPreConformed")? == Some("false")
-                    && !node.children.iter().any(|f| matches!(f.name.as_str(),
-                        "pLmVerTable" | "CompositionTable" | "VirtualAudioTrackBA"))
+                    && !node.children.iter().any(|f| matches!(f.name.as_str(), "pLmVerTable" | "CompositionTable"))
                     && ["EffectFiltersBA", "LinkedItemSync", "MarkersBA", "PrettyType",
                         "ImportExportMetadataBA", "MediaFilePath", "MediaReelNumber", "MediaMetadata"]
                         .into_iter().try_fold(true, |clean, field| {
                             Ok::<_, Box<dyn std::error::Error>>(clean && node.maybe(field)?.is_none_or(str::is_empty))
                         })?;
-                observations::append(&mut context.graph, NESTS_ADAPTER, &out.id, Value::Obj(vec![
-                    ("profile".into(), if plain { text(nests::PROFILE) } else { Value::Null }),
+                let video_controls = !audio
+                    && node.maybe("CurrentSelectorIdx")? == Some("0")
+                    && node.maybe("IsPreConformed")? == Some("false")
+                    && node.optional("VirtualAudioTrackBA")?.is_none();
+                let saved_fields = node.maybe("FieldsBlob")?;
+                let plain = neutral && video_controls && saved_fields == Some(nests::ITEM_FIELDS);
+                let audio_controls = audio && node.maybe("MediaTrackIdx")? == Some("0")
+                    && node.maybe("VirtualAudioTrackBA")? == Some(crate::stereo::SELECTOR);
+                let paired = if neutral && stereo_nest && class == "timeline"
+                    && (video_controls || audio_controls) && !plain
+                {
+                    if let Some(encoded) = saved_fields.filter(|s| !s.is_empty() && s.len() <= 512) {
+                        nests::paired_id(&context.blobs.envelope(encoded)?, audio)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let mut fields = vec![
+                    ("profile".into(), if plain { text(nests::PROFILE) } else if paired.is_some() {
+                        text(nests::STEREO_PROFILE)
+                    } else { Value::Null }),
                     ("id".into(), text(id)),
                     ("kind".into(), text(class)),
                     ("track_kind".into(), text(kind.as_str())),
@@ -1810,7 +1859,64 @@ fn read_tracks<'a>(
                     ("child_origin_frames".into(), Value::Int(child_grid.origin)),
                     ("child_rate".into(), text(&child_grid.rate.to_string())),
                     ("record_rate".into(), text(&grid.rate.to_string())),
-                ]));
+                ];
+                if let Some(paired) = paired {
+                    fields.push(("paired_occurrence".into(), text(&paired)));
+                }
+                if kind == StreamKind::Audio {
+                    fields.push(("native_track_id".into(), text(track_id)));
+                    let saved_index = node
+                        .maybe("MediaTrackIdx")?
+                        .and_then(|v| v.parse::<u32>().ok());
+                    if let Some(index) = saved_index {
+                        fields.push(("saved_media_track_index".into(), Value::Int(i64::from(index))));
+                    }
+                    // Retain the bounded selector as saved. Its channels refer
+                    // to the child mix, so do not resolve them as file channels.
+                    if let Some(encoded) =
+                        node.maybe("VirtualAudioTrackBA")?.filter(|v| !v.is_empty())
+                    {
+                        let selector = if encoded.len() <= 512 {
+                            let bytes = hex_bytes(encoded)?;
+                            context.blobs.charge(bytes.len())?;
+                            text(encoded)
+                        } else {
+                            Value::Null
+                        };
+                        fields.push(("saved_virtual_audio_track".into(), selector));
+                        if hd_24
+                            && child_grid.rate == grid.rate
+                            && child_grid.size == grid.size
+                            && class == "timeline"
+                            && index == 1
+                            && track.get("SubType")? == "0"
+                            && saved_index == Some(0)
+                            && encoded == crate::stereo::SELECTOR
+                        {
+                            fields.push((
+                                "saved_child_mix_channels".into(),
+                                Value::Arr(
+                                    crate::stereo::STREAMS.into_iter().map(Value::Int).collect(),
+                                ),
+                            ));
+                        }
+                    }
+                    if let Some(filters) = node.maybe("EffectFiltersBA")?.filter(|v| !v.is_empty()) {
+                        if let Some(effects::ClipAudio {
+                            envelope:
+                                Some(Envelope {
+                                    volume: Some(Volume::Static(db)),
+                                    fades: None,
+                                }),
+                            pan: None,
+                        }) = effects::clip_audio(filters, &mut context.blobs, edit)? {
+                            // Keep the saved Inspector value. The rendered gain
+                            // depends on the child mix and Resolve's fader.
+                            fields.push(("saved_clip_volume_db".into(), Value::Float(db)));
+                        }
+                    }
+                }
+                observations::append(&mut context.graph, NESTS_ADAPTER, &out.id, Value::Obj(fields));
                 omitted(&mut context.graph, &out.id, id, "placement",
                     nests::LOSS);
             } else if context.pool_items.contains(target) {
@@ -1964,7 +2070,7 @@ fn direct(
         && rate(&hex_bytes(node.get("MediaFrameRate")?)?)? == master.rate
         && node.maybe("EffectFiltersBA")? == Some(crate::retime::NEAREST)
     {
-        observations::constant_picture_timing(node.get("MediaTimemapBA")?, master.length, blobs)?
+        observations::picture_timing(node.get("MediaTimemapBA")?, master.length, blobs)?
     } else {
         None
     };
@@ -1989,6 +2095,7 @@ fn direct(
         _ => None,
     };
     let mut audio_in = None;
+    let mut linear_map = None;
     let (edit, speed, sampled) = match (mixed, timing) {
         (Some(crate::mixed_rate::ResolveTrim::Adjusted(cadence, source_in)), _) => {
             let length = node.get("Duration")?.parse()?;
@@ -2036,6 +2143,26 @@ fn direct(
                 owner, graph,
             )?;
             (edit, Some(speed), None)
+        }
+        (None, Some(PictureTiming::Linear(keys))) if master.prores_hq && master.start == 0
+            && master.audio.is_empty() && master.size == (1920, 1080) && grid.size == master.size
+            && Path::new(&master.path).extension().and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+            && node.maybe("MixedFrameRateAlignment")? == Some("0") =>
+        {
+            let length = node.get("Duration")?.parse()?;
+            let record_in = node.get("In")?.parse::<i64>()?;
+            let count = crate::retime::hold_count(length).ok_or("invalid Resolve Linear retime edit length")?;
+            blobs.charge(count * size_of::<i64>())?;
+            let map = crate::retime::LinearMap::new(record_in, keys, master.length)?;
+            let samples = map.samples(length)?;
+            let source_in = samples[0];
+            let source_length = samples[count - 1] - source_in + 1;
+            let edit = grid.edit_at(node, length, source_in)?;
+            leaf_range_matches(master, node, source_in, source_length, owner, graph)?;
+            record_saved_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+            linear_map = Some(map);
+            (edit, None, Some((seconds(source_in, grid.rate)?, samples)))
         }
         (None, Some(PictureTiming::Hold(frame))) if master.prores_hq && master.start == 0
             && master.audio.is_empty() && master.size == (1920, 1080) && grid.size == master.size
@@ -2149,6 +2276,9 @@ fn direct(
     if let Some((source_in, sampled)) = sampled {
         placement.source_in = source_in;
         placement.frame_map = Some(sampled);
+        if let Some(map) = linear_map {
+            graph.sidecars.push(map.receipt(&placement.id));
+        }
         if master.camera_pcm {
             graph.sidecars.push(Sidecar {
                 adapter: "resolve.input_scaling".into(),

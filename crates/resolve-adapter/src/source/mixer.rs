@@ -288,10 +288,19 @@ impl Mixer {
         self.fields.len() + self.model.len()
     }
 
-    pub(super) fn neutral_stereo(&self, tracks: &[i64]) -> bool {
+    pub(super) fn neutral_stereo(&self, rate: graph::Rational, tracks: &[i64]) -> bool {
         // Complete decoded models from the native controls and the reopened
         // generated projects, with neutral routing to the main stereo bus.
-        matches!((tracks, hex::encode(Sha256::digest(&self.model)).as_str()),
+        let digest = hex::encode(Sha256::digest(&self.model));
+        if rate == graph::Rational::integer(24) {
+            return tracks == [1]
+                && matches!(digest.as_str(),
+                    "5843fb389219b88dc288ca7e93bb5f6d5f82a71667597e4a257ea3994f41981a"
+                    | "3cf96abec771759a91c31089161ea8d1d7927431edfb81e68bb20b6bace1650f"
+                    | "1227045f565bf93b697f5055f1cdb35a8013d17e8de6625419a42a53b8a198e5"
+                    | "9d112f6756fd3b2b35916b825538ed7bf98273899b8c2f9375377dd196524ff1");
+        }
+        matches!((tracks, digest.as_str()),
             ([1], "ae637ba85911ce208e8de9c2465613d887bc040bdc792d6d7ba4661a9a5eba17"
                 | "e9d8f886b950139c1ef3a7befb84ac2e9f17ba169385ed575b6aca2c371878b0"
                 | "989bf159058637f9b9be881cd1fb3a3d1553de18b21bd2c4b56b7bc5e49bf137")

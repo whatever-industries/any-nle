@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from time import sleep
 from urllib.parse import urlencode
 
 from build_ffmpeg import sha
@@ -98,8 +99,13 @@ def publish(candidates, version, make_public):
             gh("release", "create", tag, "--repo", repo, "--target", head, "--title", "Any NLE " + tag,
                "--draft", "--prerelease", "--notes-file", str(draft_notes))
         draft = draft_for(repo, tag, head)
+        for delay in (1, 2, 4, 8):
+            if draft is not None:
+                break
+            sleep(delay)
+            draft = draft_for(repo, tag, head)
         if draft is None:
-            raise ValueError("created release draft could not be read")
+            raise ValueError("created release draft is not visible yet; resume with the original reviewed candidates")
     draft_id = draft["id"]
     require_reviewed_draft(draft, draft_body)
 

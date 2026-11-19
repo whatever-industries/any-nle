@@ -114,6 +114,12 @@ pub struct EmptyProjectOptions<'a> {
     pub build_version: Option<&'a str>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ProjectVersion {
+    V45,
+    V46,
+}
+
 fn fresh(given: Option<&str>, ids: &mut dyn UuidSource) -> String {
     match given {
         Some(s) if !s.is_empty() => s.to_string(),
@@ -124,6 +130,15 @@ fn fresh(given: Option<&str>, ids: &mut dyn UuidSource) -> String {
 /// Python `build_empty_project`: the `PremiereData` root of a new, empty project, created
 /// detached in `tree`.
 pub fn build_empty_project(tree: &mut Tree, opts: &EmptyProjectOptions, ids: &mut dyn UuidSource) -> NodeId {
+    build_empty_project_with_version(tree, opts, ProjectVersion::V45, ids)
+}
+
+pub(crate) fn build_empty_project_with_version(
+    tree: &mut Tree,
+    opts: &EmptyProjectOptions,
+    version: ProjectVersion,
+    ids: &mut dyn UuidSource,
+) -> NodeId {
     let document_id = fresh(opts.document_id, ids);
     let project_guid = fresh(opts.project_guid, ids);
     let view_state_id = fresh(opts.view_state_id, ids);
@@ -133,7 +148,11 @@ pub fn build_empty_project(tree: &mut Tree, opts: &EmptyProjectOptions, ids: &mu
     let root = tree.new_element_with("PremiereData", &[("Version", "3")]);
     tree.sub_element(root, "Project", &[("ObjectRef", ID_PROJECT)]);
 
-    let project = object(tree, root, "Project", PROJECT, "45", Some(ID_PROJECT), None);
+    let version = match version {
+        ProjectVersion::V45 => "45",
+        ProjectVersion::V46 => "46",
+    };
+    let project = object(tree, root, "Project", PROJECT, version, Some(ID_PROJECT), None);
     let node = tree.sub_element(project, "Node", &[("Version", "1")]);
     let properties = tree.sub_element(node, "Properties", &[("Version", "1")]);
     leaf(tree, properties, "MZ.Project.WorkspaceName", workspace);

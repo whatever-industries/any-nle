@@ -1,6 +1,6 @@
 //! Shared internal preparation and publication for link-in-place turnovers.
 use crate::{
-    archive::{check_output, publish_turnover_checked, review_turnover},
+    archive::{publish_turnover_checked, review_turnover},
     linked::{self, PreparedProject},
     media::media_digest,
     Result,
@@ -8,6 +8,8 @@ use crate::{
 use graph::source::SourceGraph;
 use serde::Deserialize;
 use std::{collections::HashSet, path::{Path, PathBuf}};
+
+pub use crate::archive::check_output;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +71,7 @@ impl TurnoverJob {
         let TurnoverSource::PremiereToResolve { premiere, sequence } = &self.source else {
             return Err("Media linking Review requires a Premiere to Resolve job".into());
         };
+        check_output(&self.output)?;
         crate::premiere::review_media_links(premiere, sequence, &self.ffprobe)
     }
 
@@ -78,6 +81,7 @@ impl TurnoverJob {
         let TurnoverSource::PremiereToResolve { premiere, sequence } = &self.source else {
             return Err("Media linking Review requires a Premiere to Resolve job".into());
         };
+        check_output(&self.output)?;
         crate::premiere::prepare_with_media_progress(premiere, sequence, &self.ffprobe, progress)
     }
 
@@ -268,6 +272,28 @@ pub(crate) fn is_reviewable_loss(loss: &graph::Loss) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn review_and_prepare_check_destination_before_opening_source() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("Occupied.drp");
+        std::fs::create_dir(&output).unwrap();
+        let job: TurnoverJob = serde_json::from_value(json!({
+            "schema": "anynle.job/2",
+            "source": {"route": "premiere_to_resolve", "premiere": root.path().join("absent.prproj"), "sequence": "x"},
+            "templates": {"layout": "layout.drp", "profile": "profile.drp"},
+            "ffprobe": "ffprobe",
+            "output": output,
+        })).unwrap();
+        assert_eq!(
+            job.review_media_links().unwrap_err().to_string(),
+            "project output already exists"
+        );
+        let error = job.prepare_with_media_progress(&mut |_, _| panic!("unexpected media probe"))
+            .err().expect("occupied output must refuse prepare");
+        assert_eq!(error.to_string(), "project output already exists");
+        assert!(job.output.is_dir());
+    }
 
     #[test]
     fn resolve_jobs_require_the_version_route_and_current_run_approval() {

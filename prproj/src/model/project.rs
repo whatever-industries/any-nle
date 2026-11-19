@@ -14,7 +14,7 @@ use super::{
 };
 use crate::build::media::media_relpath;
 use crate::build::sequence::{build_sequence, build_with_format, SequenceFormat};
-use crate::build::skeleton::{build_empty_project, EmptyProjectOptions};
+use crate::build::skeleton::{build_empty_project_with_version, EmptyProjectOptions, ProjectVersion};
 use crate::error::{value, Error, Result};
 use crate::ids::UuidSource;
 use crate::splice::{splice_fragment, Spliced};
@@ -139,8 +139,12 @@ impl Project {
     /// `py_premiere.new()`: a new, empty project (draws the document id, project GUID and
     /// view-state id). It reports the name `untitled.prproj` until saved.
     pub fn new(uuids: &mut dyn UuidSource) -> Result<Project> {
+        Self::new_with_version(ProjectVersion::V45, uuids)
+    }
+
+    pub(crate) fn new_with_version(version: ProjectVersion, uuids: &mut dyn UuidSource) -> Result<Project> {
         let mut tree = Tree::new();
-        let root = build_empty_project(&mut tree, &EmptyProjectOptions::default(), uuids);
+        let root = build_empty_project_with_version(&mut tree, &EmptyProjectOptions::default(), version, uuids);
         let document = PremiereDocument::new(tree, root, Some(GzipFraming::default()))?;
         Project::from_document(document, PathBuf::from("untitled.prproj"))
     }

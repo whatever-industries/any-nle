@@ -1,5 +1,5 @@
 //! Internal CLI for preparing and publishing a link-in-place turnover.
-use anynle_resolve_adapter::turnover::{JobSchema, Templates, TurnoverJob, TurnoverSource};
+use anynle_resolve_adapter::turnover::{JobSchema, Templates, TurnoverJob, TurnoverSource, check_output};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -123,6 +123,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let input = support::read(Path::new(file), 2 << 20)?;
     let (result, templates, output) = if premiere_project {
         let manifest: PremiereProjectManifest = serde_json::from_str(&input)?;
+        if !graph {
+            check_output(&manifest.output)?;
+        }
         let result = anynle_resolve_adapter::prepare_premiere_project(
             &manifest.premiere, &manifest.sequences, &manifest.ffprobe,
         )?;
@@ -132,6 +135,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             JobDocument::Versioned(job) => job,
             JobDocument::Legacy(job) => TurnoverJob::try_from(job)?,
         };
+        if !graph {
+            check_output(&job.output)?;
+        }
         (job.prepare()?, job.templates, job.output)
     };
     if std::env::var_os("ANYNLE_RESOLVE_IMPORT_TRACE").is_some() {

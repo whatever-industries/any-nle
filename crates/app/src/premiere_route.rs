@@ -24,7 +24,7 @@ impl PremiereRoute {
         bindings: &[MediaRelink],
         editorial: prproj::convert::writer::Editorial<'_>,
     ) -> Result<prproj::convert::writer::PreparedProject, WriteError> {
-        prproj::convert::writer::prepare_project_with_effects(
+        prproj::convert::writer::prepare_project_with_effects_for_premiere_27(
             model,
             editorial,
             output,

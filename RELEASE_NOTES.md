@@ -1,36 +1,37 @@
-# Any NLE v0.1.0-alpha.5
+# Any NLE v0.1.0-alpha.6
 
-## Premiere Pro and Resolve development
+## Premiere Pro 27 projects
 
-- Expand the internal conversion probes for selected editable multicam,
-  mixed-rate picture, and transitions. The
-  [qualification guide](docs/RESOLVE-TURNOVER-IMPLEMENTATION.md) records the
-  tested media profiles and each editor's read-back and render evidence.
-- Add an internal macOS Review screen for original-media linking. The
-  converter tries direct linking first and can use a running Resolve Studio
-  worker for qualified MOV and MP4 originals that need assisted linking.
-- Preserve fit and Center Crop framing for qualified wide-raster picture
-  edits. The archive comparison identifies both clip overrides and inherited
-  framing changes.
+- Avid conversions now save the native Premiere Pro 27 project version,
+  so Premiere 27 can open them directly.
+- The packaged wizard and CLI ship Avid → Premiere Pro.
 
-The packaged wizard and CLI continue to ship Avid → Premiere Pro as their
-public conversion route. Resolve development remains available through the
-internal tools described in the guide.
+## Internal Premiere Pro and Resolve development
+
+- Add editable forward piecewise Linear retiming on qualified 24 fps
+  picture edits and preserve both saved keys and frame selections.
+- Expand the qualified profiles for editable nests, multicam, repeated
+  transitions, and Resolve-assisted original-media linking.
+- Share timing validation between source capture, Resolve preparation,
+  archive writing, and read-back.
+
+The [Resolve conversion guide](docs/RESOLVE-TURNOVER-IMPLEMENTATION.md)
+records the scope and editor checks for the internal tools.
 
 ## Download
 
 | Platform |
 | --- |
-| [**Windows (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.5/Any.NLE_Windows_x64_v0.1.0-alpha.5.exe) |
-| [**Windows (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.5/Any.NLE_Windows_ARM_v0.1.0-alpha.5.exe) |
-| [**macOS (Apple Silicon)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.5/Any.NLE_macOS_ARM_v0.1.0-alpha.5.zip) |
-| [**macOS (Intel)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.5/Any.NLE_macOS_x64_v0.1.0-alpha.5.zip) |
-| [**Linux (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.5/Any.NLE_Linux_x64_v0.1.0-alpha.5.AppImage) |
-| [**Linux (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.5/Any.NLE_Linux_ARM_v0.1.0-alpha.5.AppImage) |
+| [**Windows (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.6/Any.NLE_Windows_x64_v0.1.0-alpha.6.exe) |
+| [**Windows (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.6/Any.NLE_Windows_ARM_v0.1.0-alpha.6.exe) |
+| [**macOS (Apple Silicon)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.6/Any.NLE_macOS_ARM_v0.1.0-alpha.6.zip) |
+| [**macOS (Intel)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.6/Any.NLE_macOS_x64_v0.1.0-alpha.6.zip) |
+| [**Linux (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.6/Any.NLE_Linux_x64_v0.1.0-alpha.6.AppImage) |
+| [**Linux (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.6/Any.NLE_Linux_ARM_v0.1.0-alpha.6.AppImage) |
 
 Each package includes the `any-nle` CLI, `any-nle-gui`, verified FFmpeg/ffprobe
 8.1, dependency notices, an SBOM and corresponding FFmpeg source. Separate
-provenance archives and [SHA256 checksums](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.5/SHA256SUMS) accompany the downloads.
+provenance archives and [SHA256 checksums](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.6/SHA256SUMS) accompany the downloads.
 
 macOS apps are ad hoc signed and verified, without Apple notarization. Windows
 installers are unsigned and install for the current user. Linux AppImages require

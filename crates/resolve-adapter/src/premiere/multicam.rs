@@ -1,5 +1,7 @@
 //! Premiere's sequence-backed two-angle source with two fixed mono outputs.
-use super::{components::field, mixer, owning_bin, source_clock, ticks, SelectionCapture};
+use super::{
+    MediaLinkReview, SelectionCapture, components::field, mixer, owning_bin, source_clock, ticks,
+};
 use crate::{
     linked::{GroupSpec, MediaSpec},
     prepare::{rate, MAX_EDITS_PER_LANE},
@@ -253,21 +255,30 @@ fn leaf(project: &Project, track: TrackId) -> Result<TrackItemId> {
     Ok(*clip)
 }
 
-fn camera(
+struct CameraSource {
+    item: ItemId,
+    media: NodeId,
+    saved: PathBuf,
+    extent: Range,
+}
+
+impl CameraSource {
+    fn check_frame_count(&self, frames: i64) -> Result<()> {
+        if frames.checked_mul(FRAME) != Some(self.extent.duration) {
+            return Err("Premiere saved camera duration disagrees with the verified original".into());
+        }
+        Ok(())
+    }
+}
+
+fn camera_source(
     project: &Project,
     clip: TrackItemId,
     audio: [TrackItemId; 2],
-    ffprobe: &Path,
-    capture: &mut SelectionCapture,
-) -> Result<(VerifiedBinding, Range)> {
+) -> Result<CameraSource> {
     let item = project
         .track_item_source(clip)
         .ok_or("unresolved Premiere multicam camera item")?;
-    let tree = &project.doc.tree;
-    let camera_id = tree
-        .get(project.item(item).element, "ObjectUID")
-        .ok_or("Premiere multicam camera has no project item identity")?;
-    let item_id = format!("premiere:item:{camera_id}");
     let (media, saved, declared) = physical(project, clip, item, StreamKind::Video, 0)?;
     let extent = edit(project, clip)?;
     if extent.source_in != 0
@@ -291,7 +302,74 @@ fn camera(
             return Err("Premiere multicam audio and picture extents disagree".into());
         }
     }
-    let path = std::fs::canonicalize(&saved)?;
+    Ok(CameraSource {
+        item,
+        media,
+        saved,
+        extent,
+    })
+}
+
+pub(super) fn review_links(
+    project: &Project,
+    sequence: SequenceId,
+    item: ItemId,
+    ffprobe: &Path,
+) -> Result<MediaLinkReview> {
+    let (_, _, backing, _) = group_source(project, item, sequence)?;
+    let inner = project.sequence(backing);
+    let video = tracks(project, &inner.video_tracks, 2)?;
+    let audio = tracks(project, &inner.audio_tracks, 4)?;
+    let mut review = MediaLinkReview::default();
+    let mut originals = Vec::new();
+    for ((track, lanes), angle) in video.into_iter().zip(audio.chunks_exact(2)).zip(['A', 'B']) {
+        let mut label = format!("Camera {angle}");
+        let result = (|| {
+            let source = camera_source(
+                project,
+                leaf(project, track)?,
+                [leaf(project, lanes[0])?, leaf(project, lanes[1])?],
+            )?;
+            label = format!(
+                "{label} · {} · {}",
+                project.item_name(source.item),
+                source.saved.display(),
+            );
+            let (path, profile) = crate::media::inspect_group_original(&source.saved, ffprobe)?;
+            source.check_frame_count(profile.frames)?;
+            Ok::<_, Box<dyn std::error::Error>>((path, profile.source_package))
+        })();
+        match result {
+            Ok(original) => originals.push(original),
+            Err(error) => review.blockers.push(format!("{label}: {error}")),
+        }
+    }
+    if matches!(originals.as_slice(), [(a, package_a), (b, package_b)]
+        if a == b || package_a == package_b)
+    {
+        review.blockers.push("Premiere multicam cameras share one physical original".into());
+        return Ok(review);
+    }
+    review.direct = originals.len();
+    Ok(review)
+}
+
+fn camera(
+    project: &Project,
+    clip: TrackItemId,
+    audio: [TrackItemId; 2],
+    ffprobe: &Path,
+    capture: &mut SelectionCapture,
+) -> Result<(VerifiedBinding, Range)> {
+    let source = camera_source(project, clip, audio)?;
+    let tree = &project.doc.tree;
+    let camera_id = tree
+        .get(project.item(source.item).element, "ObjectUID")
+        .ok_or("Premiere multicam camera has no project item identity")?;
+    let item_id = format!("premiere:item:{camera_id}");
+    let (item, media, saved, extent) = (source.item, source.media, &source.saved, source.extent);
+    let declared = extent.duration;
+    let path = std::fs::canonicalize(saved)?;
     let dig = hex::encode(crate::media::media_digest(&path)?);
     let streams = || {
         std::array::from_fn(|index| StreamSelector {
@@ -309,9 +387,7 @@ fn camera(
         },
         ffprobe,
     )?;
-    if binding.frames.checked_mul(FRAME) != Some(declared) {
-        return Err("Premiere saved camera duration disagrees with the verified original".into());
-    }
+    source.check_frame_count(binding.frames)?;
     let graph = &mut capture.graph.graph;
     if graph.items.iter().any(|row| row.id == item_id) {
         return Err("duplicate Premiere multicam camera identity in selected project".into());
@@ -359,7 +435,7 @@ fn camera(
             stream: Some(if audio { stream.index as i64 } else { 1 }),
             online: Some(true),
             original: Some(OriginalStream {
-                saved_locators: vec![crate::prepare::utf8_path(&saved)?.into()],
+                saved_locators: vec![crate::prepare::utf8_path(saved)?.into()],
                 container: "mxf".into(),
                 stream_index: stream.index as i64,
                 channel_index: audio.then_some(0),
@@ -445,7 +521,11 @@ fn clip_pan(project: &Project, clip: TrackItemId, lane: usize) -> Result<()> {
     Ok(())
 }
 
-fn group_source(project: &Project, item: ItemId) -> Result<(NodeId, NodeId, SequenceId, i64)> {
+fn group_source(
+    project: &Project,
+    item: ItemId,
+    parent: SequenceId,
+) -> Result<(NodeId, NodeId, SequenceId, i64)> {
     let tree = &project.doc.tree;
     let mut sources = [None; 2];
     for &clip in &project.item(item).clip_elements {
@@ -485,6 +565,9 @@ fn group_source(project: &Project, item: ItemId) -> Result<(NodeId, NodeId, Sequ
         || number(project, audio, "OriginalDuration")? != Some(duration)
     {
         return Err("Premiere multicam sources disagree on their whole-frame extent".into());
+    }
+    if sequence == parent {
+        return Err("Premiere multicam cannot refer to its own parent sequence".into());
     }
     Ok((video, audio, sequence, duration))
 }
@@ -535,10 +618,7 @@ pub(super) fn capture(
     out: &mut SourceSequence,
 ) -> Result<GroupSpec> {
     let tree = &project.doc.tree;
-    let (video_source, audio_source, backing, length) = group_source(project, item)?;
-    if backing == sequence {
-        return Err("Premiere multicam cannot refer to its own parent sequence".into());
-    }
+    let (video_source, audio_source, backing, length) = group_source(project, item, sequence)?;
     let inner = project.sequence(backing);
     let outer = project.sequence(sequence);
     for id in [sequence, backing] {
@@ -557,7 +637,7 @@ pub(super) fn capture(
         || inner.audio_frame_rate != Some(SAMPLE)
         || outer.audio_channel_count != Some(2)
         || outer.audio_frame_rate != Some(SAMPLE)
-        || mixer::read_mix_bus(project, inner.element, true)? != 0
+        || mixer::read_mix_bus(project, inner.element, mixer::MixBus::MulticamBacking, true)? != 0
         || project
             .sequence_bag_int(backing, "MZ.ZeroPoint")?
             .unwrap_or(0)

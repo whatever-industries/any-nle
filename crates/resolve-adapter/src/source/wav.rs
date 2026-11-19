@@ -2,6 +2,32 @@
 use super::*;
 use crate::linked::samples_per_frame;
 
+/// A stereo A1 at 24 fps is observed for standalone WAV edits.
+pub(super) fn all_stereo_wav_edits(
+    track: &Node,
+    masters: &HashMap<&str, Master>,
+    rate: Rational,
+) -> Result<bool> {
+    let items = track.one("Items")?;
+    if items.children.is_empty() {
+        return Ok(false);
+    }
+    for item in items.elements()? {
+        let clip = item.entry()?;
+        if clip.name != "Sm2TiAudioClip"
+            || !clip
+                .maybe("MediaRef")?
+                .and_then(|id| masters.get(id))
+                .is_some_and(|master| {
+                    master.native_stereo_pcm && master.wav_samples.is_some() && master.rate == rate
+                })
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn integer_wav_frame(text: &str) -> Result<i64> {
     integer_frame(text, false)
 }

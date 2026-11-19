@@ -221,7 +221,9 @@ pub fn read_premiere_media_graph(
                     &files[&item.path],
                     rate,
                     frame_ticks,
+                    data.frame_size,
                     &occurrence,
+                    &mut component_budget,
                     &mut sampled_frame_count,
                     &mut graph,
                 )
@@ -710,7 +712,9 @@ fn placement(
     physical: &Physical,
     rate: Rational,
     frame_ticks: i64,
+    canvas: Option<(i64, i64)>,
     occurrence: &str,
+    component_budget: &mut components::Budget,
     sampled_frame_count: &mut usize,
     graph: &mut SourceGraph,
 ) -> Result<Placement> {
@@ -736,12 +740,16 @@ fn placement(
     if start < 0 || a < 0 || span <= 0 || b.checked_sub(a) != Some(span) {
         return Err("Premiere source and record ranges disagree".into());
     }
-    let source_in = ticks(a)?;
+    let mut source_in = ticks(a)?;
     let mut duration = ticks(span)?;
     let mut mono = Vec::new();
     let mut grouped_audio = Vec::new();
     let mut frame_map = None;
     let hold = super::frame_hold::FrameHold::read(project, clip)?;
+    let remap = super::retime::parameter(project, clip)?;
+    if remap.is_some() && kind != StreamKind::Video {
+        return Err("Premiere Linear Time Remapping requires a video edit".into());
+    }
     if hold.is_some() && kind != StreamKind::Video {
         return Err("Premiere Frame Hold requires a video edit".into());
     }
@@ -752,13 +760,31 @@ fn placement(
             .as_ref()
             .ok_or("Premiere video edit lacks an original picture stream")?;
         if [a, b, start, end].iter().any(|v| v % frame_ticks != 0)
-            || ticks(b)? > picture.duration
+            || remap.is_none() && ticks(b)? > picture.duration
         {
             return Err(
                 "Premiere picture edit has unsupported timing or exceeds the original".into(),
             );
         }
-        if picture.rate != Some(rate) {
+        if let Some(param) = remap {
+            let has_components = !native.components.is_empty() || !native.selection_components.is_empty();
+            if !super::retime::plain_linear_picture(index, rate, canvas, has_components)
+                || picture.rate != Some(rate) || picture.size != canvas
+                || physical.container != "mov" || picture.codec != "prores"
+                || !physical.audio.is_empty()
+                || physical.timecode.as_deref().is_some_and(|code| code != "00:00:00:00")
+                || hold.is_some() || !super::retime::frame_sampling(project, clip)?
+            {
+                return Err("Linear Time Remapping requires plain same-rate 1080p24 V1 with Frame Sampling".into());
+            }
+            let extent = crate::prepare::frames_on(picture.duration, rate)?;
+            let (frames, receipts) = super::retime::capture(
+                project, param, occurrence, (a, b), extent, component_budget, sampled_frame_count,
+            )?;
+            source_in = Rational::new(frames[0].into(), 24).ok_or("invalid Linear retime source In")?;
+            frame_map = Some(frames);
+            graph.sidecars.extend(receipts);
+        } else if picture.rate != Some(rate) {
             let unsupported = "mixed-rate Premiere capture requires plain V1 Frame Sampling between 24 and 23.976 fps with picture-only ProRes HQ MOV";
             let cadence = picture.rate
                 .and_then(|source| mixed_rate::Cadence::between(source, rate))

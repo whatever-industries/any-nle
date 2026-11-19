@@ -478,11 +478,7 @@ pub fn verify_group_binding(spec: BindingSpec, tool: &Path) -> Result<VerifiedBi
 }
 
 fn verify(spec: BindingSpec, tool: &Path, permit_untagged: bool) -> Result<VerifiedBinding> {
-    let path = fs::canonicalize(&spec.path)?;
-    utf8_path(&path)?;
-    if !path.is_absolute() || path.extension().and_then(|s| s.to_str()) != Some("mxf") {
-        return Err("expected an absolute verified MXF file".into());
-    }
+    let path = op1a_path(&spec.path)?;
     let digest: [u8; 32] = hex::decode(&spec.sha256)?
         .try_into()
         .map_err(|_| "bad verified digest")?;
@@ -496,7 +492,59 @@ fn verify(spec: BindingSpec, tool: &Path, permit_untagged: bool) -> Result<Verif
     }) {
         return Err("expected physical selectors V0 and mono A1/A2 channel 0".into());
     }
-    let probe = ffprobe(tool, &path)?;
+    let profile = inspect_op1a(&path, tool, permit_untagged)?;
+    let modified_micros = fs::metadata(&path)?
+        .modified()?
+        .duration_since(UNIX_EPOCH)?
+        .as_micros()
+        .try_into()?;
+    let verified = VerifiedBinding {
+        item_id: spec.item_id,
+        path,
+        streams: spec.streams,
+        frames: profile.frames,
+        timecode_frames: profile.timecode_frames,
+        source_package: profile.source_package,
+        modified_micros,
+        tagged_rec709: profile.tagged_rec709,
+        digest,
+        atom: None,
+    };
+    verified.recheck()?;
+    Ok(verified)
+}
+
+fn op1a_path(saved: &Path) -> Result<PathBuf> {
+    let path = fs::canonicalize(saved)?;
+    utf8_path(&path)?;
+    if !path.is_absolute() || path.extension().and_then(|s| s.to_str()) != Some("mxf") {
+        return Err("expected an absolute verified MXF file".into());
+    }
+    Ok(path)
+}
+
+pub(crate) struct Op1aProfile {
+    pub(crate) frames: i64,
+    pub(crate) source_package: [u8; 32],
+    timecode_frames: i64,
+    tagged_rec709: bool,
+}
+
+pub(crate) fn inspect_group_original(saved: &Path, tool: &Path) -> Result<(PathBuf, Op1aProfile)> {
+    let path = op1a_path(saved)?;
+    let before = stamp(fs::metadata(&path)?)?;
+    if before.bytes > MAX_MEDIA_BYTES {
+        return Err("media must be a regular file within the 2 GiB research limit".into());
+    }
+    let profile = inspect_op1a(&path, tool, true)?;
+    if before != stamp(fs::metadata(&path)?)? || fs::canonicalize(saved)? != path {
+        return Err("OP1a original changed during inspection".into());
+    }
+    Ok((path, profile))
+}
+
+fn inspect_op1a(path: &Path, tool: &Path, permit_untagged: bool) -> Result<Op1aProfile> {
+    let probe = ffprobe(tool, path)?;
     let tags = &probe["format"]["tags"];
     let op = tags["operational_pattern_ul"]
         .as_str()
@@ -568,23 +616,10 @@ fn verify(spec: BindingSpec, tool: &Path, permit_untagged: bool) -> Result<Verif
             return Err("unsupported or mismatched mono PCM24 stream".into());
         }
     }
-    let modified_micros = fs::metadata(&path)?
-        .modified()?
-        .duration_since(UNIX_EPOCH)?
-        .as_micros()
-        .try_into()?;
-    let verified = VerifiedBinding {
-        item_id: spec.item_id,
-        path,
-        streams: spec.streams,
+    Ok(Op1aProfile {
         frames,
         timecode_frames,
         source_package,
-        modified_micros,
         tagged_rec709,
-        digest,
-        atom: None,
-    };
-    verified.recheck()?;
-    Ok(verified)
+    })
 }

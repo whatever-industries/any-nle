@@ -129,6 +129,8 @@ class DraftRecoveryTests(unittest.TestCase):
         self.repo = 'example/any-nle'
         self.remote = {}
         self.draft = None
+        self.draft_creations = 0
+        self.hidden_draft_reads = 0
         self.refs = []
         self.uploads = []
         self.fail_upload = None
@@ -142,6 +144,7 @@ class DraftRecoveryTests(unittest.TestCase):
         self.files = [self.root / name for name in ('package.zip', 'provenance.tar.gz')]
         for p in self.files:
             p.write_text(p.name)
+        self.wait = self.enterContext(patch('publish.sleep'))
         for replacement in [
             patch('publish.gh', side_effect=self.github),
             patch('publish.ROOT', self.root),
@@ -159,6 +162,9 @@ class DraftRecoveryTests(unittest.TestCase):
 
         api = f'repos/{self.repo}'
         if args == ('api', '--paginate', api + '/releases?per_page=100', '--slurp'):
+            if self.draft and self.hidden_draft_reads:
+                self.hidden_draft_reads -= 1
+                return '[[]]'
             return json.dumps([[self.draft] if self.draft else []])
         if args == ('api', f'{api}/git/matching-refs/tags/{self.tag}'):
             return json.dumps(self.refs)
@@ -169,6 +175,7 @@ class DraftRecoveryTests(unittest.TestCase):
             self.assertIn('--draft', args)
             self.assertIn('--prerelease', args)
             self.assertEqual(args[args.index('--target') + 1], self.head)
+            self.draft_creations += 1
             notes = pathlib.Path(args[args.index('--notes-file') + 1])
             self.draft = dict(id=7, tag_name=self.tag, draft=True, prerelease=True,
                               target_commitish=self.head,
@@ -201,6 +208,42 @@ class DraftRecoveryTests(unittest.TestCase):
             self.draft['draft'] = False
             return json.dumps(self.draft)
         self.fail(f'unexpected GitHub command: {args}')
+
+    def test_new_draft_can_take_time_to_appear(self):
+        from unittest.mock import call
+
+        self.hidden_draft_reads = 2
+        self.release.publish(self.root, self.version, True)
+        self.assertEqual(self.wait.call_args_list, [call(1), call(2)])
+        self.assertEqual(self.draft_creations, 1)
+        self.assertEqual(self.uploads, [p.name for p in self.files])
+        self.assertFalse(self.draft['draft'])
+
+    def test_invisible_draft_can_recover_without_creating_another(self):
+        from unittest.mock import call
+
+        self.hidden_draft_reads = 5
+        with self.assertRaisesRegex(ValueError, 'resume with the original reviewed candidates'):
+            self.release.publish(self.root, self.version, True)
+        self.assertEqual(self.wait.call_args_list, [call(1), call(2), call(4), call(8)])
+        self.assertEqual(self.uploads, [])
+        self.assertTrue(self.draft['draft'])
+        self.release.publish(self.root, self.version, True)
+        self.assertEqual(self.draft_creations, 1)
+        self.assertEqual(self.uploads, [p.name for p in self.files])
+        self.assertFalse(self.draft['draft'])
+
+    def test_conflicting_draft_stops_during_visibility_retry(self):
+        self.hidden_draft_reads = 1
+
+        def replace_source(_):
+            self.draft['target_commitish'] = 'c' * 40
+
+        self.wait.side_effect = replace_source
+        with self.assertRaisesRegex(ValueError, 'different source revision'):
+            self.release.publish(self.root, self.version, True)
+        self.wait.assert_called_once_with(1)
+        self.assertEqual(self.uploads, [])
 
     def test_interrupted_upload_resumes_then_identical_retry_publishes(self):
         self.fail_upload = self.files[1].name

@@ -135,6 +135,10 @@ SHA256 digests, uploads missing assets, and downloads the full set for a byte
 check. A conflicting tag, changed asset, unexpected file, or published version
 stops the operation. The workflow serializes publication by version.
 
+After creating a draft, the publisher retries briefly if GitHub's release
+listing still omits it. If the draft stays unavailable, rerun with the
+original reviewed candidates once it appears.
+
 After an interrupted upload, rerun the failed release job while the original
 six candidate artifacts are available. Retain those artifacts for manual
 recovery. From the exact filtered export checkout, use the original private

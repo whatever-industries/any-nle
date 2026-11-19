@@ -45,11 +45,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (direct, assisted) = project.media_counts();
         eprintln!("Media originals: {direct} standalone, {assisted} assisted");
     }
-    for loss in project.transition_approximation_losses() {
+    for loss in project.transition_approximation_losses().chain(project.empty_nest_audio_losses())
+        .chain(project.stereo_nest_edge_losses())
+    {
         eprintln!("{} ({}): {}", loss.object, loss.aspect, loss.reason);
     }
     if !accept_losses && project.transition_approximation_losses().next().is_some() {
         return Err("Resolve transition approximations require --accept-losses".into());
+    }
+    if !accept_losses && project.empty_nest_audio_losses().next().is_some() {
+        return Err("Resolve empty nest audio omissions require --accept-losses".into());
+    }
+    if !accept_losses && project.stereo_nest_edge_losses().next().is_some() {
+        return Err("Resolve stereo nest audio edge approximations require --accept-losses".into());
     }
     let published = publish_linked_with_templates(
         &project,

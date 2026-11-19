@@ -6,7 +6,8 @@ use prproj::{
         prepared::{PreparedClip, PreparedProjectInput},
         rewrap::MediaRelink,
         writer::{
-            prepare_linked_op1a_project, DestinationBinLayout, PreparedProject, Result, WriteError,
+            prepare_typed_project_for_premiere_27, DestinationBinLayout, PreparedProject, Result,
+            TypedMedia, WriteError,
         },
     },
     UuidSource,
@@ -151,5 +152,6 @@ pub(crate) fn prepare(
             "verified graph stream does not belong to a prepared clip",
         ));
     }
-    prepare_linked_op1a_project(input, output, ids, &bindings, &clips, layout, offline)
+    let media = TypedMedia::VerifiedOp1a { bindings: &bindings, clips: &clips, offline };
+    prepare_typed_project_for_premiere_27(input, output, ids, media, layout)
 }

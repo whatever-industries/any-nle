@@ -279,7 +279,13 @@ Resolve import. Malformed marks and conflicting track state are reported
 as gaps. These comparisons concern saved values, not rendered output.
 For paired edits the report also compares decoded speed and source
 duration, frame maps when available, and the saved Resolve clip-color
-code. A code outside the known palette is a gap. Paired picture edits
+code. Qualified piecewise Linear picture edits also compare retimed In
+and every editable curve key under `edit.linear_retime`. A key outside
+the visible cut can differ even when all sampled picture frames agree.
+Four retained saved and reopened timelines matched. In a disposable
+variant, changing the curve before the trim produced one curve difference
+and preserved all 48 visible source-frame selections.
+A code outside the known palette is a gap. Paired picture edits
 also compare qualified input sizing under `edit.input_scaling`. The
 native wide-raster control reports one change from `project` to
 `center_crop` with the same trim and media. `project` denotes inherited
@@ -644,6 +650,16 @@ single-field Angle 2 archive variant reverted to Angle 1 on reopen, and
 its rendered A1 and A2 matched baseline. A valid per-angle control must
 select camera B on A1 while preserving the picture and camera A on A2.
 [Blackmagic Reference Audio guide](https://documents.blackmagicdesign.com/SupportNotes/DaVinci_Resolve_20_New_Features_Guide.pdf#page=56)
+
+### Premiere 27 project version
+
+The internal Resolve → Premiere writer emits Project version 46 for
+ordinary and multicam output. Premiere 27.0.0 build 88 opened the generated
+projects directly. Save As and reopen retained the repeated and variable
+transition windows and the three picture and six audio edit occurrences
+in the multicam control. All decoded picture frames and both isolated
+PCM renders matched the earlier Premiere controls. The unedited files
+also round-tripped through the Premiere → Resolve saved-job reader.
 
 ### Write linked audio to Premiere
 
@@ -1666,12 +1682,12 @@ intact. A misaligned rotation key refused before publication.
 
 ### Resolve to Premiere video dissolves
 
-At exact 24000/1001, the internal writer maps one eight-frame V1 Cross
-Dissolve with left or centered alignment to Premiere Cross Dissolve
-(Legacy). It retains the two saved edit identities and checks the
-same-rate ProRes HQ source handles before writing. The left alignment
-needs eight frames of incoming preroll. The centered alignment needs
-four frames on each side. Visible clip trims remain intact.
+The internal writer maps V1 Cross Dissolves with left or centered
+alignment to Premiere Cross Dissolve (Legacy). It retains the two saved
+edit identities and checks the same-rate ProRes HQ handles before writing.
+The original eight-frame controls at exact 24000/1001 used eight frames
+of incoming preroll for left alignment and four frames on each side for
+centered alignment. Visible clip trims remain intact.
 
 After Save As and reopen in Premiere 27.0.0 build 88, both controls
 retained the cut at frame 24, the transition intervals (frames 16–23
@@ -1684,12 +1700,12 @@ sample across 96,096 frames.
 
 ### Resolve to Premiere audio crossfades
 
-The internal writer maps one centered eight-frame Resolve Cross Fade 0DB
-on A1 at 24 fps to an editable Premiere Constant Gain transition. The
-originals are mono 48 kHz PCM WAV. The writer uses the two saved edit
-identities, verifies both four-frame handles against the original files,
-and preserves the visible trims. Wider transition profiles and crossfades
-on a track with independent pan or clip edge fades remain unqualified.
+The internal writer maps centered Resolve Cross Fade 0DB on A1 at 24 fps
+to editable Premiere Constant Gain. The originals are mono 48 kHz PCM WAV.
+The writer uses the two saved edit identities, verifies both handles
+against the original files, and preserves the visible trims. The original
+eight-frame control used two four-frame handles. Crossfades with
+independent track pan or clip edge fades remain unqualified.
 
 In Premiere 27.0.0 build 88, the native output and Resolve's linked AAF
 both reopened with the same links, physical channels, record spans and
@@ -1704,10 +1720,10 @@ agreed within one PCM24 code value.
 
 ### Resolve to Premiere combined transitions at 24 fps
 
-The internal writer can carry one centered eight-frame V1 Cross Dissolve
-and one centered eight-frame A1 Cross Fade 0DB in the same 1080p24 project.
-It writes Premiere Cross Dissolve (Legacy) and Constant Gain at their
-own cuts and reports the picture blend sampling difference.
+The first combined 1080p24 control used a centered eight-frame V1 Cross
+Dissolve and a centered eight-frame A1 Cross Fade 0DB. The writer emits
+Premiere Cross Dissolve (Legacy) and Constant Gain at their own cuts and
+reports the picture blend sampling difference.
 
 The generated project and three controls (picture transition only, audio
 transition only, and straight cuts) went through Save As, close, and reopen
@@ -1730,8 +1746,31 @@ pan, A1's measured blend coefficients differed from Resolve by less than
 In a separate check, a disposable copy with its project version marker set
 to 46 converted back to Resolve. After reopening in Resolve, all 48 picture
 frames and both isolated 96,000-sample PCM24 lanes matched the original
-Resolve render. A left-aligned picture dissolve at 24 fps still refuses
-before publication.
+Resolve render.
+
+### Repeated and variable-length transitions
+
+The internal writer preserves each saved blend window for multiple
+nonoverlapping transitions on V1 or A1. A middle clip can carry both
+its incoming and outgoing transition references. The existing profile
+accepts left-aligned and evenly centered V1 Cross Dissolves at 24 and
+24000/1001, and evenly centered A1 Cross Fade 0DB at 24. The native
+Resolve receipts still verify the edit identities, original handles,
+and distinct blend windows. Other curves and alignments require a
+separate mapping.
+
+Offline checks preserved two dissolves and two crossfades on one
+timeline, including distinct head and tail references on both middle
+edits. A separate run preserved a six-frame centered dissolve, a
+twelve-frame left-aligned dissolve, and a ten-frame Constant Gain
+crossfade. Both retained their saved intervals through archive read-back.
+Premiere 27 build 88 saved, closed, and reopened disposable copies with
+the current project-version marker. Both retained their links, trims,
+and transition windows. The repeated-transition render matched all 48
+decoded picture frames and 96,000 PCM24 sample frames per isolated lane
+against the Premiere control. The variable-length render matched all
+picture frames and A2 samples. The A1 difference was confined to the
+Power transition window deliberately omitted from that test copy.
 
 ## Write picture nests
 

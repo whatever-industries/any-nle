@@ -26,7 +26,7 @@ pub(super) struct Budget {
 }
 
 impl Budget {
-    fn charge(&mut self, bytes: usize, records: usize) -> Result<()> {
+    pub(super) fn charge(&mut self, bytes: usize, records: usize) -> Result<()> {
         self.bytes = self
             .bytes
             .checked_add(bytes)

@@ -1,5 +1,8 @@
 //! Synthetic-only original-file semantics and independent Python construction parity.
-use prproj::convert::{model::*, prepared::*, writer::prepare_typed_project};
+use prproj::convert::{model::*, prepared::*, writer::{
+    MarkerProvenance, prepare_typed_project, prepare_typed_project_for_premiere_27,
+    prepare_typed_project_with_marker_provenance, TypedMedia,
+}};
 use prproj::SeededUuids;
 use std::{io::Read, path::PathBuf, process::Command};
 struct Scratch(PathBuf);
@@ -139,6 +142,33 @@ fn xml(p: &PathBuf) -> String {
         .read_to_string(&mut s)
         .unwrap();
     s
+}
+
+#[test]
+fn premiere_27_writers_change_only_the_seeded_project_version() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("project.prproj");
+    let project = input(original("prores_hq"));
+    let seed = || SeededUuids::new("project-version");
+    prepare_typed_project(&project, &path, &mut seed(), &[], false)
+        .unwrap().publish().unwrap();
+    let legacy = xml(&path);
+    std::fs::remove_file(&path).unwrap();
+
+    prepare_typed_project_for_premiere_27(
+        &project, &path, &mut seed(), TypedMedia::Bound { bindings: &[], native_av: false }, None,
+    ).unwrap().publish().unwrap();
+    let current = xml(&path);
+    let version_45 = "<Project ObjectID=\"1\" ClassID=\"62ad66dd-0dcd-42da-a660-6d8fbde94876\" Version=\"45\">";
+    let version_46 = version_45.replace("Version=\"45\"", "Version=\"46\"");
+    assert!(legacy.contains(version_45));
+    assert_eq!(current, legacy.replacen(version_45, &version_46, 1));
+    std::fs::remove_file(&path).unwrap();
+
+    let provenance = MarkerProvenance { custom_data: &Default::default(), original_colors: &Default::default() };
+    prepare_typed_project_with_marker_provenance(&project, &path, &mut seed(), provenance)
+        .unwrap().publish().unwrap();
+    assert_eq!(xml(&path), current);
 }
 
 #[test]

@@ -60,9 +60,13 @@ pub(crate) fn publish_checked(
     })
 }
 
-pub(crate) fn check_output(output: &Path) -> Result<()> {
+/// Check the project destination without staging or creating any files.
+pub fn check_output(output: &Path) -> Result<()> {
     if output.extension().and_then(|s| s.to_str()) != Some("drp") {
         return Err("output must end in .drp".into());
+    }
+    if !std::fs::metadata(output_parent(output)).is_ok_and(|parent| parent.is_dir()) {
+        return Err("project output must have an existing parent directory".into());
     }
     match std::fs::symlink_metadata(output) {
         Ok(_) => return Err("project output already exists".into()),
@@ -70,6 +74,13 @@ pub(crate) fn check_output(output: &Path) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+fn output_parent(output: &Path) -> &Path {
+    output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 fn write_archive(
@@ -90,10 +101,7 @@ fn write_checked_archive(
     output: &Path,
     check: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<Published> {
-    let parent = output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let parent = output_parent(output);
     let mut stage = NamedTempFile::new_in(parent)?;
     {
         let mut zip = ZipWriter::new(stage.as_file_mut());
@@ -654,6 +662,47 @@ fn build(p: &PreparedResolve, mut m: Members) -> Result<Members> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_preflight_checks_path_and_keeps_existing_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("Project.drp");
+        assert!(check_output(&output).is_ok());
+        assert!(!output.exists());
+
+        let missing_parent = root.path().join("missing").join("Project.drp");
+        assert_eq!(
+            check_output(&missing_parent).unwrap_err().to_string(),
+            "project output must have an existing parent directory"
+        );
+        assert!(!missing_parent.parent().unwrap().exists());
+        assert_eq!(
+            check_output(&output.with_extension("zip")).unwrap_err().to_string(),
+            "output must end in .drp"
+        );
+
+        std::fs::write(&output, b"existing project").unwrap();
+        assert_eq!(
+            check_output(&output).unwrap_err().to_string(),
+            "project output already exists"
+        );
+        assert!(check_output(&output.join("nested.drp")).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing project");
+    }
+
+    #[test]
+    fn publication_preserves_an_output_created_after_preflight() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("Project.drp");
+        assert!(check_output(&output).is_ok());
+        let result = write_checked_archive(Members::new(), &output, |_| {
+            std::fs::write(&output, b"another writer")?;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"another writer");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn malformed_archive_is_refused() {

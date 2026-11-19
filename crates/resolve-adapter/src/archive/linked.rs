@@ -4,7 +4,7 @@ use crate::dissolve::{self, Dissolve};
 use crate::{
     linked::{
         is_2997, mixer::DirectMixer, movie_audio_sample_extent, samples_per_frame, Media,
-        MovieVideo, PreparedProject, Profile, Timeline,
+        MovieVideo, PreparedProject, Profile, Timeline, timing::Timing,
     },
     turnover::Templates,
 };
@@ -12,6 +12,8 @@ use graph::{Rational, Value};
 
 const TEMPLATE_23976: &str = "4b2895fa6827801bce87bff7f657dae6454f7011459b689d1983bb11a017ccfc";
 const TEMPLATE_24: &str = "e2a3a1ad16be932947914d866b3c8bb49b549ffd5869a06a9fc9eb576bf21bf5";
+const TEMPLATE_STEREO_WAV_24: &str = "43bfa214eac8a096c63bb8b6d8058863c6caf6b0bae03d7da5fc67208e5b910a";
+const TIMELINE_STEREO_WAV_24_DONOR: &str = "SeqContainer/2be02669-f097-468a-b921-f7ece69ac022.xml";
 const TEMPLATE_25: &str = "3a9721f6a6d123b28389b8d20824bfcfde2ace83534e041de80587dd3b37929c";
 const TIMELINE_25_DONOR: &str = "SeqContainer/d92e8869-b608-4e44-958a-6662b238afb4.xml";
 const TEMPLATE_STEREO_25: &str = "f4ab29c6baba526708930f0549065bf2dbff2778f733c4656e2464a3bc94591e";
@@ -33,6 +35,8 @@ const THREE_MONO_SEQUENCE: &str = "SeqContainer/2ce73793-25f7-49d0-88d6-e3c95a01
 const NEST_TEMPLATE: &str = "48aa85bd7184d72532b52f993158e7c515b9e820887855f4e1065798b7e5263a";
 const NEST_PARENT: &str = "SeqContainer/d35c263e-bf97-4a72-8876-c35e133c6601.xml";
 const NEST_COMPOUND: &str = "SeqContainer/bdfee1f6-00ff-4a76-94fb-662551ca1846.xml";
+const STEREO_NEST_TEMPLATE: &str = "42cd49d9f9984c0f6961edb145ba6922ae44f39565dc221b254ff7e53a27ab32";
+const STEREO_NEST_PARENT: &str = "SeqContainer/30f61c21-7bda-4ed6-8d56-c5c0000c5934.xml";
 const MEDIA_DONOR: &str = "MediaPool/Master/002_Linked/000_Audio/MpFolder.xml";
 const TIMELINE_DONOR: &str = "SeqContainer/93a83077-933a-4ed8-9595-e12534b57e18.xml";
 const PRORES_REC709: &str = "80087810027002789e01800166880132980100d80100";
@@ -115,6 +119,8 @@ fn assemble_turnover(
     let layout = template("layout", &templates.layout, TEMPLATE_23976, 13)?;
     let stereo = prepared.timelines.iter().any(|row| row.stereo);
     let (hash, count, timeline) = match (prepared.canvas, prepared.rate.num(), prepared.rate.den()) {
+        ((1920, 1080), 24, 1) if stereo =>
+            (TEMPLATE_STEREO_WAV_24, 4, Some(("Stereo WAV 24", TIMELINE_STEREO_WAV_24_DONOR))),
         ((1920, 1080), 24, 1) => (TEMPLATE_24, 10, None),
         ((1920, 1080), 25, 1) if prepared.timelines.iter().any(|row| row.stereo && !row.lanes[2].is_empty()) =>
             (TEMPLATE_STEREO_MONO_25, 4, Some(("Stereo A1 Mono A2", TIMELINE_STEREO_MONO_25_DONOR))),
@@ -181,7 +187,11 @@ fn assemble_turnover(
     };
     let nest_template = if prepared.timelines.iter().any(|row| !row.nests.is_empty()) {
         let path = templates.nested.as_deref().ok_or("missing pinned Resolve nesting template")?;
-        Some(template("nesting", path, NEST_TEMPLATE, 9)?)
+        if stereo {
+            Some(template("stereo nesting", path, STEREO_NEST_TEMPLATE, 5)?)
+        } else {
+            Some(template("nesting", path, NEST_TEMPLATE, 9)?)
+        }
     } else { None };
     let (timeline_profile, name, path) = match timeline {
         Some((name, path)) => (&profile, name, path),
@@ -211,16 +221,6 @@ pub(crate) fn review_turnover(
     output: &Path,
 ) -> Result<()> {
     check_output(output)?;
-    let parent = output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if !std::fs::metadata(parent)
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false)
-    {
-        return Err("project output must have an existing parent directory".into());
-    }
     assemble_turnover(prepared, templates)?;
     Ok(())
 }
@@ -878,7 +878,7 @@ fn write_timeline<'a>(
             set(&mut clip, "Name", &xml(&source.name))?;
             set(&mut clip, "MediaRef", &media_ids[edit.media])?;
             set(&mut clip, "MediaFilePath", &xml(utf8_path(&source.path)?))?;
-            if let Some(cadence) = edit.mixed_rate {
+            if let Timing::MixedRate(cadence) = &edit.timing {
                 set(&mut clip, "MediaFrameRate", &hex::encode(rate_bytes(cadence.source_rate())))?;
             } else {
                 set(&mut clip, "MediaFrameRate", &rate_hex)?;
@@ -926,25 +926,30 @@ fn write_timeline<'a>(
                     seconds(binding.frames - 1)
                 }
             };
-            let (saved_in, map) = match (edit.speed, edit.mixed_rate, &source.profile) {
-                (Some(speed), None, Profile::Mov { frames, .. }) => {
+            let (saved_in, map) = match (&edit.timing, &source.profile) {
+                (Timing::Linear(linear), Profile::Mov { .. }) => {
+                    set(&mut clip, "EffectFiltersBA", crate::retime::NEAREST)?;
+                    (linear.record_in.to_string(), linear.encode(&uid()))
+                }
+                (Timing::Linear(_), _) => return Err("Resolve Linear retime requires a plain linked MOV edit".into()),
+                (Timing::Constant(speed), Profile::Mov { frames, .. }) => {
                     let saved_in = speed.record_source_in(edit.source_in, edit.length, *frames)
                         .ok_or("invalid Resolve retime source trim")?;
                     set(&mut clip, "EffectFiltersBA", crate::retime::NEAREST)?;
                     (saved_in, speed.encode(*frames, &uid())?)
                 }
-                (Some(_), _, _) => return Err("Resolve picture speed requires linked MOV media".into()),
-                (None, None, Profile::Mov { frames, .. }) if edit.hold => {
+                (Timing::Constant(_), _) => return Err("Resolve picture speed requires linked MOV media".into()),
+                (Timing::Hold, Profile::Mov { frames, .. }) => {
                     set(&mut clip, "EffectFiltersBA", crate::retime::NEAREST)?;
                     (crate::retime::HOLD_IN.to_owned(), crate::retime::encode_hold(edit.source_in, *frames, &uid())?)
                 }
-                (None, Some(cadence), Profile::Mov { frames, .. }) => {
+                (Timing::MixedRate(cadence), Profile::Mov { frames, .. }) => {
                     let saved_in = cadence.encode_in(edit.source_in)
                         .ok_or("mixed-rate picture cadence is not qualified for Resolve writing")?;
                     (saved_in, cadence.time_map(*frames))
                 }
-                (None, Some(_), _) => return Err("Resolve mixed-rate picture requires linked MOV media".into()),
-                (None, None, _) => {
+                (Timing::MixedRate(_), _) => return Err("Resolve mixed-rate picture requires linked MOV media".into()),
+                (Timing::Straight | Timing::Hold, _) => {
                     let mut map = vec![2];
                     map.extend_from_slice(&end.to_be_bytes());
                     (edit.source_in.to_string(), map)
@@ -1040,6 +1045,7 @@ fn write_nested_uses(
     project: &PreparedProject,
     pools: &[Option<String>],
     template: &str,
+    audio_template: Option<&str>,
     container: &mut String,
     remaining_xml: &mut usize,
 ) -> Result<()> {
@@ -1052,20 +1058,23 @@ fn write_nested_uses(
     if edits.len() != parent.lanes[0].len() {
         return Err("generated Resolve parent V1 layout differs from preparation".into());
     }
+    let mut nested_audio = String::new();
     for usage in &parent.nests {
         let child = &project.timelines[usage.child];
         let pool = pools[usage.child].as_ref().ok_or("missing generated child pool identity")?;
-        let mut clip = remap(template.to_owned(), &new_ids(template)?);
-        for (key, value) in [
-            ("Name", xml(&child.name)),
-            ("Start", (parent.origin + usage.start).to_string()),
-            ("Duration", usage.length.to_string()),
-            ("In", usage.source_in.to_string()),
-            ("MediaRef", pool.to_owned()),
-            ("MediaStartTime", (usage.origin as f64 / 24.0).to_string()),
-            ("MediaTimemapBA", hex::encode(crate::nests::compact_map(usage.child_length))),
-        ] {
-            set(&mut clip, key, &value)?;
+        let mut clip = write_nest_clip(template, parent, child, usage, pool)?;
+        if usage.stereo_audio.is_some() {
+            let audio_template = audio_template.ok_or("missing stereo nested audio template")?;
+            let mut audio = write_nest_clip(audio_template, parent, child, usage, pool)?;
+            let video_id = dbid(&clip)?.to_owned();
+            let audio_id = dbid(&audio)?.to_owned();
+            replace_fields(&mut clip, |_| Ok(crate::nests::pair_fields(&audio_id, false)))?;
+            replace_fields(&mut audio, |_| Ok(crate::nests::pair_fields(&video_id, true)))?;
+            *remaining_xml = remaining_xml.checked_sub(audio.len() + 19)
+                .ok_or("nested edit XML exceeds its construction budget")?;
+            nested_audio.push_str("<Element>");
+            nested_audio.push_str(&audio);
+            nested_audio.push_str("</Element>");
         }
         *remaining_xml = remaining_xml.checked_sub(clip.len() + 19)
             .ok_or("nested edit XML exceeds its construction budget")?;
@@ -1077,7 +1086,36 @@ fn write_nested_uses(
     container_field(&mut track, "Items", &list)?;
     let mut video = old_video.clone();
     replace_once(&mut video, &old_track, &track)?;
-    replace_once(container, &old_video, &video)
+    replace_once(container, &old_video, &video)?;
+    if !nested_audio.is_empty() {
+        let original = block(container, "AudioTrackVec")?;
+        let mut audio = original.clone();
+        container_field(&mut audio, "Items", &nested_audio)?;
+        replace_once(container, &original, &audio)?;
+    }
+    Ok(())
+}
+
+fn write_nest_clip(
+    template: &str,
+    parent: &Timeline,
+    child: &Timeline,
+    usage: &crate::nests::Use,
+    pool: &str,
+) -> Result<String> {
+    let mut clip = remap(template.to_owned(), &new_ids(template)?);
+    for (key, value) in [
+        ("Name", xml(&child.name)),
+        ("Start", (parent.origin + usage.start).to_string()),
+        ("Duration", usage.length.to_string()),
+        ("In", usage.source_in.to_string()),
+        ("MediaRef", pool.to_owned()),
+        ("MediaStartTime", (usage.origin as f64 / 24.0).to_string()),
+        ("MediaTimemapBA", hex::encode(crate::nests::compact_map(usage.child_length))),
+    ] {
+        set(&mut clip, key, &value)?;
+    }
+    Ok(clip)
 }
 
 fn write_grade(clip: &mut String, body: &str) -> Result<()> {
@@ -1236,15 +1274,28 @@ fn build(
         }),
         _ => None,
     };
-    let compound_pool = nest_template.map(|members| block(member(members, POOL)?, "Sm2MpCompoundClip")).transpose()?;
-    let compound_donors = match (nest_template, compound_pool.as_deref()) {
+    let stereo_nest = p.timelines.iter().flat_map(|row| &row.nests).any(|usage| usage.stereo_audio.is_some());
+    let compound_template = nest_template.filter(|_| !stereo_nest);
+    let compound_pool = compound_template.map(|members| block(member(members, POOL)?, "Sm2MpCompoundClip")).transpose()?;
+    let compound_donors = match (compound_template, compound_pool.as_deref()) {
         (Some(members), Some(pool)) => Some(TimelineDonors {
             pool, container: member(members, NEST_COMPOUND)?, fairlight: None,
         }),
         _ => None,
     };
-    let nest_edit = nest_template.map(|members|
-        named(member(members, NEST_PARENT)?, "Sm2TiVideoClip", "Witness A")).transpose()?;
+    let (nest_edit, nest_audio) = if let Some(members) = nest_template {
+        if stereo_nest {
+            let parent = member(members, STEREO_NEST_PARENT)?;
+            (
+                Some(named(parent, "Sm2TiVideoClip", "Child A")?),
+                Some(named(parent, "Sm2TiAudioClip", "Child A")?),
+            )
+        } else {
+            (Some(named(member(members, NEST_PARENT)?, "Sm2TiVideoClip", "Witness A")?), None)
+        }
+    } else {
+        (None, None)
+    };
     let stereo_sources: HashSet<_> = p.timelines.iter().filter(|row| row.stereo)
         .flat_map(|row| row.lanes[1].iter().map(|edit| edit.media))
         .collect();
@@ -1342,7 +1393,7 @@ fn build(
         for (timeline, path) in p.timelines.iter().zip(timeline_containers) {
             if timeline.nests.is_empty() { continue; }
             let target = path.and_then(|path| members.get_mut(&path)).ok_or("missing parent container")?;
-            write_nested_uses(timeline, p, &timeline_pools, template, target, &mut remaining_xml)?;
+            write_nested_uses(timeline, p, &timeline_pools, template, nest_audio.as_deref(), target, &mut remaining_xml)?;
         }
     }
     markers::write_edits(&mut project, &edit_metadata)?;
@@ -1441,20 +1492,27 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
     let mut dissolves = Vec::with_capacity(p.timelines.len());
     let mut nested_ids = std::collections::HashSet::new();
     for (timeline, &read) in p.timelines.iter().zip(&readbacks) {
-        use crate::nests::{int, string, ADAPTER, PROFILE};
+        use crate::nests::{int, stereo_pairs, string, ADAPTER, PROFILE, STEREO_PROFILE};
+        let audio_uses = timeline.nests.iter().filter(|usage| usage.stereo_audio.is_some());
+        let count = timeline.nests.len() + audio_uses.clone().count();
         match graph.sidecar(ADAPTER, &read.id) {
             None if timeline.nests.is_empty() => {}
-            Some(Value::Arr(rows)) if rows.len() == timeline.nests.len() => {
-                for (row, expected) in rows.iter().zip(&timeline.nests) {
+            Some(Value::Arr(rows)) if rows.len() == count => {
+                stereo_pairs(rows)?;
+                let expected_uses = timeline.nests.iter().map(|usage| (usage, false))
+                    .chain(audio_uses.map(|usage| (usage, true)));
+                for (row, (expected, is_audio)) in rows.iter().zip(expected_uses) {
                     let child = &ids.sequences[expected.child];
                     let pool = ids.timeline_pools[expected.child].as_deref().ok_or("missing staged child pool")?;
                     let id = string(row,"id").ok_or("missing staged nested occurrence ID")?;
+                    let profile = if expected.stereo_audio.is_some() { STEREO_PROFILE } else { PROFILE };
                     if !nested_ids.insert((read.id.as_str(), id))
-                        || string(row,"profile") != Some(PROFILE)
+                        || string(row,"profile") != Some(profile)
                         || string(row,"child_sequence") != Some(child.as_str())
                         || string(row,"pool_id") != Some(pool)
                         || string(row,"kind") != Some(expected.kind.saved())
-                        || string(row,"track_kind") != Some("video") || int(row,"track") != Some(1)
+                        || string(row,"track_kind") != Some(if is_audio { "audio" } else { "video" })
+                        || int(row,"track") != Some(1)
                         || string(row,"record_rate") != Some("24") || string(row,"child_rate") != Some("24")
                         || int(row,"child_origin_frames") != Some(expected.origin)
                         || int(row,"record_start_frames") != Some(expected.start)
@@ -1852,18 +1910,13 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                     recovered_labels.insert(edit.id.as_str());
                 }
                 let frame = |time| crate::prepare::frames_on(time, p.rate);
-                let matches_map = match (&edit.frame_map, wanted.mixed_rate) {
-                    (Some(map), Some(cadence)) => cadence.agrees(map, wanted.source_in, wanted.length),
-                    (Some(map), None) => wanted.hold && usize::try_from(wanted.length).ok() == Some(map.len())
-                        && map.iter().all(|&frame| frame == wanted.source_in),
-                    (None, cadence) => !wanted.hold && cadence.is_none(),
-                };
+                let matches_timing =
+                    wanted.timing.matches_readback(&graph, edit, wanted.source_in, wanted.length)?;
                 if edit.item != ids.media[wanted.media]
                     || frame(edit.record_start)? != wanted.start
                     || frame(edit.source_in)? != wanted.source_in
                     || frame(edit.duration)? != wanted.length
-                    || edit.speed != wanted.speed.and_then(|speed| speed.graph(wanted.length))
-                    || !matches_map
+                    || !matches_timing
                     || crate::grade::prepare(&graph, &edit.id)?.map(|grade| grade.0)
                         != wanted.grade.as_ref().map(|grade| grade.0)
                     || !crate::video::matches_readback(edit, wanted.video.as_ref())

@@ -2,6 +2,7 @@
 mod clip_envelope;
 mod markers;
 pub(crate) mod mixer;
+pub(crate) mod timing;
 
 use crate::{
     atom::{verify_atom_binding, AtomBindingSpec},
@@ -22,6 +23,7 @@ use graph::{
 };
 use serde::Deserialize;
 use serde_json::Value as Json;
+use timing::{PreparedTiming, Timing, TimingContext};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -325,9 +327,7 @@ pub(crate) struct Edit {
     pub(crate) envelope: Option<Envelope>,
     pub(crate) label: Option<ClipLabel>,
     pub(crate) markers: Vec<PreparedMarker>,
-    pub(crate) speed: Option<crate::retime::PictureSpeed>,
-    pub(crate) hold: bool,
-    pub(crate) mixed_rate: Option<crate::mixed_rate::Cadence>,
+    pub(crate) timing: Timing,
     pub(crate) grade: Option<(crate::grade::Operation, String)>,
 }
 
@@ -405,6 +405,14 @@ impl PreparedProject {
 
     pub fn transition_approximation_losses(&self) -> impl Iterator<Item = &graph::Loss> {
         self.destination_losses.iter().filter(|loss| loss.aspect == "transition_approximation")
+    }
+
+    pub fn empty_nest_audio_losses(&self) -> impl Iterator<Item = &graph::Loss> {
+        self.destination_losses.iter().filter(|loss| loss.aspect == crate::nests::EMPTY_NEST_AUDIO_LOSS)
+    }
+
+    pub fn stereo_nest_edge_losses(&self) -> impl Iterator<Item = &graph::Loss> {
+        self.destination_losses.iter().filter(|loss| loss.aspect == crate::nests::STEREO_NEST_EDGE_LOSS)
     }
 }
 
@@ -1168,6 +1176,11 @@ pub(crate) fn prepare_project(
     }
     let nests = crate::nests::plan(graph, &spec.timelines)?;
     let nested_children: HashSet<_> = nests.iter().flatten().map(|usage| usage.child).collect();
+    let stereo_children: HashSet<_> = nests.iter().flatten()
+        .filter(|usage| usage.stereo_audio.is_some()).map(|usage| usage.child).collect();
+    if !stereo_children.is_empty() && spec.timelines.len() != 2 {
+        return Err("a Resolve stereo audio nest requires one selected parent and child".into());
+    }
     let mut bins = vec![Bin {
         parent: None,
         name: "Master".into(),
@@ -1489,16 +1502,44 @@ pub(crate) fn prepare_project(
             let compound = crate::nests::compound(graph, &sequence.id);
             let faders = mixer::StaticFaders::prepare(graph, sequence)?;
             let uses = &nests[row_index];
+            destination_losses.extend(uses.iter().filter_map(|usage| {
+                Some(graph::Loss {
+                    object: usage.empty_audio_companion.clone()?,
+                    aspect: crate::nests::EMPTY_NEST_AUDIO_LOSS.into(),
+                    reason: "The matched child has no audio edits. Resolve keeps the picture nest and omits its empty audio companion.".into(),
+                })
+            }));
+            if graph.sidecar(crate::nests::PREMIERE_ADAPTER, &sequence.id).is_some() {
+                destination_losses.extend(uses.iter().filter_map(|usage| {
+                    Some(graph::Loss {
+                        object: usage.stereo_audio.clone()?,
+                        aspect: crate::nests::STEREO_NEST_EDGE_LOSS.into(),
+                        reason: "Resolve applies short audio ramps at the nested edit edges. The clip remains editable with the original stereo channel order and trim.".into(),
+                    })
+                }));
+            }
             let nest_member = !uses.is_empty() || nested_children.contains(&row_index);
+            let stereo_parent = uses.iter().any(|usage| usage.stereo_audio.is_some());
+            let stereo_child = stereo_children.contains(&row_index);
+            let stereo_nest = stereo_parent || stereo_child;
             let shape = |kind, index| sequence.tracks.iter().any(|t|
                 t.kind == kind && t.index == index && t.level_db.is_none());
+            if stereo_nest && (canvas != (1920, 1080) || sequence.tracks.len() != 2
+                || !shape(StreamKind::Audio, 1)
+                || (stereo_child && !sequence.placements.iter().any(crate::stereo::placement)))
+            {
+                return Err("Resolve stereo audio nesting requires neutral V1 and stereo WAV A1".into());
+            }
             if nest_member && (!shape(StreamKind::Video, 1)
-                || !(sequence.tracks.len() == 1 && !compound
+                || !(stereo_nest || sequence.tracks.len() == 1 && !compound
                     || sequence.tracks.len() == 3 && !compound
                         && shape(StreamKind::Audio, 1) && shape(StreamKind::Audio, 2)
                     || sequence.tracks.len() == 2 && compound && shape(StreamKind::Audio, 1))
-                || sequence.placements.iter().any(|p| p.video_track != Some(1)
-                    || !p.audio_tracks.is_empty() || !p.grouped_audio.is_empty())
+                || sequence.placements.iter().any(|p| {
+                    let picture = p.video_track == Some(1)
+                        && p.audio_tracks.is_empty() && p.grouped_audio.is_empty();
+                    !(picture || stereo_child && crate::stereo::placement(p))
+                })
                 || !sequence.texts.is_empty() || !sequence.transitions.is_empty()
                 || graph.sidecar(crate::dissolve::ADAPTER, &sequence.id).is_some()
                 || graph.sidecar(crate::generator::ADAPTER, &sequence.id).is_some()
@@ -1509,12 +1550,16 @@ pub(crate) fn prepare_project(
             let second_picture = sequence.tracks.iter().any(|track|
                 track.kind == StreamKind::Video && track.index == 2 && track.level_db.is_none());
             let track_count = sequence.tracks.len() - usize::from(second_picture);
-            let stereo = !nest_member && !second_picture && matches!(track_count, 2 | 3)
+            let stereo_wav_24 = track_count == 2
+                && sequence.rate == Rational::integer(24)
+                && canvas == (1920, 1080);
+            let stereo = stereo_nest || !nest_member && !second_picture && matches!(track_count, 2 | 3)
                 && spec.timelines.len() == 1
-                && crate::stereo::clock(sequence.rate, (i64::from(canvas.0), i64::from(canvas.1)))
+                && (stereo_wav_24
+                    || crate::stereo::clock(sequence.rate, (i64::from(canvas.0), i64::from(canvas.1))))
                 && sequence.placements.iter().any(crate::stereo::placement);
             let mixed_stereo = stereo && track_count == 3;
-            let picture_only = nest_member || track_count == 1;
+            let picture_only = nest_member && !stereo_nest || track_count == 1;
             let third_mono = track_count == 4 && second_picture && sequence.rate == Rational::integer(24);
             if (!picture_only && track_count != 3 && !third_mono && !stereo)
                 || [
@@ -1724,7 +1769,8 @@ pub(crate) fn prepare_project(
                 ) {
                     (None, [], [], profile) if stereo_edit => {
                         let supported = match profile {
-                            Profile::Mov { rate, video: MovieVideo::Avc, pcm: Some(_), .. } if !mixed_stereo =>
+                            Profile::Mov { rate, video: MovieVideo::Avc, pcm: Some(_), .. }
+                                if !mixed_stereo && !stereo_wav_24 =>
                                 *rate == sequence.rate && crate::stereo::mov(&media[*media_index].path),
                             Profile::Wav { channels: 2, .. } => true,
                             _ => false,
@@ -1732,6 +1778,9 @@ pub(crate) fn prepare_project(
                         if !supported || selectors.get(&Some(1)) != Some(&Some(0))
                             || selectors.get(&Some(2)) != Some(&Some(1))
                         {
+                            if stereo_wav_24 {
+                                return Err(format!("{}: 24 fps stereo A1 requires verified left/right PCM channels from WAV", edit.id).into());
+                            }
                             return Err(format!("{}: stereo A1 requires verified left/right PCM channels from WAV or AVC MOV", edit.id).into());
                         }
                         (1, None)
@@ -1818,70 +1867,34 @@ pub(crate) fn prepare_project(
                 if let Some(&postroll) = transition_tails.get(edit.id.as_str()) {
                     length -= postroll;
                 }
-                let speed = crate::retime::PictureSpeed::prepare(edit, sequence.rate, length)
-                    .map_err(|e| format!("{}: {e}", edit.id))?;
-                let hold = if let Some(cadence) = mixed_rate {
-                    if lane != 0 || edit.speed.is_some() || edit.transform.is_some() || !edit.effects.is_empty()
-                        || !edit.frame_map.as_deref().is_some_and(|map| cadence.agrees(map, source_in, length))
-                    {
-                        return Err(format!("{}: mixed-rate Resolve picture requires a verified Frame Sampling map and plain V1 trim", edit.id).into());
-                    }
-                    false
-                } else if let Some(map) = &edit.frame_map {
-                    let frame = map.first().copied().ok_or("empty Resolve frame hold")?;
-                    if !picture_only || lane != 0 || sequence.rate != Rational::integer(24)
-                        || canvas != (1920, 1080) || speed.is_some()
-                        || edit.transform.is_some() || !edit.effects.is_empty()
-                        || media[media_index].profile.movie_timecode().is_some()
-                        || !matches!(&media[media_index].profile, Profile::Mov {
-                            video: MovieVideo::ProResHq, aac: false, pcm: None, avid_source_timecode: None, ..
-                        })
-                        || crate::retime::hold_count(length) != Some(map.len())
-                        || map.iter().any(|&sample| sample != frame)
-                    {
-                        return Err(format!("{}: Resolve frame hold requires a constant map on linked picture-only 1080p24 ProRes HQ", edit.id).into());
-                    }
-                    if frame != source_in {
-                        if review_caption_omissions.is_none() {
-                            return Err(format!("{}: a hold away from source In requires the Resolve turnover job with loss review", edit.id).into());
-                        }
-                        destination_losses.push(graph::Loss {
-                            object: edit.id.clone(),
-                            aspect: "frame_hold_source_in".into(),
-                            reason: format!("Resolve retains held source frame {frame} and uses it as the source In. The original source In at frame {source_in} is retained in graph/2."),
-                        });
-                        // Native Resolve exposes the held picture as the edit's source In.
-                        source_in = frame;
-                    }
-                    true
-                } else {
-                    false
-                };
-                if speed == Some(crate::retime::PictureSpeed::Double)
-                    && !matches!(media[media_index].profile, Profile::Mov { video: MovieVideo::ProResHq, .. })
-                {
-                    return Err(format!("{}: 200% Resolve picture speed requires linked ProRes HQ MOV", edit.id).into());
-                }
-                if speed == Some(crate::retime::PictureSpeed::Half) && length % 2 != 0
-                    && !matches!(media[media_index].profile, Profile::Mov { video: MovieVideo::ProResHq, .. })
-                {
-                    return Err(format!("{}: odd-length Resolve half-speed picture requires linked ProRes HQ MOV", edit.id).into());
-                }
-                let source_length = if hold {
-                    1
-                } else {
-                    speed.map(|speed| speed.sampled_source_frames(length)).transpose()?.unwrap_or(length)
-                };
-                let end = if let Some(cadence) = mixed_rate {
-                    cadence.last_frame(source_in, length).and_then(|last| last.checked_add(1))
-                } else {
-                    source_in.checked_add(source_length)
-                }.ok_or("source range overflow")?;
+                let PreparedTiming { timing, source_in, source_end, loss } = TimingContext {
+                    media: &media[media_index],
+                    rate: sequence.rate,
+                    canvas,
+                    lane,
+                    picture_only,
+                    raster_mismatch,
+                    transition_trimmed: transition_heads.contains_key(edit.id.as_str())
+                        || transition_tails.contains_key(edit.id.as_str()),
+                    mixed_rate,
+                    can_review_losses: review_caption_omissions.is_some(),
+                }.prepare(graph, edit, source_in, length)?;
+                destination_losses.extend(loss);
                 if is_2997(sequence.rate) && matches!(lane, 1 | 2) {
-                    let exact = [start, source_in, length]
+                    let aligned_record = whole_sample_count(start, sequence.rate).is_ok();
+                    let exact = aligned_record && [source_in, length]
                         .into_iter().all(|frame| whole_sample_count(frame, sequence.rate).is_ok());
-                    if !exact {
-                        return Err(format!("{}: 29.97 audio edit must align to whole 48 kHz samples", edit.id).into());
+                    let resolve_source = graph.sidecar(crate::source::ADAPTER, &sequence.id)
+                        .and_then(|record| record.get("kind"))
+                        .is_some_and(|kind| matches!(kind, Value::Str(kind) if kind == "registered_timeline"));
+                    let verified_movie = media[media_index].native.as_ref()
+                        .is_some_and(|movie| movie.verified_fractional_frame_audio());
+                    if !exact && !(resolve_source && verified_movie) {
+                        if !verified_movie || graph.sidecar("premiere.source", &sequence.id).is_none() {
+                            return Err(format!("{}: 29.97 audio edit must align to whole 48 kHz samples", edit.id).into());
+                        }
+                        check_premiere_audio_record_grid(origin, start, sequence.rate)
+                            .map_err(|error| format!("{} A{lane} ({}): {error}", sequence.name, edit.id))?;
                     }
                 }
                 let available = match &media[media_index].profile {
@@ -1889,7 +1902,7 @@ pub(crate) fn prepare_project(
                     Profile::Wav { samples, .. } => samples / samples_per_frame(sequence.rate)?,
                     Profile::BoundMxf(binding) => binding.frames,
                 };
-                if length <= 0 || end > available {
+                if length <= 0 || source_end > available {
                     return Err(
                         format!("{}: edit exceeds the physical playable range", edit.id).into(),
                     );
@@ -1900,9 +1913,12 @@ pub(crate) fn prepare_project(
                 let video = crate::video::prepare(edit, sequence.rate, source_in, length, available)
                     .map_err(|e| format!("{}: {e}", edit.id))?;
                 let mut grade = crate::grade::prepare(graph, &edit.id)?;
+                if matches!(timing, Timing::Linear(_)) && grade.is_some() {
+                    return Err(format!("{}: Linear retime with a saved grade is unqualified", edit.id).into());
+                }
                 if grade.as_ref().is_some_and(|(operation, _)| matches!(operation, crate::grade::Operation::ExposureCdl(_)))
                     && (lane != 0 || sequence.rate != Rational::integer(24) || row.canvas != (1920, 1080)
-                        || hold || speed.is_some() || video.is_some()
+                        || matches!(timing, Timing::Hold | Timing::Constant(_)) || video.is_some()
                         || !matches!(&media[media_index].profile, Profile::Mov {
                             video: MovieVideo::ProResHq, raster: (1920,1080), aac: false, pcm: None, ..
                         }))
@@ -1921,14 +1937,14 @@ pub(crate) fn prepare_project(
                     }
                 }
                 if grade.is_some() {
-                    if hold {
+                    if matches!(timing, Timing::Hold) {
                         return Err(format!("{}: Resolve frame hold with a saved grade is unqualified", edit.id).into());
                     }
-                    if mixed_rate.is_some() {
+                    if matches!(timing, Timing::MixedRate(_)) {
                         return Err(format!("{}: Resolve mixed-rate picture with a saved grade is unqualified", edit.id).into());
                     }
                 }
-                if uhd && (video.is_some() || grade.is_some() || speed.is_some()) {
+                if uhd && (video.is_some() || grade.is_some() || matches!(timing, Timing::Constant(_))) {
                     return Err(format!("{}: editable UHD picture effects require a separate profile", edit.id).into());
                 }
                 let input_sizing = crate::input_scaling::prepare(
@@ -1936,12 +1952,12 @@ pub(crate) fn prepare_project(
                 ).map_err(|error| format!("{}: {error}", edit.id))?;
                 if input_sizing == Some(crate::input_scaling::Sizing::CenterCrop)
                     && (lane != 0 || media[media_index].native.is_none()
-                    || video.is_some() || grade.is_some() || speed.is_some() || hold || mixed_rate.is_some())
+                    || video.is_some() || grade.is_some() || matches!(timing, Timing::Constant(_) | Timing::Hold | Timing::MixedRate(_)))
                 {
                     return Err(format!("{}: center crop requires a plain assisted picture edit", edit.id).into());
                 }
                 let label = ClipLabel::prepare(graph, &edit.id)?;
-                if stereo && (video.is_some() || speed.is_some() || grade.is_some() || envelope.is_some()) {
+                if stereo && (video.is_some() || matches!(timing, Timing::Constant(_)) || grade.is_some() || envelope.is_some()) {
                     return Err(format!("{}: linked stereo A1 requires neutral picture and audio edits", edit.id).into());
                 }
                 if label.is_some() {
@@ -1953,7 +1969,7 @@ pub(crate) fn prepare_project(
                 let markers = marker_preparation.prepare_edit(
                     edit,
                     &media[media_index].profile,
-                    lane == 0 && !hold && mixed_rate.is_none() && speed.is_none(),
+                    lane == 0 && matches!(timing, Timing::Straight),
                 )?;
                 lanes[lane].push(Edit {
                     media: media_index,
@@ -1966,14 +1982,12 @@ pub(crate) fn prepare_project(
                     envelope,
                     label,
                     markers,
-                    speed,
-                    hold,
-                    mixed_rate,
+                    timing,
                     grade,
                 });
             }
             let mut duration = None;
-            let base_lanes: &[usize] = if picture_only { &[0] }
+            let base_lanes: &[usize] = if picture_only || stereo_parent { &[0] }
                 else if stereo && !mixed_stereo { &[0, 1] }
                 else if third_mono { &[0, 1, 2, 4] }
                 else { &[0, 1, 2] };
@@ -2044,14 +2058,8 @@ pub(crate) fn prepare_project(
                 return Err("picture-only timeline contains audio placements".into());
             }
             let length = duration.ok_or("empty linked project timeline")?;
-            if nest_member {
-                let receipt = graph.sidecar(crate::source::ADAPTER, &sequence.id)
-                    .ok_or("missing saved Resolve nesting extent")?;
-                if crate::nests::int(receipt, "record_length") != Some(length)
-                    || crate::nests::int(receipt, "record_origin") != Some(origin)
-                {
-                    return Err("prepared nesting extent disagrees with the saved Resolve sequence".into());
-                }
+            if nest_member && !crate::nests::matches_extent(graph, sequence, origin, length) {
+                return Err("prepared nesting extent disagrees with the saved sequence".into());
             }
             if second_picture {
                 if lanes[3].is_empty() {
@@ -2306,6 +2314,26 @@ fn sample_count(frames: i64, rate: Rational) -> Result<Rational> {
         .ok_or_else(|| "invalid Resolve audio sample count".into())
 }
 
+fn check_premiere_audio_record_grid(origin: i64, start: i64, rate: Rational) -> Result<()> {
+    // The two editors agreed across all source trim phases with a
+    // whole-sample origin and whole-sample record starts.
+    for (label, frame, relative_to) in [
+        ("Timeline origin", origin, "timecode zero"),
+        ("Audio record start", start, "the timeline origin"),
+    ] {
+        let samples = sample_count(frame, rate)?;
+        if samples.den() != 1 {
+            let whole = samples.num() / samples.den();
+            let remainder = samples.num() % samples.den();
+            return Err(format!(
+                "{label} at frame {frame} falls between 48 kHz samples ({whole} + {remainder}/{} samples from {relative_to}). Premiere to Resolve needs both positions to align to whole samples for this edit.",
+                samples.den(),
+            ).into());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2324,6 +2352,18 @@ mod tests {
         assert_eq!(whole_sample_count(5, rate).unwrap(), 8008);
         assert_eq!(whole_sample_count(40, rate).unwrap(), 64064);
         assert_eq!(movie_audio_sample_extent(48, rate).unwrap(), 76876);
+    }
+
+    #[test]
+    fn premiere_fractional_audio_reports_the_off_sample_record_position() {
+        let rate = Rational::new(30000, 1001).unwrap();
+        assert!(check_premiere_audio_record_grid(1790, 20, rate).is_ok());
+        let origin = check_premiere_audio_record_grid(1791, 5, rate).unwrap_err().to_string();
+        assert!(origin.starts_with("Timeline origin at frame 1791"));
+        assert!(origin.contains("2868465 + 3/5 samples from timecode zero"));
+        let cut = check_premiere_audio_record_grid(1790, 13, rate).unwrap_err().to_string();
+        assert!(cut.starts_with("Audio record start at frame 13"));
+        assert!(cut.contains("20820 + 4/5 samples from the timeline origin"));
     }
 
     #[test]

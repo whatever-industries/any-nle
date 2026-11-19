@@ -510,6 +510,23 @@ Native results cover Separate mode and separate timelines in one project.
 Grouped and Merged and a single timeline mixing both source types still
 need their own native checks.
 
+### Open Avid conversions directly in Premiere 27
+
+The Avid CLI, saved jobs, and wizard use Project version 46 when writing
+Premiere projects. Premiere 27 build 88 opened the generated Separate
+and combined linked projects directly and saved and reopened them on
+the original media. The linked managed OP1a and the picture-only
+rewrap controls also opened directly. Seeded linked outputs differ
+from their earlier XML only at the Project version field.
+
+The locally packaged macOS arm64 wizard passed the Separate-files
+control. Review found all three original MXFs. **Open in Premiere**
+opened the exact output path in build 88 without creating an upgrade
+copy. After Save As and reopen, both sequences retained their clocks,
+cuts, trims, original paths, and independent mono selectors. In the
+rendered split edit, all 48 picture frames and all 96,096 PCM samples
+per lane matched the retained Premiere control.
+
 ## Ranged filler marker read-back
 
 A graph-authored control over the qualified 29.97 DNxHD originals put six

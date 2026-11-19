@@ -26,6 +26,9 @@ pub enum WorkerStatus {
     Unconfigured,
     OpenWorker(String),
     Busy,
+    Rendering,
+    ContainsContent(String),
+    Setup(String),
     Ready,
 }
 
@@ -64,6 +67,9 @@ pub fn worker_status() -> WorkerStatus {
         "worker_unconfigured" => WorkerStatus::Unconfigured,
         "open_worker" => WorkerStatus::OpenWorker(detail),
         "worker_busy" => WorkerStatus::Busy,
+        "worker_rendering" => WorkerStatus::Rendering,
+        "worker_contains_content" => WorkerStatus::ContainsContent(detail),
+        "worker_setup" => WorkerStatus::Setup(detail),
         "ready" => WorkerStatus::Ready,
         _ => WorkerStatus::Disconnected,
     }
@@ -237,6 +243,13 @@ impl Movie {
         self.audio_clock().is_some_and(|(codec, _)| codec == "aac")
     }
 
+    pub(crate) fn verified_fractional_frame_audio(&self) -> bool {
+        self.raster() == (1920, 1080)
+            && self.picture_codec == "prores"
+            && self.streams[0].codec.as_deref() == Some("apch")
+            && matches!(self.audio_clock(), Some(("pcm_s24le", _)))
+    }
+
     pub(crate) fn check_audio_end(&self, edit: &graph::Placement) -> Result<()> {
         let samples = self
             .audio
@@ -279,10 +292,13 @@ pub(crate) fn capture(path: &Path, ffprobe: &Path) -> Result<Movie> {
         Duration::from_secs(45),
     )?;
     if !status.success() {
-        let message = if status.code() == Some(2) {
-            "Resolve import worker is unavailable or its dedicated scratch project is not active and empty"
-        } else {
-            "Resolve could not export the original from the dedicated import worker"
+        let message = match status.code() {
+            Some(2) => "Resolve import worker is unavailable. Check the dedicated scratch project in Resolve Studio.",
+            Some(3) => "Resolve import worker is unavailable while another assisted import is running. Wait for it to finish and try again.",
+            Some(4) => "Resolve import worker is unavailable because the scratch project contains media, bins, or timelines. Return the dedicated scratch project to an empty state and try again.",
+            Some(5) => "Resolve import worker is unavailable. Set the scratch project to 24 fps, select its Media Pool root, and try again.",
+            Some(6) => "Resolve import worker is unavailable while the scratch project is rendering. Wait for the render to finish and try again.",
+            _ => "Resolve could not export the original from the dedicated import worker",
         };
         return Err(linked::UnavailableCache(message).into());
     }
