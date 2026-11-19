@@ -136,11 +136,15 @@ class DraftRecoveryTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = pathlib.Path(temp.name)
+        (self.root / 'RELEASE_NOTES.md').write_text(
+            '# Any NLE\n\nPremiere → Resolve\n', encoding='utf-8',
+        )
         self.files = [self.root / name for name in ('package.zip', 'provenance.tar.gz')]
         for p in self.files:
             p.write_text(p.name)
         for replacement in [
             patch('publish.gh', side_effect=self.github),
+            patch('publish.ROOT', self.root),
             patch('publish.verify_all', return_value=self.files),
             patch('publish.validate_workflow', return_value='reviewed binding'),
             patch.dict(os.environ, GITHUB_REPOSITORY=self.repo,
@@ -165,9 +169,10 @@ class DraftRecoveryTests(unittest.TestCase):
             self.assertIn('--draft', args)
             self.assertIn('--prerelease', args)
             self.assertEqual(args[args.index('--target') + 1], self.head)
+            notes = pathlib.Path(args[args.index('--notes-file') + 1])
             self.draft = dict(id=7, tag_name=self.tag, draft=True, prerelease=True,
                               target_commitish=self.head,
-                              body=pathlib.Path(args[args.index('--notes-file') + 1]).read_text().strip(),
+                              body=notes.read_text(encoding='utf-8').strip(),
                               upload_url=f'https://uploads.github.com/{api}/releases/7/assets' + '{?name,label}')
             return ''
         if args == ('api', '--paginate', f'{api}/releases/7/assets?per_page=100', '--slurp'):
