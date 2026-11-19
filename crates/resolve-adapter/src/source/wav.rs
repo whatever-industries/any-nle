@@ -1,15 +1,8 @@
 //! Standalone PCM cache and virtual routing for WAV and mono OP-Atom audio.
 use super::*;
+use crate::linked::samples_per_frame;
 
-pub(super) fn samples_per_frame(rate: Rational) -> Result<i64> {
-    match (rate.num(), rate.den()) {
-        (24, 1) => Ok(2000),
-        (24000, 1001) => Ok(2002),
-        _ => Err("unqualified standalone WAV frame basis".into()),
-    }
-}
-
-pub(super) fn integer_duration(text: &str) -> Result<i64> {
+pub(super) fn integer_wav_frame(text: &str) -> Result<i64> {
     integer_frame(text, false)
 }
 
@@ -29,11 +22,20 @@ fn integer_frame(text: &str, mono_atom: bool) -> Result<i64> {
     // Resolve sometimes serializes binary64 noise beside an integral frame
     // count. Keep true fractional edits outside this frame-aligned profile.
     // A nonzero MXF origin adds binary64 cancellation at the file clock scale.
-    let tolerance = if mono_atom { 1e-9 } else { whole.unsigned_abs() as f64 * f64::EPSILON };
-    if fraction.abs() > tolerance || !fraction.is_finite() {
-        return Err("unqualified Resolve fractional audio edit".into());
+    let tolerance = if mono_atom {
+        1e-9
+    } else {
+        (whole.unsigned_abs() as f64 * f64::EPSILON).min(1e-9)
+    };
+    if fraction.abs() <= tolerance {
+        return Ok(whole);
     }
-    Ok(whole)
+    // Native WAV durations can also save the frame immediately below the
+    // boundary, with a positive remainder that lands on the next frame.
+    if !mono_atom && (fraction - 1.0).abs() <= tolerance {
+        return whole.checked_add(1).ok_or_else(|| "Resolve audio frame overflow".into());
+    }
+    Err("unqualified Resolve fractional audio edit".into())
 }
 
 pub(super) fn identity_timemap(node: &Node, samples: i64, rate: Rational) -> Result<bool> {
@@ -252,6 +254,8 @@ pub(super) fn read(
         ],
     );
     let wav_stereo_pool_route = !item.stream_groups.is_empty();
+    let native_stereo_pcm = !atom && wav_stereo_pool_route
+        && clip.maybe("VirtualAudioTracksBA")?.is_none_or(str::is_empty);
     metadata::capture(clip, node, None, blobs, graph)?;
     graph.items.push(item);
     Ok(Some(Master {
@@ -261,9 +265,13 @@ pub(super) fn read(
         audio: selectors,
         path,
         size: (0, 0),
+        prores_hq: false,
+        camera_pcm: false,
+        native_mono_movie: false,
         wav_samples: Some(samples),
         standalone_mono_atom: atom,
         stereo_pool_route: wav_stereo_pool_route,
+        native_stereo_pcm,
         split_atom_audio: false,
     }))
 }
@@ -278,14 +286,20 @@ fn optional_int(map: &encoding::Map, key: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{integer_atom_frame, integer_duration};
+    use super::{integer_atom_frame, integer_wav_frame};
 
     #[test]
     fn observed_binary64_residue_does_not_change_the_wav_edit() {
-        assert_eq!(integer_duration("48|000000000000003d").unwrap(), 48);
-        assert!(integer_duration("48|000000000000e03f").is_err());
-        assert!(integer_duration("48|000000000000f87f").is_err());
-        assert!(integer_duration("48|00").is_err());
+        assert_eq!(integer_wav_frame("48|000000000000003d").unwrap(), 48);
+        assert_eq!(integer_wav_frame("7|000000000000d03c").unwrap(), 7);
+        assert_eq!(integer_wav_frame("23|e0ffffffffffef3f").unwrap(), 24);
+        let sample = hex::encode((1.0f64 / 1920.0).to_le_bytes());
+        assert!(integer_wav_frame(&format!("7|{sample}")).is_err());
+        let almost = hex::encode((1.0f64 - 1.0 / 2000.0).to_le_bytes());
+        assert!(integer_wav_frame(&format!("23|{almost}")).is_err());
+        assert!(integer_wav_frame("48|000000000000e03f").is_err());
+        assert!(integer_wav_frame("48|000000000000f87f").is_err());
+        assert!(integer_wav_frame("48|00").is_err());
     }
 
     #[test]

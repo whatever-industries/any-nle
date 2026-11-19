@@ -5,20 +5,24 @@ use graph::{
     source::{SourceGraph, SourceSequence, SourceTransition},
     Loss, Rational, StreamKind, Value,
 };
-use std::io::Read;
+use sha2::{Digest, Sha256};
+use std::{collections::HashSet, io::Read};
 
 pub(crate) const ADAPTER: &str = "resolve.transitions";
 pub(crate) const INTERPRETATION: &str = "resolve.left_cross_dissolve_8";
 pub(crate) const CENTER_INTERPRETATION: &str = "resolve.center_cross_dissolve_8";
 pub(crate) const AUDIO_INTERPRETATION: &str = "resolve.center_cross_fade_0db_8";
-pub(crate) const AUDIO_TYPE: &str = "Cross Fade 0DB";
+const VIDEO_LEFT_PROFILE: &str = "resolve.left_cross_dissolve";
+const VIDEO_CENTER_PROFILE: &str = "resolve.center_cross_dissolve";
+const AUDIO_GAIN_PROFILE: &str = "resolve.center_cross_fade_0db";
+const AUDIO_POWER_PROFILE: &str = "resolve.center_cross_fade_plus_3db";
 pub(crate) const PREMIERE_AUDIO_STYLE: &str = "premiere.Constant Gain";
+pub(crate) const PREMIERE_POWER_STYLE: &str = "premiere.Constant Power";
 pub(crate) const AUDIO_FIELDS: &str =
     "00000002000000158012120000002c789c636660642016000000da0005";
 const AUDIO_FIELDS_SHA: &str =
     "bc87b3394116f6be254b620a0fdfaec66a3130602aad452bef2dc8ef6d02ddc1";
-pub(crate) const DURATION: i64 = 8;
-pub(crate) const TYPE: &str = "Cross Dissolve";
+pub(crate) const LEGACY_DURATION: i64 = 8;
 pub(crate) const ALIGNMENT: &str = "3";
 pub(crate) const POSITION: &str = "2";
 pub(crate) const LOSS: &str =
@@ -26,7 +30,7 @@ pub(crate) const LOSS: &str =
 pub(crate) const TIMELINE_EXPORT_LOSS: &str =
     "Resolve Cross Dissolve retained in its native sidecar; destination mapping required";
 pub(crate) const EFFECT: &str = "000000020000003a800a37081238024a004a004a004a004a29088b015224ffffffe00000000000000c0000000000000000000800000000000c00000000000000f03f";
-const EFFECT_SHA: &str = "8293817214186b6015e1ba95399050f8f7553ad91e9685183970fb58e33c2cae";
+const EFFECT_DURATION: std::ops::Range<usize> = 50..54;
 // Native synthetic transition envelope. Four inner bytes vary between saves.
 pub(crate) const FIELDS: &str =
     "000000020000001b8012180000002c789c6366606400018ebc351e0c0400003124016f";
@@ -73,26 +77,91 @@ fn fields_match(encoded: &str, timeline_export: bool) -> bool {
         && bytes[12..].iter().all(|&b| b == 0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Style {
+    Video,
+    Gain,
+    Power,
+}
+
+impl Style {
+    pub(crate) fn audio(self) -> bool {
+        self != Self::Video
+    }
+
+    pub(crate) fn native_label(self) -> &'static str {
+        match self {
+            Self::Video => "Cross Dissolve",
+            Self::Gain => "Cross Fade 0DB",
+            Self::Power => "Cross Fade +3DB",
+        }
+    }
+
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "Cross Dissolve" => Some(Self::Video),
+            "Cross Fade 0DB" => Some(Self::Gain),
+            "Cross Fade +3DB" => Some(Self::Power),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn offset(self, duration: i64, alignment: &str) -> Option<i64> {
+        if !(2..=i64::from(u32::MAX)).contains(&duration) {
+            return None;
+        }
+        match alignment {
+            ALIGNMENT if !self.audio() => Some(duration),
+            "2" if duration % 2 == 0 => Some(duration / 2),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn interpretation(self, duration: i64, alignment: &str) -> &'static str {
+        let legacy = duration == LEGACY_DURATION;
+        match (self, alignment, legacy) {
+            (Self::Video, ALIGNMENT, true) => INTERPRETATION,
+            (Self::Video, ALIGNMENT, false) => VIDEO_LEFT_PROFILE,
+            (Self::Video, _, true) => CENTER_INTERPRETATION,
+            (Self::Video, _, false) => VIDEO_CENTER_PROFILE,
+            (Self::Gain, _, true) => AUDIO_INTERPRETATION,
+            (Self::Gain, _, false) => AUDIO_GAIN_PROFILE,
+            (Self::Power, _, _) => AUDIO_POWER_PROFILE,
+        }
+    }
+}
+
+pub(crate) fn video_effect(duration: i64) -> Result<Vec<u8>> {
+    let mut bytes = hex::decode(EFFECT)?;
+    bytes[EFFECT_DURATION].copy_from_slice(&u32::try_from(duration)?.to_le_bytes());
+    Ok(bytes)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Dissolve {
     pub(crate) cut: i64,
     pub(crate) before: i64,
+    pub(crate) duration: i64,
     pub(crate) id: String,
-    pub(crate) audio: bool,
+    pub(crate) style: Style,
 }
 
 impl Dissolve {
-    pub(crate) fn type_label(&self) -> &'static str {
-        if self.audio { AUDIO_TYPE } else { TYPE }
+    pub(crate) fn audio(&self) -> bool {
+        self.style.audio()
+    }
+
+    pub(crate) fn after(&self) -> i64 {
+        self.duration - self.before
     }
 
     pub(crate) fn alignment(&self) -> &'static str {
-        if self.before == DURATION { ALIGNMENT } else { "2" }
+        if self.before == self.duration { ALIGNMENT } else { "2" }
     }
 
     pub(crate) fn window(&self) -> std::ops::Range<i64> {
         let start = self.cut - self.before;
-        start..start + DURATION
+        start..start + self.duration
     }
 }
 
@@ -105,19 +174,60 @@ pub(crate) struct SourceDissolve<'a> {
 /// The common graph stores source handles as overlapping placements. Resolve
 /// stores the incoming preroll in its transition and abuts the visible edits.
 pub(crate) fn from_source(sequence: &SourceSequence) -> Result<Vec<SourceDissolve<'_>>> {
+    check_count(sequence.transitions.len())?;
+    let prepared = sequence.transitions.iter()
+        .map(|transition| prepare_source(sequence, transition))
+        .collect::<Result<Vec<_>>>()?;
+    validate_windows(&prepared)?;
+    if sequence.transitions.iter().any(|transition| transition.style == "avid.EFF2_BLEND_DISSOLVE") {
+        require_single_per_lane(&prepared)?;
+    }
+    Ok(prepared)
+}
+
+fn check_count(count: usize) -> Result<()> {
+    if count > 2 * crate::prepare::MAX_EDITS_PER_LANE {
+        return Err("Resolve transition count exceeds the linked layout limit".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn require_single_per_lane(transitions: &[SourceDissolve<'_>]) -> Result<()> {
     let mut seen = [false; 2];
-    let mut prepared = Vec::with_capacity(2);
-    for transition in &sequence.transitions {
-        let lane = usize::from(transition.kind == StreamKind::Audio);
+    for transition in transitions {
+        let lane = usize::from(transition.prepared.audio());
         if std::mem::replace(&mut seen[lane], true) {
             return Err(format!(
                 "Resolve transition {}: expected one transition per supported lane",
-                transition.id
+                transition.prepared.id
             ).into());
         }
-        prepared.push(prepare_source(sequence, transition)?);
     }
-    Ok(prepared)
+    Ok(())
+}
+
+fn validate_windows(transitions: &[SourceDissolve<'_>]) -> Result<()> {
+    let mut ids = HashSet::new();
+    let mut windows = Vec::with_capacity(transitions.len());
+    for transition in transitions {
+        let d = &transition.prepared;
+        if !ids.insert(d.id.as_str()) {
+            return Err(format!("duplicate Resolve transition ID {}", d.id).into());
+        }
+        let first = d.cut.checked_sub(d.before).filter(|first| *first >= 0);
+        let Some(start) = first.filter(|first| first.checked_add(d.duration).is_some()) else {
+            return Err(format!("Resolve transition {}: invalid blend interval", d.id).into());
+        };
+        windows.push((d.audio(), start, start + d.duration, d.id.as_str()));
+    }
+    windows.sort_unstable();
+    for pair in windows.windows(2) {
+        let [(a_lane, _, a_end, a_id), (b_lane, b_start, _, b_id)] = [pair[0], pair[1]];
+        if a_lane == b_lane && a_end > b_start {
+            return Err(format!("Resolve transitions {a_id} and {b_id} overlap on the same lane").into());
+        }
+    }
+    Ok(())
 }
 
 fn prepare_source<'a>(
@@ -126,23 +236,23 @@ fn prepare_source<'a>(
 ) -> Result<SourceDissolve<'a>> {
     let refuse = |why| format!("Resolve transition {}: {why}", transition.id);
     let before = frames_on(transition.cut_offset, sequence.rate)?;
-    let audio = transition.kind == StreamKind::Audio;
-    let qualified = if audio {
-        sequence.rate == Rational::integer(24)
-            && transition.style == PREMIERE_AUDIO_STYLE
-            && before == 4
-    } else {
-        supported_rate(sequence.rate)
-            && matches!(transition.style.as_str(), "avid.EFF2_BLEND_DISSOLVE" | "premiere.ADBE Cross Dissolve")
-            && matches!(before, 4 | DURATION)
+    let duration = frames_on(transition.duration, sequence.rate)?;
+    let style = match (transition.kind, transition.style.as_str()) {
+        (StreamKind::Video, "premiere.ADBE Cross Dissolve") if supported_rate(sequence.rate) => Style::Video,
+        (StreamKind::Video, "avid.EFF2_BLEND_DISSOLVE")
+            if supported_rate(sequence.rate) && duration == LEGACY_DURATION => Style::Video,
+        (StreamKind::Audio, PREMIERE_AUDIO_STYLE) if sequence.rate == Rational::integer(24) => Style::Gain,
+        (StreamKind::Audio, PREMIERE_POWER_STYLE) if sequence.rate == Rational::integer(24) => Style::Power,
+        _ => return Err(refuse("unqualified transition style or edit rate").into()),
     };
-    if !qualified
+    let audio = style.audio();
+    let alignment = if before == duration { ALIGNMENT } else { "2" };
+    if style.offset(duration, alignment) != Some(before)
         || transition.track != 1
-        || frames_on(transition.duration, sequence.rate)? != DURATION
         || transition.outgoing.reason.is_some()
         || transition.incoming.reason.is_some()
     {
-        return Err(refuse("expected an eight-frame V1 dissolve or centered 24 fps A1 Constant Gain").into());
+        return Err(refuse("expected a left or centered V1 dissolve or centered 24 fps A1 crossfade").into());
     }
     let ([out], [input]) = (
         transition.outgoing.placements.as_slice(), transition.incoming.placements.as_slice()
@@ -171,7 +281,7 @@ fn prepare_source<'a>(
         return Err(refuse("expected plain endpoints spanning the saved interval and a visible incoming edit").into());
     }
     Ok(SourceDissolve {
-        prepared: Dissolve { cut, before, id: transition.id.clone(), audio },
+        prepared: Dissolve { cut, before, duration, id: transition.id.clone(), style },
         incoming: &incoming.id,
         outgoing: &outgoing.id,
     })
@@ -212,22 +322,13 @@ pub(crate) fn prepare_all_native<'a>(
     let Value::Arr(rows) = data else {
         return Err("invalid Resolve transition receipt".into());
     };
-    if rows.is_empty() || rows.len() > 2 {
-        return Err("expected one transition per supported Resolve lane".into());
+    if rows.is_empty() {
+        return Err("empty Resolve transition receipt".into());
     }
-    let mut seen = [false; 2];
-    let mut prepared = Vec::with_capacity(rows.len());
-    for row in rows {
-        let transition = prepare_native_row(graph, sequence, row)?;
-        let lane = usize::from(transition.prepared.audio);
-        if std::mem::replace(&mut seen[lane], true) {
-            return Err(format!(
-                "Resolve transition {}: expected one transition per supported lane",
-                transition.prepared.id
-            ).into());
-        }
-        prepared.push(transition);
-    }
+    check_count(rows.len())?;
+    let prepared = rows.iter().map(|row| prepare_native_row(graph, sequence, row))
+        .collect::<Result<Vec<_>>>()?;
+    validate_windows(&prepared)?;
     Ok(prepared)
 }
 
@@ -242,11 +343,22 @@ fn prepare_native_row<'a>(
         .clock
         .as_ref()
         .ok_or_else(|| unsupported("missing timeline clock"))?;
-    let audio = str_field(row, "interpretation") == Some(AUDIO_INTERPRETATION);
-    let before = match (str_field(row, "alignment_type"), str_field(row, "interpretation")) {
-        (Some(ALIGNMENT), Some(INTERPRETATION)) => DURATION,
-        (Some("2"), Some(CENTER_INTERPRETATION | AUDIO_INTERPRETATION)) => 4,
-        _ => return Err(unsupported("unqualified Resolve dissolve alignment").into()),
+    let style = str_field(row, "type_label").and_then(Style::from_label)
+        .ok_or_else(|| unsupported("unqualified Resolve transition type"))?;
+    let audio = style.audio();
+    let duration: i64 = str_field(row, "saved_duration").and_then(|s| s.parse().ok())
+        .ok_or_else(|| unsupported("invalid saved duration"))?;
+    let alignment = str_field(row, "alignment_type")
+        .ok_or_else(|| unsupported("missing Resolve transition alignment"))?;
+    let before = style.offset(duration, alignment)
+        .ok_or_else(|| unsupported("unqualified Resolve dissolve alignment"))?;
+    let after = duration - before;
+    let effect_matches = if audio {
+        row.get("effect_filters_sha256").is_none()
+            && str_field(row, "fields_blob_sha256") == Some(AUDIO_FIELDS_SHA)
+    } else {
+        let hash = hex::encode(Sha256::digest(video_effect(duration)?));
+        str_field(row, "effect_filters_sha256") == Some(hash.as_str())
     };
     if !supported_rate(sequence.rate)
         || sequence.frame_size != Some((1920, 1080))
@@ -258,16 +370,10 @@ fn prepare_native_row<'a>(
         || row.get("track_rate_denominator") != Some(&Value::Int(sequence.rate.den()))
         || row.get("timeline_origin_frames").and_then(int)
             != i64::try_from(clock.effective_count).ok()
-        || str_field(row, "type_label") != Some(if audio { AUDIO_TYPE } else { TYPE })
+        || str_field(row, "interpretation") != Some(style.interpretation(duration, alignment))
         || str_field(row, "position") != Some(POSITION)
-        || str_field(row, "saved_duration").and_then(|s| s.parse().ok()) != Some(DURATION)
         || str_field(row, "flags") != Some("0")
-        || (if audio {
-            row.get("effect_filters_sha256").is_some()
-                || str_field(row, "fields_blob_sha256") != Some(AUDIO_FIELDS_SHA)
-        } else {
-            str_field(row, "effect_filters_sha256") != Some(EFFECT_SHA)
-        })
+        || !effect_matches
         || str_field(row, "native_track_id").is_none_or(str::is_empty)
         || str_field(row, "id").is_none_or(str::is_empty)
     {
@@ -319,12 +425,12 @@ fn prepare_native_row<'a>(
         return Err(unsupported("expected plain edits at the transition").into());
     }
     if length < before
-        || frames_on(right.duration, sequence.rate)? < DURATION - before
+        || frames_on(right.duration, sequence.rate)? < after
         || frames_on(right.source_in, sequence.rate)? < before
     {
         return Err(unsupported("insufficient outgoing frames or incoming source handle").into());
     }
-    if before != DURATION {
+    if after != 0 {
         let check_handle = |edit: &graph::Placement, before, after| -> Result<()> {
             let kind = if audio { StreamKind::Audio } else { StreamKind::Video };
             let item = graph.items.iter().find(|item| item.id == edit.item)
@@ -349,7 +455,7 @@ fn prepare_native_row<'a>(
             }
             Ok(())
         };
-        check_handle(left, 0, DURATION - before)?;
+        check_handle(left, 0, after)?;
         if audio { check_handle(right, before, 0)?; }
     }
     if !sequence
@@ -360,7 +466,7 @@ fn prepare_native_row<'a>(
         return Err(unsupported("missing transition track owner").into());
     }
     Ok(SourceDissolve {
-        prepared: Dissolve { cut, before, id: id(row).into(), audio },
+        prepared: Dissolve { cut, before, duration, id: id(row).into(), style },
         incoming,
         outgoing,
     })
@@ -387,6 +493,36 @@ fn str_field<'a>(row: &'a Value, name: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encodes_native_video_duration_without_changing_the_rest_of_the_effect() {
+        let legacy = video_effect(8).unwrap();
+        assert_eq!(hex::encode(&legacy), EFFECT);
+        let mut longer = video_effect(304).unwrap();
+        assert_eq!(&longer[EFFECT_DURATION], &[48, 1, 0, 0]);
+        longer[EFFECT_DURATION].copy_from_slice(&legacy[EFFECT_DURATION]);
+        assert_eq!(longer, legacy);
+        assert_eq!(Style::Video.offset(12, ALIGNMENT), Some(12));
+        assert_eq!(Style::Gain.offset(10, "2"), Some(5));
+        assert_eq!(Style::Power.offset(9, "2"), None);
+    }
+
+    #[test]
+    fn repeated_transitions_require_separate_windows_on_each_lane() {
+        let row = |id: &str, cut, audio| SourceDissolve {
+            prepared: Dissolve { cut, before: 4, duration: LEGACY_DURATION,
+                id: id.into(), style: if audio { Style::Gain } else { Style::Video } },
+            incoming: "in",
+            outgoing: "out",
+        };
+        assert!(validate_windows(&[
+            row("later", 24, false), row("audio", 17, true), row("earlier", 16, false),
+        ]).is_ok());
+        let overlap = validate_windows(&[row("a", 16, false), row("b", 23, false)]);
+        assert!(overlap.unwrap_err().to_string().contains("a and b overlap"));
+        let repeated = validate_windows(&[row("a", 16, false), row("a", 24, true)]);
+        assert!(repeated.unwrap_err().to_string().contains("duplicate Resolve transition ID a"));
+    }
 
     #[test]
     fn qualifies_saved_envelope_variants_and_refuses_malformed_compression() {

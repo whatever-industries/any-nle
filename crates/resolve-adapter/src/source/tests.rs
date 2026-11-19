@@ -12,6 +12,50 @@ const CLIP: &str = "55555555-0000-0000-0000-000000000000";
 const HANDLE: &str = "66666666-0000-0000-0000-000000000000";
 const SEQUENCE: &str = "77777777-0000-0000-0000-000000000000";
 
+#[test]
+fn imported_movie_split_selectors_follow_physical_channel_order() {
+    let selector = |channel| {
+        encode_qt(&[
+            ("AudioType", Qt::Int(1)),
+            ("ChannelsBA", Qt::Bytes(&[0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0x40, channel])),
+        ])
+    };
+    let left = selector(1);
+    let right = selector(2);
+    let clip = |second: &[u8]| {
+        let routes = hex::encode(encode_qt(&[("0", Qt::Bytes(&left)), ("1", Qt::Bytes(second))]));
+        xml::parse(
+            &format!("<Sm2MpVideoClip><VirtualAudioTracksBA>{routes}</VirtualAudioTracksBA></Sm2MpVideoClip>"),
+            &mut 0,
+        ).unwrap()
+    };
+    let mut blobs = Blobs::default();
+    assert_eq!(
+        native_mono_selectors(&clip(&right), &mut blobs).unwrap(),
+        Some([hex::encode(&left), hex::encode(&right)]),
+    );
+    assert!(native_mono_selectors(&clip(&left), &mut blobs).unwrap().is_none());
+}
+
+#[test]
+fn embedded_movie_overrides_physical_audio_channel_without_changing_track() {
+    let make = |stream, channel| {
+        let selector = hex::encode(encode_qt(&[
+            ("AudioType", Qt::Int(1)),
+            ("ChannelsBA", Qt::Bytes(&[0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0x40, channel])),
+        ]));
+        xml::parse(
+            &format!("<Edit><VirtualAudioTrackBA>{selector}</VirtualAudioTrackBA><MediaTrackIdx>{stream}</MediaTrackIdx></Edit>"),
+            &mut 0,
+        ).unwrap()
+    };
+    let mut blobs = Blobs::default();
+    assert_eq!(mono(&make(0, 2), &mut blobs, true, true).unwrap(), Some(1));
+    assert_eq!(mono(&make(1, 2), &mut blobs, true, true).unwrap(), Some(1));
+    assert!(mono(&make(1, 1), &mut blobs, true, true).is_err());
+    assert!(mono(&make(0, 2), &mut blobs, true, false).is_err());
+}
+
 fn build(path: &Path, handle: &str, child_parent: &str) {
     build_with_child_registration(path, handle, child_parent, CHILD);
 }
@@ -186,6 +230,7 @@ fn transition_observations_keep_their_owners_after_graph_serialization() {
     graph.sequences.push(second);
     let grid = Grid {
         rate: crate::prepare::rate(),
+        drop: false,
         origin: 86_400,
         length: 60,
         size: (1920, 1080),

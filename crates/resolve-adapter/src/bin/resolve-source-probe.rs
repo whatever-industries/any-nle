@@ -24,7 +24,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     match args.as_slice() {
         [mode, input, id, ffprobe, output, flags @ ..] if mode == "--premiere" => {
-            let accept_metadata_losses = match flags {
+            let accept_losses = match flags {
                 [] => false,
                 [flag] if flag == "--accept-losses" => true,
                 _ => return Err("expected only --accept-losses after the Premiere output path".into()),
@@ -33,7 +33,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Path::new(input), graph::source::MAX_SOURCE_GRAPH_BYTES,
             )?)?;
             for loss in anynle_resolve_adapter::premiere_export::write_with_options(
-                graph, text(id)?, Path::new(ffprobe), Path::new(output), accept_metadata_losses,
+                graph, text(id)?, Path::new(ffprobe), Path::new(output), accept_losses,
             )? {
                 eprintln!("{} ({}): {}", loss.object, loss.aspect, loss.reason);
             }

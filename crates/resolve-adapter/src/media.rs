@@ -56,7 +56,7 @@ impl VerifiedBinding {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileStamp {
     pub(crate) bytes: u64,
     pub(crate) modified: std::time::SystemTime,
@@ -411,6 +411,43 @@ fn inspect_movie_packets(
         return Err("MOV packet inspection failed".into());
     }
     Ok(())
+}
+
+pub(crate) fn parse_timecode(label: &str, base: u16) -> Result<(u64, bool)> {
+    let bytes = label.as_bytes();
+    if bytes.len() != 11 || bytes[2] != b':' || bytes[5] != b':' || !matches!(bytes[8], b':' | b';')
+    {
+        return Err("invalid physical source timecode label".into());
+    }
+    let parts = [0, 3, 6, 9].map(|i| {
+        let pair = &bytes[i..i + 2];
+        pair.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| u64::from((pair[0] - b'0') * 10 + (pair[1] - b'0')))
+    });
+    let [Some(h), Some(m), Some(s), Some(f)] = parts else {
+        return Err("invalid physical source timecode fields".into());
+    };
+    let drop = bytes[8] == b';';
+    if h >= 24
+        || m >= 60
+        || s >= 60
+        || f >= u64::from(base)
+        || drop && (base != 30 || m % 10 != 0 && s == 0 && f < 2)
+    {
+        return Err("physical source timecode is outside its display clock".into());
+    }
+    let minutes = 60 * h + m;
+    let nominal = (60 * minutes + s) * u64::from(base) + f;
+    Ok((
+        nominal
+            - if drop {
+                2 * (minutes - minutes / 10)
+            } else {
+                0
+            },
+        drop,
+    ))
 }
 
 pub(crate) fn tc_frames(text: &str) -> Result<i64> {

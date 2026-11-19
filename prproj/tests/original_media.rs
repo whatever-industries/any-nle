@@ -103,6 +103,7 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         av_subclips: Vec::new(),
         av_subclip_uses: Vec::new(),
         constant_speeds: Vec::new(),
+        frame_holds: Default::default(),
         picture_nests: Vec::new(),
         layered_submasters: Vec::new(),
         png_mattes: Default::default(),
@@ -112,6 +113,7 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         audio_pans: Vec::new(),
         audio_mixers: Default::default(),
         track_states: Default::default(),
+        timeline_marks: Default::default(),
         non_drop_sequences: Default::default(),
         picture_effects: Vec::new(),
         source_luts: Vec::new(),
@@ -836,6 +838,142 @@ fn mono_wav_edge_fades_and_volume_keys_keep_their_own_clocks() {
         ).unwrap()).unwrap();
         let value = doc.tree.findtext(param, "CurrentValue").unwrap().unwrap();
         assert_eq!(value.parse::<f64>().unwrap(), want);
+    }
+}
+
+#[test]
+fn original_prores_speed_preserves_raw_file_trim() {
+    let scratch = Scratch::new();
+    let frame = TICKS_PER_SECOND / 24;
+    for (name, first, length, ratio, span, playback) in [
+        ("double", 13, 12, (1, 2), 24 * frame, 2.0),
+        ("half-at-tail", 36, 23, (2, 1), 23 * frame / 2, 0.5),
+    ] {
+        let mut project = input(original("prores_hq"));
+        let mut edit = event();
+        edit.stereo.clear();
+        edit.source_in = first * frame;
+        edit.duration = length * frame;
+        edit.speed_ratio = Some(ratio);
+        edit.source_duration = Some(span);
+        project.sequences.push(sequence(vec![edit]));
+        let path = scratch.0.join(format!("{name}.prproj"));
+        let mut ids = SeededUuids::new(name);
+
+        prepare_typed_project(&project, &path, &mut ids, &[], false)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let doc = prproj::xml::parse_prproj(&path).unwrap();
+        let track_item_subclip = doc
+            .tree
+            .find1(doc.root, "VideoClipTrackItem/ClipTrackItem/SubClip")
+            .unwrap();
+        let subclip = doc.resolve(track_item_subclip).unwrap();
+        let clip = doc.resolve(doc.tree.find1(subclip, "Clip").unwrap()).unwrap();
+        let saved = |tag| doc.tree.findtext(clip, tag).unwrap().unwrap();
+        assert_eq!(saved("Clip/PlaybackSpeed").parse::<f64>().unwrap(), playback);
+        assert_eq!(saved("Clip/InPoint").parse::<i64>().unwrap(), first * frame);
+        assert_eq!(saved("Clip/OutPoint").parse::<i64>().unwrap(), first * frame + span);
+
+        let edit = &mut project.sequences[0].events[0];
+        edit.source_duration = Some(span - frame / 2);
+        let invalid = scratch.0.join(format!("{name}-contradictory.prproj"));
+        assert!(prepare_typed_project(&project, &invalid, &mut ids, &[], false).is_err());
+        assert!(!invalid.exists());
+    }
+}
+
+#[test]
+fn frame_hold_belongs_to_the_placed_picture_and_preserves_edit_bounds() {
+    let scratch = Scratch::new();
+    let frame = TICKS_PER_SECOND / 24;
+    let mut project = input(original("prores_hq"));
+    let mut moving = event();
+    moving.stereo.clear();
+    moving.source_in = 12 * frame;
+    moving.duration = 5 * frame;
+    let mut held = moving.clone();
+    held.record_start += moving.duration;
+    held.source_in = 17 * frame;
+    held.duration = 18 * frame;
+    project.sequences.push(sequence(vec![moving, held]));
+    project.frame_holds.insert((0, 1), 47 * frame);
+
+    let path = scratch.0.join("frame-hold.prproj");
+    let mut ids = SeededUuids::new("frame-hold");
+    prepare_typed_project(&project, &path, &mut ids, &[], false)
+        .unwrap()
+        .publish()
+        .unwrap();
+    let doc = prproj::xml::parse_prproj(&path).unwrap();
+    let edits = doc.tree.children(doc.root).iter().copied()
+        .filter(|&node| doc.tree.tag(node) == "VideoClipTrackItem");
+    let mut saved = Vec::new();
+    for edit in edits {
+        let subclip = doc.resolve(doc.tree.find1(edit, "ClipTrackItem/SubClip").unwrap()).unwrap();
+        let clip = doc.resolve(doc.tree.find1(subclip, "Clip").unwrap()).unwrap();
+        let end = doc.tree.findtext(edit, "ClipTrackItem/TrackItem/End").unwrap().unwrap();
+        let hold = doc.tree.findtext(clip, "FrameHold").unwrap();
+        let hold_start = doc.tree.findtext(clip, "FrameHoldStart").unwrap();
+        saved.push((end.parse::<i64>().unwrap(), hold, hold_start));
+    }
+    saved.sort_by_key(|edit| edit.0);
+    assert_eq!(saved, vec![
+        (5 * frame, None, None),
+        (23 * frame, Some("5".into()), Some((47 * frame).to_string())),
+    ]);
+
+    project.frame_holds.insert((0, 1), 48 * frame);
+    let invalid = scratch.0.join("hold-past-file.prproj");
+    assert!(prepare_typed_project(&project, &invalid, &mut ids, &[], false).is_err());
+    assert!(!invalid.exists());
+
+    project.frame_holds.insert((0, 1), 47 * frame);
+    project.frame_holds.insert((0, 2), 47 * frame);
+    let invalid = scratch.0.join("unknown-hold.prproj");
+    assert!(prepare_typed_project(&project, &invalid, &mut ids, &[], false).is_err());
+    assert!(!invalid.exists());
+}
+
+#[test]
+fn sequence_marks_keep_zero_and_an_exclusive_out_without_moving_the_edit() {
+    let scratch = Scratch::new();
+    let frame = TICKS_PER_SECOND / 24;
+    let mut project = input(original("prores_hq"));
+    let mut clip = event();
+    clip.stereo.clear();
+    clip.record_start = 0;
+    clip.source_in = 4 * frame;
+    clip.duration = 12 * frame;
+    let mut timeline = sequence(vec![clip]);
+    timeline.start = 86401 * frame;
+    project.sequences.push(timeline);
+    let mut ids = SeededUuids::new("timeline-marks");
+    let output = scratch.0.join("marks.prproj");
+    project.timeline_marks.insert(0, PreparedTimelineMarks {
+        in_ticks: Some(0),
+        out_ticks: Some(12 * frame),
+    });
+    prepare_typed_project(&project, &output, &mut ids, &[], false)
+        .unwrap().publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&output).unwrap();
+    let seq = doc.tree.children(doc.root).iter().copied()
+        .find(|&node| doc.tree.tag(node) == "Sequence").unwrap();
+    let saved = |key| {
+        doc.tree.findtext(seq, key).unwrap().unwrap().parse::<i64>().unwrap()
+    };
+    assert_eq!(saved("Node/Properties/MZ.ZeroPoint"), 86401 * frame);
+    assert_eq!(saved("Node/Properties/MZ.InPoint"), 0);
+    assert_eq!(saved("Node/Properties/MZ.OutPoint"), 12 * frame);
+
+    let invalid = scratch.0.join("invalid.prproj");
+    for (start, end) in [(Some(frame), Some(frame)), (None, Some(frame + 1)),
+        (Some(12 * frame), None), (None, Some(13 * frame))]
+    {
+        project.timeline_marks.insert(0, PreparedTimelineMarks { in_ticks: start, out_ticks: end });
+        assert!(prepare_typed_project(&project, &invalid, &mut ids, &[], false).is_err());
+        assert!(!invalid.exists());
     }
 }
 

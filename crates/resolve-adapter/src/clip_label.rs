@@ -65,6 +65,10 @@ impl ClipLabel {
         bytes[PREFIX.len()] = self.0;
         bytes
     }
+
+    pub(crate) fn code(self) -> u8 {
+        self.0
+    }
 }
 
 /// Premiere stores a preference slot and a cached packed color on the edit.

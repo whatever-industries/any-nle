@@ -2,13 +2,30 @@
 use super::*;
 use crate::dissolve::{self, Dissolve};
 use crate::{
-    linked::{mixer::DirectMixer, samples_per_frame, Media, PreparedProject, Profile, Timeline},
+    linked::{
+        is_2997, mixer::DirectMixer, movie_audio_sample_extent, samples_per_frame, Media,
+        MovieVideo, PreparedProject, Profile, Timeline,
+    },
     turnover::Templates,
 };
 use graph::{Rational, Value};
 
 const TEMPLATE_23976: &str = "4b2895fa6827801bce87bff7f657dae6454f7011459b689d1983bb11a017ccfc";
 const TEMPLATE_24: &str = "e2a3a1ad16be932947914d866b3c8bb49b549ffd5869a06a9fc9eb576bf21bf5";
+const TEMPLATE_25: &str = "3a9721f6a6d123b28389b8d20824bfcfde2ace83534e041de80587dd3b37929c";
+const TIMELINE_25_DONOR: &str = "SeqContainer/d92e8869-b608-4e44-958a-6662b238afb4.xml";
+const TEMPLATE_STEREO_25: &str = "f4ab29c6baba526708930f0549065bf2dbff2778f733c4656e2464a3bc94591e";
+const TIMELINE_STEREO_25_DONOR: &str = "SeqContainer/a6276b9a-c5f8-4179-bde7-8a7ae6768ec5.xml";
+const TEMPLATE_STEREO_MONO_25: &str = "7e432d101ccafcf1474638f7d44a4f95cb15d457365bfe2af7377b00e2e83e94";
+const TIMELINE_STEREO_MONO_25_DONOR: &str = "SeqContainer/6cfa0ade-e84e-4483-a838-a32132c2efe7.xml";
+const TEMPLATE_2997_DF: &str = "8682789306a7452cfb25e6a59a8e7136a21023d89b43df1eff4c4fe9923f42f8";
+const TIMELINE_2997_DF_DONOR: &str = "SeqContainer/785f172e-1544-45cc-be16-f3f2e67936e8.xml";
+const TEMPLATE_UHD_25: &str = "b601597551a420a0b4469c132e32b515ad5b9c7f19889208f0c3fb28b6a619e5";
+const TIMELINE_UHD_25_DONOR: &str = "SeqContainer/938667b8-5dfd-4dc0-893b-4a0c3e88211b.xml";
+const TEMPLATE_UHD_23976: &str = "761f1ba75ff3435ae525d8025583c4cadca30fdc0156dcc20872b91aee066721";
+const TIMELINE_UHD_23976_DONOR: &str = "SeqContainer/e877d5be-159e-4955-b0e8-7156917f19a6.xml";
+const TEMPLATE_UHD_DF: &str = "db653bc2658d3474efb8b1e594ebead13506c6af688e9dde6a956be82e1557ff";
+const TIMELINE_UHD_DF_DONOR: &str = "SeqContainer/1652bcc5-d67c-4348-b982-8143b1783e0b.xml";
 const TWO_BUS_TEMPLATE: &str = "51e9255ae6fed4f82b7a297531a7fab0bff8353153bfe39e7f797bb7296570cf";
 const TWO_BUS_FOLDER: &str = "MediaPool/Master/000_Originals/MpFolder.xml";
 const THREE_MONO_TEMPLATE: &str = "346c93372828c5068323833437cbb4331ea1b8520d546e75850ea522926b771b";
@@ -21,6 +38,8 @@ const TIMELINE_DONOR: &str = "SeqContainer/93a83077-933a-4ed8-9595-e12534b57e18.
 const PRORES_REC709: &str = "80087810027002789e01800166880132980100d80100";
 const AVC_UNTAGGED: &str = "80089403100228108801329001d080a006980100d80100";
 const AVC_REC709: &str = "80089403100228107002789e018001668801329001d080a006980100d80100";
+const AVC_UHD_UNTAGGED: &str = "80089403100228108801329001e680a006980100d80100";
+const HEVC_MAIN10_UNTAGGED: &str = "8008940310028801329001f08110980100d80100";
 
 pub fn publish_linked(
     prepared: &PreparedProject,
@@ -94,15 +113,26 @@ fn assemble_turnover(
             .map_err(|error| format!("Resolve {role} template {}: {error}", path.display()).into())
     };
     let layout = template("layout", &templates.layout, TEMPLATE_23976, 13)?;
-    let profile = if prepared.rate == Rational::integer(24) {
-        template("profile", &templates.profile, TEMPLATE_24, 10)?
-    } else {
-        template("profile", &templates.profile, TEMPLATE_23976, 13)?
+    let stereo = prepared.timelines.iter().any(|row| row.stereo);
+    let (hash, count, timeline) = match (prepared.canvas, prepared.rate.num(), prepared.rate.den()) {
+        ((1920, 1080), 24, 1) => (TEMPLATE_24, 10, None),
+        ((1920, 1080), 25, 1) if prepared.timelines.iter().any(|row| row.stereo && !row.lanes[2].is_empty()) =>
+            (TEMPLATE_STEREO_MONO_25, 4, Some(("Stereo A1 Mono A2", TIMELINE_STEREO_MONO_25_DONOR))),
+        ((1920, 1080), 25, 1) if stereo =>
+            (TEMPLATE_STEREO_25, 4, Some(("Stereo PCM 25", TIMELINE_STEREO_25_DONOR))),
+        ((1920, 1080), 25, 1) => (TEMPLATE_25, 4, Some(("Linked 25", TIMELINE_25_DONOR))),
+        ((1920, 1080), 30000, 1001) => (TEMPLATE_2997_DF, 4, Some(("Linked DF", TIMELINE_2997_DF_DONOR))),
+        ((1920, 1080), 24000, 1001) => (TEMPLATE_23976, 13, None),
+        ((3840, 2160), 24000, 1001) => (TEMPLATE_UHD_23976, 4, Some(("Linked UHD", TIMELINE_UHD_23976_DONOR))),
+        ((3840, 2160), 25, 1) => (TEMPLATE_UHD_25, 4, Some(("Linked UHD", TIMELINE_UHD_25_DONOR))),
+        ((3840, 2160), 30000, 1001) => (TEMPLATE_UHD_DF, 4, Some(("Linked UHD", TIMELINE_UHD_DF_DONOR))),
+        _ => return Err("missing pinned template for Resolve project rate and canvas".into()),
     };
+    let profile = template("profile", &templates.profile, hash, count)?;
     let atom_donor = if prepared
         .media
         .iter()
-        .any(|m| matches!(m.profile, Profile::Atom(_)))
+        .any(|m| matches!(&m.profile, Profile::BoundMxf(binding) if binding.atom.is_some()))
     {
         let path = templates
             .atom
@@ -110,6 +140,14 @@ fn assemble_turnover(
             .ok_or("split MXF project requires its pinned media template")?;
         let members = template("split MXF", path, SKELETON_SHA256, 6)?;
         Some(block(member(&members, SOURCE)?, "Sm2MpVideoClip")?)
+    } else {
+        None
+    };
+    let op1a_donor = if prepared.media.iter()
+        .any(|m| matches!(&m.profile, Profile::BoundMxf(binding) if binding.atom.is_none()))
+    {
+        Some(super::group::camera_donor(templates.group.as_deref()
+            .ok_or("OP1a cameras require the pinned Resolve Group template")?)?)
     } else {
         None
     };
@@ -145,13 +183,23 @@ fn assemble_turnover(
         let path = templates.nested.as_deref().ok_or("missing pinned Resolve nesting template")?;
         Some(template("nesting", path, NEST_TEMPLATE, 9)?)
     } else { None };
+    let (timeline_profile, name, path) = match timeline {
+        Some((name, path)) => (&profile, name, path),
+        None => (&layout, "Linked A", TIMELINE_DONOR),
+    };
+    let pool = named(member(timeline_profile, POOL)?, "Sm2MpTimelineClip", name)?;
+    let donors = TimelineDonors {
+        pool: &pool,
+        container: member(timeline_profile, path)?,
+        fairlight: fairlight.as_ref(),
+    };
     build(
         prepared,
         &layout,
         &profile,
-        atom_donor.as_deref(),
+        [atom_donor.as_deref(), op1a_donor.as_deref()],
         templates.group.as_deref(),
-        fairlight.as_ref(),
+        &donors,
         wider_layout.as_ref(),
         nest_template.as_ref(),
     )
@@ -311,8 +359,10 @@ fn clip_cache(media: &Media, codec: &[u8], video: bool) -> Result<String> {
     pb_bytes(2, file.as_bytes(), &mut data);
     let embedded_pcm = matches!(media.profile,Profile::Mov {pcm:Some(_),..});
     let mono_atom = matches!(media.profile, Profile::MonoAtom { .. });
-    if embedded_pcm || mono_atom {
-        pb_bytes(3, resolve_file_stamp(media.modified_micros / 1_000_000)?.as_bytes(), &mut data);
+    let hevc = matches!(media.profile, Profile::Mov { video: MovieVideo::HevcMain10, .. });
+    if embedded_pcm || mono_atom || hevc {
+        let seconds = media.calendar_seconds.unwrap_or(media.modified_micros / 1_000_000);
+        pb_bytes(3, resolve_file_stamp(seconds)?.as_bytes(), &mut data);
     }
     pb_bytes(5, codec, &mut data);
     if video {
@@ -320,13 +370,15 @@ fn clip_cache(media: &Media, codec: &[u8], video: bool) -> Result<String> {
         pb_bytes(7, uid().as_bytes(), &mut data);
     }
     pb_int(13, media.modified_micros, &mut data);
-    if embedded_pcm && video {
+    if video && hevc {
+        pb_int(14, 2570, &mut data);
+    } else if video && matches!(media.profile, Profile::Mov { video: MovieVideo::ProResHq, pcm: Some(_), .. }) {
         pb_int(14, 244, &mut data);
     } else if matches!(
         media.profile,
         Profile::Mov {
-            quicktime_timecode: false,
-            h264: false,
+            quicktime_timecode: None,
+            video: MovieVideo::ProResHq,
             ..
         }
     ) {
@@ -348,11 +400,15 @@ fn clip_cache(media: &Media, codec: &[u8], video: bool) -> Result<String> {
     pack(&data)
 }
 
-fn embedded_audio(item: &mut String, source: &str, media: &Media, frames: i64, rate: Rational, pcm: Option<i64>) -> Result<()> {
+fn embedded_audio(item: &mut String, source: &str, media: &Media, frames: i64, rate: Rational, pcm: Option<i64>, stereo: bool) -> Result<()> {
     let donor = named(source, "Sm2MpAudioClip", "Signals-24.wav")?;
     let base = block(&donor, "BtAudioInfo")?;
     let id = uid();
-    let samples = frames * samples_per_frame(rate);
+    let samples = if matches!(&media.profile, Profile::Mov { video: MovieVideo::Avc | MovieVideo::HevcMain10, .. }) {
+        movie_audio_sample_extent(frames, rate)?
+    } else {
+        frames * samples_per_frame(rate)?
+    };
     let (codec, depth) = match pcm { Some(16) => ("Linear PCM",1), Some(24) => ("Linear PCM",2), _ => ("AAC",3) };
     let start = match &media.profile {
         Profile::Mov { avid_source_timecode: Some(start), .. } if pcm.is_some() => *start as f64 / fps(rate),
@@ -386,13 +442,14 @@ fn embedded_audio(item: &mut String, source: &str, media: &Media, frames: i64, r
         "EmbeddedAudioVec",
         &format!("<Element>{audio}</Element>"),
     )?;
-    let mono_left = mono_selector(0, false)?;
-    let mono_right = mono_selector(1, false)?;
-    set(
-        item,
-        "VirtualAudioTracksBA",
-        &hex::encode(qt(&[("1", Bytes(&mono_right)), ("0", Bytes(&mono_left))])),
-    )?;
+    let virtual_tracks = if stereo {
+        String::new() // Native stereo uses the embedded track's default left/right mapping.
+    } else {
+        let mono_left = mono_selector(0, false)?;
+        let mono_right = mono_selector(1, false)?;
+        hex::encode(qt(&[("1", Bytes(&mono_right)), ("0", Bytes(&mono_left))]))
+    };
+    set(item, "VirtualAudioTracksBA", &virtual_tracks)?;
     let left = qt(&[("MediaRef", Text(&id))]);
     let right = qt(&[("MediaRef", Text(&id)), ("ChannelIdx", Int(1))]);
     let channels = qt(&[("1", Bytes(&right)), ("0", Bytes(&left))]);
@@ -417,7 +474,7 @@ fn embedded_audio(item: &mut String, source: &str, media: &Media, frames: i64, r
     })
 }
 
-fn mono_selector(channel: usize, atom: bool) -> Result<Vec<u8>> {
+pub(super) fn mono_selector(channel: usize, atom: bool) -> Result<Vec<u8>> {
     let mut channels = [0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0x40, 1];
     let index = u8::try_from(channel + 1)?;
     if atom {
@@ -450,8 +507,18 @@ fn pool_item(
     media: &Media,
     bin: &str,
     project_rate: Rational,
-    atom_donor: Option<&str>,
+    mxf_donors: [Option<&str>; 2],
+    stereo: bool,
 ) -> Result<(String, String)> {
+    if let Some(native) = &media.native {
+        let ids = new_ids(&native.xml)?;
+        let mut item = remap(native.xml.clone(), &ids);
+        let id = dbid(&item)?.to_owned();
+        replace_fields(&mut item, |data| Ok(remap_blob(data, &ids)))?;
+        set(&mut item, "MpFolder", bin)?;
+        prefix_name(&mut item, &media.name)?;
+        return Ok((id, item));
+    }
     let donor = match &media.profile {
         Profile::Mov { .. } => named(source, "Sm2MpVideoClip", "Counter-23976.mov")?,
         Profile::Wav { bits, channels, .. } => {
@@ -463,8 +530,9 @@ fn pool_item(
         }
         Profile::MonoAtom { bits, .. } =>
             named(source, "Sm2MpAudioClip", &format!("Mono-{bits}.wav"))?,
-        Profile::Atom(binding) => {
-            let donor = atom_donor.ok_or("missing split MXF template")?;
+        Profile::BoundMxf(binding) => {
+            let donor = mxf_donors[usize::from(binding.atom.is_none())]
+                .ok_or("missing linked MXF template")?;
             let id = uid();
             let (folder, file) = media_path_parts(&binding.path)?;
             let mut item = bind_pool_item(donor, binding, folder, file, &id)?;
@@ -482,11 +550,11 @@ fn pool_item(
         Profile::Mov {
             rate,
             frames,
+            raster,
             tagged_rec709,
-            h264,
+            video: codec,
             aac,
             pcm,
-            avid_source_timecode,
             ..
         } => {
             let old = block(&item, "BtVideoInfo")?;
@@ -494,7 +562,7 @@ fn pool_item(
             set(
                 &mut video,
                 "Clip",
-                &clip_cache(media, if *h264 { b"avc1" } else { b"apch" }, true)?,
+                &clip_cache(media, codec.cache_codec()?.as_bytes(), true)?,
             )?;
             let timing_id = uid();
             let frame_rate = rate_bytes(*rate);
@@ -504,32 +572,31 @@ fn pool_item(
                 ("NumFrames", Int(i32::try_from(*frames)?)),
                 ("FrameRate", Bytes(&frame_rate)),
             ];
-            let timecode = avid_source_timecode.map(crate::linked::non_drop_24);
+            let timecode = media.profile.movie_timecode().map(crate::linked::non_drop_24);
             if let Some(timecode) = &timecode {
                 timing.push(("Timecode", Text(timecode)));
             }
             timing.push(("DbType", Text("BtVideoTime")));
             set(&mut video, "Time", &hex::encode(qt(&timing)))?;
-            if *h264 {
+            if *codec != MovieVideo::ProResHq {
+                let (frame_size, radiometry) = match (codec, raster) {
+                    (MovieVideo::Avc, (1920, 1080)) if *tagged_rec709 => (3126784, AVC_REC709),
+                    (MovieVideo::Avc, (1920, 1080)) => (3126784, AVC_UNTAGGED),
+                    (MovieVideo::Avc, (3840, 2160)) if !tagged_rec709 => (12457984, AVC_UHD_UNTAGGED),
+                    (MovieVideo::HevcMain10, (1920, 1080)) => (6237184, HEVC_MAIN10_UNTAGGED),
+                    _ => return Err("unqualified Resolve AVC or HEVC media cache geometry".into()),
+                };
                 let mut resolution = [0; 16];
-                resolution[..8].copy_from_slice(&1920u64.to_be_bytes());
-                resolution[8..].copy_from_slice(&1080u64.to_be_bytes());
+                resolution[..8].copy_from_slice(&u64::from(raster.0).to_be_bytes());
+                resolution[8..].copy_from_slice(&u64::from(raster.1).to_be_bytes());
                 let geometry = qt(&[
                     ("UniqueId", Text(&uid())),
                     ("Resolution", Bytes(&resolution)),
-                    ("FrameSize", Int(3126784)),
+                    ("FrameSize", Int(frame_size)),
                     ("DbType", Text("BtGeometry")),
                 ]);
                 set(&mut video, "Geometry", &hex::encode(geometry))?;
-                set(
-                    &mut video,
-                    "Radiometry",
-                    if *tagged_rec709 {
-                        AVC_REC709
-                    } else {
-                        AVC_UNTAGGED
-                    },
-                )?;
+                set(&mut video, "Radiometry", radiometry)?;
             } else if *tagged_rec709 {
                 set(&mut video, "Radiometry", PRORES_REC709)?;
             }
@@ -540,7 +607,7 @@ fn pool_item(
             set(&mut video, "VideoMetadata", &hex::encode(metadata))?;
             replace_once(&mut item, &old, &video)?;
             if *aac || pcm.is_some() {
-                embedded_audio(&mut item, source, media, *frames, *rate, *pcm)?;
+                embedded_audio(&mut item, source, media, *frames, *rate, *pcm, stereo)?;
             }
             if let Some(proxy) = &media.proxy {
                 let proxy_cache = super::proxy_cache::build(proxy)?;
@@ -563,11 +630,11 @@ fn pool_item(
             ]);
             set(&mut item, "VirtualAudioTracksBA", "")?;
             standalone_audio(
-                &mut item, media, project_rate, frames * samples_per_frame(project_rate),
+                &mut item, media, project_rate, frames * samples_per_frame(project_rate)?,
                 *bits, 1, Some((seconds(*start), &identity)),
             )?;
         }
-        Profile::Atom(_) => return Err("unexpected split MXF template profile".into()),
+        Profile::BoundMxf(_) => return Err("unexpected split MXF template profile".into()),
     }
     Ok((id, item))
 }
@@ -659,14 +726,14 @@ struct TimelineDonors<'a> {
     fairlight: Option<&'a Mixer>,
 }
 
-fn write_timeline(
-    timeline: &Timeline,
+fn write_timeline<'a>(
+    timeline: &'a Timeline,
     rate: Rational,
     bin: &str,
     media: &[Media],
     media_ids: &[String],
     donors: &TimelineDonors<'_>,
-    labels: &mut Vec<(String, crate::clip_label::ClipLabel)>,
+    edit_metadata: &mut Vec<markers::EditMetadata<'a>>,
 ) -> Result<(String, String, String, String, String)> {
     let mut ids = new_ids(donors.pool)?;
     for (old, new) in new_ids(donors.container)? {
@@ -701,7 +768,9 @@ fn write_timeline(
     let mut sequence = old_sequence.clone();
     let sequence_id = dbid(&sequence)?.to_owned();
     let rate_hex = hex::encode(rate_bytes(rate));
-    set(&mut sequence, "FrameRate", &rate_hex)?;
+    let mut timeline_clock = rate_bytes(rate);
+    timeline_clock[15] = u8::from(is_2997(rate));
+    set(&mut sequence, "FrameRate", &hex::encode(timeline_clock))?;
     set(
         &mut sequence,
         "MediaExtents",
@@ -765,7 +834,7 @@ fn write_timeline(
         .find_iter(&container)
         .map(|m| m.range())
         .collect();
-    let lane_order: &[usize] = if timeline.compound {
+    let lane_order: &[usize] = if timeline.compound || timeline.stereo && timeline.lanes[2].is_empty() {
         &[0, 1]
     } else if third_mono {
         &[0, 3, 1, 2, 4]
@@ -790,22 +859,30 @@ fn write_timeline(
             if let Some(dissolve) = timeline
                 .dissolves
                 .iter()
-                .find(|dissolve| lane == usize::from(dissolve.audio) && edit.start == dissolve.cut)
+                .find(|dissolve| lane == usize::from(dissolve.audio()) && edit.start == dissolve.cut)
             {
-                write_dissolve(&mut list, timeline.origin, dissolve);
+                write_dissolve(&mut list, timeline.origin, dissolve)?;
             }
             let source = &media[edit.media];
             let mut clip = base.to_owned();
             let old_id = dbid(&clip)?.to_owned();
             let clip_id = uid();
             replace_once(&mut clip, &old_id, &clip_id)?;
-            if let Some(label) = edit.label {
-                labels.push((clip_id, label));
+            if edit.label.is_some() || !edit.markers.is_empty() {
+                edit_metadata.push(markers::EditMetadata {
+                    owner: clip_id,
+                    label: edit.label,
+                    markers: &edit.markers,
+                });
             }
             set(&mut clip, "Name", &xml(&source.name))?;
             set(&mut clip, "MediaRef", &media_ids[edit.media])?;
             set(&mut clip, "MediaFilePath", &xml(utf8_path(&source.path)?))?;
-            set(&mut clip, "MediaFrameRate", &rate_hex)?;
+            if let Some(cadence) = edit.mixed_rate {
+                set(&mut clip, "MediaFrameRate", &hex::encode(rate_bytes(cadence.source_rate())))?;
+            } else {
+                set(&mut clip, "MediaFrameRate", &rate_hex)?;
+            }
             set(
                 &mut clip,
                 "Start",
@@ -815,28 +892,32 @@ fn write_timeline(
             if let Some(video) = &edit.video {
                 set(&mut clip, "EffectFiltersBA", &video.encoded)?;
             }
+            if edit.input_sizing == Some(crate::input_scaling::Sizing::CenterCrop) {
+                replace_fields(&mut clip, |fields| crate::input_scaling::crop_fields(&fields))?;
+                set(&mut clip, "EffectFiltersBA", crate::input_scaling::CROP_FILTERS)?;
+            }
             if let Some(envelope) = edit.envelope {
                 set(&mut clip, "EffectFiltersBA", &envelope.encode()?)?;
             }
             let atom = match &source.profile {
-                Profile::Atom(binding) => Some(binding),
+                Profile::BoundMxf(binding) => Some(binding),
                 _ => None,
             };
             let end = match &source.profile {
-                Profile::Mov { frames, avid_source_timecode, .. } => {
-                    if let Some(start) = avid_source_timecode {
-                        set(&mut clip, "MediaStartTime", &(*start as f64 / fps(rate)).to_string())?;
+                Profile::Mov { frames, .. } => {
+                    if let Some(start) = source.profile.movie_timecode() {
+                        set(&mut clip, "MediaStartTime", &(start as f64 / fps(rate)).to_string())?;
                     }
                     (frames - 1) as f64 / fps(rate)
                 }
                 Profile::Wav { samples, .. } => {
-                    (samples - samples_per_frame(rate)) as f64 / 48000.0
+                    (samples - samples_per_frame(rate)?) as f64 / 48000.0
                 }
                 Profile::MonoAtom { frames, start, .. } => {
                     set(&mut clip, "MediaStartTime", &seconds(*start).to_string())?;
                     seconds(frames - 1)
                 }
-                Profile::Atom(binding) => {
+                Profile::BoundMxf(binding) => {
                     set(
                         &mut clip,
                         "MediaStartTime",
@@ -845,33 +926,48 @@ fn write_timeline(
                     seconds(binding.frames - 1)
                 }
             };
-            let (saved_in, map) = match (edit.speed, &source.profile) {
-                (Some(speed), Profile::Mov { frames, .. }) => {
+            let (saved_in, map) = match (edit.speed, edit.mixed_rate, &source.profile) {
+                (Some(speed), None, Profile::Mov { frames, .. }) => {
                     let saved_in = speed.record_source_in(edit.source_in, edit.length, *frames)
                         .ok_or("invalid Resolve retime source trim")?;
                     set(&mut clip, "EffectFiltersBA", crate::retime::NEAREST)?;
                     (saved_in, speed.encode(*frames, &uid())?)
                 }
-                (Some(_), _) => return Err("Resolve picture speed requires linked MOV media".into()),
-                (None, _) => {
+                (Some(_), _, _) => return Err("Resolve picture speed requires linked MOV media".into()),
+                (None, None, Profile::Mov { frames, .. }) if edit.hold => {
+                    set(&mut clip, "EffectFiltersBA", crate::retime::NEAREST)?;
+                    (crate::retime::HOLD_IN.to_owned(), crate::retime::encode_hold(edit.source_in, *frames, &uid())?)
+                }
+                (None, Some(cadence), Profile::Mov { frames, .. }) => {
+                    let saved_in = cadence.encode_in(edit.source_in)
+                        .ok_or("mixed-rate picture cadence is not qualified for Resolve writing")?;
+                    (saved_in, cadence.time_map(*frames))
+                }
+                (None, Some(_), _) => return Err("Resolve mixed-rate picture requires linked MOV media".into()),
+                (None, None, _) => {
                     let mut map = vec![2];
                     map.extend_from_slice(&end.to_be_bytes());
-                    (edit.source_in, map)
+                    (edit.source_in.to_string(), map)
                 }
             };
-            set(&mut clip, "In", &saved_in.to_string())?;
+            set(&mut clip, "In", &saved_in)?;
             set(&mut clip, "MediaTimemapBA", &hex::encode(map))?;
             if let Some((_, body)) = &edit.grade {
                 write_grade(&mut clip, body)?;
             }
             if let Some(channel) = edit.channel {
-                let selector = if atom.is_some() { channel } else { 0 };
-                set(
-                    &mut clip,
-                    "VirtualAudioTrackBA",
-                    &hex::encode(mono_selector(channel, atom.is_some())?),
-                )?;
+                let (selector, payload) = if let Some(native) = &source.native {
+                    let saved = native.selectors.as_ref().and_then(|selectors| selectors.get(channel))
+                        .ok_or("missing verified native audio selector")?;
+                    (channel, saved.clone())
+                } else {
+                    (if atom.is_some() { channel } else { 0 }, hex::encode(mono_selector(channel, atom.is_some())?))
+                };
+                set(&mut clip, "VirtualAudioTrackBA", &payload)?;
                 set(&mut clip, "MediaTrackIdx", &selector.to_string())?;
+            } else if timeline.stereo && lane == 1 {
+                set(&mut clip, "VirtualAudioTrackBA", crate::stereo::SELECTOR)?;
+                set(&mut clip, "MediaTrackIdx", "0")?;
             }
             if list.len().saturating_add(clip.len()).saturating_add(32) as u64 > MAX_XML {
                 return Err("timeline XML exceeds its construction budget".into());
@@ -1040,7 +1136,7 @@ fn write_captions(container: &mut String, timeline: &Timeline, sequence_id: &str
     Ok(())
 }
 
-fn write_dissolve(list: &mut String, origin: i64, transition: &Dissolve) {
+fn write_dissolve(list: &mut String, origin: i64, transition: &Dissolve) -> Result<()> {
     use std::fmt::Write as _;
     // Resolve keeps the visible edit ranges and stores overlap on the transition.
     let start = origin + transition.window().start;
@@ -1059,15 +1155,16 @@ fn write_dissolve(list: &mut String, origin: i64, transition: &Dissolve) {
             "</Sm2TiTransition></Element>"
         ),
         id = uid(),
-        fields = if transition.audio { dissolve::AUDIO_FIELDS } else { dissolve::FIELDS },
-        kind = transition.type_label(),
+        fields = if transition.audio() { dissolve::AUDIO_FIELDS } else { dissolve::FIELDS },
+        kind = transition.style.native_label(),
         start = start,
-        duration = dissolve::DURATION,
-        effect = if transition.audio { "" } else { dissolve::EFFECT },
+        duration = transition.duration,
+        effect = if transition.audio() { String::new() } else { hex::encode(dissolve::video_effect(transition.duration)?) },
         alignment = transition.alignment(),
         position = dissolve::POSITION,
     )
     .expect("writing to a String cannot fail");
+    Ok(())
 }
 
 fn folder_path(index: usize, project: &PreparedProject) -> Result<String> {
@@ -1116,9 +1213,9 @@ fn build(
     p: &PreparedProject,
     layout: &Members,
     profile: &Members,
-    atom_donor: Option<&str>,
+    mxf_donors: [Option<&str>; 2],
     group_template: Option<&Path>,
-    fairlight: Option<&Mixer>,
+    donors: &TimelineDonors<'_>,
     wider_layout: Option<&Members>,
     nest_template: Option<&Members>,
 ) -> Result<(Members, Identities)> {
@@ -1131,12 +1228,6 @@ fn build(
     let mut media_ids = Vec::new();
     let mut remaining_xml = MAX_XML as usize;
     let donor = member(layout, MEDIA_DONOR)?;
-    let timeline_donor = named(member(layout, POOL)?, "Sm2MpTimelineClip", "Linked A")?;
-    let donors = TimelineDonors {
-        pool: &timeline_donor,
-        container: member(layout, TIMELINE_DONOR)?,
-        fairlight,
-    };
     let wide_pool = wider_layout.map(|members|
         named(member(members, POOL)?, "Sm2MpTimelineClip", "Native lanes")).transpose()?;
     let wider_donors = match (wider_layout, wide_pool.as_deref()) {
@@ -1154,8 +1245,13 @@ fn build(
     };
     let nest_edit = nest_template.map(|members|
         named(member(members, NEST_PARENT)?, "Sm2TiVideoClip", "Witness A")).transpose()?;
-    for media in &p.media {
-        let (id, item) = pool_item(donor, media, &bin_ids[media.bin], p.rate, atom_donor)?;
+    let stereo_sources: HashSet<_> = p.timelines.iter().filter(|row| row.stereo)
+        .flat_map(|row| row.lanes[1].iter().map(|edit| edit.media))
+        .collect();
+    for (index, media) in p.media.iter().enumerate() {
+        let (id, item) = pool_item(
+            donor, media, &bin_ids[media.bin], p.rate, mxf_donors, stereo_sources.contains(&index),
+        )?;
         remaining_xml = remaining_xml
             .checked_sub(item.len() + 19)
             .ok_or("media XML exceeds its construction budget")?;
@@ -1168,7 +1264,7 @@ fn build(
     let mut timeline_pools = Vec::new();
     let mut timeline_containers = Vec::new();
     let mut group_id = None;
-    let mut labels = Vec::new();
+    let mut edit_metadata = Vec::new();
     let mut project = member(profile, PROJECT)?.to_owned();
     set(&mut project, "ProjectName", &xml(&p.name))?;
     set(
@@ -1210,7 +1306,7 @@ fn build(
         let donors = if timeline.compound {
             compound_donors.as_ref().ok_or("missing native compound template")?
         } else if timeline.lanes[4].is_empty() {
-            &donors
+            donors
         } else {
             wider_donors.as_ref().ok_or("missing three-mono timeline layout")?
         };
@@ -1221,7 +1317,7 @@ fn build(
             &p.media,
             &media_ids,
             donors,
-            &mut labels,
+            &mut edit_metadata,
         )?;
         remaining_xml = remaining_xml
             .checked_sub(pool.len() + container.len() + 19)
@@ -1249,7 +1345,12 @@ fn build(
             write_nested_uses(timeline, p, &timeline_pools, template, target, &mut remaining_xml)?;
         }
     }
-    markers::write_labels(&mut project, &labels)?;
+    markers::write_edits(&mut project, &edit_metadata)?;
+    if !p.pool_markers.is_empty() {
+        let rows = media_ids.iter().enumerate().filter_map(|(index, id)|
+            p.pool_markers.get(&index).map(|marks| (id.as_str(), marks.as_slice())));
+        markers::write_pool(&mut project, rows)?;
+    }
     container_field(&mut project, "TimelineHandleVec", &handles)?;
     members.insert(PROJECT.into(), project);
     members.insert("Gallery.xml".into(), member(profile, "Gallery.xml")?.into());
@@ -1368,7 +1469,8 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
         }
         let saved = dissolve::prepare_all_native(&graph, read)?;
         if saved.len() != timeline.dissolves.len() || !timeline.dissolves.iter().all(|expected| {
-            saved.iter().any(|actual| actual.prepared.audio == expected.audio
+            saved.iter().any(|actual| actual.prepared.style == expected.style
+                && actual.prepared.duration == expected.duration
                 && actual.prepared.cut == expected.cut && actual.prepared.before == expected.before)
         }) {
             return Err("generated Resolve dissolve differs from preparation".into());
@@ -1415,7 +1517,29 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             return Err("generated Resolve child bin order differs from preparation".into());
         }
     }
-    for (media, id) in p.media.iter().zip(&ids.media) {
+    for (index, (media, id)) in p.media.iter().zip(&ids.media).enumerate() {
+        let item = graph.items.iter().find(|item| item.id == *id)
+            .ok_or("generated Resolve media item absent")?;
+        if let Some(expected) = p.pool_markers.get(&index) {
+            let (rate, frames) = media.profile.pool_marker_grid(p.rate)?
+                .ok_or("generated Resolve source markers require qualified linked media")?;
+            let (actual, omitted) = crate::prepare::prepare_pool_markers(&graph, item, rate, frames)?;
+            if !omitted.is_empty() || &actual != expected
+                || graph.sidecar(crate::source::POOL_MARKER_ADAPTER, id).is_none()
+            {
+                return Err("generated Resolve source markers differ from preparation".into());
+            }
+        } else if !item.markers.is_empty()
+            || graph.sidecar(crate::source::POOL_MARKER_ADAPTER, id).is_some()
+        {
+            return Err("generated Resolve media has unexpected source markers".into());
+        }
+        if let Some(native) = &media.native {
+            if !native.readback(&graph, id) {
+                return Err("generated native media bindings differ from the verified import".into());
+            }
+            continue;
+        }
         if let Profile::MonoAtom { frames, bits, start, package, material } = &media.profile {
             let stream_id = format!("{id}/audio/1");
             let item = graph.items.iter().find(|item| item.id == *id)
@@ -1449,7 +1573,9 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                 return Err("generated Resolve proxy locator, extent or PCM assignment disagrees".into());
             }
         }
-        if let Profile::Mov { avid_source_timecode: Some(start), rate, frames, .. } = &media.profile {
+        if let (Profile::Mov { rate, frames, .. }, Some(start)) =
+            (&media.profile, media.profile.movie_timecode())
+        {
             let file = utf8_path(&media.path)?;
             let source = graph.media.iter().find(|source| source.id == format!("{id}/video"))
                 .ok_or("generated camera-original video stream absent")?;
@@ -1457,36 +1583,42 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                 || source.codec.as_deref() != Some("apch")
                 || source.rate != Some(*rate)
                 || Some(source.duration) != Rational::new(i128::from(*frames) * i128::from(rate.den()), rate.num().into())
-                || source.start != Rational::new(i128::from(*start) * i128::from(rate.den()), rate.num().into())
-                || source.clock.as_ref().is_none_or(|clock| clock.effective_count != *start as u64)
+                || source.start != Rational::new(i128::from(start) * i128::from(rate.den()), rate.num().into())
+                || source.clock.as_ref().is_none_or(|clock| clock.effective_count != start as u64)
             {
                 return Err("generated camera-original locator, source timecode or extent differs from preparation".into());
             }
         }
         if let Profile::Mov {
-            h264,
+            video,
             rate,
             frames,
+            raster: (width, height),
             aac,
             pcm,
             ..
         } = &media.profile
         {
-            if !*h264 && pcm.is_none() { continue; }
+            if *video == MovieVideo::ProResHq && pcm.is_none() { continue; }
             let item = graph
                 .items
                 .iter()
                 .find(|item| item.id == *id)
-                .ok_or("generated AVC media item absent")?;
+                .ok_or("generated MOV or MP4 media item absent")?;
             let duration = Rational::new(
                 i128::from(*frames) * i128::from(rate.den()),
                 rate.num().into(),
             )
-            .ok_or("generated AVC duration overflow")?;
+            .ok_or("generated MOV or MP4 duration overflow")?;
             let file = utf8_path(&media.path)?;
-            let video_codec = if *h264 {"avc1"} else {"apch"};
+            let video_codec = video.cache_codec()?;
             let audio_codec = if *aac { Some("aac") } else {
-                match pcm {Some(16)=>Some("pcm_s16le"),Some(24)=>Some("pcm_s24le"),_=>None}
+                match pcm {
+                    Some(_) if *video == MovieVideo::Avc => Some("pcm"),
+                    Some(16) => Some("pcm_s16le"),
+                    Some(24) => Some("pcm_s24le"),
+                    _ => None,
+                }
             };
             let expected = [Some(video_codec),audio_codec,audio_codec];
             let mut streams = item.media.iter();
@@ -1494,27 +1626,52 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                 let saved = streams
                     .next()
                     .and_then(|link| graph.media.iter().find(|row| row.id == link.media))
-                    .ok_or("generated AVC media stream absent")?;
+                    .ok_or("generated MOV or MP4 media stream absent")?;
+                let stream_duration = if matches!(codec, "aac" | "pcm") {
+                    Rational::new(movie_audio_sample_extent(*frames, *rate)?.into(), 48_000)
+                        .ok_or("generated embedded movie audio duration overflow")?
+                } else { duration };
                 if saved.locations.as_slice() != [file]
-                    || saved.duration != duration
+                    || saved.duration != stream_duration
                     || saved.codec.as_deref() != Some(codec)
+                    || (codec == "pcm" && saved.bits != *pcm)
+                    || (saved.kind == graph::StreamKind::Video
+                        && saved.frame_size != Some((i64::from(*width), i64::from(*height))))
                 {
                     return Err(
-                        "generated AVC source clock or locator differs from preparation".into(),
+                        "generated MOV or MP4 source clock or locator differs from preparation".into(),
                     );
                 }
             }
             if streams.next().is_some() {
-                return Err("generated AVC media has an unexpected stream".into());
+                return Err("generated MOV or MP4 media has an unexpected stream".into());
             }
         }
-        let Profile::Atom(binding) = &media.profile else {
+        let Profile::BoundMxf(binding) = &media.profile else {
             continue;
         };
-        let files = binding
-            .atom
-            .as_ref()
-            .ok_or("split MXF verification absent")?;
+        let Some(files) = &binding.atom else {
+            // Reuse the native media check with the IDs allocated by this archive.
+            let saved_binding = crate::VerifiedBinding {
+                item_id: id.clone(),
+                path: binding.path.clone(),
+                streams: std::array::from_fn(|index| crate::StreamSelector {
+                    media_id: if index == 0 { format!("{id}/video") } else { format!("{id}/audio/{index}") },
+                    index,
+                    channel: (index > 0).then_some(0),
+                }),
+                frames: binding.frames,
+                timecode_frames: binding.timecode_frames,
+                source_package: binding.source_package,
+                modified_micros: binding.modified_micros,
+                tagged_rec709: binding.tagged_rec709,
+                digest: binding.digest,
+                atom: None,
+            };
+            crate::prepare::check_binding_profile(&graph, &saved_binding, true)
+                .map_err(|error| format!("generated OP1a camera differs from preparation: {error}"))?;
+            continue;
+        };
         let item = graph
             .items
             .iter()
@@ -1554,6 +1711,8 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
         } else {
             timeline.lanes.iter().map(Vec::len).sum::<usize>()
         };
+        let marker_count = timeline.markers.len()
+            + timeline.lanes.iter().flatten().map(|edit| edit.markers.len()).sum::<usize>();
         let owner = graph.sidecar("resolve.source", &read.id).ok_or("generated Resolve sequence owner is absent")?;
         let folder = owner.get("bin_id");
         if timeline.compound && (crate::nests::string(owner,"kind") != Some("compound")
@@ -1565,13 +1724,13 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
         if read.id != ids.sequences[index]
             || read.name != timeline.name
             || read.rate != p.rate
-            || read.frame_size != Some((1920, 1080))
-            || read.clock.as_ref().map(|clock| clock.effective_count)
-                != Some(timeline.origin as u64)
+            || read.frame_size != Some((i64::from(p.canvas.0), i64::from(p.canvas.1)))
+            || read.clock.as_ref().map(|clock| (clock.effective_count, clock.drop))
+                != Some((timeline.origin as u64, is_2997(p.rate)))
             || owner.get("record_length") != Some(&Value::Int(timeline.length))
             || read.placements.len() != count
             || crate::prepare::prepare_markers(&graph, read, timeline.length)?.0 != timeline.markers
-            || read.markers.len() != timeline.markers.len()
+            || read.markers.len() != marker_count
             || crate::timeline_marks::TimelineMarks::prepare(&graph, &read.id, timeline.length)?
                 != timeline.marks
             || crate::track_state::TrackState::prepare(&graph, read)? != timeline.track_state
@@ -1670,13 +1829,22 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
             continue;
         }
         for (lane, expected) in timeline.lanes.iter().enumerate() {
-            let actual = read.placements.iter().filter(|edit| match lane {
+            let on_lane = |edit: &&graph::Placement| match lane {
                 0 => edit.video_track == Some(1),
+                1 if timeline.stereo => crate::stereo::placement(edit),
                 3 => edit.video_track == Some(2),
                 4 => edit.audio_tracks.as_slice() == [3],
                 audio => edit.audio_tracks.as_slice() == [audio as i64],
-            });
-            for (edit, wanted) in actual.zip(expected) {
+            };
+            for (edit, wanted) in read.placements.iter().filter(on_lane).zip(expected) {
+                let saved_markers = graph.sidecar(crate::source::EDIT_MARKER_ADAPTER, &edit.id);
+                if saved_markers.is_some() || !wanted.markers.is_empty() {
+                    let (actual, omitted) =
+                        crate::prepare::prepare_edit_markers(read, edit, saved_markers, None)?;
+                    if saved_markers.is_none() || actual != wanted.markers || !omitted.is_empty() {
+                        return Err("generated Resolve edit markers differ from preparation".into());
+                    }
+                }
                 if let Some(loss) = wanted.envelope.and_then(crate::audio::Envelope::recovered_loss) {
                     recovered_audio.insert(edit.id.as_str(), loss);
                 }
@@ -1684,14 +1852,22 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                     recovered_labels.insert(edit.id.as_str());
                 }
                 let frame = |time| crate::prepare::frames_on(time, p.rate);
+                let matches_map = match (&edit.frame_map, wanted.mixed_rate) {
+                    (Some(map), Some(cadence)) => cadence.agrees(map, wanted.source_in, wanted.length),
+                    (Some(map), None) => wanted.hold && usize::try_from(wanted.length).ok() == Some(map.len())
+                        && map.iter().all(|&frame| frame == wanted.source_in),
+                    (None, cadence) => !wanted.hold && cadence.is_none(),
+                };
                 if edit.item != ids.media[wanted.media]
                     || frame(edit.record_start)? != wanted.start
                     || frame(edit.source_in)? != wanted.source_in
                     || frame(edit.duration)? != wanted.length
                     || edit.speed != wanted.speed.and_then(|speed| speed.graph(wanted.length))
+                    || !matches_map
                     || crate::grade::prepare(&graph, &edit.id)?.map(|grade| grade.0)
                         != wanted.grade.as_ref().map(|grade| grade.0)
                     || !crate::video::matches_readback(edit, wanted.video.as_ref())
+                    || !crate::input_scaling::matches_readback(&graph, &read.id, &edit.id, wanted.input_sizing)?
                     || crate::clip_label::ClipLabel::prepare(&graph, &edit.id)? != wanted.label
                     || (matches!(lane, 1 | 2 | 4)
                         && crate::audio::prepare(
@@ -1707,18 +1883,7 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                     return Err("generated Resolve edit differs from preparation".into());
                 }
             }
-            if read
-                .placements
-                .iter()
-                .filter(|edit| match lane {
-                    0 => edit.video_track == Some(1),
-                    3 => edit.video_track == Some(2),
-                    4 => edit.audio_tracks.as_slice() == [3],
-                    audio => edit.audio_tracks.as_slice() == [audio as i64],
-                })
-                .count()
-                != expected.len()
-            {
+            if read.placements.iter().filter(on_lane).count() != expected.len() {
                 return Err("generated Resolve track count differs from preparation".into());
             }
         }

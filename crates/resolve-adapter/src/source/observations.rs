@@ -47,9 +47,7 @@ pub(super) fn transition(
         (
             "interpretation",
             text(match qualified {
-                Some(_) if audio => dissolve::AUDIO_INTERPRETATION,
-                Some((_, _, _, 4)) => dissolve::CENTER_INTERPRETATION,
-                Some(_) => dissolve::INTERPRETATION,
+                Some((_, _, _, interpretation)) => interpretation,
                 None => "saved_fields_only",
             }),
         ),
@@ -115,7 +113,7 @@ fn read_transition<'a>(
     grid: Grid,
     timeline_export: bool,
     audio: bool,
-) -> Result<Option<(i64, &'a str, &'a str, i64)>> {
+) -> Result<Option<(i64, &'a str, &'a str, &'static str)>> {
     let [Some(left), Some(right)] = neighbors else {
         return Ok(None);
     };
@@ -123,15 +121,23 @@ fn read_transition<'a>(
     if left.name != clip_class || right.name != clip_class {
         return Ok(None);
     }
-    let before = match node.maybe("AlignmentType")? {
-        Some(dissolve::ALIGNMENT) if !audio => dissolve::DURATION,
-        Some("2") => 4,
-        _ => return Ok(None),
+    let Some(style) = node.maybe("PrettyType")?.and_then(dissolve::Style::from_label) else {
+        return Ok(None);
+    };
+    let Some(duration) = node.maybe("Duration")?.and_then(|value| value.parse().ok()) else {
+        return Ok(None);
+    };
+    if style.audio() != audio || (timeline_export && duration != dissolve::LEGACY_DURATION) {
+        return Ok(None);
+    }
+    let Some(alignment) = node.maybe("AlignmentType")? else {
+        return Ok(None);
+    };
+    let Some(before) = style.offset(duration, alignment) else {
+        return Ok(None);
     };
     for (field, expected) in [
-        ("PrettyType", if audio { dissolve::AUDIO_TYPE } else { dissolve::TYPE }),
         ("Position", dissolve::POSITION),
-        ("Duration", "8"),
         ("Flags", "0"),
         ("WasDisbanded", "false"),
         ("PriorityIndex", "0"),
@@ -146,7 +152,13 @@ fn read_transition<'a>(
         }
     }
     let effect = node.maybe("EffectFiltersBA")?.unwrap_or("");
-    if effect != if audio { "" } else { dissolve::EFFECT }
+    let effect_matches = if audio {
+        effect.is_empty()
+    } else {
+        effect.len() == dissolve::EFFECT.len()
+            && dissolve::video_effect(duration).is_ok_and(|expect| hex::encode(expect) == effect)
+    };
+    if !effect_matches
         || !node
             .maybe("FieldsBlob")?
             .is_some_and(|fields| {
@@ -180,7 +192,7 @@ fn read_transition<'a>(
     let Some(relative) = cut.checked_sub(grid.origin) else {
         return Ok(None);
     };
-    Ok(Some((relative, left.id()?, right.id()?, before)))
+    Ok(Some((relative, left.id()?, right.id()?, style.interpretation(duration, alignment))))
 }
 
 pub(super) fn append(graph: &mut SourceGraph, adapter: &str, owner: &str, value: Value) {
@@ -251,12 +263,17 @@ pub(super) fn time_map(encoded: &str, blobs: &mut encoding::Blobs) -> Result<Val
     Ok(Value::Obj(row))
 }
 
-pub(super) fn constant_picture_speed(
+pub(super) enum PictureTiming {
+    Speed(crate::retime::PictureSpeed),
+    Hold(i64),
+}
+
+pub(super) fn constant_picture_timing(
     encoded: &str,
     available: i64,
     blobs: &mut encoding::Blobs,
-) -> Result<Option<crate::retime::PictureSpeed>> {
-    use crate::retime::PictureSpeed;
+) -> Result<Option<PictureTiming>> {
+    use crate::retime::{PictureSpeed, HOLD_MAP_END};
     if !encoded.starts_with("00000001") {
         return Ok(None);
     }
@@ -299,14 +316,21 @@ pub(super) fn constant_picture_speed(
         ])
     })();
     Ok(observed.and_then(|observed| {
-        [PictureSpeed::Half, PictureSpeed::Reverse].into_iter().find(|mode| {
+        let [first, last_record, last_source, source_end, x_max] = observed;
+        if last_record == HOLD_MAP_END && x_max == HOLD_MAP_END && first == last_source {
+            let frame = encoding::frames(first, graph::Rational::integer(24)).ok()?;
+            let last = encoding::frames(source_end, graph::Rational::integer(24)).ok()?;
+            return ((0..available).contains(&frame) && last == available - 1)
+                .then_some(PictureTiming::Hold(frame));
+        }
+        [PictureSpeed::Half, PictureSpeed::Double, PictureSpeed::Reverse].into_iter().find(|mode| {
             mode.coordinates(available).is_some_and(|(first, last_record, last_source, source_end)| {
                 [first, last_record, last_source, source_end, last_record]
                     .into_iter()
                     .zip(observed)
                     .all(|(expected, saved)| (expected - saved).abs() * 24.0 <= 1e-7)
             })
-        })
+        }).map(PictureTiming::Speed)
     }))
 }
 
@@ -417,6 +441,21 @@ fn double(bytes: &[u8]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_hold_map_requires_exact_frame_and_original_extent() {
+        let mut blobs = encoding::Blobs::default();
+        let id = "b27cdc8f-3d5a-4fe5-89b1-5226e9c4b506";
+        for frame in [0, 17, 95] {
+            let saved = hex::encode(crate::retime::encode_hold(frame, 96, id).unwrap());
+            assert!(matches!(
+                constant_picture_timing(&saved, 96, &mut blobs).unwrap(),
+                Some(PictureTiming::Hold(selected)) if selected == frame
+            ));
+            assert!(constant_picture_timing(&saved, 97, &mut blobs).unwrap().is_none());
+        }
+        assert!(crate::retime::encode_hold(96, 96, id).is_err());
+    }
 
     #[test]
     fn reverse_time_map_retains_missing_coordinate_and_explicit_zero() {

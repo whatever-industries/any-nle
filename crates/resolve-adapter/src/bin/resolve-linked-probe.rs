@@ -8,6 +8,10 @@ use support::read;
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let accept_losses = args.first().is_some_and(|arg| arg == "--accept-losses");
+    if accept_losses {
+        args.remove(0);
+    }
     let mut fairlight = None;
     let mut nested = None;
     while args.len() >= 2 {
@@ -32,11 +36,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         [graph, spec, layout, profile, probe, output, atom, group] => {
             (graph, spec, layout, profile, probe, output, Some(Path::new(atom)), Some(Path::new(group)))
         }
-        _ => return Err("usage: resolve-linked-probe GRAPH SPEC MONO-LAYOUT.drp RATE-PROFILE.drp FFPROBE OUTPUT.drp [ATOM-TEMPLATE.drp [GROUP-TEMPLATE.drp]] [--fairlight TWO-BUS.drp] [--nested NEST-TEMPLATE.drp]".into()),
+        _ => return Err("usage: resolve-linked-probe [--accept-losses] GRAPH SPEC MONO-LAYOUT.drp RATE-PROFILE.drp FFPROBE OUTPUT.drp [ATOM-TEMPLATE.drp [GROUP-TEMPLATE.drp]] [--fairlight TWO-BUS.drp] [--nested NEST-TEMPLATE.drp]".into()),
     };
     let graph = SourceGraph::from_json_text(&read(Path::new(graph), MAX_SOURCE_GRAPH_BYTES)?)?;
     let spec = serde_json::from_str(&read(Path::new(spec), 2 << 20)?)?;
     let project = linked::prepare(&graph, spec, Path::new(probe))?;
+    if std::env::var_os("ANYNLE_RESOLVE_IMPORT_TRACE").is_some() {
+        let (direct, assisted) = project.media_counts();
+        eprintln!("Media originals: {direct} standalone, {assisted} assisted");
+    }
+    for loss in project.transition_approximation_losses() {
+        eprintln!("{} ({}): {}", loss.object, loss.aspect, loss.reason);
+    }
+    if !accept_losses && project.transition_approximation_losses().next().is_some() {
+        return Err("Resolve transition approximations require --accept-losses".into());
+    }
     let published = publish_linked_with_templates(
         &project,
         &Templates {
@@ -51,6 +65,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     for marker in project.omitted_markers() {
         println!("omitted marker occurrence {marker}");
+    }
+    for loss in project.marker_ownership_losses() {
+        println!("{} ({}): {}", loss.object, loss.aspect, loss.reason);
     }
     if let Some(id) = project.omitted_active_timeline() {
         println!("Saved active timeline {id} was omitted. Using the first exported timeline.");

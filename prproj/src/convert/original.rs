@@ -64,6 +64,7 @@ pub fn add_item(
             SampleRepresentation::Aac => Some(m::AAC_SAMPLE_TYPE),
             SampleRepresentation::Mp3 => m::compressed_sample_type(".mp3"),
             SampleRepresentation::Pcm16 => Some("3"),
+            SampleRepresentation::Pcm16Be => Some("11"),
             SampleRepresentation::Pcm24 => None,
         };
         let e = m::new_audio_stream(

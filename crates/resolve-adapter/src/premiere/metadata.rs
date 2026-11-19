@@ -114,12 +114,12 @@ pub(super) fn capture_timeline_marks(
         graph.losses.push(Loss {
             object: owner.into(),
             aspect: TIMELINE_MARK_LOSS.into(),
-            reason: format!("Premiere sequence {tag} at {ticks} ticks retained in graph; Resolve range mapping is pending"),
+            reason: format!("Premiere sequence {tag} at {ticks} ticks retained in graph; Resolve requires a representable timeline selection"),
         });
     }
     if !saved.is_empty() {
         graph.sidecars.push(Sidecar {
-            adapter: "premiere.timeline_marks".into(),
+            adapter: crate::timeline_marks::PREMIERE_ADAPTER.into(),
             object: owner.into(),
             data: Value::Obj(saved),
         });
@@ -127,11 +127,17 @@ pub(super) fn capture_timeline_marks(
     Ok(())
 }
 
+pub(super) enum ClipLabelCapture {
+    IncludeDefaults,
+    OverridesOnly,
+}
+
 pub(super) fn capture_edit_label(
     project: &Project,
     clip: NodeId,
     item: ItemId,
     owner: &str,
+    capture: ClipLabelCapture,
     graph: &mut SourceGraph,
 ) -> Result<()> {
     let tree = &project.doc.tree;
@@ -158,12 +164,15 @@ pub(super) fn capture_edit_label(
     }
 
     let label = name.zip(packed).and_then(|(name, packed)| PremiereLabel::parse(name, packed));
+    if name.into_iter().chain(packed).any(|value| value.len() > 128) {
+        return Err("Premiere edit label field exceeds limit".into());
+    }
+    if matches!(capture, ClipLabelCapture::OverridesOnly) && matches_master && label.is_some() {
+        return Ok(());
+    }
     let mut fields = vec![("default_matches_master".into(), Value::Bool(matches_master))];
     for (field, value) in [("label_name", name), ("packed_color", packed)] {
         if let Some(value) = value {
-            if value.len() > 128 {
-                return Err("Premiere edit label field exceeds limit".into());
-            }
             fields.push((field.into(), Value::Str(value.into())));
         }
     }

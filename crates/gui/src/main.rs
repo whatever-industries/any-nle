@@ -5,12 +5,16 @@ mod direction;
 mod palette;
 #[cfg(target_os = "macos")]
 mod relink;
+#[cfg(target_os = "macos")]
+mod resolve_review;
 mod report;
 mod storage;
 mod wizard;
 
 fn main() -> eframe::Result {
     let mut job = None;
+    #[cfg(target_os = "macos")]
+    let mut resolve_job = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -23,6 +27,14 @@ fn main() -> eframe::Result {
                     "Any NLE native wizard\nUsage: any-nle-gui [--job SETTINGS.json]\nThe shared engine reads Avid bins and writes a new Premiere project."
                 );
                 return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            "--resolve-job" => {
+                let Some(path) = args.next() else {
+                    eprintln!("--resolve-job needs a saved Premiere to Resolve job");
+                    std::process::exit(2);
+                };
+                resolve_job = Some(std::path::PathBuf::from(path));
             }
             "--job" => {
                 let Some(path) = args.next() else {
@@ -55,6 +67,14 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
+    #[cfg(target_os = "macos")]
+    if let Some(path) = resolve_job {
+        if job.is_some() {
+            eprintln!("Select one job per wizard window");
+            std::process::exit(2);
+        }
+        return resolve_review::run(path, options);
+    }
     eframe::run_native(
         "Any NLE",
         options,

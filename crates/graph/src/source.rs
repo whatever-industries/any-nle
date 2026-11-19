@@ -9,6 +9,7 @@ pub const SCHEMA: &str = "anynle.graph/2";
 pub const MAX_SOURCE_GRAPH_BYTES: usize = 256 << 20;
 pub const AVID_SOURCE_COLUMNS_TIMECODE: &str = "avid_source_columns_verified_mov_timecode";
 pub const AVID_LINKED_MOV_TIMECODE: &str = "avid_linked_mov_timecode";
+pub const VERIFIED_LINKED_MOV_TIMECODE: &str = "verified_linked_mov_timecode";
 
 /// Exact source timecode facts. Display base and physical counting rate are distinct.
 #[derive(Clone, Debug, PartialEq)]
@@ -425,6 +426,10 @@ impl SourceGraph {
                                         && Some(o.time_base) == Rational::new(1, rate.into())
                                 }),
                             Some("pcm16") => m.bits == Some(16),
+                            Some("pcm16be") => m.bits == Some(16) && o.container == "mov"
+                                && o.stream_index == 1 && o.channels == Some(2)
+                                && m.sample_rate == Some(48_000)
+                                && o.time_base == Rational::new(1, 48_000).unwrap(),
                             Some("pcm24") => m.bits == Some(24),
                             _ => false,
                         }, &w, "audio sample representation contradicts bit depth or media profile")?;

@@ -23,6 +23,7 @@ const SELECTED: Color32 = Color32::from_rgb(37, 49, 63);
 const PRIMARY: Color32 = Color32::from_rgb(48, 77, 112);
 const GOOD: Color32 = Color32::from_rgb(133, 222, 190);
 const AMBER: Color32 = Color32::from_rgb(244, 199, 137);
+const ERROR_SURFACE: Color32 = Color32::from_rgb(63, 35, 43);
 const CONVERTING: &str = "Converting project";
 const SAVING_PREFLIGHT: &str = "Saving preflight report";
 const WHY: &str = include_str!("../../../docs/DECISIONS-EXPLAINED.md");
@@ -206,6 +207,7 @@ pub struct App {
     task: String,
     progress: Option<Progress>,
     error: Option<String>,
+    highlight_required_input: bool,
     notice: Option<String>,
     search: String,
     report: ReportBrowser,
@@ -248,6 +250,7 @@ impl App {
             task: String::new(),
             progress: None,
             error,
+            highlight_required_input: false,
             notice: None,
             search: String::new(),
             report: ReportBrowser::default(),
@@ -819,8 +822,11 @@ impl App {
         ui.add_space(6.);
     }
     fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+        Self::card_with_fill(ui, SURFACE, content);
+    }
+    fn card_with_fill(ui: &mut egui::Ui, fill: Color32, content: impl FnOnce(&mut egui::Ui)) {
         egui::Frame::group(ui.style())
-            .fill(SURFACE)
+            .fill(fill)
             .inner_margin(10.)
             .corner_radius(8)
             .show(ui, |ui| {
@@ -828,7 +834,26 @@ impl App {
                 content(ui);
             });
     }
+    fn require_project_paths(&mut self) -> bool {
+        let ready = self.wizard.inputs.check_required_paths().is_ok();
+        self.highlight_required_input = !ready;
+        if !ready {
+            self.wizard.page = Page::Direction;
+        }
+        ready
+    }
     fn direction(&mut self, ui: &mut egui::Ui) {
+        let required_input = if self.highlight_required_input {
+            self.wizard.inputs.check_required_paths().err()
+        } else {
+            None
+        };
+        self.highlight_required_input = required_input.is_some();
+        let (source_fill, destination_fill) = match required_input {
+            Some(RequiredInput::Bins | RequiredInput::BinSelection) => (ERROR_SURFACE, SURFACE),
+            Some(RequiredInput::Output | RequiredInput::OutputExtension) => (SURFACE, ERROR_SURFACE),
+            None => (SURFACE, SURFACE),
+        };
         Self::title(
             ui,
             "Project",
@@ -840,7 +865,7 @@ impl App {
             self.relink.open = true;
         }
         ui.add_space(8.);
-        Self::card(ui, |ui| {
+        Self::card_with_fill(ui, source_fill, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Source");
                 if ui.button("Choose project folder…").clicked() {
@@ -931,7 +956,7 @@ impl App {
             }
         });
         ui.add_space(8.);
-        Self::card(ui, |ui| {
+        Self::card_with_fill(ui, destination_fill, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("Destination");
                 if ui.button("New Premiere project…").clicked() {
@@ -1313,7 +1338,6 @@ impl App {
     fn blocker_card(
         ui: &mut egui::Ui,
         issue: &ReviewBlocker,
-        can_save: bool,
         browser: &mut ReportBrowser,
     ) -> Option<ReviewAction> {
         use BlockerKind::*;
@@ -1425,7 +1449,7 @@ impl App {
                     details.extend(issue.affected.iter().map(String::as_str));
                     ui.ctx().copy_text(details.join("\n"));
                 }
-                if can_save && ui.button("Save preflight report").clicked() {
+                if ui.button("Save preflight report").clicked() {
                     action = Some(ReviewAction::Choose(Pick::SavePreflightReport));
                 }
             });
@@ -1493,17 +1517,9 @@ impl App {
             return;
         }
         Self::title(ui, "Review & convert", "Avid Media Composer to Premiere Pro");
-        let missing = self.wizard.inputs.check_required_paths().err().map(|input| {
-            let kind = match input {
-                RequiredInput::Bins | RequiredInput::BinSelection => BlockerKind::ProjectSource,
-                RequiredInput::Output | RequiredInput::OutputExtension => BlockerKind::ProjectOutput,
-            };
-            ReviewBlocker::new(kind, input.message())
-        });
-        let issue = missing.as_ref().or(self.review_blocker.as_ref());
-        let blocked = issue.is_some();
-        if let Some(issue) = issue {
-            if let Some(action) = Self::blocker_card(ui, issue, missing.is_none(), &mut self.report) {
+        let blocked = self.review_blocker.is_some();
+        if let Some(issue) = &self.review_blocker {
+            if let Some(action) = Self::blocker_card(ui, issue, &mut self.report) {
                 self.take_review_action(action, ui.ctx());
             }
         }
@@ -1926,29 +1942,22 @@ impl App {
                         self.prepare(ui.ctx());
                     }
                 } else {
-                    if ui.add(primary("Next ›")).clicked() {
-                        match self.wizard.inputs.required_paths() {
-                            Ok(()) => {
-                                self.wizard.page = self.wizard.page.next();
-                                if self.wizard.page == Page::Review {
-                                    self.prepare(ui.ctx());
-                                }
-                            }
-                            Err(e) => self.error = Some(e),
+                    if ui.add(primary("Next ›")).clicked() && self.require_project_paths() {
+                        self.wizard.page = self.wizard.page.next();
+                        if self.wizard.page == Page::Review {
+                            self.prepare(ui.ctx());
                         }
                     }
-                    if self.wizard.page != Page::Review && ui.link("Use recommended settings").clicked() {
-                        match self.wizard.inputs.required_paths() {
-                            Ok(()) => {
-                                self.wizard.recommended();
-                                if let Err(e) = storage::save(&self.wizard.choices) {
-                                    self.error = Some(e);
-                                }
-                                self.invalidate();
-                                self.prepare(ui.ctx());
-                            }
-                            Err(e) => self.error = Some(e),
+                    if self.wizard.page != Page::Review
+                        && ui.link("Use recommended settings").clicked()
+                        && self.require_project_paths()
+                    {
+                        self.wizard.recommended();
+                        if let Err(e) = storage::save(&self.wizard.choices) {
+                            self.error = Some(e);
                         }
+                        self.invalidate();
+                        self.prepare(ui.ctx());
                     }
                 }
             });
@@ -1977,12 +1986,8 @@ impl App {
                     egui::Stroke::new(2., ACCENT),
                 );
             }
-            if response.clicked() {
-                match self.wizard.inputs.required_paths() {
-                    Ok(()) => self.wizard.page = page,
-                    Err(_) if matches!(page, Page::Direction | Page::Review) => self.wizard.page = page,
-                    Err(e) => self.error = Some(e),
-                }
+            if response.clicked() && (page == Page::Direction || self.require_project_paths()) {
+                self.wizard.page = page;
             }
         }
         ui.add_space(10.);
@@ -2048,6 +2053,9 @@ impl eframe::App for App {
             }
         }
         self.poll(&ctx);
+        if self.wizard.page == Page::Review {
+            self.require_project_paths();
+        }
         if self.completion.is_none() || self.busy {
             egui::Panel::bottom("navigation")
                 .frame(egui::Frame::new()
@@ -2077,7 +2085,7 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 if let Some(error) = self.error.clone() {
                     egui::Frame::group(ui.style())
-                        .fill(Color32::from_rgb(63, 35, 43))
+                        .fill(ERROR_SURFACE)
                         .inner_margin(12.)
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
@@ -2308,6 +2316,57 @@ mod report_view_tests {
     }
 
     #[test]
+    fn missing_project_paths_highlight_only_the_blocking_section() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), None);
+        app.wizard = Wizard::default();
+        app.error = None;
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut draw = |app: &mut App, input: egui::RawInput| {
+            let mut output = ctx.run_ui(input, |ui| eframe::App::ui(app, ui, &mut frame));
+            output.textures_delta.clear();
+            output
+        };
+        let highlighted = |output: &egui::FullOutput, label| {
+            let text = text_center(output, label).expect("Project section heading");
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.fill == ERROR_SURFACE && rect.rect.contains(text))
+            })
+        };
+        let initial = draw(&mut app, egui::RawInput::default());
+        assert!(!highlighted(&initial, "Source"));
+        assert!(!highlighted(&initial, "Destination"));
+
+        for button in ["Next ›", "Use recommended settings", "5  Review"] {
+            app.highlight_required_input = false;
+            let current = draw(&mut app, egui::RawInput::default());
+            let blocked = draw(&mut app, click(text_center(&current, button).unwrap()));
+            assert_eq!(app.wizard.page, Page::Direction);
+            assert!(app.error.is_none());
+            assert!(highlighted(&blocked, "Source"), "{button}");
+            assert!(!highlighted(&blocked, "Destination"), "{button}");
+            assert!(text_center(&blocked, RequiredInput::Bins.message()).is_none());
+        }
+
+        app.wizard.inputs.bins.push(PathBuf::from("source.avb"));
+        let missing_output = draw(&mut app, egui::RawInput::default());
+        assert!(!highlighted(&missing_output, "Source"));
+        assert!(highlighted(&missing_output, "Destination"));
+        assert!(text_center(&missing_output, RequiredInput::Output.message()).is_none());
+
+        app.wizard.inputs.output = PathBuf::from("output.mov");
+        let wrong_extension = draw(&mut app, egui::RawInput::default());
+        assert!(highlighted(&wrong_extension, "Destination"));
+        app.wizard.inputs.output.set_extension("prproj");
+        let ready = draw(&mut app, egui::RawInput::default());
+        assert!(!highlighted(&ready, "Source"));
+        assert!(!highlighted(&ready, "Destination"));
+        draw(&mut app, click(text_center(&ready, "Next ›").unwrap()));
+        assert_eq!(app.wizard.page, Page::Clips);
+    }
+
+    #[test]
     fn preflight_recovery_opens_the_correct_media_panel() {
         for (kind, button, expected) in [
             (BlockerKind::RewrapMissingMedia, "Locate media", MediaJump::Locations),
@@ -2319,7 +2378,7 @@ mod report_view_tests {
             let ctx = egui::Context::default();
             let mut browser = ReportBrowser::default();
             let mut initial = ctx.run_ui(egui::RawInput::default(), |ui| {
-                App::blocker_card(ui, &issue, true, &mut browser);
+                App::blocker_card(ui, &issue, &mut browser);
             });
             initial.textures_delta.clear();
             let can_switch = initial.shapes.iter().any(|shape| {
@@ -2333,7 +2392,7 @@ mod report_view_tests {
             let button_center = text_center(&initial, button).expect("recovery button");
             let mut selected = None;
             let mut output = ctx.run_ui(click(button_center), |ui| {
-                selected = App::blocker_card(ui, &issue, true, &mut browser);
+                selected = App::blocker_card(ui, &issue, &mut browser);
             });
             output.textures_delta.clear();
             assert!(matches!(selected, Some(ReviewAction::Media(jump)) if jump == expected), "{kind:?}");
@@ -2350,7 +2409,7 @@ mod report_view_tests {
         let mut browser = ReportBrowser::default();
         let mut frame = |raw| {
             let mut output = ctx.run_ui(raw, |ui| {
-                App::blocker_card(ui, &issue, true, &mut browser);
+                App::blocker_card(ui, &issue, &mut browser);
             });
             output.textures_delta.clear();
             output

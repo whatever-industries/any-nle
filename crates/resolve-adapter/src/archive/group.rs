@@ -6,6 +6,21 @@ const GROUP_SKELETON: &str = "374b1e3c0645ebf8927fdce6b3cca3b54c4814b4034666d4f7
 const CAMERA_BIN: &str = "MediaPool/Master/000_Camera sources/MpFolder.xml";
 const GROUP_ORIGIN: i64 = 86400;
 
+pub(super) fn camera_donor(skeleton: &Path) -> Result<String> {
+    let members = load_skeleton(skeleton, GROUP_SKELETON, 7)?;
+    let [first, _] = camera_items(members.get(CAMERA_BIN).ok_or("missing camera bin")?)?;
+    Ok(first.to_owned())
+}
+
+fn camera_items(bin: &str) -> Result<[&str; 2]> {
+    Regex::new(r"(?s)<Sm2MpVideoClip [^>]+>.*?</Sm2MpVideoClip>")?
+        .find_iter(bin)
+        .map(|item| item.as_str())
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| "expected two synthetic camera masters".into())
+}
+
 pub fn publish_group(
     prepared: &PreparedGroup,
     skeleton: &Path,
@@ -240,13 +255,7 @@ fn build_group(p: &PreparedGroup, mut m: Members) -> Result<Members> {
     replace_once(&mut pool, &old_timeline, &timeline)?;
     set(&mut project, "ProjectName", &xml(&p.project_name))?;
 
-    let masters = Regex::new(r"(?s)<Sm2MpVideoClip [^>]+>.*?</Sm2MpVideoClip>")?;
-    let originals: [String; 2] = masters
-        .find_iter(&cameras)
-        .map(|m| m.as_str().to_owned())
-        .collect::<Vec<_>>()
-        .try_into()
-        .map_err(|_| "expected exactly two synthetic camera masters")?;
+    let originals = camera_items(&cameras)?.map(str::to_owned);
     let old_media = [
         dbid(&originals[0])?.to_owned(),
         dbid(&originals[1])?.to_owned(),
@@ -352,13 +361,8 @@ pub(super) fn build_turnover_group(
         )),
     )?;
     set(&mut timeline, "CurPlayheadPosition", "0")?;
-    let pattern = Regex::new(r"(?s)<Sm2MpVideoClip [^>]+>.*?</Sm2MpVideoClip>")?;
-    let old_media: [String; 2] = pattern
-        .find_iter(&cameras)
-        .map(|item| dbid(item.as_str()).map(str::to_owned))
-        .collect::<Result<Vec<_>>>()?
-        .try_into()
-        .map_err(|_| "expected two synthetic camera masters")?;
+    let [first, second] = camera_items(&cameras)?;
+    let old_media = [dbid(first)?.to_owned(), dbid(second)?.to_owned()];
     let inner_xml = write_inner(
         p,
         m.remove(&inner).ok_or("missing Group container")?,

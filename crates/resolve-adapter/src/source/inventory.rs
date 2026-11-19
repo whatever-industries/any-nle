@@ -351,7 +351,7 @@ fn apply_recognition(graph: &SourceGraph, effects: &mut [Effect<'_>]) {
             for row in rows {
                 if let Some(id) = string(row, "id") {
                     let recognition =
-                        if string(row, "interpretation") == Some(dissolve::INTERPRETATION) {
+                        if matches!(row.get("cut_frames"), Some(Value::Int(_))) {
                             Recognition::Recognized
                         } else {
                             Recognition::Unqualified

@@ -4,6 +4,20 @@ Premiere 27 places Adjust, Style, and LUT operations in Color Mode. The legacy
 Lumetri Color effect remains editable. An operation can belong to a clip, a
 group, or the sequence. [Adobe Color Mode guide](https://helpx.adobe.com/premiere/desktop/correct-color/color-mode-fundamentals/color-mode-basics.html) · [Adobe Lumetri changes](https://helpx.adobe.com/premiere/desktop/correct-color/color-mode-fundamentals/lumetri-color.html)
 
+## Translation target
+
+New translations to Premiere 27 write native Color Mode operations.
+For translations from Premiere 27, capture the saved Color Mode operation
+on its original owner and retain the color pipeline through graph/2.
+Qualify the native destination mapping with reopened chart renders and
+report unmapped source operations in Review.
+
+The affine clip LUT and isolated extended Rec.709 SDR controls below
+already use Color Mode. The modeled Avid correction and retimed source
+LUT legacy writer profiles remain migration work. Compare their native
+Color Mode candidates against the source render before switching each
+profile.
+
 ## Clip Adjust
 
 Premiere 27.0.0 build 88 saved a clip-owned Adjust 1 on a 1080p24
@@ -37,6 +51,67 @@ were achromatic throughout.
 This establishes response for the tested Rec.709 pipeline. Before mapping
 Avid grades to the Adjust controls, compare the source and destination
 response on a chart with neutral, saturated, and near-clipping patches.
+
+### Clip Adjust Exposure to Resolve
+
+The internal Premiere → Resolve route captures the clip-owned global
+Exposure value and its saved color context on the edit in graph/2. With
+the other Adjust controls at their observed defaults, it supports static
+values across the saved −5 through +5 range on plain 1080p24 ProRes HQ
+picture in the measured Rec.709 pipeline. Exposure stays visible in
+graph/2 when changed controls or color context require a different mapping.
+
+Resolve receives one editable CDL node with equal RGB slopes of
+`2^(Exposure/2)`, zero offset, and unit power and saturation. Zero leaves
+the edit neutral. Master Gain matched the gray ramp at +1 but missed
+saturated patches by up to 75.31 RGB codes on an 8-bit scale.
+
+Renders from Premiere 27.0.0 build 88 and Resolve Studio 21.2.0 build
+00006 covered −5, −2, −1, +0.5, +1, +2 and +5 after Save As and reopen.
+Serialized graph/2 reproduced the seven independent slopes on one V1
+timeline linked to the original chart. All 336 reopened frames matched
+independently authored Resolve controls exactly. Across the 24 neutral,
+saturated and clipping patches, the largest difference from Premiere was
+1.29 RGB codes on an 8-bit scale. The reader verifies the complete
+Save As node body apart from the three equal slope values. It also
+recognizes the earlier native +1 encoding.
+
+The trial of a clip LUT saved a Resolve library reference. An export
+requested with LUT assets did not include the table in that control.
+An install-independent LUT transfer remains separate work.
+
+### Global Contrast and Pivot
+
+The same clip-owned Color And Contrast filter saves global Contrast as
+parameter ID `4` and Pivot as ID `5`. Their neutral values are 1 and 0.
+The reader retains non-neutral static values as `contrast` and `pivot`
+on the existing `premiere.color_mode_exposure` graph/2 receipt. Each
+known scalar survives independently when another control is unresolved.
+The isolated Exposure mapping still requires the complete neutral
+witness for the other Adjust controls. An edit with changed Contrast
+or Pivot stays in Review.
+
+Premiere 27 Save As and reopen covered Contrast values 0.5, 0.75,
+1.1, 1.25, 1.5 and 2, Pivot at −1, 0, +0.5 and +1, and combined
+Exposure at −1.5 and +1. On the measured Rec.709 chart, the response
+fits a shared multiplier for the three RGB channels. Apply Exposure
+first, square the resulting RGB values before computing Rec.709
+luminance, and multiply the exposed RGB by
+`(luminance/pivot) ^ ((power - 1)/2)`. Power equals the Contrast
+value below unity and rises three times as fast above unity. Each
+Pivot stop doubles the luminance reference. With the effective
+calibration value 0.1786 for the decoded chart at Pivot 0, the
+formula predicts the measured patches within 0.42 RGB codes on an
+8-bit scale, including the clipped patches. The calibration is
+scoped to this chart and pipeline.
+
+Two private archive prototypes embedded a Fusion Custom Tool with
+editable Exposure, Contrast and Pivot inputs. Each kept its
+values and original media link after import, save and reopen in
+Resolve Studio 21.2. Across 96 frames, the largest measured
+chart difference from Premiere was 1.20 codes. The ordinary writer
+reports the grade in Review until composition timing and media
+ownership are verified on trimmed and repeated edits.
 
 ## Clip LUT
 

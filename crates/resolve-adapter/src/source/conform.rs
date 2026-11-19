@@ -238,7 +238,7 @@ struct Timeline<'a> {
     extent: Option<i64>,
     unqualified: Vec<Range<i64>>,
     coverage_boundaries: Vec<i64>,
-    dissolve: Option<Range<i64>>,
+    dissolves: Vec<Range<i64>>,
     issue: Option<&'static str>,
 }
 
@@ -285,7 +285,7 @@ fn direct_timeline<'a>(
         extent: None,
         unqualified: Vec::new(),
         coverage_boundaries: Vec::new(),
-        dissolve: None,
+        dissolves: Vec::new(),
         issue: None,
     };
     if !matches!((seq.rate.num(), seq.rate.den()), (24, 1) | (24000, 1001)) {
@@ -441,6 +441,7 @@ fn saved_source<'a>(
                     .map_err(|_| "invalid constant picture speed extent")?;
                 match mode {
                     PictureSpeed::Half => (sampled, 1, 2),
+                    PictureSpeed::Double => (sampled, 2, 1),
                     PictureSpeed::Reverse => (sampled, -1, 1),
                 }
             }
@@ -500,16 +501,20 @@ fn track_unknowns(graph: &SourceGraph, timeline: &mut Timeline<'_>) -> Result<()
     if let Some(data) = graph.sidecar(dissolve::ADAPTER, &seq.id) {
         if let Value::Arr(rows) = data {
             let qualified = dissolve::prepare_all_native(graph, seq).unwrap_or_default();
-            if let Some(known) = qualified.iter().find(|d| !d.prepared.audio) {
-                timeline.dissolve = Some(known.prepared.window());
-            }
+            let qualified_video: HashMap<_, _> = qualified.iter()
+                .filter(|d| !d.prepared.audio())
+                .map(|d| (d.prepared.id.as_str(), d.prepared.window()))
+                .collect();
             for row in rows {
                 if let Some(Value::Str(id)) = row.get("id") {
                     identified.insert(("transition", id.as_str()));
+                    if let Some(window) = qualified_video.get(id.as_str()) {
+                        timeline.dissolves.push(window.clone());
+                        continue;
+                    }
                 }
                 if matches!(row.get("kind"), Some(Value::Str(kind)) if kind == "audio")
                     || matches!(row.get("track"), Some(Value::Int(track)) if *track > 1)
-                    || timeline.dissolve.is_some()
                 {
                     continue;
                 }
@@ -529,9 +534,10 @@ fn track_unknowns(graph: &SourceGraph, timeline: &mut Timeline<'_>) -> Result<()
     }
     if let Some(Value::Arr(rows)) = graph.sidecar("resolve.timing", &seq.id) {
         let qualified: HashMap<_, _> = timeline.edits.iter().filter_map(|edit| {
-            match edit.content {
-                EditContent::Media { placement, source: Ok(_), .. } if placement.speed.is_some() => {
-                    Some((placement.id.as_str(), &edit.range))
+            match &edit.content {
+                EditContent::Media { placement, source: Ok(source), .. }
+                    if placement.speed.is_some() || placement.frame_map.is_some() => {
+                    Some((placement.id.as_str(), (&edit.range, source.rate)))
                 }
                 _ => None,
             }
@@ -553,8 +559,11 @@ fn track_unknowns(graph: &SourceGraph, timeline: &mut Timeline<'_>) -> Result<()
             }) {
                 if id.is_some_and(|id| {
                     !unresolved.contains(id)
-                        && qualified.get(id).is_some_and(|qualified| **qualified == range)
-                        && matches!(row.get("source_rate"), Some(Value::Str(saved)) if Rational::parse(saved) == Some(rate))
+                        && qualified.get(id).is_some_and(|(edit_range, source_rate)| {
+                            **edit_range == range
+                                && matches!(row.get("source_rate"), Some(Value::Str(saved))
+                                    if Rational::parse(saved) == Some(*source_rate))
+                        })
                 }) {
                     continue;
                 }
@@ -753,7 +762,7 @@ fn compare<'g>(
             return Ok(result);
         }
     }
-    for range in [&left.dissolve, &right.dissolve].into_iter().flatten() {
+    for range in left.dissolves.iter().chain(&right.dissolves) {
         if !result.excluded_dissolve_windows.contains(range) {
             result.excluded_dissolve_windows.push(range.clone());
         }
@@ -1165,6 +1174,11 @@ mod tests {
         assert_eq!(compare(&left, &left, None, false).unwrap().samples[0].status, "match");
 
         let mut candidate = reference.clone();
+        candidate.sequences[0].placements[0].speed = None;
+        candidate.sequences[0].placements[0].frame_map = Some(vec![13; 24]);
+        let right = timeline(&candidate, "timeline").unwrap();
+        assert_eq!(compare(&left, &right, None, false).unwrap().samples[0].status, "match");
+
         candidate.losses.push(graph::Loss {
             object: "timeline".into(),
             aspect: "timing".into(),
@@ -1174,6 +1188,17 @@ mod tests {
         let report = compare(&left, &right, None, false).unwrap();
         assert_eq!(report.samples[0].status, "inconclusive");
         assert_eq!(report.samples[1].status, "match");
+
+        candidate.losses.clear();
+        candidate.media[0].rate = Rational::new(24000, 1001);
+        let right = timeline(&candidate, "timeline").unwrap();
+        assert_eq!(compare(&right, &right, None, false).unwrap().samples[0].status, "inconclusive");
+        let Value::Arr(rows) = &mut candidate.sidecars[0].data else { unreachable!() };
+        let Value::Obj(fields) = &mut rows[0] else { unreachable!() };
+        let (_, source_rate) = fields.iter_mut().find(|(key, _)| key == "source_rate").unwrap();
+        *source_rate = Value::Str("24000/1001".into());
+        let right = timeline(&candidate, "timeline").unwrap();
+        assert_eq!(compare(&right, &right, None, false).unwrap().mapping_status, "match");
     }
 
     #[test]

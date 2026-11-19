@@ -223,7 +223,7 @@ version = "0.1.0"
 
 [[package]]
 name = "anynle-gui"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "anynle-app",
  "anynle-mapping",

@@ -37,7 +37,7 @@ impl PreparedGroup {
     }
 }
 
-fn member(alt: &MulticamAlternative, length: i64) -> Result<(&str, i64, i64, i64)> {
+pub(crate) fn member(alt: &MulticamAlternative, length: i64) -> Result<(&str, i64, i64, i64)> {
     if alt.reason.is_some() || alt.pieces.len() > 3 {
         return Err("unresolved or multipart Group angle".into());
     }
@@ -95,6 +95,25 @@ pub(crate) fn prepare_bound_group(
     explicit_origin: Option<i64>,
     cameras: [Arc<VerifiedBinding>; 2],
 ) -> Result<PreparedGroup> {
+    prepare_group_profile(graph, sequence_id, canvas, explicit_origin, cameras, false)
+}
+
+pub(crate) fn prepare_native_group(
+    graph: &SourceGraph,
+    sequence_id: &str,
+    cameras: [Arc<VerifiedBinding>; 2],
+) -> Result<PreparedGroup> {
+    prepare_group_profile(graph, sequence_id, (1920, 1080), None, cameras, true)
+}
+
+fn prepare_group_profile(
+    graph: &SourceGraph,
+    sequence_id: &str,
+    canvas: (u16, u16),
+    explicit_origin: Option<i64>,
+    cameras: [Arc<VerifiedBinding>; 2],
+    native_resolve: bool,
+) -> Result<PreparedGroup> {
     graph.validate()?;
     let sequence = graph
         .sequences
@@ -121,7 +140,13 @@ pub(crate) fn prepare_bound_group(
             )],
         )
     } else {
-        let origin = qualified_origin(sequence)?;
+        let origin = if native_resolve || sequence.clock.as_ref().is_some_and(|clock| {
+            clock.provenance.route == "Premiere sequence ticks"
+        }) {
+            crate::linked::check_origin(sequence)?
+        } else {
+            qualified_origin(sequence)?
+        };
         if explicit_origin.is_some_and(|value| value != origin) {
             return Err("explicit origin conflicts with qualified source clock".into());
         }
@@ -163,7 +188,14 @@ pub(crate) fn prepare_bound_group(
             .iter()
             .find(|l| l.kind == kind && l.index == index)
             .ok_or("Group lane absent")?;
-        if lane.reason.is_some() || lane.alternatives.len() != 2 || lane.selected != Some(0) {
+        let supported = if native_resolve && lane_index == 0 {
+            lane.alternatives.len() == 2
+                && crate::source::native_group_default_unavailable(lane)
+        } else {
+            lane.reason.is_none() && lane.selected == Some(0)
+                && lane.alternatives.len() == if native_resolve { 1 } else { 2 }
+        };
+        if !supported {
             return Err("unsupported Group alternatives or default selection".into());
         }
         for (camera_index, (binding, alt)) in cameras.iter().zip(&lane.alternatives).enumerate() {
@@ -174,7 +206,11 @@ pub(crate) fn prepare_bound_group(
                 );
             }
             if lane_index == 0 {
-                check_binding(graph, binding)?;
+                if native_resolve {
+                    crate::prepare::check_binding_profile(graph, binding, true)?;
+                } else {
+                    check_binding(graph, binding)?;
+                }
                 offsets[camera_index] = start;
             } else if offsets[camera_index] != start {
                 return Err("Group picture and mono camera extents disagree".into());

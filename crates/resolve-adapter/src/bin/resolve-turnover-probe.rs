@@ -29,6 +29,16 @@ enum JobDocument {
     Legacy(LegacyProbeJob),
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PremiereProjectManifest {
+    premiere: PathBuf,
+    sequences: Vec<String>,
+    templates: Templates,
+    ffprobe: PathBuf,
+    output: PathBuf,
+}
+
 impl TryFrom<LegacyProbeJob> for TurnoverJob {
     type Error = &'static str;
 
@@ -74,7 +84,7 @@ impl TryFrom<LegacyProbeJob> for TurnoverJob {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    const USAGE: &str = "usage: resolve-turnover-probe JOB.json [--review | --graph | --accept-losses]\n       resolve-turnover-probe --list-premiere-sequences INPUT.prproj\n       resolve-turnover-probe --capture-premiere INPUT.prproj SEQUENCE_ID FFPROBE";
+    const USAGE: &str = "usage: resolve-turnover-probe JOB.json [--review | --graph | --accept-losses]\n       resolve-turnover-probe --premiere-project MANIFEST.json [--review | --graph | --accept-losses]\n       resolve-turnover-probe --list-premiere-sequences INPUT.prproj\n       resolve-turnover-probe --capture-premiere INPUT.prproj SEQUENCE_ID FFPROBE";
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let (job, flags) = args.split_first().ok_or(USAGE)?;
     if job == "--list-premiere-sequences" {
@@ -97,6 +107,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         graph.write_json(&mut std::io::stdout().lock())?;
         return Ok(());
     }
+    let premiere_project = job == "--premiere-project";
+    let (file, flags) = if premiere_project {
+        flags.split_first().ok_or(USAGE)?
+    } else {
+        (job, flags)
+    };
     let (review, graph, accept) = match flags {
         [] => (false, false, false),
         [flag] if flag == "--review" => (true, false, false),
@@ -104,11 +120,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         [flag] if flag == "--accept-losses" => (false, false, true),
         _ => return Err("invalid turnover probe options".into()),
     };
-    let job = match serde_json::from_str(&support::read(Path::new(job), 2 << 20)?)? {
-        JobDocument::Versioned(job) => job,
-        JobDocument::Legacy(job) => TurnoverJob::try_from(job)?,
+    let input = support::read(Path::new(file), 2 << 20)?;
+    let (result, templates, output) = if premiere_project {
+        let manifest: PremiereProjectManifest = serde_json::from_str(&input)?;
+        let result = anynle_resolve_adapter::prepare_premiere_project(
+            &manifest.premiere, &manifest.sequences, &manifest.ffprobe,
+        )?;
+        (result, manifest.templates, manifest.output)
+    } else {
+        let job = match serde_json::from_str(&input)? {
+            JobDocument::Versioned(job) => job,
+            JobDocument::Legacy(job) => TurnoverJob::try_from(job)?,
+        };
+        (job.prepare()?, job.templates, job.output)
     };
-    let result = job.prepare()?;
+    if std::env::var_os("ANYNLE_RESOLVE_IMPORT_TRACE").is_some() {
+        let (direct, assisted) = result.media_counts();
+        eprintln!("Media originals: {direct} standalone, {assisted} assisted");
+    }
     for notice in &result.notices {
         eprintln!("{notice}");
     }
@@ -123,7 +152,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .source_graph()
             .write_json(&mut std::io::stdout().lock())?;
     } else if review {
-        let review = result.review(&job.templates, &job.output)?;
+        let review = result.review(&templates, &output)?;
         println!("Resolve review complete. Link to originals.");
         if !review.new_proxy_paths.is_empty() {
             println!("Creates new media.");
@@ -133,7 +162,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        let published = result.publish(&job.templates, &job.output, accept)?;
+        let published = result.publish(&templates, &output, accept)?;
         if let Some(warning) = published.cleanup_warning {
             eprintln!("{warning}");
         }

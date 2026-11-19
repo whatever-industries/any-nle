@@ -264,9 +264,12 @@ argument. The internal manifest's optional `atom_media` array holds
 `{item_id, siblings}` shape with explicit picture, A1, and A2 file
 identities. A selected Group timeline adds a `group` object with its
 owning `bin_id` and the two `cameras` item IDs in saved angle order.
-Every Group camera needs a verified split MXF binding. The project can
-register one Group timeline at the qualified 23.976 rate. The same pool
-items can supply straight cuts and Group members. The staged reader
+The Avid Group profile uses verified split MXF bindings. The
+[Premiere Group profile](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-editable-multicam)
+uses verified OP1a cameras in the manifest's ordinary `media` array and
+reads the camera donor from the Group template. The project can register
+one Group timeline at the qualified 23.976 rate. A split MXF pool item
+can supply both straight cuts and Group members. The staged reader
 checks original locators and package identities, plus both mono selectors,
 edit ranges, and each saved angle. Publication rechecks all sibling bytes.
 
@@ -281,6 +284,11 @@ selector change survived native reopen and changed precisely the first
 frames. Samples 10,000 onward were identical across the switch and
 within one PCM24 code of the expected sibling samples after the measured
 native stereo-bus gain. The startup envelope differed on A2.
+
+The retained combined project later passed Save Project As, reopen, timeline
+switching, and re-export. That archive uses explicit media bindings. The
+[automatic mixed Avid test](ROADMAP.md#avid--resolve) assembles the cohort
+from saved Avid input.
 
 The retained linked MOV/WAV project was saved and reopened through
 Resolve scripting. Fresh PCM16 and PCM24 stereo insertions with explicit
@@ -522,28 +530,28 @@ for the untagged and Rec.709 cohorts, respectively.
 
 ## Pending editor checks
 
-When an authorized Resolve UI session is available, use the private
-linked-project return packet and perform these checks.
+These recipes cover the retained linked-project fixtures. Use the
+[Resolve roadmap](ROADMAP.md#davinci-resolve-user-2026-10-26-bookmark-and-research)
+for their qualification status and the
+[Avid → Resolve route](ROADMAP.md#avid--resolve) for the automatic mixed
+project. The private linked-project return packet identifies the exact
+projects, hashes, filenames and output directory.
 
 1. Open `Final-linked-23976.drp` and Save Project As a new disposable project.
    Close and reopen it, switch between both timelines and export a new DRP.
    Verify the one-frame start difference, nested media bin, shared picture,
    exact trims, and both discrete audio lanes. Repeat with
    `Final-linked-24.drp`, `Final-stereo.drp` and `Final-tagged-24.drp`.
-2. In the stereo candidate, insert the existing PCM16 and PCM24 pool items
-   afresh and explicitly assign left and right to separate mono tracks.
-   Save and reopen. Export isolated PCM24 lane references to the packet's
-   `native-return` folder. Compare with the original physical channels,
-   including nonzero trims and both clip boundaries.
+2. To replay the completed fresh-insertion control, use the stereo candidate.
+   Insert the PCM16 and PCM24 pool items and explicitly assign left and right
+   to separate mono tracks. Save and reopen. Export isolated PCM24 lane
+   references to the packet's `native-return` folder. Compare with the original
+   physical channels, including nonzero trims and both clip boundaries.
 3. Author one isolated, editable mixed-rate timing control per direction.
    The retained default Resolve controls differ from Avid's phase-aware
    floor sampling. Export the saved control and full numbered-frame picture,
    then isolated audio. Verify every selected source frame, first sample and
    playable tail before admitting an editable mapping.
-
-The private packet identifies the exact local projects, hashes, filenames
-and output directory. The roadmap retains these checks under their feature
-tasks so they can resume after keyboard and mouse authorization.
 
 Resolve authority revision 6eaa0e747ee98f679d9677d24a102fe033447eb9. Finding content pins:
 

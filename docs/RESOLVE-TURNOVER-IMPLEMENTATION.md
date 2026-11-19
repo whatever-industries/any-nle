@@ -6,6 +6,64 @@ destination preparation and archive writer. The probe uses original files in
 place. Resolve Studio 21.2.0 build 00006, project version 17, remains the native
 qualification target.
 
+## Automatic native media import fallback
+
+The internal linked and turnover writers try standalone preparation first.
+A supported project can be written with Resolve closed. Assisted linking
+uses a running DaVinci Resolve Studio 21.2.0 build 00006 on macOS with
+local external scripting available. Set `ANYNLE_RESOLVE_IMPORT_WORKER` to
+the exact name of a disposable project beginning with
+`Any NLE Import Worker `. Open that project at 24 fps with the root Media
+Pool selected, empty, and free of timelines. The worker exports temporary
+Media Pool records and removes the imported items. If an interruption
+leaves media in the worker, empty the disposable project before retrying.
+
+The internal `any-nle-gui --resolve-job JOB.json` entry point opens Review
+for a Premiere → Resolve job/2. **Media linking** counts distinct
+originals and lists affected names and paths. The launch action starts
+the selected application only on click. A verified media blocker takes
+precedence over Studio readiness. Review shows the affected original and
+offers to recheck the source. Status checks read the running
+edition, build, and scratch state. If the application bundle cannot be
+found, **Locate Resolve Studio…** accepts an installed Resolve bundle.
+An application with an unconfirmed edition is checked through the live
+scripting connection. **Prepare project** rechecks the worker, verifies
+the links, and makes the report available before **Convert** publishes.
+
+The assisted profile covers 1080p straight cuts at exact `24000/1001`,
+24, 25, and `30000/1001`. The original may be progressive square-pixel
+MOV or MP4 at its verified raster, with picture only or embedded 48 kHz
+stereo PCM16, PCM24, or AAC-LC assigned to two independent mono lanes.
+Graph/2 owns the edit clocks, trims and selectors. Resolve supplies the
+Media Pool cache. The converter verifies file-relative picture and audio
+packet grids and checks the saved timecode, including its drop-frame flag.
+PCM and AAC use their physical playable sample extents independently of
+picture. The 29.97 audio edit still needs sample-aligned edit boundaries.
+When Premiere saves a different source raster from the timeline canvas,
+graph/2 retains the edit's input sizing policy. A native-size Premiere
+edit uses Resolve's editable Center Crop control. A saved fit policy
+uses the qualified Resolve scaling default.
+The linked archive writer also uses the Resolve reader's verified
+inherited sizing for this profile. Inherited Center Crop becomes an
+editable clip setting on the affected edits. Inherited fit uses the
+template's verified fit setting. The writer checks the staged sizing
+and identifies the edit when its inherited setting is unresolved.
+The writer reads back the staged archive before exclusive publication.
+An explicitly supplied media digest has to match.
+
+The internal benchmark uses `ANYNLE_RESOLVE_IMPORT_ORDER=api-first` to
+request API-first and `ANYNLE_RESOLVE_IMPORT_TRACE=1` to count imports.
+Standalone-first is the default.
+
+The macOS Review trial launched Studio and published an assisted UHD AAC
+project after the scratch worker became ready. Resolve Save Project As,
+close, reopen, and re-export preserved the compared timeline facts for the
+23.976 UHD AAC, 24 fps picture-only, 25 fps wide-raster PCM24, and 29.97 DF
+PCM24 controls. Every decoded picture frame and both isolated mono PCM
+lanes where present matched independently authored Resolve controls. The
+absent, Free, and unsupported-build Review states were exercised with
+simulated inputs.
+
 ## Premiere linked-media source capture
 
 `resolve-turnover-probe --capture-premiere INPUT.prproj SEQUENCE_ID FFPROBE`
@@ -24,7 +82,7 @@ The Premiere 27 Save As and reopen controls cover:
 | --- | --- |
 | 24 | Eleven trimmed native edits covering AVC MP4/MOV with 48 kHz AAC-LC or PCM, independent mono MOV streams, ProRes HQ MOV with or without PCM, and Main 10 HEVC MP4 with AAC-LC. |
 | 25 and 30000/1001 | Fifteen sources per rate, including UHD AVC with AAC-LC or PCM16/24, 720p and 2048×858 AVC, ProRes HQ, Main 10 HEVC, and DNxHR LB OP1a MXF with PCM16/24. Both the native imports and the saved outputs of the Avid conversion were checked. |
-| 24000/1001 | UHD AVC MP4 with PCM16, PCM24, or AAC-LC. The native AAC saves cover both one stereo edit and two independent mono edits. |
+| 24000/1001 | UHD AVC MP4 with PCM16, PCM24, or AAC-LC, and HD AVC MP4 with AAC-LC. The native UHD AAC saves cover both one stereo edit and two independent mono edits. |
 
 The 29.97 ProRes control retains its `00:00:59;20` file source clock
 independently of the sequence origin. When a full-length native audio edit
@@ -33,6 +91,21 @@ graph carries the playable PCM or AAC extent and records the exact saved
 end in `premiere.saved_audio_tail`. A whole-sample overrun fails capture.
 A retained 24 fps ProRes/48 kHz PCM WAV control also verifies the explicit
 left and right selectors used by split-mono edits of a stereo WAV master.
+
+Standalone capture also retains saved sequence In/Out in
+`premiere.timeline_marks`, using the same reader as conversion jobs. An
+explicit In at frame zero stays distinct from an unset In. Subframe
+values keep exact ticks for destination preparation. Retained Premiere
+27 saves cover 23.976, 24, 25 and 29.97 DF, including a marked and an
+unmarked sequence in the same project. Duplicate and invalid mark fields
+fail capture.
+[Timeline In/Out](#premiere-timeline-inout)
+
+Standalone capture also records saved per-edit label overrides and
+unrecognized label fields in `premiere.clip_label`. Edits with valid
+labels inherited from their matching source templates need no edit-label
+record in this capture. The conversion job continues to record both
+inherited labels and overrides. [Timeline clip labels](#premiere-timeline-clip-labels)
 
 This command covers source media and edit timing. Clip processing and mix
 controls still need their own destination preparation. Resolve publication
@@ -58,12 +131,17 @@ to read sequence ObjectUIDs, names, rates, canvas, saved start ticks,
 and track, clip and transition counts. This reads only the project.
 Use a listed ObjectUID when several sequences share a name.
 
-The prototype admits straight cuts on 1080p24 or 1080p23.976, a saved
-whole-frame origin, picture-only ProRes HQ MOV and 48 kHz PCM16/24 WAV.
+The prototype admits qualified HD and UHD straight cuts with a saved
+whole-frame origin.
+Picture-only ProRes HQ MOV and 48 kHz PCM16/24 WAV use 24 or 23.976 fps.
+The [AVC profile](#premiere-avc-mov-and-mp4) uses `24000/1001`, exact
+24 or 25 fps, or `30000/1001` with a saved drop-frame clock.
+The [Main 10 HEVC profile](#premiere-hevc-main-10-mp4) uses exact 24 fps.
 It follows the saved audio selector through its source reference, checks
 cached timing against the file, and admits independent mono selections on
 two tracks feeding one stereo Mix bus. The static mixer profile below
 defines which mixer controls transfer. Source and record ranges must agree.
+
 Premiere source bins retain panel ownership and stable IDs. Captions keep
 their content, lane and exact record span in graph/2. The reader captures
 sequence Comment markers with exact ticks and preserves bounded native
@@ -78,6 +156,320 @@ the source document. Reviewable omissions require
 `--accept-losses` on the publication run. Timing, media, routing and topology
 failures still block publication. Each input project and media binding is
 checked again before exclusive publication.
+
+### Premiere project selections
+
+Use the internal `resolve-turnover-probe --premiere-project MANIFEST.json`
+entry point to write one project for an ordered selection. The manifest
+contains `premiere`, `sequences`, `templates`, `ffprobe`, and `output`.
+`sequences` is an ordered array of exact saved ObjectUIDs from
+`--list-premiere-sequences`. The existing `--review`, `--graph`, and
+`--accept-losses` options apply. Multi-sequence export uses the 1080p24
+project profile. Existing single-sequence jobs retain their selectors.
+
+The source reader parses the project once, shares physical file checks,
+and retains Premiere item identities and the selected timelines' bin
+ancestry in graph/2. The writer registers timelines in selection order
+and selects the track layout for each timeline. The three-mono profile
+uses the existing `templates.fairlight` donor for V1/V2 and A1/A2/A3.
+
+Two offline controls derived from a retained project use same-named
+timelines, same-named nested bins, distinct starts, and shared ProRes
+HQ and WAV originals. One control pairs a V1/A1/A2 timeline with a
+V1/V2/A1/A2/A3 timeline. It verifies overlapping picture, separate audio
+source trims and distinct Premiere master identities for the same file.
+Staged read-back and unmodified graph/2 replay matched both timelines in
+each control. Instrumented publication performed one media stream probe
+per physical path. Review required approval for the known logging
+omission. Duplicate or missing IDs, invalid media bindings, trims past
+the source extent and occupied output paths refused publication.
+
+Both generated projects passed save, close, reopen, and re-export in
+Resolve Studio 21.2.0 build 00006. The re-exported archives retained the
+ordered timelines, active selection, nested bin ownership, exact starts,
+edits, source trims, paths, and physical channel selectors. Read-back also
+confirmed that shared masters stayed shared and distinct masters for the
+same file stayed distinct.
+
+Native Resolve controls authored with the same originals and ranges
+matched all 48 decoded picture frames per timeline and all nine isolated
+mono renders, each 96,000 sample frames through the same stereo bus.
+The V2 overlay changed picture only over its saved interval. A native
+WAV edit saved just below an integer frame boundary now reads at its
+whole-frame length. A true one-sample difference still refuses graph
+publication.
+
+The combined source fixtures were derived from a retained Premiere
+project. A fully native Premiere source for this combined multi-timeline
+case remains a separate check.
+
+### Premiere AVC MOV and MP4
+
+Current Premiere projects can link progressive, square-pixel 1920×1080
+H.264 High level 4.0 MOV and MP4 at 23.976, 24, 25 or 29.97 DF. The tested layout
+is V1 with two independent mono edits selecting the left and right
+channels of the file's 48 kHz audio track. AAC-LC is qualified at all
+four rates. Embedded PCM16 and PCM24 are qualified at
+[25 fps](#embedded-pcm16-and-pcm24-at-25-fps) and
+[29.97 DF](#embedded-pcm16-and-pcm24-at-2997-df). The turnover reader uses the
+same saved master, media cache and channel-group checks as
+`--capture-premiere`. Graph/2 retains the physical stream and channel
+selectors. The existing Resolve writer checks the original's packet
+clocks and extent, then links the file in place. A separate
+[stereo A1 profile](#native-stereo-a1-at-25-fps) keeps embedded PCM on one
+editable track.
+
+Two native Premiere 27.0.0 build 88 controls used the existing MOV and
+MP4 sources at `01:00:00:00` and trimmed each to file frames 6–41.
+After Premiere Save As and reopen, both split-mono projects generated
+DRPs. After Resolve Studio 21.2.0 build 00006 save, close and reopen,
+both retained the paths, trims and selectors. Both matched all 36
+decoded picture frames and all 72,000 stereo PCM24 sample frames of
+isolated A1 against direct-import Resolve controls. Picture-only
+projects from both sources also reopened and matched all 36 frames.
+
+Isolated A2 matched outside samples 36,192–36,447 (zero-based). The two
+containers hold byte-identical AAC packets. Reimporting the same MP4
+natively changed those same 256 sample frames to the candidate waveform.
+The controls establish channel routing, sample placement and playable
+extent. Exact AAC PCM repeatability inside that window remains unqualified.
+The native AVC imports also saved the default Resolve radiometry cache
+when the originals identified the Rec.709 matrix and limited range but
+left transfer and primaries unset. The writer uses that same record.
+
+#### Exact 24000/1001 fps
+
+The internal route links 1080p H.264 High level 4.0 and UHD H.264
+High level 5.1 with 48 kHz stereo AAC-LC. UHD uses the matching
+hash-pinned project and timeline with the established UHD geometry and
+radiometry fields. Premiere capture and graph/2 retain the unchanged
+locator, exact clock and both physical selectors. The shared verification
+checks the original picture and AAC packet grids, including priming and
+the last playable audio packet.
+
+Three saved and reopened Premiere 27.0.0 build 88 MP4 controls each start
+at `01:00:00:00` and run for 36 frames. The HD control uses source
+frames `[6, 42)`. The first UHD control uses picture `[6, 42)` and audio
+`[7, 43)`. The second uses picture `[11, 47)` and audio `[12, 48)`,
+ending exactly at source sample 96,096. Resolve Studio 21.2.0 build 00006
+saved, reopened and re-exported each conversion with the same clocks,
+raster, trims and independent A1/A2 assignments. All 36 decoded picture
+frames per timeline and both isolated 72,072-sample PCM24 renders
+matched corresponding native Resolve controls. All three staged
+timelines also matched after replay from serialized graph/2. The
+reopened UHD tail replay matched both native renders again. An audio trim
+past the tail, duplicate physical selectors, 44.1 kHz AAC, the wrong UHD
+profile, and an occupied output path refused publication.
+
+#### Exact 25 fps
+
+Two Premiere 27 Save As and reopen controls use 1080p25 AVC MOV and MP4
+with V1 and split-mono A1/A2, a non-drop start of `01:00:00:07` and file
+frames 6–41. The source and reader retain an exact 25-frame display clock.
+At this rate, a 48 kHz frame is exactly 1,920 samples. The AAC cache
+holds 92,160 playable samples per channel for the 48-frame original.
+The writer uses the hash-pinned native Resolve 25 fps project and timeline
+skeleton supplied as `templates.profile`, with the existing linked media
+donor supplied as `templates.layout`.
+
+Both generated projects saved and reopened in Resolve Studio 21.2.0
+build 00006 with their original paths, clocks, trims and channel assignments.
+All 36 frames per container and the 69,120 sample frames of each of the
+two MOV lanes and MP4 A1 matched the direct-import Resolve controls.
+MP4 A2 differed in samples 36,672–36,927 (zero-based). A fresh native MP4
+import reproduced the candidate's A2 output sample for sample. Review
+rejects a contradictory Premiere display clock or an incompatible profile
+template before publication.
+
+#### 29.97 drop-frame
+
+The Premiere 27 MOV and MP4 controls save a base-30 drop-frame display
+clock at exact `30000/1001`. The linked DRP uses the same-build native 29.97
+DF profile supplied as `templates.profile`. The timeline stores the
+drop-frame flag separately from the media rate. Save, close and reopen in
+Resolve Studio 21.2.0 build 00006 retained the start at `00:00:59;20` and
+the minute rollover to `00:01:00;02` ten picture frames later.
+
+The 48-frame original has 76,876 playable AAC samples per channel.
+The writer verifies the packet extent, stores the playable sample count,
+and preserves the picture extent independently. The tested split-mono
+edits use file frames 5–44 and sample interval `[8008, 72072)`. Each
+container matched all 40 decoded picture frames and both isolated
+64,064-sample-frame PCM24 renders against its direct-import Resolve control.
+This profile requires whole 48 kHz sample boundaries for each audio edit.
+The non-drop display format, off-sample trims and mismatched template
+refuse before publication.
+
+#### UHD AVC at 25 and 29.97 DF
+
+The internal Premiere route links progressive, square-pixel 3840×2160
+H.264 High level 5.1 MP4 with 48 kHz AAC-LC when the saved timeline uses
+the same raster and exact rate. The checked files declare limited range
+and a Rec.709 matrix, with primaries and transfer unset. The writer uses
+the same observed UHD media geometry and radiometry fields at these rates
+and at [23.976](#exact-240001001-fps).
+The project and timeline come from the matching hash-pinned UHD native
+profile. Read-back checks the file raster and timeline canvas separately.
+
+Both Premiere 27 controls saved and reopened with picture and two
+independent mono edits using source frames 5–44. Resolve Studio 21.2.0
+build 00006 saved and reopened the generated projects at 3840×2160.
+The 25 fps timeline starts at `01:00:00:07`. The 29.97 DF timeline starts
+at `00:00:59;20` and skips to `00:01:00;02` ten frames later. All 40
+decoded frames per rate and both isolated PCM24 lanes matched the native
+Resolve controls exactly. The exports contain 76,800 sample frames per
+lane at 25 fps and 64,064 at 29.97 DF.
+
+An HD timeline referencing a UHD original and an HD template for a UHD
+job both refuse before output. Other UHD clocks, editable UHD picture
+effects and mixed-raster scaling need separate qualification.
+
+#### Embedded PCM16 and PCM24 at 25 fps
+
+The internal AVC route links 48 kHz stereo PCM16 and PCM24 directly
+from matching 25 fps MOV or MP4 originals. It validates the codec tag,
+bit depth, channel layout, packet grid and payload sizes. Premiere
+graph/2 keeps the physical file stream and both channel selectors. The
+Resolve reader verifies the saved track, bit depth and channel routing
+in the embedded PCM cache.
+
+Premiere 27 saved and reopened four controls at `01:00:00:07`, with
+independent left and right mono edits and a source range of frames 5–44.
+They use HD MOV and UHD MP4 at both bit depths. The PCM24 MOV test file
+combines the retained HD picture and PCM24 signal for this test.
+Resolve Studio 21.2.0 build 00006 saved and reopened all four generated
+projects. Each retained the exact trim, paths, bit depth and channel
+assignments. All 160 decoded picture frames and all eight isolated
+76,800-sample-frame PCM24 exports matched their native Resolve controls.
+
+#### Embedded PCM16 and PCM24 at 29.97 DF
+
+The four same-rate Premiere 27 controls use HD MOV and UHD MP4 with
+embedded 48 kHz stereo PCM16 or PCM24. The HD PCM24 MOV combines retained
+HD picture with a retained PCM24 signal. Each 48-frame source has 76,876
+complete audio samples per channel. The writer validates the physical
+PCM packets and keeps the audio extent separate from picture duration.
+Audio edit boundaries must fall on whole 48 kHz samples.
+
+After Resolve Studio 21.2.0 build 00006 saved and reopened the generated
+projects, the originals stayed online. The timelines retained their
+`00:00:59;20` start, `00:01:00;02` rollover, file frames 5–44 and exact
+sample interval `[8008, 72072)` on both independently selected mono lanes.
+All 160 decoded picture frames and eight isolated 64,064-sample-frame
+PCM24 lane renders matched their native Resolve controls exactly.
+An off-sample trim, a saved cache one sample too long, and an occupied
+output all refused before publication.
+
+#### Native stereo A1 at 25 fps
+
+The internal route can link 1920×1080 25 fps H.264 MOV with one embedded
+48 kHz PCM16 or PCM24 stereo stream. It keeps a neutral stereo edit on A1
+using graph/2 `grouped_audio` with the ordered left/right selectors. The
+writer takes the native stereo layout from the hash-pinned
+`templates.profile` export and validates both channels on staged read-back.
+The Resolve reader recognizes the saved stereo clip selector and Media Pool
+default for the same profile. The timeline comparison checks each channel.
+
+Two Premiere 27 save-and-reopen controls start at `01:00:00:07` and use
+file frames 5–44. The HD PCM24 MOV is a synthetic control made from retained
+picture and audio. Both generated projects saved and reopened in Resolve
+Studio 21.2.0 build 00006 with V1 and one editable stereo A1 track. Fresh
+insertion from the Media Pool also used one stereo track in left/right order.
+All 80 decoded picture frames and both channels of the two
+76,800-sample-frame PCM24 renders matched their direct-import Resolve
+controls exactly. Contradictory Premiere channel layouts, a wrong native
+template and occupied outputs refused publication. Replaying saved
+graph/2 through the linked probe matched the reopened timelines, and
+reversing the saved left/right selectors refused publication.
+
+#### Separate stereo WAV at 25 fps
+
+The same stereo track and mixer also carry a separate 48 kHz PCM16 or
+PCM24 WAV on a neutral 1080p25 timeline. The Premiere reader validates the
+WAV's saved channel group and records both physical selectors in one
+graph/2 `grouped_audio` edit. The WAV's own locator, playable sample extent
+and source trim remain independent of picture. The Resolve writer shares
+the standalone WAV cache and the same stereo timeline selector.
+
+Premiere 27.0.0 build 88 saved and reopened two timelines at
+`01:00:00:07`. Both use picture frames `[5, 45)` and WAV frames `[7, 47)`,
+which select samples `[13440, 90240)`. The staged and reopened DRP graphs
+match the native Resolve controls, including when the separate picture and
+audio sources are replayed from serialized graph/2. The native WAV
+in-point carries a binary64 residue beside the integer frame. The reader
+accepts that representation and refuses a real one-sample offset.
+
+After save, close and reopen in Resolve Studio 21.2.0 build 00006, the WAV
+stays online in left/right order on one editable A1 track. Fresh insertion
+uses the same mapping. All 80 decoded picture frames and both channels of
+each 76,800-sample-frame PCM24 render match the native Resolve controls.
+The interior samples match the trimmed source exactly. The native and
+generated renders share the same differences within the first and last
+72 sample frames. Swapped selectors, a trim past the WAV tail, a missing
+file, a mismatched media digest and an occupied output path refuse.
+
+[pr2resolve's audio format notes](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md#L27-L29)
+and [drpkit's WAV cache writer](https://github.com/higuchiki/drpkit/blob/af3cedc0f40ae2192929158399667b4d28863dd6/drpkit/compose.py#L202-L250)
+cross-check the cache structure. The saved stereo edit and mixer match
+come from the same-build native controls.
+
+#### Stereo A1 with mono A2 at 25 fps
+
+The internal single-timeline route also supports separate 48 kHz stereo
+and mono PCM WAV originals on A1 and A2, with neutral mixer controls and
+contiguous, equal record coverage on V1, A1 and A2. Graph/2 keeps the
+ordered stereo group on A1 and a physical mono selector on A2. The
+writer uses a distinct hash-pinned 25 fps layout and mixer donor through
+`templates.profile`. Staged read-back checks both lanes against the
+prepared edits.
+
+A Premiere 27.0.0 build 88 source saved and reopened at `01:00:00:07`
+with picture frames `[5, 45)`, stereo PCM24 frames `[7, 47)` and mono
+PCM24 frames `[11, 51)`. The saved job and serialized graph replay
+kept those edits and original file paths. In Resolve Studio 21.2.0
+build 00006, both outputs saved, reopened and re-exported with exact
+trims and channel order. Fresh insertion from the Media Pool kept the
+stereo and mono routes.
+
+All 40 decoded picture frames and both channels of each 76,800-sample
+render matched the native Resolve control for the full mix, isolated A1
+and isolated A2. Outside the edge ramps, stereo matched the two original
+channels and the mono source reached both bus channels at Resolve's
+measured −3 dB center pan. The archive comparison checks the edits and
+physical selectors. The reader separately recognizes the two observed
+neutral mixer models from the donor and reopened exports. Unknown mixer
+state remains a comparison gap. Wrong selectors, an A2 trim past the
+WAV tail, the stereo-only donor and occupied output paths refused
+publication.
+
+Other stereo clocks, stereo MP4 edits, mix changes and combinations with
+mono timeline tracks need separate qualification. Dual-mono movie
+streams, HEVC and MXF also need destination checks. Public route exposure
+remains under the [product gate](ROADMAP.md#resolve-product-exposure).
+
+### Premiere HEVC Main 10 MP4
+
+The internal route links progressive, square-pixel 1080p24 Main 10
+level 4 MP4 tagged `hvc1`, with limited range, a Rec.709 matrix and
+unspecified primaries and transfer. The tested original carries one
+48 kHz AAC-LC stereo stream. The writer uses Resolve's native Main 10
+media cache and shares the physical packet, trim and channel checks
+with AVC. Graph/2 retains the original path, exact clocks and physical
+channel selectors.
+
+A Premiere 27.0.0 build 88 control saved and reopened with V1 and two
+independent mono edits on A1 and A2. All three edits use source frames
+`[6, 42)` at a record start of `01:00:00:00`. The saved job and serialized
+graph replay both saved, reopened and re-exported in Resolve Studio
+21.2.0 build 00006. Their codec, geometry, radiometry and saved cache
+flag match the native Resolve import. All 36 decoded picture frames and
+both isolated 72,000-sample PCM24 renders match the native control
+exactly. The saved Media Pool assignment also retains both mono channels.
+
+A trim past the original, duplicate physical selectors, HDR signaling,
+the wrong rate template and an occupied output path refuse publication.
+Other HEVC rasters, rates, encodings and color profiles remain outside
+this qualification.
 
 ### Camera picture with independent editorial audio
 
@@ -136,8 +528,8 @@ Review reports the substitution and graph/2 keeps the Premiere color.
 A marker whose position or duration cannot be represented, whose start
 is shared with another marker, or whose type or payload is unsupported
 is reported by occurrence and requires loss approval.
-Saved values remain in graph/2 or the bounded source receipt. Clip
-markers and richer Premiere marker types remain outside this profile.
+Saved values remain in graph/2 or the bounded source receipt. Richer
+Premiere marker types remain outside this writer profile.
 
 A Premiere 27.0.0 build 88 Save As and reopen supplied a 24 fps
 sequence beginning at `01:00:00:01`. Resolve Studio 21.2.0 build 00006
@@ -149,18 +541,137 @@ channel selectors were unchanged. The same Premiere project's linked
 AAF contained all five marker positions and comments, with no embedded
 essence. Its marker entries lacked names, colors and range lengths.
 Resolve imported the AAF at the same timeline origin and reopened it
-with zero timeline markers. That import did not reconnect the originals
-in the tested setup, so it does not qualify AAF media or audio behavior.
+with zero timeline markers. The initial import used a preloaded Media Pool
+and left the originals offline. The same unmodified AAF reopened online
+with automatic source import enabled and still had zero timeline markers.
+The AAF import also used the left channel from each stereo WAV on both
+audio lanes. The native DRP retained all five markers and kept the
+distinct left and right selectors. The reopened 48-frame renders matched
+in picture, and the isolated PCM confirmed the AAF's duplicated left
+channel across the 96,000-sample-frame span. See the
+[linked AAF benchmark](#premiere-linked-aaf-benchmark).
+
+### Premiere linked AAF benchmark
+
+Open and save the 1080p24 combined-transition control in Premiere 27,
+then close and reopen it. Export AAF with video mixdown, Breakout to Mono,
+and rendered audio effects disabled. Import that unchanged AAF into a
+disposable Resolve project with automatic source import enabled. Import
+the matching Any NLE DRP into a second project. Save, close and reopen
+both. Compare the saved V1 and audio ranges and render each populated audio
+lane separately with the same Resolve settings.
+
+On Premiere 27.0.0 build 88 and Resolve Studio 21.2.0 build 00006, the
+AAF export log reported three ignored Cross Dissolve properties. The AAF
+still contained the eight-frame Video Dissolve and Mono Audio Dissolve,
+and Resolve reopened both as editable transitions. The AAF and DRP kept
+the same one-hour origin, all five linked edits, both transition windows,
+and the same source files and trims. The AAF placed its populated audio
+tracks on A2 and A4. The DRP retained Premiere's A1 and A2. After adjusting
+for the track numbers when isolating lanes, all 48 decoded picture frames
+and both 96,000-sample-frame PCM24 renders matched exactly.
+
+The AAF linked in place with automatic source import. Preloading the same
+three files and disabling automatic source import left the AAF events
+unbound. A separate locator-only diagnostic copy also linked automatically
+and produced identical saved edit facts. The render comparison uses the
+unmodified AAF.
+
+## Premiere source clip markers
+
+Both Premiere source readers retain Comment markers on linked source items
+in graph/2, with names, comments, palette colors, and exact item-relative
+times. The `premiere.clip_markers` receipt records the native object ID and
+payload digest. Unsupported payloads retain a bounded receipt and produce
+a loss for the affected occurrence.
+
+A Premiere 27.0.0 build 88 Save As and reopen preserved a point before
+both trims and a ranged marker on a picture item used twice. Graph/2
+kept both markers once on the source item, with the ranged marker's exact
+saved subframe length.
+
+The linked Resolve writer maps frame-aligned source markers for verified
+picture-only 1920×1080 ProRes HQ MOV at 24 or `24000/1001` fps. Both
+profiles accept nonzero embedded source timecode that
+agrees with the saved Premiere media origin. The writer uses the verified
+picture source rate and assigns the Media Pool marker collection to the
+linked item's UUID. Both trimmed edits share the same item. A Premiere
+point is a one-frame Resolve marker. Red, Cyan, Blue, Green, and Yellow use
+the same palette names. Magenta, Orange, and White use Lavender, Sand, and
+Cream with approval in Review. Subframe positions or durations, conflicting
+starts, and unsupported colors produce occurrence-specific omissions.
+[Source marker palettes](RESOLVE-SOURCE-READER.md#source-marker-palettes)
+
+The frame-aligned variant placed a point at source frame 2 and a
+seven-frame range at source frame 10. Resolve Studio 21.2.0 build 00006
+saved, closed, reopened, and re-exported both markers on the shared Media
+Pool item, with the accents and multiline comment intact. The native
+control also distinguished an independent timeline item marker. Editing
+the generated marker's custom data survived a separate save and reopen.
+The generated and native Resolve renders matched all 48 decoded picture
+frames and both PCM24 channels over 96,000 sample frames. The
+`24000/1001` round trip also preserved distinct custom values on the
+shared source and matched both isolated mono lanes.
+[Exact 23.976 source marker clock](RESOLVE-SOURCE-READER.md#exact-23976-source-marker-clock)
+[Embedded source timecode](RESOLVE-SOURCE-READER.md#embedded-source-timecode)
+
+The same source marker route supports standalone mono 48 kHz PCM16 and
+PCM24 WAV at 24 and `24000/1001` audio import rates. The
+`24000/1001` stereo controls preserve one marker collection on the
+shared source while the left and right lanes keep their separate
+trims and selectors. Sample-level Premiere positions remain exact in
+graph/2. Resolve Review reports
+positions or durations outside its frame grid by marker occurrence.
+[WAV source marker qualification](RESOLVE-SOURCE-READER.md#standalone-wav-source-markers)
 
 ## Premiere timeline In/Out
 
 The Premiere 27 reader retains saved `MZ.InPoint` and `MZ.OutPoint` ticks in a
 `premiere.timeline_marks` sidecar on the sequence. Whole-frame values also
 carry their saved frame number. Subframe values retain their exact ticks, and
-the unset sentinel produces no mark. Resolve turnover reports each mark as an
-omission and requires `--accept-losses` before writing. Premiere export tests
-must establish the saved Out boundary before the route writes a destination
-range. Timeline In/Out is separate from work area, clip trims and timecode origin.
+the unset sentinel produces no mark. Timeline In/Out is separate from work
+area, clip trims and timecode origin.
+
+The writer maps frame-aligned In-only, Out-only and paired selections to
+matching timeline-relative audio and video marks. The absent side of a
+one-sided selection stays unset. Premiere stores an exclusive Out
+boundary. Resolve includes its saved Out frame, so it gets the Premiere
+Out minus one frame. Subframe values and ranges outside the edit remain
+in graph/2 and are reported for loss approval. Contradictory tick and
+frame receipts refuse publication. [Pinned pr2resolve mark encoding](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md#L24)
+
+Two Premiere 27.0.0 build 88 saves start at `01:00:00:01`. In frame 2
+with saved Out 13 exported 11 frames. Advancing Out to 14 exported 12.
+The generated projects reopened in Resolve Studio 21.2.0 build 00006
+with Out 12 and 13 respectively. Both applications exported the same
+positions within their own full render. Each generated Resolve render
+matched its native Resolve control frame for frame and sample for
+sample. Three more controls reopened and matched native Resolve at
+23.976, 25 and 29.97 DF, including an Out at the end of the edit and
+a range spanning the dropped timecode numbers. The 25 fps range also
+matched after serialized graph/2 replay and native reopen.
+
+#### One-sided and frame-zero marks
+
+The 24 fps controls use a Premiere 27 save with a 48-frame timeline
+starting at `01:00:00:01`. Derived source projects change the saved mark
+fields. In-only at frame 2 selected 46 frames through the end. Out-only
+at exclusive frame 13 selected 13 frames from the start. Out-only at
+exclusive frame 1 selected just the first frame. The mark values survived
+Resolve 21.2 save, close and reopen, with both audio selectors intact.
+
+In-only, paired and single-frame selections at zero survived import on
+the Edit page and reopen. Import on the Deliver page dropped the explicit
+In at zero in this build. A one-field archive comparison confirmed that
+changing the saved playhead did not fix Deliver-page import. Use the
+Edit page for import when retaining the explicit zero mark matters.
+
+Serialized graph/2 replay matched the saved-job picture and stereo PCM
+for In-only, Out-only and paired frame-zero In. For paired single-frame
+selections, the render API defaulted to the full timeline when passed
+only `SelectAllFrames=false`. Explicit equal render bounds returned the
+correct decoded frame and 2,000 exact stereo PCM sample frames on both
+tests. The paired-mark and unmarked regressions matched their controls.
 
 ## Premiere timeline track state
 
@@ -279,7 +790,7 @@ for changed labels remains open.
 
 ## Premiere Cross Dissolve
 
-The internal 1080p23.976 turnover maps one eight-frame V1 Cross Dissolve
+The first 1080p23.976 turnover mapped one eight-frame V1 Cross Dissolve
 (Legacy) with left or centered alignment to an editable Resolve Cross
 Dissolve. The reader requires the outgoing clip's saved tail reference
 and the incoming clip's saved head reference to agree with the transition
@@ -298,7 +809,7 @@ outgoing image, while the Resolve blend is already visible on that frame.
 
 ## Premiere Constant Gain crossfade
 
-The internal 1080p24 turnover maps one centered eight-frame Constant
+The first 1080p24 turnover mapped one centered eight-frame Constant
 Gain transition on A1 to an editable Resolve Cross Fade 0DB. It verifies
 both saved clip references, the fade settings, and four frames of linked
 WAV source on each side of the cut. The visible trims and separate mono
@@ -314,10 +825,10 @@ matched the corresponding native Resolve PCM24 render across all
 
 ### Combined picture and audio transitions
 
-A 1080p24 timeline can carry one qualified V1 Cross Dissolve and one
-qualified A1 Constant Gain crossfade. Each transition keeps its own
-cut, clip references, and handles. Two transitions on the same lane
-are outside this profile.
+A 1080p24 timeline can carry qualified V1 Cross Dissolves and A1
+Constant Gain crossfades. Each transition keeps its own cut, clip
+references and handles. The initial combined control used one on
+each lane.
 
 An offline Premiere fixture combined a centered picture cut at frame
 20 and a centered audio cut at frame 24. After saving and reopening
@@ -327,6 +838,175 @@ the picture-only transition control. Both isolated PCM24 renders
 matched the audio-only transition control across 96,000 sample frames
 per lane. The linked Resolve writer also reproduces the combined
 project from the saved graph of either editor.
+
+### Repeated transitions on one lane
+
+Premiere 27 saved and reopened a 1080p24 control with two centered
+Cross Dissolves on V1 and two centered Constant Gain crossfades on A1.
+Each transition is eight frames. The middle edit on each lane owns a
+head and a tail transition. Source capture binds each transition by its
+unique saved references and exact cut before adjusting graph/2 ranges
+for source handles. The writer restores the visible trims and verifies
+each saved interval and endpoint after staging. Duplicate references,
+ambiguous endpoints, overlapping windows and insufficient handles
+refuse publication.
+
+Resolve Studio 21.2.0 build 00006 saved and reopened the direct DRP,
+the serialized graph/2 replay and the untouched linked Premiere AAF.
+The three outputs matched all seven edit ranges, original paths,
+source trims and four blend windows. All 48 decoded picture frames
+and both isolated 96,000-sample PCM24 renders matched exactly. The
+DRP retained A1/A2 while the AAF placed the same audio on A2/A4.
+Premiere's export reported ignored Border Width, Border Color and
+Anti-aliasing Quality for each dissolve. Review still reports the
+known blend sampling difference from native Premiere by occurrence.
+Archive comparison reports a later transition by its own lane and
+cut when more than one candidate shares that lane.
+
+### Variable lengths and Constant Power
+
+Premiere source capture retains the exact whole-frame interval, cut and
+endpoint identities in graph/2. The Resolve writer keeps visible trims
+and checks the required handles for the saved interval. The linked path
+accepts left-aligned V1 Cross Dissolves and even-length centered V1
+Cross Dissolves or A1 crossfades within its existing media and rate
+profiles. A centered transition with an odd duration remains outside
+this profile. Native video saves at 2, 6, 8, 12 and 304 frames establish
+the little-endian duration field in the saved effect bytes.
+
+The 1080p24 control saved a six-frame centered and a twelve-frame
+left-aligned dissolve, an eight-frame centered Constant Power crossfade,
+and a ten-frame centered Constant Gain crossfade. Both internal output
+paths kept all seven edits and four windows after save, close, reopen
+and re-export in Resolve Studio 21.2.0 build 00006. All 48 decoded
+pictures matched both the separately authored Resolve dissolve control
+and the linked Premiere AAF import. Both isolated PCM24 lanes matched the
+native Resolve control across all 96,000 sample frames per lane.
+
+Resolve imported the AAF's Constant Power as a linear 0 dB fade. The
+internal writer maps a qualified plain mono Constant Power to the
+editable +3 dB preset. After accounting for the dry level difference,
+the relative RMS error against Premiere over the test fade was 21.1%
+for the AAF import and 13.7% for the +3 dB mapping. Review reports the
+approximation by occurrence and publication requires `--accept-losses`.
+Constant Gain remains a 0 dB fade. The fade on A1 leaves the other lane
+sample-identical to the AAF import. Custom fade controls and an exact
+Constant Power envelope still need separate qualification.
+
+### Premiere editable multicam
+
+The internal linked turnover captures one 1080p23.976 Premiere multicam
+source with two continuous DNxHR LB OP1a camera files and two independent
+48 kHz PCM24 mono streams per file. It keeps the saved camera offsets
+and visible trims in graph/2. The hidden backing sequence must have a
+neutral Mix bus, camera A's hard-panned mono transport, and muted camera B
+audio. Each outer audio edit identifies its logical channel group and its
+physical output independently of the picture's saved SelectedTrackIndex.
+Resolve reuses the native two-camera Group and links both camera originals
+in place. Other track layouts, creative processing, and an audio angle
+switch need separate mappings.
+
+Premiere 27 build 88 saved, closed and reopened a three-cut picture
+control with independent fixed mono lanes and a qualified 01:00:00:00
+record start. Resolve Studio 21.2.0 build 00006 reopened the direct
+conversion and the graph/2 replay with nine matching ranges and trims.
+All 145 decoded picture frames agree between the two Resolve paths.
+Comparison with the Premiere render identified the same camera at every
+frame. The synthetic color patches have a small cross-editor level
+difference. Resolve exposed the native multicam switch commands for
+the reopened clip.
+
+A second graph selected camera A in place of camera B on the middle
+picture edit. After reopen, precisely frames 48–95 changed. All 290,290
+sample frames per isolated lane remained identical across the original
+and switched Resolve projects. Against the camera-A sources, each lane
+kept sample placement and matched within two PCM24 codes after accounting
+for Resolve's stereo-bus gain and its 72-sample start and end ramps. Wrong
+saved audio selectors, a swapped internal routing matrix, and an
+independent audio angle change refused publication.
+
+The pinned pr2resolve notes informed earlier audio channel work. Its
+native export guard rejects nested sequences. The Group mapping here
+uses the saved Premiere multicam object graph and the retained Resolve
+native Group template.
+[pr2resolve format notes](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md#L27-L29)
+· [Native export guard](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/pr2_native.py#L415-L416)
+
+### Mixed-rate native comparison
+
+A separate Premiere 27 control cuts from 23.976 to 24 fps ProRes HQ
+on a `24000/1001` timeline, with separate PCM16 mono WAVs trimmed
+by 4,004 and 6,006 samples. Premiere Save As and reopen retained
+both physical links, a nonzero timeline origin and the two clocks.
+On the 24 fps edit, Premiere's saved source In corresponds to 23.023
+source frames. Flooring that origin plus the record-relative frame
+index times 1001/1000 predicts all 1,059 source selections.
+
+Default Resolve conform begins and ends on the same file frames
+when the visible extent is matched. Premiere skips source frame
+1,000 at record frame 993, and Resolve skips source frame 1,021 at
+record frame 1,014. The 21 intervening picture selections differ.
+Both source pulses landed at the same PCM sample positions in the
+two 2,152,150-sample renders. Waveform checks near the start and
+tail agree within one 16-bit code after fitting each editor's
+center mix coefficient.
+
+For plain V1 Frame Sampling from 24 fps ProRes HQ on a 23.976 timeline,
+the internal job now captures the saved source In and all selected
+picture frames in graph/2. Resolve writes its compact mixed-rate map
+with a source In one thousandth of a record frame before the exact
+Premiere In. The graph keeps the exact Premiere time. The reader checks
+the map and alignment and reconstructs the same frame selections.
+Verified media stay linked in place and WAV trims stay on their own
+48 kHz clock.
+
+After save, close and reopen in Resolve Studio 21.2.0 build 00006, the
+generated project matched all 1,075 numbered Premiere picture frames.
+Its mix PCM matched the native Resolve control exactly. The isolated
+A1 and A2 renders each retained 2,152,150 sample frames, their distinct
+4,004- and 6,006-sample source trims, and their known pulse positions.
+Three longer Resolve experiments reproduced all 3,136 expected frame
+selections per test with different nonzero trims. This rate pairing
+requires a known positive source In and plain picture sampling.
+
+#### 23.976 picture on a 24 fps timeline
+
+Premiere 27.0.0 build 88 saved and reopened controls with a same-rate
+lead-in and a picture-only 23.976 ProRes HQ MOV on V1. Both 1080p24
+sequences start at non-drop `01:00:00:00`. The mixed-rate edit is 1,059
+record frames. Its source In is either zero or one second, which is
+exactly `24000/1001` source frames. Premiere Frame Sampling selects source frame
+`floor((InOnRecordGrid + recordOffset) × 1000/1001)`. On the trimmed
+control, Premiere repeats source frame 1,000 at record frame 994.
+Resolve's default conform selected different source frames at 29
+positions on that control.
+
+The same graph/2 frame map carries the exact source In and selected
+frames for both rate pairings. Resolve writes the compact mixed-rate
+map with its source In 0.002 of a record frame earlier for the
+23.976-to-24 case. The writer uses a zero whole part and a negative
+fraction for the zero-trim case. The reader checks the rate, alignment
+and compact map and reconstructs the exact graph trim and frame
+selections. [Pinned compact timemap reference](https://github.com/samuelgursky/davinci-resolve-mcp/blob/1e2bf0342ad1eee4efc69b4d2d1e89e8dc493048/resolve-advanced/vendor/drp-format/media-timemap.js)
+
+The offline conform probe checks explicit picture maps against the saved
+file clock and marks contradictory timing receipts as inconclusive.
+
+After Save Project As, close and reopen in Resolve Studio 21.2.0 build
+00006, both generated timelines matched all 1,075 numbered Premiere
+frames. A serialized graph replay reproduced the trimmed timeline.
+Re-exported archives preserved the start, edit ranges, linked originals
+and both mono selections. The 4,000- and 6,000-sample WAV trims stayed
+independent. The mix and both isolated lanes matched the native Resolve
+control exactly across 2,150,000 PCM24 sample frames each. Four longer
+Resolve controls also matched every expected frame selection, including
+a trim that starts at an exact repeat boundary.
+
+The qualified profile uses picture-only, square-pixel 1080p ProRes HQ
+MOV at its original clock and plain V1 Frame Sampling. Zero source In
+for 24 fps picture on a 23.976 timeline, frame blending, optical flow,
+and the linked AAF comparison remain open.
+[Resolve → Premiere verification](RESOLVE-SOURCE-READER.md#resolve-to-premiere-mixed-rate-frame-sampling)
 
 ## Premiere clip components
 
@@ -446,6 +1126,137 @@ native −6 dB control for the first edit and the neutral control for the
 second, sample for sample across 96,000 frames. Review reported the
 animated volume ramp and the existing clip metadata omissions.
 
+### Premiere Linear clip-volume curve
+
+Premiere 27.0.0 build 88 retained the same two Linear keys at item-source
+frames 5 and 28 after Save As and reopen. In separate saves, the levels
+were changed to test rising, falling, entirely negative, entirely
+positive, and wider ranges. The tests sampled 65 parameter values per
+range and rendered the trimmed mono clip in isolation. The retained
+Resolve PCM follows a dB-linear ramp. Premiere's measured parameter
+curve differs from that interpolation by up to 0.31 dB for −6 to +3 dB
+and 4.66 dB for −24 to +9 dB.
+
+Away from unity, the sampled Premiere curve fits interpolation in a
+coordinate that uses `exp(k * dB)` below 0 dB and
+`2 - exp(-k * dB)` above it, with measured `k ≈ 0.05154588`. Inverting
+that coordinate predicts the sampled parameter values within 0.00002 dB
+outside the unity region. The isolated PCM also shows a unity plateau
+near ±0.03 dB. The fitted constant and the plateau are measured evidence
+for these controls.
+
+For two ordered whole-frame Linear keys inside a 24 fps mono edit, the
+reader now records item-source times, calibrated dB endpoints and
+Premiere's native interpolation identity in the occurrence-owned
+`premiere.clip_volume` sidecar. Raw levels, ticks and interpolation flags
+remain in `premiere.component_parameters`. Review reports the curve
+difference for the affected edit. Subframe and other interpolation
+receipts continue to retain their raw values.
+
+#### Editable Resolve ramp trial
+
+Resolve Studio 21.2.0 build 00006 retained all 100 Linear keys across the
+six ramp controls after Save Project As, close, reopen and re-export. All
+controls used the same 24 fps trim and the same physical right channel of
+the stereo PCM24 WAV on a mono lane. In the Inspector, a new −4 dB key on a
+duplicate survived a second reopen at item-source frame 17. The original
+endpoints at frames 5 and 28 and the other test curves were unchanged.
+
+Each isolated render was measured against its editor's own dry reference.
+Premiere held unity for 344 samples on the −6 to +3 dB rise and 341 on the
++3 to −6 dB fall at 48 kHz, about 7.1 ms in each direction.
+
+| Resolve keys | Peak error, rise | Peak error, fall | Rendered unity region |
+|---|---|---|---|
+| Two original endpoints | 0.309 dB | 0.310 dB | No plateau in either direction |
+| One key per frame from the measured curve | 0.044 dB | 0.045 dB | One measured unity sample on the rise and none on the fall |
+| One key per frame with the two surrounding keys set to unity | 0.318 dB | 0.318 dB | About 21 ms, early on the rise and late on the fall |
+
+The tested frame-based mappings fail to reproduce the unity plateau. The
+converter retains the source curve in graph/2 and reports the affected
+edit in Review. Resolve clip-volume writing for this Premiere curve
+remains pending.
+
+#### Subframe clip-volume keys
+
+The [Resolve 21 New Features Guide](https://documents.blackmagicdesign.com/SupportNotes/DaVinci_Resolve_21_New_Features_Guide.pdf)
+documents subframe audio keyframing on the Edit page. In Resolve Studio
+21.2.0 build 00006, two keys authored with Option-click at high zoom
+survived Save Project As and reopen at item-source frames 19.417334 and
+19.799095. In the saved clip-volume parameter 95, a Linear key with a
+nonzero fractional time sets flag `0x02000000` and appends a little-endian
+`f64` fraction of a frame after the dB value. The frame-aligned keys kept
+their original encoding.
+
+The rising and falling candidates each used 187 keys, with keys near the
+plateau placed on the 48 kHz sample grid. Their saved key data survived
+Save Project As, close, reopen and re-export byte for byte. The right
+channel stayed assigned to the trimmed mono edit. Peak render errors
+against Premiere were 0.030 dB for the rise and 0.034 dB for the fall.
+The rise had no measured unity sample and the fall had one, compared with
+the 344- and 341-sample unity spans in Premiere.
+
+Separate steep-change controls placed 347 samples at unity in the edited
+curve. Both renders reached unity only at sample 19,072. Around that point,
+rendered gain fit linear interpolation in amplitude between points 1,000
+samples apart, within 0.000024 dB. This playback result is scoped to the
+tested 24 fps, 48 kHz clip path. The editable subframe data did not reproduce
+the Premiere plateau, so the graph/2 source receipt and Review loss remain
+the conversion behavior for this case.
+
+## Premiere frame holds
+
+Current Premiere projects using Source Timecode Frame Hold can capture the
+underlying edit trim and the held picture through graph/2. The internal
+linked Resolve writer recreates the hold at source In. When the held picture
+differs from Premiere's source In, the turnover job reports the change in
+Resolve's exposed source In and uses the existing `--accept-losses` approval
+before publishing. The captured graph keeps both values. [Frame-hold profile and native verification](RESOLVE-SOURCE-READER.md#linked-picture-frame-holds)
+
+## Odd-length Premiere 50% picture speed
+
+The internal Premiere → Resolve route reads a saved half-frame Out at 50%
+when Premiere uses Frame Sampling and the record and source spans agree
+exactly. The linked 1080p24 ProRes HQ MOV writer requires every sampled
+source picture to exist, including the final picture shown once. Saved jobs
+and graph/2 retain the fractional source span. [Native qualification](RESOLVE-SOURCE-READER.md#odd-length-half-speed-picture)
+
+## Premiere 200% forward picture speed
+
+The internal linked route carries a same-rate 24 fps V1 ProRes HQ
+MOV edit with Premiere Frame Sampling as graph/2 `Speed` with ratio
+`[1, 2]`. The placement keeps the exact file-relative source In. The
+source duration covers twice the record duration. Serialized graph/2
+retains the original Premiere trim ticks in `premiere.picture_speed`.
+A Premiere Out immediately after the last sampled picture and an Out
+including the final skipped frame produced the same numbered cadence.
+Both require the full nominal source span to fit the verified original.
+
+Resolve stores In on the retimed clock. Whole source starts that are
+odd require a saved half-frame remainder. The two-point native map ends
+at source frame `available - 2` and retains `available - 1` as the
+`LastValidYOffset` boundary. Native Resolve controls on 96- and 95-frame
+media established the saved map fields and the reader's exact decoding.
+[Pinned pr2resolve speed reference](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md#L10-L12)
+
+Premiere 27.0.0 build 88 saved and reopened three seeded project variants
+with their 200% controls and rendered the source-frame controls. Resolve
+Studio 21.2.0 build 00006 saved, closed and reopened the output from the
+turnover job and from serialized graph/2. The two 24-frame cuts start at
+file frames 12 and 13. A 12-frame cut starts at 72 and reaches the
+verified file boundary. All 60 Premiere frame selections agree with
+both Resolve outputs. The two 24-frame cases also match the corresponding
+native Resolve controls pixel for pixel. On a separate duplicate, the
+200% speed could be changed to 100%, and both values survived reopen.
+An abbreviated span that would
+exclude a sampled frame, Optical Flow, a contradictory fractional
+Resolve In, and an occupied output were refused. The retained 50% and
+reverse turnovers preserved their saved timeline facts.
+
+The same linked picture profile is qualified in the reverse conversion
+direction. Ramps and retimed audio remain separate.
+[Resolve to Premiere qualification](RESOLVE-SOURCE-READER.md#resolve-to-premiere-200-forward-picture-speed)
+
 ## Capture in graph/2
 
 Resolve archive reading now retains the following scoped facts for future
@@ -453,7 +1264,7 @@ destination mappings.
 
 | Graph location | Saved facts | Destination status |
 |---|---|---|
-| `resolve.transitions`, sequence | Occurrence, track identity, saved start and duration, and separate alignment and position codes | The internal linked DRP path reads and writes the [qualified eight-frame V1 Cross Dissolve](RESOLVE-DRP-FORMAT-CLOSEOUT.md#qualified-left-aligned-cross-dissolve). Cross-editor and other alignment mappings remain open. |
+| `resolve.transitions`, sequence | Occurrence, track identity, saved start and duration, and separate alignment and position codes | The internal linked DRP path reads and writes [qualified variable-length V1 dissolves and A1 crossfades](#variable-lengths-and-constant-power). The standalone eight-frame profile and the narrower Resolve-to-Premiere profile remain separately qualified. |
 | `resolve.timing`, sequence | Timing evidence, compact extents, and recognized time-map points, explicit zero flags and saved handles | Cadence and audio treatment pending |
 | `resolve.fairlight`, sequence | Track and bus columns identified by strip ID, pan, bypass, solo, gain, output assignment, EQ/dynamics fields and bounded plug-in records | The [drpkit closeout](RESOLVE-DRPKIT-CLOSEOUT.md) records static mono pan, direct routing, and Bus 2 gain and mute in the linked turnover profile. |
 | `resolve.clip_fairlight`, placement | Keyed Voice Isolation and Dialogue Leveler records with saved identity, flags and normalized parameters | Source capture only |
@@ -481,9 +1292,9 @@ The automatic Avid probe reopened a nested, two-timeline split-MXF and
 editable Group project, and separately reopened an H.264 UME project. A
 picture-only Group angle switch changed the picture while both isolated
 PCM lanes remained byte-identical to the Save As copy. A retained combined
-turnover also passed Save As and reopen. Product rollout still needs an
-automatically produced same-rate mixed UME and managed-media cohort, a native
-Premiere-authored source cohort, a distributable template review, and the
-packaged CLI, saved job and wizard gate. The current probe is internal.
-See the [Resolve project qualification](RESOLVE-PROJECT-CORE.md) and
-[roadmap](ROADMAP.md#davinci-resolve-user-2026-10-26-bookmark-and-research).
+turnover with explicit media bindings also passed Save As and reopen.
+The [project core guide](RESOLVE-PROJECT-CORE.md) records the linked fixtures
+and editor checks. The roadmap tracks the
+[automatic mixed Avid project](ROADMAP.md#avid--resolve), the
+[fully native Premiere source](ROADMAP.md#premiere--resolve), and the
+[packaged route gates](ROADMAP.md#resolve-product-exposure).

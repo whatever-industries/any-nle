@@ -12,6 +12,7 @@ use crate::{
     clip_label::{self, ClipLabel},
     dissolve,
     grade,
+    input_scaling,
     timeline_marks::TimelineMarks,
     track_state::{self, TrackState},
     Result,
@@ -134,6 +135,7 @@ struct Timeline<'a> {
     media: HashMap<&'a str, &'a SourceMedia>,
     receipts: HashMap<&'a str, &'a Value>,
     clip_labels: HashMap<&'a str, &'a Value>,
+    input_sizing: HashMap<&'a str, &'a Value>,
     grades: HashMap<(&'a str, &'a str), &'a Value>,
     unknown_grades: HashSet<&'a str>,
     clip_plugins: HashMap<&'a str, &'a Value>,
@@ -221,8 +223,14 @@ impl<'a> Timeline<'a> {
                 .filter(|s| s.adapter == clip_label::ADAPTER && placements.contains(s.object.as_str()))
                 .map(|s| (s.object.as_str(), &s.data))
                 .collect(),
+            input_sizing: graph
+                .sidecars
+                .iter()
+                .filter(|s| s.adapter == input_scaling::RESOLVE && placements.contains(s.object.as_str()))
+                .map(|s| (s.object.as_str(), &s.data))
+                .collect(),
             grades: graph.sidecars.iter()
-                .filter(|row| matches!(row.adapter.as_str(), grade::ADAPTER | grade::OPAQUE_ADAPTER)
+                .filter(|row| matches!(row.adapter.as_str(), grade::ADAPTER | grade::CDL_ADAPTER | grade::OPAQUE_ADAPTER)
                     && placements.contains(row.object.as_str()))
                 .map(|row| ((row.object.as_str(), row.adapter.as_str()), &row.data))
                 .collect(),
@@ -268,14 +276,38 @@ impl<'a> Timeline<'a> {
         }
     }
 
-    fn binding(&self, p: &Placement) -> Option<Json> {
+    fn input_sizing(&self, edit: &Placement) -> Option<Json> {
+        match self.input_sizing.get(edit.id.as_str()) {
+            None => Some(json!("project")),
+            Some(Value::Str(mode))
+                if matches!(mode.as_str(), input_scaling::FIT | input_scaling::CENTER_CROP) =>
+            {
+                Some(json!(mode))
+            }
+            _ => None,
+        }
+    }
+
+    fn inherits_input_sizing(&self, edit: &Placement) -> bool {
+        let Some(item) = self.items.get(edit.item.as_str()) else { return false };
+        if self.seq.frame_size != Some((1920, 1080)) || self.input_sizing.contains_key(edit.id.as_str()) {
+            return false;
+        }
+        let mut picture = item.media.iter().filter_map(|reference| self.media.get(reference.media.as_str()))
+            .filter(|media| media.kind == StreamKind::Video);
+        matches!((picture.next(), picture.next()), (Some(media), None)
+            if media.rate == Some(self.seq.rate)
+                && media.frame_size.is_some_and(|size| size != (1920, 1080)))
+    }
+
+    fn binding(&self, p: &Placement, channel: Option<i64>) -> Option<Json> {
         let (kind, _) = lane(p)?;
         let item = self.items.get(p.item.as_str())?;
         let audio = if kind == "audio" {
-            let [stream] = p.audio_streams.as_slice() else {
-                return None;
-            };
-            Some(*stream)
+            Some(channel.or_else(|| match p.audio_streams.as_slice() {
+                [mono] => Some(*mono),
+                _ => None,
+            })?)
         } else {
             None
         };
@@ -588,6 +620,7 @@ fn lane(p: &Placement) -> Option<(&'static str, i64)> {
     match (p.video_track, p.audio_tracks.as_slice()) {
         (Some(v), []) => Some(("video", v)),
         (None, [a]) => Some(("audio", *a)),
+        (None, []) if crate::stereo::placement(p) => Some(("audio", 1)),
         _ => None,
     }
 }
@@ -753,41 +786,20 @@ fn compare_edits(
             }
         }
     }
-    match (left.binding(a), right.binding(b)) {
-        (Some(old), Some(new)) => {
-            for key in ["locators", "source_offset", "start", "physical_audio"] {
-                if key == "physical_audio" && a.video_track.is_some() {
-                    continue;
-                }
-                let resolved = |value: &Json| value.get(key).filter(|v| !v.is_null()).cloned();
-                known(
-                    diff,
-                    &format!("media.{key}"),
-                    &context,
-                    resolved(&old),
-                    resolved(&new),
-                );
-            }
-            for key in [
-                "duration",
-                "clock",
-                "rate",
-                "frame_size",
-                "sample_rate",
-                "bits",
-                "codec",
-            ] {
-                if old[key] != new[key] {
-                    diff.change(
-                        &format!("media.{key}"),
-                        &context,
-                        old[key].clone(),
-                        new[key].clone(),
-                    );
-                }
-            }
+    let a_stereo = crate::stereo::placement(a);
+    let b_stereo = crate::stereo::placement(b);
+    if a_stereo && b_stereo {
+        for channel in crate::stereo::STREAMS {
+            let mut context = context.clone();
+            context["channel"] = json!(channel);
+            compare_binding(diff, &context, true,
+                left.binding(a, Some(channel)), right.binding(b, Some(channel)));
         }
-        (a, b) => known(diff, "media.binding", &context, a, b),
+    } else if a_stereo != b_stereo {
+        diff.change("edit.stereo_routing", &context, json!(a_stereo), json!(b_stereo));
+    } else {
+        compare_binding(diff, &context, a.video_track.is_none(),
+            left.binding(a, None), right.binding(b, None));
     }
     let opaque = |t: &Timeline<'_>, p: &Placement| {
         t.unknown_effects.contains(p.id.as_str()) || t.unknown_effects.contains(t.seq.id.as_str())
@@ -804,6 +816,24 @@ fn compare_edits(
         );
     }
     if !opaque(left, a) && !opaque(right, b) {
+        if a.video_track.is_some() && b.video_track.is_some() {
+            known(
+                diff,
+                "edit.input_scaling",
+                &context,
+                left.input_sizing(a),
+                right.input_sizing(b),
+            );
+            if left.inherits_input_sizing(a) && right.inherits_input_sizing(b) {
+                known(
+                    diff,
+                    "edit.inherited_input_scaling",
+                    &context,
+                    left.receipt(&left.seq.id, input_scaling::PROJECT_SETTING).map(graph_value),
+                    right.receipt(&right.seq.id, input_scaling::PROJECT_SETTING).map(graph_value),
+                );
+            }
+        }
         diff.change("edit.picture_controls", &context, picture(a), picture(b));
         diff.change(
             "edit.clip_volume",
@@ -811,6 +841,45 @@ fn compare_edits(
             volume(left, a),
             volume(right, b),
         );
+    }
+}
+
+fn compare_binding(diff: &mut Diff, context: &Json, audio: bool, old: Option<Json>, new: Option<Json>) {
+    match (old, new) {
+        (Some(old), Some(new)) => {
+            for key in ["locators", "source_offset", "start", "physical_audio"] {
+                if key == "physical_audio" && !audio {
+                    continue;
+                }
+                let resolved = |value: &Json| value.get(key).filter(|v| !v.is_null()).cloned();
+                known(
+                    diff,
+                    &format!("media.{key}"),
+                    context,
+                    resolved(&old),
+                    resolved(&new),
+                );
+            }
+            for key in [
+                "duration",
+                "clock",
+                "rate",
+                "frame_size",
+                "sample_rate",
+                "bits",
+                "codec",
+            ] {
+                if old[key] != new[key] {
+                    diff.change(
+                        &format!("media.{key}"),
+                        context,
+                        old[key].clone(),
+                        new[key].clone(),
+                    );
+                }
+            }
+        }
+        (a, b) => known(diff, "media.binding", context, a, b),
     }
 }
 
@@ -822,6 +891,15 @@ fn compare_grade(
     context: &Json,
     diff: &mut Diff,
 ) {
+    let old_cdl = left.grades.get(&(a.id.as_str(), grade::CDL_ADAPTER));
+    let new_cdl = right.grades.get(&(b.id.as_str(), grade::CDL_ADAPTER));
+    if old_cdl.is_some() || new_cdl.is_some() {
+        let slope = |row: Option<&&Value>| match row.and_then(|row| row.get("slope")) {
+            Some(Value::Float(slope)) => json!(slope),
+            _ => Json::Null,
+        };
+        diff.change("edit.cdl_slope", context, slope(old_cdl), slope(new_cdl));
+    }
     let saved = |timeline: &Timeline<'_>, edit: &Placement| -> Result<Json> {
         if timeline.unknown_grades.contains(edit.id.as_str())
             || timeline.grades.contains_key(&(edit.id.as_str(), grade::OPAQUE_ADAPTER))
@@ -935,11 +1013,26 @@ fn compare_transitions(
         return;
     }
     for audio in [false, true] {
-        let left = a.iter().find(|row| row.prepared.audio == audio);
-        let right = b.iter().find(|row| row.prepared.audio == audio);
         let mut context = scope.clone();
         context["track_kind"] = json!(if audio { "audio" } else { "video" });
-        compare_transition(left, right, pairs, &context, diff);
+        let slots = |rows: &'_ [dissolve::SourceDissolve<'_>]| {
+            rows.iter().enumerate().filter(|(_, row)| row.prepared.audio() == audio)
+                .map(|(index, row)| (row.prepared.cut, index))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let left = slots(&a);
+        let right = slots(&b);
+        if left.len() <= 1 && right.len() <= 1 {
+            compare_transition(left.values().next().map(|&i| &a[i]),
+                right.values().next().map(|&i| &b[i]), pairs, &context, diff);
+            continue;
+        }
+        let cuts: BTreeSet<_> = left.keys().chain(right.keys()).copied().collect();
+        for cut in cuts {
+            context["cut_frame"] = json!(cut);
+            compare_transition(left.get(&cut).map(|&i| &a[i]), right.get(&cut).map(|&i| &b[i]),
+                pairs, &context, diff);
+        }
     }
 }
 
@@ -953,8 +1046,8 @@ fn compare_transition(
     let summary = |value: Option<&dissolve::SourceDissolve<'_>>| {
         value.map_or(Json::Null, |row| {
             let d = &row.prepared;
-            json!({"kind":d.type_label(), "track":1, "cut_frames":d.cut,
-                "duration_frames":dissolve::DURATION, "alignment":d.alignment()})
+            json!({"kind":d.style.native_label(), "track":1, "cut_frames":d.cut,
+                "duration_frames":d.duration, "alignment":d.alignment()})
         })
     };
     diff.change("transition", scope, summary(left), summary(right));

@@ -295,44 +295,192 @@ pub(crate) struct PreparedMarker {
     pub(crate) custom_data: String,
 }
 
+pub(crate) const MAX_MARKERS_PER_OWNER: usize = 128;
+pub(crate) const MARKER_STORAGE_BUDGET: usize = 32 << 10;
+
+pub(crate) fn marker_storage(name: &str, note: &str, custom_data: &str) -> usize {
+    name.len() + note.len() + custom_data.len() + 128
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MarkerScope {
+    Sequence,
+    Pool,
+    Edit,
+}
+
 pub(crate) fn prepare_markers(
     graph: &SourceGraph,
     sequence: &SourceSequence,
     duration: i64,
 ) -> Result<(Vec<PreparedMarker>, Vec<String>)> {
+    let saved = graph.sidecar(ADAPTER, &sequence.id).and_then(|row| row.get("markers"));
+    let carried = graph.sidecar(crate::premiere::SEQUENCE_MARKER_DATA_ADAPTER, &sequence.id);
+    if saved.is_some() && carried.is_some() {
+        return Err("sequence markers have both Resolve and Premiere custom-data receipts".into());
+    }
+    let custom_data = carried_marker_custom_data(carried, "sequence", |occurrence| {
+        sequence.markers.iter().any(|marker| marker.owner_occurrence == occurrence
+            && marker.owner == MarkerOwner::Sequence)
+    })?;
+    prepare_marker_rows(
+        &sequence.markers,
+        saved,
+        sequence.rate,
+        duration,
+        MarkerScope::Sequence,
+        &custom_data,
+    )
+}
+
+pub(crate) fn prepare_pool_markers(
+    graph: &SourceGraph,
+    item: &graph::source::SourceItem,
+    rate: Rational,
+    frames: i64,
+) -> Result<(Vec<PreparedMarker>, Vec<String>)> {
+    if item.rate.is_some_and(|item_rate| item_rate != rate) || !crate::source::supported_marker_rate(rate) {
+        return Err(format!("{}: Resolve source marker clock disagrees with linked media", item.id).into());
+    }
+    let saved = graph.sidecar(crate::source::POOL_MARKER_ADAPTER, &item.id);
+    let carried = graph.sidecar(crate::premiere::SOURCE_MARKER_DATA_ADAPTER, &item.id);
+    if saved.is_some() && carried.is_some() {
+        return Err(format!("{}: source markers have both Resolve and Premiere custom-data receipts", item.id).into());
+    }
+    let custom_data = carried_marker_custom_data(carried, "source", |occurrence| {
+        item.markers.iter().any(|marker| marker.owner_occurrence == occurrence
+            && marker.owner == MarkerOwner::Sequence)
+    })?;
+    prepare_marker_rows(
+        &item.markers,
+        saved,
+        rate,
+        frames,
+        MarkerScope::Pool,
+        &custom_data,
+    )
+}
+
+pub(crate) fn prepare_edit_markers(
+    sequence: &SourceSequence,
+    edit: &graph::Placement,
+    saved: Option<&Value>,
+    carried: Option<&Value>,
+) -> Result<(Vec<PreparedMarker>, Vec<String>)> {
+    let end = edit.source_in.checked_add(edit.duration).ok_or("Resolve edit marker extent overflow")?;
+    let bound = frames_on(end, sequence.rate)?;
+    let mut source_rows = Vec::new();
+    let mut dropped = Vec::new();
+    for marker in sequence.markers.iter().filter(|marker|
+        marker.owner == MarkerOwner::Edit && marker.binding.placements.as_slice() == [edit.id.as_str()])
+    {
+        let source = marker.source.filter(|&source| {
+            source >= edit.source_in && source < end
+                && source.checked_sub(edit.source_in).is_some_and(|local|
+                    marker.owner_local == Some(local)
+                        && marker.start == edit.record_start.checked_add(local))
+        });
+        if marker.binding.reason.is_some() || marker.track.is_none_or(|track|
+            track.kind != StreamKind::Video || track.index != 1)
+            || source.is_none()
+        {
+            dropped.push(marker.owner_occurrence.clone());
+            continue;
+        }
+        let mut source_row = marker.clone();
+        source_row.owner = MarkerOwner::Sequence;
+        source_row.start = source;
+        source_row.owner_local = source;
+        source_row.source = None;
+        source_row.track = None;
+        source_row.binding.placements.clear();
+        source_rows.push(source_row);
+    }
+    let custom_data = carried_marker_custom_data(carried, "edit", |occurrence| {
+        sequence.markers.iter().any(|marker| marker.owner_occurrence == occurrence
+            && marker.owner == MarkerOwner::Edit
+            && marker.binding.placements.as_slice() == [edit.id.as_str()])
+    })?;
+    let (prepared, omitted) = prepare_marker_rows(&source_rows, saved, sequence.rate, bound, MarkerScope::Edit, &custom_data)?;
+    dropped.extend(omitted);
+    Ok((prepared, dropped))
+}
+
+fn carried_marker_custom_data<'a>(
+    carried: Option<&'a Value>,
+    owner: &str,
+    owns: impl Fn(&str) -> bool,
+) -> Result<HashMap<&'a str, &'a str>> {
+    let mut custom_data = HashMap::new();
+    let mut budget = prproj::convert::markers::MAX_MARKER_CUSTOM_DATA;
+    if let Some(carried) = carried {
+        let Value::Arr(rows) = carried else { return Err(format!("invalid Premiere {owner}-marker receipt").into()) };
+        for row in rows {
+            let Some(custom) = row.get("custom_data") else { continue };
+            let (Value::Str(custom), Some(Value::Str(occurrence))) = (custom, row.get("source_marker")) else {
+                return Err(format!("invalid Premiere {owner}-marker custom-data receipt").into());
+            };
+            if custom.is_empty() || custom.len() > budget
+                || !owns(occurrence)
+                || custom_data.insert(occurrence.as_str(), custom.as_str()).is_some()
+            {
+                return Err(format!("unbound, duplicate or over-limit Premiere {owner}-marker custom data").into());
+            }
+            budget -= custom.len();
+        }
+    }
+    Ok(custom_data)
+}
+
+fn prepare_marker_rows(
+    markers: &[SourceMarker],
+    saved_rows: Option<&Value>,
+    rate: Rational,
+    duration: i64,
+    scope: MarkerScope,
+    carried: &HashMap<&str, &str>,
+) -> Result<(Vec<PreparedMarker>, Vec<String>)> {
     let mut native = HashMap::new();
-    if let Some(data) = graph.sidecar(ADAPTER, &sequence.id).and_then(|row| row.get("markers")) {
+    let owner = if scope == MarkerScope::Sequence { "sequence" } else { "source" };
+    if let Some(data) = saved_rows {
         let Value::Arr(rows) = data else {
-            return Err("invalid Resolve sequence marker receipt".into());
+            return Err(format!("invalid Resolve {owner} marker receipt").into());
         };
         for row in rows {
             let (Some(Value::Int(frame)), Some(Value::Int(color)), Some(Value::Str(custom))) =
                 (row.get("frame"), row.get("color_bit"), row.get("custom_data"))
-            else { return Err("invalid Resolve sequence marker receipt".into()) };
+            else { return Err(format!("invalid Resolve {owner} marker receipt").into()) };
             if native.insert(*frame, (*color, custom.as_str())).is_some() {
-                return Err("duplicate frame in Resolve sequence marker receipt".into());
+                return Err(format!("duplicate frame in Resolve {owner} marker receipt").into());
             }
         }
     }
     let mut counts = HashMap::new();
-    for marker in &sequence.markers {
-        if let Some(frame) = marker.start.and_then(|t| frames_on(t, sequence.rate).ok()) {
+    // Pool and edit rows have already been normalized to this owner. When
+    // building the timeline's rows, edit markers own a separate native map.
+    for marker in markers.iter().filter(|marker| marker.owner == MarkerOwner::Sequence) {
+        if let Some(frame) = marker.start.and_then(|t| frames_on(t, rate).ok()) {
             *counts.entry(frame).or_insert(0) += 1;
         }
     }
     let mut kept = Vec::new();
     let mut omitted = Vec::new();
-    let mut budget = 32 << 10;
-    for marker in &sequence.markers {
-        let frame = marker.start.and_then(|t| frames_on(t, sequence.rate).ok());
+    let mut budget = MARKER_STORAGE_BUDGET;
+    for marker in markers {
+        let frame = marker.start.and_then(|t| frames_on(t, rate).ok());
         let saved = frame.filter(|_| marker.owner == MarkerOwner::Sequence)
             .and_then(|frame| native.remove(&frame));
-        let custom = saved.map_or("", |(_, custom)| custom);
-        let bytes = marker.name.len() + marker.comment.len() + custom.len() + 128;
-        if kept.len() < 128 && bytes <= budget {
-            if let Some(mark) = prepare_marker(marker, sequence.rate, duration, &counts) {
+        let custom = saved.map(|(_, custom)| custom)
+            .or_else(|| carried.get(marker.owner_occurrence.as_str()).copied()).unwrap_or("");
+        let bytes = marker_storage(&marker.name, &marker.comment, custom);
+        let qualified_palette = scope == MarkerScope::Sequence || marker.color.as_ref().is_some_and(|color|
+            color.palette == "resolve" || (color.palette == "premiere"
+                && (matches!(color.name.as_str(), "Blue" | "Cyan" | "Green" | "Yellow" | "Red")
+                    || scope == MarkerScope::Pool && crate::marker_palette::premiere_substitute(&color.name).is_some())));
+        if kept.len() < MAX_MARKERS_PER_OWNER && bytes <= budget && qualified_palette {
+            if let Some(mark) = prepare_marker(marker, rate, duration, &counts) {
                 if saved.is_some_and(|(color, _)| u64::try_from(color).ok() != Some(mark.color_bit)) {
-                    return Err("Resolve sequence marker color disagrees with its receipt".into());
+                    return Err(format!("Resolve {owner} marker color disagrees with its receipt").into());
                 }
                 kept.push(PreparedMarker { custom_data: custom.into(), ..mark });
                 budget -= bytes;
@@ -342,13 +490,13 @@ pub(crate) fn prepare_markers(
         omitted.push(marker.owner_occurrence.clone());
     }
     if !native.is_empty() {
-        return Err("Resolve sequence marker receipt lacks a matching marker".into());
+        return Err(format!("Resolve {owner} marker receipt lacks a matching marker").into());
     }
     kept.sort_unstable_by_key(|marker| marker.frame);
     Ok((kept, omitted))
 }
 
-fn prepare_marker(
+pub(crate) fn prepare_marker(
     marker: &SourceMarker,
     rate: Rational,
     end: i64,
@@ -472,7 +620,7 @@ pub(crate) fn check_binding<'a>(
     check_binding_profile(graph, binding, false)
 }
 
-fn check_binding_profile<'a>(
+pub(crate) fn check_binding_profile<'a>(
     graph: &'a SourceGraph,
     binding: &VerifiedBinding,
     native: bool,
@@ -489,6 +637,13 @@ fn check_binding_profile<'a>(
     }
     if item.rate != Some(rate()) || !item.stream_groups.is_empty() || item.media.len() != 3 {
         return Err("unsupported item rate, routing or stream count".into());
+    }
+    let premiere_camera = graph.sidecar(crate::premiere::MULTICAM_CAMERA, &item.id);
+    let premiere = !native && binding.atom.is_none() && premiere_camera.is_some();
+    if premiere && premiere_camera.and_then(|row| row.get("file_package"))
+        != Some(&Value::Str(hex::encode_upper(binding.source_package)))
+    {
+        return Err("Premiere multicam camera file-package identity changed".into());
     }
     for (index, selector) in binding.streams.iter().enumerate() {
         let link = item
@@ -511,6 +666,26 @@ fn check_binding_profile<'a>(
                 && matches!(source.locations.as_slice(), [path]
                     if std::fs::canonicalize(path).is_ok_and(|path| path == file.path))
                 && file.agrees_with_clock(source)
+        } else if premiere {
+            let start = Rational::new(i128::from(binding.timecode_frames) * 1001, 24000);
+            source.start == start
+                && matches!(source.locations.as_slice(), [path] if Path::new(path) == binding.path)
+                && source.clock.as_ref().is_some_and(|clock| {
+                    clock.exact_start() == start && clock.rate == rate() && !clock.drop
+                        && clock.display_base == 24
+                        && clock.effective_count == binding.timecode_frames as u64
+                        && clock.provenance.route == "verified Premiere OP1a original"
+                        && clock.provenance.source_package == item.id
+                })
+                && source.original.as_ref().is_some_and(|original| {
+                    original.stream_index == index as i64 && original.container == "mxf"
+                        && original.start_pts == 0
+                        && original.channel_index == (index > 0).then_some(0)
+                        && original.channels == (index > 0).then_some(1)
+                        && original.time_base == if index == 0 { Rational::new(1001, 24000).unwrap() }
+                            else { Rational::new(1, 48000).unwrap() }
+                        && original.duration_ts == if index == 0 { binding.frames } else { binding.frames * 2002 }
+                })
         } else if native {
             let start = Rational::new(i128::from(binding.timecode_frames) * 1001, 24000);
             let receipt = graph.sidecar(ADAPTER, &source.id);
@@ -551,13 +726,13 @@ fn check_binding_profile<'a>(
                 && source.rate == Some(rate())
                 && source.frame_size == Some((1920, 1080))
                 && source.codec.as_deref() == Some(if native { "dnxhd_lb" } else { "AVdn" })
-                && (!native || source.stream == Some(1))
+                && (!(native || premiere) || source.stream == Some(1))
         } else {
             source.kind == StreamKind::Audio
                 && source.sample_rate == Some(48000)
                 && source.bits == Some(24)
                 && source.stream == Some(index as i64)
-                && (!native || source.codec.as_deref() == Some("pcm"))
+                && (!(native || premiere) || source.codec.as_deref() == Some("pcm"))
         };
         if !layout_ok
             || link.gain_db != 0.0
@@ -615,13 +790,13 @@ pub(crate) fn check_plain(p: &graph::Placement) -> Result<()> {
     check_placement(p, false)
 }
 
-pub(crate) fn check_linked_placement(p: &graph::Placement) -> Result<()> {
+pub(crate) fn check_linked_placement(p: &graph::Placement, stereo: bool) -> Result<()> {
     let mono = p.video_track.is_none() && matches!(p.audio_tracks.as_slice(), [1 | 2 | 3]);
-    check_placement_profile(p, mono, p.video_track == Some(1), true)
+    check_placement_profile(p, mono, p.video_track == Some(1), !stereo, stereo)
 }
 
 fn check_placement(p: &graph::Placement, allow_audio_controls: bool) -> Result<()> {
-    check_placement_profile(p, allow_audio_controls, false, false)
+    check_placement_profile(p, allow_audio_controls, false, false, false)
 }
 
 fn check_placement_profile(
@@ -629,14 +804,15 @@ fn check_placement_profile(
     allow_audio_controls: bool,
     allow_picture_controls: bool,
     allow_speed: bool,
+    allow_stereo: bool,
 ) -> Result<()> {
     if p.gain_db != 0.0
         || (!allow_audio_controls && (p.volume_db.is_some() || !p.volume_keys.is_empty()))
         || !p.track_gains_db.is_empty()
         || !p.track_pans.is_empty()
-        || !p.grouped_audio.is_empty()
+        || (!p.grouped_audio.is_empty() && !(allow_stereo && crate::stereo::placement(p)))
         || (!allow_speed && p.speed.is_some())
-        || p.frame_map.is_some()
+        || (p.frame_map.is_some() && !(allow_speed && allow_picture_controls))
         || (!allow_picture_controls && (p.transform.is_some() || !p.effects.is_empty()))
     {
         return Err(format!("unsupported Resolve placement semantics at {}", p.id).into());
@@ -667,6 +843,45 @@ mod tests {
         assert_eq!(frames(Rational::new(1001, 1000).unwrap()).unwrap(), 24);
         assert!(frames(Rational::new(1, 1000).unwrap()).is_err());
         assert!(frames(Rational::new(-1001, 24000).unwrap()).is_err());
+    }
+
+    #[test]
+    fn media_pool_markers_use_the_exact_picture_source_grid() {
+        let source_rate = rate();
+        let start = Rational::new(1001, 2400).unwrap();
+        let mut item = SourceItem {
+            id: "picture".into(), name: "Picture".into(), media: vec![],
+            umid: None, tape: None, rate: Some(source_rate), color_rgb16: None,
+            stream_groups: vec![], markers: vec![SourceMarker {
+                name: "Range".into(), comment: String::new(), user: String::new(),
+                color: Some(graph::Label { palette: "premiere".into(), name: "Green".into() }),
+                start: Some(start), duration: Rational::new(7007, 24000).unwrap(),
+                track: None, owner: MarkerOwner::Sequence, owner_occurrence: "picture/marker/1".into(),
+                owner_local: Some(start), owner_rate: Some(source_rate),
+                binding: graph::source::SourceBinding { placements: vec![], reason: None },
+                source: None, inherited: false,
+            }],
+        };
+        let graph = SourceGraph {
+            project: graph::Project { name: "Test".into() }, media: vec![], items: vec![],
+            bins: vec![], sequences: vec![], losses: vec![], sidecars: vec![],
+            multicams: vec![], multicam_uses: vec![],
+        };
+        let (markers, omitted) = prepare_pool_markers(&graph, &item, source_rate, 48).unwrap();
+        assert!(omitted.is_empty());
+        assert_eq!((markers[0].frame, markers[0].duration), (10, 7));
+        assert!(prepare_pool_markers(&graph, &item, Rational::integer(24), 48).is_err());
+
+        for (name, bit) in [("Magenta", 2048), ("Orange", 32768), ("White", 131072)] {
+            item.markers[0].color.as_mut().unwrap().name = name.into();
+            let (markers, omitted) = prepare_pool_markers(&graph, &item, source_rate, 48).unwrap();
+            assert!(omitted.is_empty());
+            assert_eq!(markers[0].color_bit, bit);
+        }
+        item.markers[0].duration = Rational::new(7, 24).unwrap();
+        let (markers, omitted) = prepare_pool_markers(&graph, &item, source_rate, 48).unwrap();
+        assert!(markers.is_empty());
+        assert_eq!(omitted, ["picture/marker/1"]);
     }
 
     #[test]
@@ -726,6 +941,22 @@ mod tests {
         );
         assert!(prepare_marker(&marker, rate(), 3, &counts).is_none());
         assert!(prepare_marker(&marker, rate(), 48, &HashMap::from([(0, 2)])).is_none());
+
+        let mut coincident = marker.clone();
+        coincident.owner_occurrence = "other".into();
+        let prepared = |other| {
+            prepare_marker_rows(
+                &[marker.clone(), other], None, rate(), 48, MarkerScope::Sequence, &HashMap::new(),
+            ).unwrap()
+        };
+        let (kept, omitted) = prepared(coincident.clone());
+        assert!(kept.is_empty());
+        assert_eq!(omitted, ["test", "other"]);
+        coincident.owner = MarkerOwner::Edit;
+        let (kept, omitted) = prepared(coincident);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(omitted, ["other"]);
+
         marker.duration = Rational::ZERO;
         assert!(prepare_marker(&marker, rate(), 48, &counts).is_none());
         marker.duration = Rational::new(1001, 6000).unwrap();

@@ -20,14 +20,23 @@ pub(super) struct GraphCapture {
 
 impl GraphCapture {
     pub(super) fn new(project: &Project, path: &Path, root: ItemId, panel: ItemId) -> Result<Self> {
-        let mut graph = SourceGraph {
-            project: GraphProject {
-                name: path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .ok_or("invalid Premiere project name")?
-                    .into(),
-            },
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or("invalid Premiere project name")?;
+        let mut graph = Self::empty_graph(name.into());
+        let mut folder_ids = HashMap::from([(root, 0)]);
+        let sequence_bin = owning_bin(project, panel, &mut folder_ids, &mut graph.bins)?;
+        Ok(Self {
+            graph,
+            folder_ids,
+            sequence_bin,
+        })
+    }
+
+    pub(super) fn empty_graph(name: String) -> SourceGraph {
+        SourceGraph {
+            project: GraphProject { name },
             media: vec![],
             items: vec![],
             bins: vec![Bin {
@@ -41,14 +50,7 @@ impl GraphCapture {
             sidecars: vec![],
             multicams: vec![],
             multicam_uses: vec![],
-        };
-        let mut folder_ids = HashMap::from([(root, 0)]);
-        let sequence_bin = owning_bin(project, panel, &mut folder_ids, &mut graph.bins)?;
-        Ok(Self {
-            graph,
-            folder_ids,
-            sequence_bin,
-        })
+        }
     }
 }
 

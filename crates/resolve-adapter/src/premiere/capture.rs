@@ -8,7 +8,7 @@ use super::{
     source_capture::{owning_bin, source_clock, source_receipt, source_sequence, GraphCapture},
     ticks, MAX_EDITS,
 };
-use crate::Result;
+use crate::{mixed_rate, Result};
 use graph::{
     source::{
         OriginalStream, SourceClock, SourceGraph, SourceItem, SourceItemMedia, SourceMedia,
@@ -119,6 +119,7 @@ pub fn read_premiere_media_graph(
     let mut files = HashMap::new();
     let mut items = HashMap::new();
     let mut component_budget = components::Budget::default();
+    let mut sampled_frame_count = 0usize;
     let mut track_state = metadata::TrackStateCapture::default();
     for (kind, tracks) in [
         (StreamKind::Video, &data.video_tracks),
@@ -221,16 +222,34 @@ pub fn read_premiere_media_graph(
                     rate,
                     frame_ticks,
                     &occurrence,
+                    &mut sampled_frame_count,
                     &mut graph,
                 )
                 .map_err(|error| format!("{occurrence}: {error}"))?;
+                metadata::capture_edit_label(
+                    &project,
+                    native.clip,
+                    source,
+                    &occurrence,
+                    metadata::ClipLabelCapture::OverridesOnly,
+                    &mut graph,
+                )
+                .map_err(|error| format!("Premiere label on {occurrence}: {error}"))?;
                 if let Some(saved) =
                     components::capture(&project, clip, kind, &occurrence, &mut component_budget)?
                 {
                     graph.sidecars.push(saved);
                 }
-                if !native.components.is_empty()
-                    || !native.selection_components.is_empty()
+                let color = if kind == StreamKind::Video {
+                    super::color_mode::capture(&project, data.element, clip, source, &occurrence)?
+                } else {
+                    None
+                };
+                let mapped_color = color.as_ref()
+                    .and_then(|row| super::color_mode::qualified_exposure(&row.data))
+                    .is_some();
+                graph.sidecars.extend(color);
+                if (!mapped_color && (!native.components.is_empty() || !native.selection_components.is_empty()))
                     || project.doc.tree.find1(native.element, "Panner").is_some()
                 {
                     graph.losses.push(Loss {
@@ -238,6 +257,11 @@ pub fn read_premiere_media_graph(
                         aspect: "premiere.appearance_or_mix".into(),
                         reason: "Clip processing needs separate destination preparation; this capture verifies the underlying linked edit".into(),
                     });
+                }
+                if kind == StreamKind::Video && files[&item.path].video.as_ref()
+                    .is_some_and(|video| video.size.is_some() && video.size != data.frame_size)
+                {
+                    super::capture_input_scaling(&project, source, clip, &placement.id, &mut graph)?;
                 }
                 if project.is_disabled(clip)? {
                     out.disabled_placements.push(placement);
@@ -261,13 +285,8 @@ pub fn read_premiere_media_graph(
     if !project.caption_tracks(sequence).is_empty() {
         return Err("Premiere captions require separate text preparation".into());
     }
-    markers::capture(
-        &project.doc.tree,
-        &data.markers,
-        &mut out,
-        &mut graph.sidecars,
-        &mut graph.losses,
-    );
+    markers::capture(&project.doc.tree, data.element, &data.markers, &mut out, &mut graph)?;
+    metadata::capture_timeline_marks(&project, data.element, &id, frame_ticks, &mut graph)?;
     for (adapter, rows) in [
         (crate::track_state::PREMIERE_ADAPTER, track_state.mapped),
         (metadata::SYNC_LOCK_LOSS, track_state.sync_unlocked),
@@ -282,6 +301,10 @@ pub fn read_premiere_media_graph(
     }
     graph.losses.extend(track_state.losses);
     graph.sequences.push(out);
+    let provenance = super::marker_provenance::read(&project, &graph)?;
+    graph.sidecars.extend(provenance.into_iter().flat_map(|record| {
+        record.receipts.into_iter().map(|row| row.sidecar)
+    }));
     graph.validate()?;
     if physical::file_state(&path)? != before {
         return Err("Premiere project changed during capture".into());
@@ -313,6 +336,178 @@ struct Item {
     path: PathBuf,
     primary: NodeId,
     bindings: saved::ItemBindings,
+}
+
+pub(super) struct VerifiedBinding {
+    item: Item,
+    physical: Physical,
+}
+
+impl VerifiedBinding {
+    pub(super) fn bind(
+        project: &Project,
+        source: ItemId,
+        saved_path: &Path,
+        spec: &mut crate::linked::MediaSpec,
+        ffprobe: &Path,
+        bin: usize,
+        graph: &mut SourceGraph,
+    ) -> Result<Self> {
+        let physical = physical::inspect(&spec.path, ffprobe)?;
+        Self::bind_physical(project, source, saved_path, spec, physical, bin, graph)
+    }
+
+    pub(super) fn bind_standalone_movie(
+        project: &Project,
+        item: ItemId,
+        saved_path: &Path,
+        spec: &mut crate::linked::MediaSpec,
+        verified: &crate::linked::Media,
+        time_base: Rational,
+        count: i64,
+        bin: usize,
+        graph: &mut SourceGraph,
+    ) -> Result<Self> {
+        use crate::linked::{self, MovieVideo, Profile};
+        let Profile::Mov { rate, frames, raster: (width, height), video, aac, pcm, quicktime_timecode, .. }
+            = verified.profile
+        else {
+            return Err("expected verified standalone movie".into());
+        };
+        let codec = match video {
+            MovieVideo::Avc => "h264",
+            MovieVideo::HevcMain10 => "hevc",
+            MovieVideo::ProResHq => "prores",
+            MovieVideo::Imported => return Err("expected standalone picture cache".into()),
+        };
+        let mut audio = Vec::new();
+        if aac || pcm.is_some() {
+            let samples = linked::movie_audio_sample_extent(frames, rate)?;
+            let time_base = Rational::new(1, 48000).unwrap();
+            let codec = pcm.map_or_else(|| "aac".into(), |bits| format!("pcm_s{bits}le"));
+            audio.push(physical::Stream {
+                index: 1,
+                codec,
+                time_base,
+                count: samples,
+                duration: linked::extent(samples, time_base)?,
+                size: None,
+                rate: None,
+                channels: Some(2),
+                bits: pcm,
+            });
+        }
+        let physical = Physical {
+            container: "mov",
+            video: Some(physical::Stream {
+                index: 0,
+                codec: codec.into(),
+                time_base,
+                count,
+                duration: linked::extent(count, time_base)?,
+                size: Some((width.into(), height.into())),
+                rate: Some(rate),
+                channels: None,
+                bits: None,
+            }),
+            audio,
+            timecode: quicktime_timecode.map(linked::non_drop_24),
+            package: None,
+            file_package: None,
+            state: physical::file_state(&spec.path)?,
+        };
+        Self::bind_physical(project, item, saved_path, spec, physical, bin, graph)
+    }
+
+    pub(super) fn bind_native(
+        project: &Project,
+        source: ItemId,
+        saved_path: &Path,
+        spec: &mut crate::linked::MediaSpec,
+        native: &crate::native_import::Movie,
+        bin: usize,
+        graph: &mut SourceGraph,
+    ) -> Result<Self> {
+        let (time_base, count) = native.picture_clock();
+        let duration = crate::linked::extent(count, time_base)?;
+        let (width, height) = native.raster();
+        let video = physical::Stream {
+            index: 0, codec: native.picture_codec().into(), time_base, count, duration,
+            size: Some((width.into(), height.into())), rate: Some(native.rate()), channels: None, bits: None,
+        };
+        let mut audio = Vec::new();
+        if let Some((codec, samples)) = native.audio_clock() {
+            let time_base = Rational::new(1, 48000).unwrap();
+            audio.push(physical::Stream {
+                index: 1,
+                codec: codec.into(),
+                time_base,
+                count: samples,
+                duration: crate::linked::extent(samples, time_base)?,
+                size: None,
+                rate: None,
+                channels: Some(2),
+                bits: native.bits(),
+            });
+        }
+        let physical = Physical {
+            container: "mov", video: Some(video), audio, timecode: native.timecode.clone(),
+            package: None, file_package: None, state: physical::file_state(&spec.path)?,
+        };
+        Self::bind_physical(project, source, saved_path, spec, physical, bin, graph)
+    }
+
+    fn bind_physical(
+        project: &Project,
+        source: ItemId,
+        saved_path: &Path,
+        spec: &mut crate::linked::MediaSpec,
+        physical: Physical,
+        bin: usize,
+        graph: &mut SourceGraph,
+    ) -> Result<Self> {
+        let first_stream = graph.media.len();
+        let item = capture_item(project, source, saved_path, &spec.path, &physical, bin, graph)?;
+        for media in &graph.media[first_stream..] {
+            let original = media.original.as_ref().ok_or("missing Premiere original stream")?;
+            spec.streams.push(crate::StreamSelector {
+                media_id: media.id.clone(),
+                index: usize::try_from(original.stream_index)?,
+                channel: original.channel_index.map(usize::try_from).transpose()?,
+            });
+        }
+        Ok(Self { item, physical })
+    }
+
+    pub(super) fn channels(
+        &self,
+        project: &Project,
+        clip: TrackItemId,
+        kind: StreamKind,
+    ) -> Result<Vec<i64>> {
+        let native = project.track_item(clip);
+        if kind == StreamKind::Video {
+            self.item.bindings.video(project, native.clip)?;
+            return Ok(vec![]);
+        }
+        let channels = self.item.bindings.audio(
+            project,
+            native.clip,
+            native.subclip,
+            self.item.primary,
+            &self.item.saved_path,
+            &self.physical,
+        )?;
+        if self.physical.container == "wav" && !self.mono_wav() && channels != crate::stereo::STREAMS {
+            return Err("Premiere 25 fps standalone WAV requires its ordered stereo group".into());
+        }
+        Ok(channels)
+    }
+
+    pub(super) fn mono_wav(&self) -> bool {
+        self.physical.container == "wav"
+            && matches!(self.physical.audio.as_slice(), [audio] if audio.channels == Some(1))
+    }
 }
 
 fn capture_item(
@@ -420,6 +615,8 @@ fn capture_item(
             ),
         });
     }
+    let rate = physical.video.as_ref().and_then(|v| v.rate);
+    let source_markers = markers::capture_item(project, item, &id, rate, graph)?;
     graph.bins[bin].items.push(id.clone());
     graph.items.push(SourceItem {
         id: id.clone(),
@@ -427,7 +624,7 @@ fn capture_item(
         media: item_media,
         umid: physical.package.clone(),
         tape,
-        rate: physical.video.as_ref().and_then(|v| v.rate),
+        rate,
         color_rgb16: None,
         stream_groups: bindings
             .groups
@@ -435,7 +632,7 @@ fn capture_item(
             .filter(|g| g.len() > 1)
             .cloned()
             .collect(),
-        markers: vec![],
+        markers: source_markers,
     });
     Ok(Item {
         id,
@@ -479,7 +676,7 @@ fn original_clock(
         .and_then(|v| v.rate)
         .ok_or("file timecode lacks a picture clock")?;
     let base = physical::display_base(rate)?;
-    let (count, drop) = parse_timecode(timecode, base)?;
+    let (count, drop) = crate::media::parse_timecode(timecode, base)?;
     let native = source_clock(
         count,
         rate,
@@ -502,42 +699,6 @@ fn original_clock(
     Ok(Some(native))
 }
 
-fn parse_timecode(label: &str, base: u16) -> Result<(u64, bool)> {
-    let bytes = label.as_bytes();
-    if bytes.len() != 11 || bytes[2] != b':' || bytes[5] != b':' || !matches!(bytes[8], b':' | b';')
-    {
-        return Err("invalid physical source timecode label".into());
-    }
-    let parts = [0, 3, 6, 9].map(|i| {
-        let pair = &bytes[i..i + 2];
-        pair.iter()
-            .all(u8::is_ascii_digit)
-            .then(|| u64::from((pair[0] - b'0') * 10 + (pair[1] - b'0')))
-    });
-    let [Some(h), Some(m), Some(s), Some(f)] = parts else {
-        return Err("invalid physical source timecode fields".into());
-    };
-    let drop = bytes[8] == b';';
-    if h >= 24
-        || m >= 60
-        || s >= 60
-        || f >= u64::from(base)
-        || drop && (base != 30 || m % 10 != 0 && s == 0 && f < 2)
-    {
-        return Err("physical source timecode is outside its display clock".into());
-    }
-    let minutes = 60 * h + m;
-    let nominal = (60 * minutes + s) * u64::from(base) + f;
-    Ok((
-        nominal
-            - if drop {
-                2 * (minutes - minutes / 10)
-            } else {
-                0
-            },
-        drop,
-    ))
-}
 
 #[allow(clippy::too_many_arguments)]
 fn placement(
@@ -550,6 +711,7 @@ fn placement(
     rate: Rational,
     frame_ticks: i64,
     occurrence: &str,
+    sampled_frame_count: &mut usize,
     graph: &mut SourceGraph,
 ) -> Result<Placement> {
     let native = project.track_item(clip);
@@ -578,19 +740,50 @@ fn placement(
     let mut duration = ticks(span)?;
     let mut mono = Vec::new();
     let mut grouped_audio = Vec::new();
+    let mut frame_map = None;
+    let hold = super::frame_hold::FrameHold::read(project, clip)?;
+    if hold.is_some() && kind != StreamKind::Video {
+        return Err("Premiere Frame Hold requires a video edit".into());
+    }
     if kind == StreamKind::Video {
         item.bindings.video(project, native.clip)?;
         let picture = physical
             .video
             .as_ref()
             .ok_or("Premiere video edit lacks an original picture stream")?;
-        if picture.rate != Some(rate)
-            || [a, b, start, end].iter().any(|v| v % frame_ticks != 0)
+        if [a, b, start, end].iter().any(|v| v % frame_ticks != 0)
             || ticks(b)? > picture.duration
         {
             return Err(
                 "Premiere picture edit has unsupported timing or exceeds the original".into(),
             );
+        }
+        if picture.rate != Some(rate) {
+            let unsupported = "mixed-rate Premiere capture requires plain V1 Frame Sampling between 24 and 23.976 fps with picture-only ProRes HQ MOV";
+            let cadence = picture.rate
+                .and_then(|source| mixed_rate::Cadence::between(source, rate))
+                .ok_or(unsupported)?;
+            if index != 1 || picture.size != Some((1920, 1080))
+                || physical.container != "mov" || picture.codec != "prores"
+                || !physical.audio.is_empty()
+                || physical.timecode.as_deref().is_some_and(|code| code != "00:00:00:00")
+                || hold.is_some() || !native.components.is_empty() || !native.selection_components.is_empty()
+                || project.time_interpolation_type(clip)? != prproj::model::enums::TimeInterpolationType::FrameSampling
+            {
+                return Err(unsupported.into());
+            }
+            frame_map = Some(cadence.capture(a / frame_ticks, span / frame_ticks, sampled_frame_count)?);
+        } else if let Some(hold) = hold {
+            if index != 1 || rate != Rational::integer(24) || picture.size != Some((1920, 1080))
+                || physical.container != "mov" || picture.codec != "prores"
+                || !physical.audio.is_empty()
+                || physical.timecode.as_deref().is_some_and(|code| code != "00:00:00:00")
+                || !native.components.is_empty() || !native.selection_components.is_empty()
+            {
+                return Err("unsupported Premiere Frame Hold clock or source".into());
+            }
+            let extent = crate::prepare::frames_on(picture.duration, rate)?;
+            frame_map = Some(hold.capture(occurrence, span, frame_ticks, extent, sampled_frame_count, graph)?);
         }
     } else {
         let selectors = item.bindings.audio(
@@ -669,7 +862,7 @@ fn placement(
         track_gains_db: vec![],
         track_pans: vec![],
         speed: None,
-        frame_map: None,
+        frame_map,
         transform: None,
         effects: vec![],
     })
@@ -681,12 +874,12 @@ mod tests {
 
     #[test]
     fn source_timecode_counts_drop_frame_numbers_exactly() {
-        assert_eq!(parse_timecode("00:00:59;20", 30).unwrap(), (1790, true));
-        assert_eq!(parse_timecode("00:01:00;02", 30).unwrap(), (1800, true));
-        assert_eq!(parse_timecode("01:00:00;00", 30).unwrap(), (107892, true));
-        assert_eq!(parse_timecode("00:01:00:00", 30).unwrap(), (1800, false));
-        assert!(parse_timecode("00:01:00;01", 30).is_err());
-        assert!(parse_timecode("00:00:00;00", 25).is_err());
+        assert_eq!(crate::media::parse_timecode("00:00:59;20", 30).unwrap(), (1790, true));
+        assert_eq!(crate::media::parse_timecode("00:01:00;02", 30).unwrap(), (1800, true));
+        assert_eq!(crate::media::parse_timecode("01:00:00;00", 30).unwrap(), (107892, true));
+        assert_eq!(crate::media::parse_timecode("00:01:00:00", 30).unwrap(), (1800, false));
+        assert!(crate::media::parse_timecode("00:01:00;01", 30).is_err());
+        assert!(crate::media::parse_timecode("00:00:00;00", 25).is_err());
     }
 
     #[test]

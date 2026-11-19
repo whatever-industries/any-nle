@@ -19,7 +19,7 @@ pub(super) fn read_mix_bus(project: &Project, sequence: NodeId, allow_gain: bool
         let master = tree
             .find1(group, "MasterTrack")
             .ok_or("missing Premiere mix bus")?;
-        gain = read_mixer(project, project.doc.resolve(master)?, allow_gain, false)?.tenths_db;
+        gain = read_mixer(project, project.doc.resolve(master)?, allow_gain, false, false)?.tenths_db;
     }
     if buses != 1 {
         return Err("expected one Premiere audio track group".into());
@@ -36,7 +36,7 @@ pub(super) struct StaticFader {
 
 const AUDIO_SCALAR_CLASS: &str = "a714635e-a628-4b27-9d59-77eba47dbc1a";
 
-fn static_mixer_value(
+pub(super) fn static_mixer_value(
     tree: &prproj::xml::Tree,
     parameter: NodeId,
     invalid: impl Fn() -> String,
@@ -65,7 +65,11 @@ pub(super) fn read_track(
     track: NodeId,
     capture_static: bool,
 ) -> Result<StaticFader> {
-    read_mixer(project, track, capture_static, capture_static)
+    read_mixer(project, track, capture_static, capture_static, false)
+}
+
+pub(super) fn read_multicam_strip(project: &Project, track: NodeId) -> Result<StaticFader> {
+    read_mixer(project, track, true, true, true)
 }
 
 fn read_mixer(
@@ -73,6 +77,7 @@ fn read_mixer(
     track: NodeId,
     allow_gain: bool,
     allow_mute: bool,
+    multicam: bool,
 ) -> Result<StaticFader> {
     let tree = &project.doc.tree;
     let mut fader = StaticFader::default();
@@ -179,13 +184,35 @@ fn read_mixer(
         return Err("missing or ambiguous Premiere panner".into());
     };
     let panner = project.doc.resolve(*panner)?;
+    let direct = multicam && tree.tag(panner) == "StereoTo16ChannelPanProcessor";
+    if multicam && !direct {
+        return Err("Premiere multicam strip lacks its direct output routing".into());
+    }
     if !matches!(
         tree.tag(panner),
         "StereoToStereoPanProcessor" | "MonoToStereoPanProcessor" | "DefaultPanProcessor"
-    ) {
+    ) && !direct {
         return Err("unsupported Premiere mixer channel routing".into());
     }
-    if allow_mute && tree.tag(panner) == "MonoToStereoPanProcessor" {
+    if direct {
+        let [processor] = tree.findall(panner, "DirectPanProcessor")?.try_into()
+            .map_err(|_| "missing or ambiguous Premiere multicam direct panner")?;
+        let matrix = components::field(tree, processor, "Matrix")?
+            .ok_or("missing Premiere multicam output matrix")?;
+        if serde_json::from_str::<Vec<(u8, Vec<u8>)>>(matrix)? != [(0, vec![0]), (1, vec![1])] {
+            return Err("unsupported Premiere multicam output matrix".into());
+        }
+        for reference in tree.findall(panner, "DirectPanProcessor/PanProcessor/AudioComponent/Component/Params/Param")? {
+            let parameter = project.doc.resolve(reference)?;
+            let invalid = || "unqualified Premiere multicam strip balance".to_owned();
+            let (start, current) = static_mixer_value(tree, parameter, invalid)?;
+            if components::field(tree, parameter, "Name")? != Some("Balance")
+                || [start, current].into_iter().flatten().any(|value| value.parse::<f64>() != Ok(0.0))
+            {
+                return Err(invalid().into());
+            }
+        }
+    } else if allow_mute && tree.tag(panner) == "MonoToStereoPanProcessor" {
         fader.pan = read_mono_track_pan(project, track, panner)?;
     } else {
         for param in tree.findall(panner, "PanProcessor/AudioComponent/Component/Params/Param")? {

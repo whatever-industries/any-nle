@@ -91,6 +91,14 @@ pub(crate) const FAIRLIGHT_LOSS: (&str, &str) = (
     "Resolve Fairlight state retained in graph; destination mapping is unqualified",
 );
 
+pub(crate) fn neutral_empty_stereo(receipt: &graph::Value) -> bool {
+    // Complete decoded models of the untouched stereo mixer in the native
+    // whole and split picture-hold controls.
+    matches!(receipt.get("mixer_sha256"), Some(graph::Value::Str(hash)) if matches!(hash.as_str(),
+        "580134087faf7a8026aac11ebe966b99d88c31237c850f0dfad7fb1a78c04a71"
+        | "0159aa3bcfaae37cf2a7cf0aa8fd0a6208ca5579ce267ee4523beb8d66976284"))
+}
+
 const NATIVE_CONTROL: &str = "07df7b43d05ef9564fd6cf69e1b911eb9b3884c65d5c1f86aa7bde797aad5f35";
 const NATIVE_BUS_CONTROL: &str = "dcf061b1178e516baf8157cba488fb260a37e77b653b914e649fa7df1b06c060";
 
@@ -278,6 +286,17 @@ impl Mixer {
     }
     pub(crate) fn decoded_bytes(&self) -> usize {
         self.fields.len() + self.model.len()
+    }
+
+    pub(super) fn neutral_stereo(&self, tracks: &[i64]) -> bool {
+        // Complete decoded models from the native controls and the reopened
+        // generated projects, with neutral routing to the main stereo bus.
+        matches!((tracks, hex::encode(Sha256::digest(&self.model)).as_str()),
+            ([1], "ae637ba85911ce208e8de9c2465613d887bc040bdc792d6d7ba4661a9a5eba17"
+                | "e9d8f886b950139c1ef3a7befb84ac2e9f17ba169385ed575b6aca2c371878b0"
+                | "989bf159058637f9b9be881cd1fb3a3d1553de18b21bd2c4b56b7bc5e49bf137")
+            | ([1, 2], "b109341d3967bc449ad81e55e70cc078f88bc713adf88f3f33bca1e867c5c4b7"
+                | "c54001fed6d264ea03265c0ca1161d49cbc32c50dd986a7b733c05d642ad92f0"))
     }
 
     pub(crate) fn decode(encoded: &str) -> Result<Option<Self>> {

@@ -10,7 +10,6 @@ pub(crate) const ADAPTER: &str = "resolve.nested_uses";
 pub(crate) const PROFILE: &str = "resolve.picture_nest_24";
 pub(crate) const LOSS: &str =
     "Resolve nested sequence retained in graph; destination mapping is unqualified";
-pub(crate) const EMPTY_STEREO: &str = "unqualified Resolve track state or layout";
 pub(crate) const ITEM_FIELDS: &str =
     "0000000200000017800a02200112100000000000000006ffffffffffffffff";
 
@@ -229,19 +228,8 @@ pub(crate) fn recover(loss: &Loss, owner: &str, uses: &[Use]) -> bool {
 }
 
 pub(crate) fn recover_empty_stereo(graph: &SourceGraph, loss: &Loss, owner: &str) -> bool {
-    if loss.object != owner || loss.aspect != "track" || !compound(graph, owner) {
-        return false;
-    }
-    let Some((id, reason)) = loss.reason.split_once(": ") else {
-        return false;
-    };
-    reason == EMPTY_STEREO
-        && matches!(
-            graph.sidecar("resolve.omitted_tracks",owner),
-            Some(Value::Arr(rows)) if matches!(rows.as_slice(), [row] if string(row,"id") == Some(id)
-                && string(row,"kind") == Some("audio") && int(row,"track") == Some(1)
-                && row.get("empty_default_stereo") == Some(&Value::Bool(true)))
-        )
+    compound(graph, owner) && crate::source::default_empty_stereo(graph, owner)
+        .is_some_and(|track| crate::source::is_empty_stereo_loss(loss, owner, track))
 }
 
 #[cfg(test)]

@@ -5,6 +5,17 @@ use graph::source::{
     Multicam, MulticamAlternative, MulticamLane, MulticamPiece, MulticamUse, SourceBinding,
 };
 
+const UNKNOWN_PICTURE_DEFAULT: &str =
+    "Resolve Group-wide picture default is unqualified; edit selectors are separate";
+pub(crate) const REFERENCE_AUDIO_SWITCH: (&str, &str) = (
+    "multicam_reference_audio_envelope",
+    "Resolve's saved angle differs from the reference audio source; the native cut-edge envelope has no qualified destination mapping",
+);
+
+pub(crate) fn native_group_default_unavailable(lane: &MulticamLane) -> bool {
+    lane.selected.is_none() && lane.reason.as_deref() == Some(UNKNOWN_PICTURE_DEFAULT)
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct Member<'a> {
     item: &'a str,
@@ -135,10 +146,7 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
                     alternative(id, track, StreamKind::Video, 1, member, grid)
                 })
                 .collect::<Result<_>>()?,
-            reason: Some(
-                "Resolve Group-wide picture default is unqualified; edit selectors are separate"
-                    .into(),
-            ),
+            reason: Some(UNKNOWN_PICTURE_DEFAULT.into()),
         });
     } else {
         loss(
@@ -327,7 +335,7 @@ pub(super) fn placement(
     let meta = pb_bytes(&data, 1)?.ok_or("missing Resolve Group edit metadata")?;
     let angle = pb_bytes(meta, 3)?.map(std::str::from_utf8).transpose()?;
     let channel = if kind == StreamKind::Audio {
-        mono(node, blobs, true)?
+        mono(node, blobs, true, false)?
     } else {
         None
     };
@@ -344,7 +352,9 @@ pub(super) fn placement(
         StreamKind::Audio => group
             .audio
             .as_ref()
-            .filter(|(_, name, _)| angle == Some(name.as_str()))
+            // Definition only admits reference audio once both saved angle
+            // tracks resolve to exactly the same member and range.
+            .filter(|_| group.picture.iter().any(|(_, name, _)| angle == Some(name.as_str())))
             .zip(channel)
             .map(|((_, _, member), channel)| (channel + 1, 0, member)),
     };
@@ -394,6 +404,12 @@ pub(super) fn placement(
     let use_id = format!("{id}/use");
     if let Some(reason) = &binding.reason {
         loss(graph, &use_id, "multicam_binding", reason);
+    }
+    if kind == StreamKind::Audio
+        && qualified.is_some()
+        && group.audio.as_ref().is_some_and(|(_, reference, _)| angle != Some(reference.as_str()))
+    {
+        loss(graph, &use_id, REFERENCE_AUDIO_SWITCH.0, REFERENCE_AUDIO_SWITCH.1);
     }
     receipt(
         graph,

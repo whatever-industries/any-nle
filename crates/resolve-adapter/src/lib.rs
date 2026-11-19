@@ -10,9 +10,12 @@ mod dissolve;
 mod generator;
 mod grade;
 mod group;
+mod input_scaling;
 pub mod linked;
+pub mod native_import;
 mod media;
 mod marker_palette;
+mod mixed_rate;
 mod nests;
 mod prepare;
 mod premiere;
@@ -20,6 +23,7 @@ pub mod premiere_export;
 pub mod relink;
 mod retime;
 pub mod source;
+mod stereo;
 pub mod turnover;
 mod timeline_marks;
 mod track_state;
@@ -36,7 +40,7 @@ pub use media::{
     verify_binding, verify_group_binding, BindingSpec, StreamSelector, VerifiedBinding,
 };
 pub use prepare::{prepare, PreparedResolve};
-pub use premiere::{list_premiere_sequences, prepare_premiere_turnover, read_premiere_media_graph};
+pub use premiere::{MediaLinkReview, list_premiere_sequences, prepare_premiere_project, prepare_premiere_turnover, read_premiere_media_graph};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const RATE: f64 = 24000.0 / 1001.0;

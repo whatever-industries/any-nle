@@ -1,4 +1,5 @@
-//! Internal Resolve-to-Premiere path for linked ProRes and discrete mono PCM.
+//! Internal Resolve-to-Premiere paths for linked media.
+mod multicam;
 use crate::{
     audio::{self, Volume},
     dissolve,
@@ -8,14 +9,17 @@ use crate::{
         MediaSpec, Profile,
     },
     media::{check_wav_extent, media_digest},
+    mixed_rate::{Cadence, ResolveTrim},
     prepare::{frames_on, MAX_EDITS_PER_LANE},
+    retime::PictureSpeed,
     source::{
         mixer::{
-            fader_ticks, parse_track_mutes, DIRECT_PROFILE, FAIRLIGHT_ADAPTER, FAIRLIGHT_LOSS,
+            fader_ticks, neutral_empty_stereo, parse_track_mutes, DIRECT_PROFILE, FAIRLIGHT_ADAPTER, FAIRLIGHT_LOSS,
             MAIN_BUS_LEVEL, MAIN_BUS_LOSS, MUTED_AUDIO_TRACKS, TRACK_MUTE_LOSS,
         },
-        ADAPTER,
+        ADAPTER, EDIT_MARKER_ADAPTER, EDIT_MARKER_LOSS, POOL_MARKER_ADAPTER,
     },
+    timeline_marks::{self, TimelineMarks},
     video::{
         centered_crop_profile, rotation_axis_profile, validate_static_geometry,
         motion::{LinearMotion, NATIVE_LINEAR_KIND},
@@ -24,16 +28,17 @@ use crate::{
     Result, StreamSelector,
 };
 use graph::{
-    source::{OriginalStream, SourceGraph, SourceSequence, TextKind},
-    Loss, Rational, StreamKind, Value,
+    source::{OriginalStream, SourceGraph, SourceItem, SourceMarker, SourceMedia, SourceSequence, TextKind},
+    Loss, Placement, Rational, StreamKind, Value,
 };
 use prproj::{
     convert::{
         colors::LABEL_NAMES,
         model::{Options, TICKS_PER_SECOND},
         prepared::{PictureEffect, PreparedAudioCrossfade, PreparedAudioEdgeFade, PreparedAudioMixer,
-            PreparedEditLabel, PreparedPictureEffect, PreparedTrackLane, PreparedTrackState, PreparedVideoDissolve},
-        writer::prepare_typed_project,
+            PreparedClip, PreparedEditLabel, PreparedPictureEffect, PreparedTimelineMarks, PreparedTrackLane,
+            PreparedTrackState, PreparedVideoDissolve, SampleRepresentation},
+        writer::{prepare_typed_project_with_marker_provenance, MarkerDataKey, MarkerProvenance},
     },
     RandomUuids,
 };
@@ -56,7 +61,7 @@ pub fn write_with_options(
     sequence_id: &str,
     ffprobe: &Path,
     output: &Path,
-    accept_metadata_losses: bool,
+    accept_losses: bool,
 ) -> Result<Vec<graph::Loss>> {
     graph.validate()?;
     let index = graph
@@ -68,21 +73,39 @@ pub fn write_with_options(
     if let Some(edit) = sequence.disabled_placements.first() {
         return Err(format!("{}: disabled source edit has no qualified Resolve export mapping", edit.id).into());
     }
+    if graph.multicam_uses.iter().any(|usage| usage.sequence == sequence_id) {
+        return multicam::write(&graph, sequence, ffprobe, output, accept_losses);
+    }
     let track_state = crate::track_state::TrackState::prepare(&graph, sequence)?;
     let (mut mixer, mapped_direct_mixer) = validate_sequence(&graph, sequence, track_state.is_some())?;
-    let mut metadata_losses = omitted_timeline_marks(&graph, sequence)?;
-    let omitted_marks = metadata_losses.iter().any(|loss| loss.aspect == crate::timeline_marks::LOSS.0);
+    let empty_stereo = if track_state.is_none()
+        && sequence.tracks.iter().map(|track| (track.kind, track.index, track.level_db))
+            .eq([(StreamKind::Video, 1, None), (StreamKind::Audio, 1, None)])
+        && sequence.placements.iter().all(|edit| edit.audio_tracks.is_empty() && edit.grouped_audio.is_empty())
+        && graph.sidecar(FAIRLIGHT_ADAPTER, sequence_id).is_some_and(neutral_empty_stereo)
+    {
+        crate::source::default_empty_stereo(&graph, sequence_id).map(str::to_owned)
+    } else {
+        None
+    };
+    let (timeline_marks, mut metadata_losses) = prepare_timeline_marks(&graph, sequence)?;
+    let accounted_marks = timeline_marks.is_some() || !metadata_losses.is_empty();
     let labels = prepare_edit_labels(&graph, sequence, &mut metadata_losses)?;
     let handled_labels: HashSet<_> = labels.iter().map(|label| label.owner.as_str())
         .chain(metadata_losses.iter().filter(|loss| loss.aspect == "clip_label")
             .map(|loss| loss.object.as_str())).collect();
     let mut transitions = Vec::new();
-    for transition in dissolve::prepare_all_native(&graph, sequence)? {
+    let native_transitions = dissolve::prepare_all_native(&graph, sequence)?;
+    dissolve::require_single_per_lane(&native_transitions)?;
+    for transition in native_transitions {
         let d = transition.prepared;
-        if d.audio && mixer.mono_track_pans.is_some() {
+        if d.duration != dissolve::LEGACY_DURATION || d.style == dissolve::Style::Power {
+            return Err(format!("Resolve transition {}: outside the qualified Premiere transition profile", d.id).into());
+        }
+        if d.audio() && mixer.mono_track_pans.is_some() {
             return Err(format!("Resolve transition {}: audio crossfade with track pan is unqualified", d.id).into());
         }
-        if !d.audio && sequence.rate == Rational::integer(24) && d.before != dissolve::DURATION / 2 {
+        if !d.audio() && sequence.rate == Rational::integer(24) && d.before != dissolve::LEGACY_DURATION / 2 {
             return Err(format!(
                 "Resolve transition {}: 24 fps Premiere video dissolve requires centered alignment",
                 d.id
@@ -107,14 +130,24 @@ pub fn write_with_options(
     owned.extend(used_media.iter().cloned());
     graph.sequences = vec![graph.sequences.swap_remove(index)];
     let (fades, mut destination_losses) = prepare_clip_controls(&mut graph)?;
+    let selected_edit_marker = |loss: &Loss| {
+        owned.contains(&loss.object) && graph.sidecar(EDIT_MARKER_ADAPTER, &loss.object).is_some()
+    };
+    let selected_marker_color = |loss: &Loss| {
+        loss.aspect == "marker_color"
+            && (loss.object == sequence_id
+                || (used.contains(&loss.object)
+                    && graph.sidecar(POOL_MARKER_ADAPTER, &loss.object).is_some())
+                || selected_edit_marker(loss))
+    };
     if let Some(loss) = graph
         .losses
         .iter()
         .find(|loss| {
-            if loss.object == sequence_id && loss.aspect == "marker_color" {
+            if selected_marker_color(loss) || (loss.aspect == EDIT_MARKER_LOSS && selected_edit_marker(loss)) {
                 return false;
             }
-            if (omitted_marks && crate::timeline_marks::TimelineMarks::recover(loss, sequence_id))
+            if (accounted_marks && TimelineMarks::recover(loss, sequence_id))
                 || (handled_labels.contains(loss.object.as_str())
                     && crate::clip_label::ClipLabel::recover(loss))
                 || (track_state.is_some() && crate::track_state::TrackState::recover(loss, sequence_id))
@@ -125,6 +158,12 @@ pub fn write_with_options(
                 return false;
             }
             let control = (loss.aspect.as_str(), loss.reason.as_str());
+            if empty_stereo.as_deref().is_some_and(|track|
+                crate::source::is_empty_stereo_loss(loss, sequence_id, track)
+                    || (loss.object == sequence_id && control == FAIRLIGHT_LOSS))
+            {
+                return false;
+            }
             let recovered = loss.object == sequence_id
                 && ((mixer.mix_level_db.is_some() && control == MAIN_BUS_LOSS)
                     || (!mixer.muted_tracks.is_empty() && control == TRACK_MUTE_LOSS)
@@ -134,38 +173,24 @@ pub fn write_with_options(
     {
         return Err(format!("Resolve source loss on {}: {}", loss.object, loss.reason).into());
     }
-    if !accept_metadata_losses && !metadata_losses.is_empty() {
+    metadata_losses.extend(graph.losses.iter().filter(|loss| {
+        loss.aspect == EDIT_MARKER_LOSS && selected_edit_marker(loss)
+    }).cloned());
+    if !accept_losses && !metadata_losses.is_empty() {
         let details = metadata_losses.iter()
             .map(|loss| format!("{}: {}", loss.object, loss.reason))
             .collect::<Vec<_>>().join("\n");
         return Err(format!("Resolve metadata requires --accept-losses before conversion:\n{details}").into());
     }
     destination_losses.extend(metadata_losses);
-    destination_losses.extend(
-        graph.losses.iter().filter(|loss| {
-            loss.object == sequence_id && loss.aspect == "marker_color"
-        }).cloned(),
-    );
-    if let Some(Value::Arr(rows)) = graph
-        .sidecar(ADAPTER, sequence_id)
-        .and_then(|data| data.get("markers"))
-    {
-        for row in rows {
-            if let (Some(Value::Int(frame)), Some(Value::Str(custom))) =
-                (row.get("frame"), row.get("custom_data"))
-            {
-                if !custom.is_empty() {
-                    destination_losses.push(Loss {
-                        object: sequence_id.into(),
-                        aspect: "marker_custom_data".into(),
-                        reason: format!(
-                            "{sequence_id}/marker/{frame}: Resolve custom data retained in source graph"
-                        ),
-                    });
-                }
-            }
-        }
+    if let Some(track) = empty_stereo {
+        destination_losses.push(Loss {
+            object: track,
+            aspect: "empty_stereo_track".into(),
+            reason: "Resolve's empty default stereo track is omitted from the Premiere timeline".into(),
+        });
     }
+    destination_losses.extend(graph.losses.iter().filter(|loss| selected_marker_color(loss)).cloned());
     prepare_track_pan(&mut graph.sequences[0], &mut mixer, &mut destination_losses);
     graph.media.retain(|media| used_media.contains(&media.id));
     graph
@@ -179,9 +204,24 @@ pub fn write_with_options(
         .sidecars
         .retain(|receipt| owned.contains(&receipt.object));
     let verified = verify_originals(&mut graph, ffprobe)?;
-    let motions = prepare_discrete_tracks(&mut graph)?;
+    let mut trim_losses = Vec::new();
+    let picture = prepare_discrete_tracks(&mut graph, &verified, &mut trim_losses)?;
+    if !accept_losses && !trim_losses.is_empty() {
+        let details = trim_losses.iter().map(|loss| format!("{}: {}", loss.object, loss.reason))
+            .collect::<Vec<_>>().join("\n");
+        return Err(format!("Resolve frame hold trim changes require --accept-losses before conversion:\n{details}").into());
+    }
+    destination_losses.extend(trim_losses);
 
     let mut prepared = premiere_adapter::prepare_resolve_originals(&graph, &Options::default())?;
+    if let Some(marks) = timeline_marks {
+        prepared.input.timeline_marks.insert(0, marks);
+    }
+    for (owner, held_ticks) in picture.holds {
+        let &edit = prepared.ownership.get(&owner)
+            .ok_or_else(|| format!("{owner}: Resolve frame hold lost its prepared edit"))?;
+        prepared.input.frame_holds.insert(edit, held_ticks);
+    }
     if let Some(state) = track_state {
         let states = state.0.into_iter().enumerate().filter_map(|(lane, track)| {
             (!track.name.is_empty() || track.locked || track.disabled).then(|| PreparedTrackState {
@@ -208,7 +248,7 @@ pub fn write_with_options(
             });
         }
     }
-    for (owner, effect) in motions {
+    for (owner, effect) in picture.motions {
         let &(sequence, event) = prepared.ownership.get(&owner)
             .ok_or_else(|| format!("{owner}: Resolve Linear motion lost its prepared edit"))?;
         prepared.input.picture_effects.push(PreparedPictureEffect {
@@ -229,8 +269,8 @@ pub fn write_with_options(
             return Err(refuse("endpoints resolved to different sequences").into());
         }
         let before_cut = d.before * frame;
-        let duration = dissolve::DURATION * frame;
-        if d.audio {
+        let duration = dissolve::LEGACY_DURATION * frame;
+        if d.audio() {
             if fades.iter().any(|fade| fade.track == 1) {
                 return Err(refuse("crossfade cannot share a lane with clip edge fades").into());
             }
@@ -264,8 +304,74 @@ pub fn write_with_options(
             tail: fade.tail,
         });
     }
-    let output =
-        prepare_typed_project(&prepared.input, output, &mut RandomUuids::new(), &[], false)?;
+    let mut custom_data = HashMap::new();
+    let mut custom_losses = Vec::new();
+    let mut original_colors = HashMap::new();
+    let mut color_losses = Vec::new();
+    let sequence = &graph.sequences[0];
+    let timeline_data = graph.sidecar(ADAPTER, &sequence.id).and_then(|data| data.get("markers"));
+    let owners = std::iter::once((&sequence.id, timeline_data, None))
+        .chain(sequence.placements.iter().map(|edit|
+            (&edit.id, graph.sidecar(EDIT_MARKER_ADAPTER, &edit.id), None)))
+        .chain(graph.items.iter().map(|item|
+            (&item.id, graph.sidecar(POOL_MARKER_ADAPTER, &item.id), Some(item))));
+    for (owner, receipt, item) in owners {
+        let Some(Value::Arr(rows)) = receipt else { continue };
+        for row in rows {
+            let (Some(Value::Int(frame)), Some(Value::Str(custom))) =
+                (row.get("frame"), row.get("custom_data")) else { continue };
+            let original_color = match row.get("color_bit") {
+                Some(Value::Int(bit)) => u64::try_from(*bit).ok()
+                    .filter(|&bit| crate::marker_palette::resolve_only_color(bit).is_some()),
+                _ => None,
+            };
+            if custom.is_empty() && original_color.is_none() {
+                continue;
+            }
+            let match_with_marker = if let Some(item) = item {
+                source_marker_key(item, *frame, &prepared.input.clips)
+            } else if owner == &sequence.id {
+                sequence_marker_key(sequence, *frame, &prepared.input.sequences[0].markers)
+            } else {
+                edit_marker_key(sequence, owner, *frame, &prepared.ownership)
+            };
+            let key = match_with_marker.as_ref().map(|(key, _)| key.clone());
+            if !custom.is_empty() {
+                if key.as_ref().is_some_and(|key| custom_data.insert(key.clone(), custom.clone()).is_some()) {
+                    return Err(format!("{owner}: duplicate marker custom-data claim").into());
+                }
+                custom_losses.push((key.clone(), owner, *frame));
+            }
+            if let Some(bit) = original_color {
+                let expected = crate::marker_palette::resolve_only_color(bit);
+                let key = match_with_marker.filter(|(_, marker)| marker.color.as_ref().is_some_and(|color|
+                    color.palette == "resolve" && Some(color.name.as_str()) == expected))
+                    .map(|(key, _)| key);
+                if key.as_ref().is_some_and(|key| original_colors.insert(key.clone(), bit).is_some()) {
+                    return Err(format!("{owner}: duplicate marker original-color claim").into());
+                }
+                color_losses.push((key, owner, *frame));
+            }
+        }
+    }
+    let output = prepare_typed_project_with_marker_provenance(
+        &prepared.input, output, &mut RandomUuids::new(),
+        MarkerProvenance { custom_data: &custom_data, original_colors: &original_colors },
+    )?;
+    for (key, owner, frame) in custom_losses {
+        if key.is_none_or(|key| !output.has_marker_custom_data(&key)) {
+            destination_losses.push(marker_custom_data_loss(owner, frame));
+        }
+    }
+    for (key, owner, frame) in color_losses {
+        if key.is_none_or(|key| !output.has_marker_original_color(&key)) {
+            destination_losses.push(Loss {
+                object: owner.into(),
+                aspect: "marker_color".into(),
+                reason: format!("{owner}/marker/{frame}: original Resolve color retained in source graph"),
+            });
+        }
+    }
     for media in verified.values() {
         media.0.recheck()?;
     }
@@ -274,40 +380,138 @@ pub fn write_with_options(
     Ok(destination_losses)
 }
 
-fn omitted_timeline_marks(graph: &SourceGraph, sequence: &SourceSequence) -> Result<Vec<Loss>> {
-    let mut losses = Vec::new();
-    if let Some(marks) = graph.sidecar(ADAPTER, &sequence.id)
-        .and_then(|data| data.get(crate::timeline_marks::FIELD))
-    {
-        let Value::Obj(fields) = marks else {
-            return Err(format!("{}: malformed Resolve timeline mark receipt", sequence.id).into());
-        };
-        if fields.iter().any(|(name, _)| {
-            !crate::timeline_marks::TAGS.iter().any(|(_, field)| name == field)
-        }) {
-            return Err(format!("{}: unknown Resolve timeline mark field", sequence.id).into());
-        }
-        for (_, field) in crate::timeline_marks::TAGS {
-            let Some((_, value)) = fields.iter().find(|(name, _)| name == field) else {
-                continue;
-            };
-            if matches!(value, Value::Str(text) if text.is_empty()) {
-                continue;
-            }
-            let description = match value {
-                Value::Str(frame) if frame.bytes().all(|b| b.is_ascii_digit()) => {
-                    format!("{field} at Resolve frame {frame}")
-                }
-                _ => format!("{field} with an unqualified saved value"),
-            };
-            losses.push(Loss {
-                object: sequence.id.clone(),
-                aspect: crate::timeline_marks::LOSS.0.into(),
-                reason: format!("{description} omitted from Premiere"),
-            });
+fn sequence_marker_key<'a>(
+    sequence: &'a SourceSequence,
+    frame: i64,
+    prepared: &[prproj::convert::model::Marker],
+) -> Option<(MarkerDataKey, &'a SourceMarker)> {
+    let mut markers = sequence.markers.iter().filter(|marker| {
+        marker.owner == graph::MarkerOwner::Sequence && marker.track.is_none()
+            && !marker.inherited && marker.binding.reason.is_none()
+            && marker.start.and_then(|start| frames_on(start, sequence.rate).ok()) == Some(frame)
+    });
+    let marker = markers.next()?;
+    let ticks = marker.start?.to_units(TICKS_PER_SECOND)?;
+    if markers.next().is_some() {
+        return None;
+    }
+    let mut candidates = prepared.iter().enumerate().filter(|(_, marker)|
+        marker.owner == "sequence" && marker.start == ticks);
+    let index = candidates.next()?.0;
+    candidates.next().is_none().then_some((MarkerDataKey::Sequence(0, index), marker))
+}
+
+fn edit_marker_key<'a>(
+    sequence: &'a SourceSequence,
+    owner: &str,
+    frame: i64,
+    ownership: &HashMap<String, (usize, usize)>,
+) -> Option<(MarkerDataKey, &'a SourceMarker)> {
+    let mut markers = sequence.markers.iter().filter(|marker| {
+        marker.owner == graph::MarkerOwner::Edit && !marker.inherited
+            && marker.binding.reason.is_none() && marker.binding.placements.as_slice() == [owner]
+            && marker.source.and_then(|source| frames_on(source, sequence.rate).ok()) == Some(frame)
+    });
+    let marker = markers.next()?;
+    if markers.next().is_some() {
+        return None;
+    }
+    let &(sequence_index, event) = ownership.get(owner)?;
+    let key = MarkerDataKey::Edit(sequence_index, event, marker.source?.to_units(TICKS_PER_SECOND)?);
+    Some((key, marker))
+}
+
+fn marker_custom_data_loss(owner: &str, frame: i64) -> Loss {
+    Loss {
+        object: owner.into(),
+        aspect: "marker_custom_data".into(),
+        reason: format!("{owner}/marker/{frame}: Resolve custom data retained in source graph"),
+    }
+}
+
+fn source_marker_key<'a>(
+    item: &'a SourceItem, frame: i64, clips: &[PreparedClip],
+) -> Option<(MarkerDataKey, &'a SourceMarker)> {
+    let clip = clips.iter().find(|clip| clip.id() == item.id)?;
+    let PreparedClip::Original(clip) = clip else { return None };
+    match (&clip.video, &clip.audio) {
+        (Some(video), None) if item.rate.is_some_and(|rate|
+            video.codec == "apch"
+                && (video.rate.num, video.rate.den) == (rate.num(), rate.den())
+                && (video.width, video.height) == (1920, 1080)) => {}
+        (None, Some(audio)) if item.rate.is_none() && clip.container == "wav"
+            && audio.source_start == 0 && audio.sample_rate == 48000 && matches!(audio.channels, 1 | 2)
+            && matches!(audio.representation, SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24) => {}
+        _ => return None,
+    }
+    let mut markers = item.markers.iter().filter(|marker| {
+        marker.owner == graph::MarkerOwner::Sequence && marker.track.is_none()
+            && !marker.inherited && marker.binding.reason.is_none()
+            && marker.owner_local == marker.start
+            && item.rate.or(marker.owner_rate).filter(|&rate| crate::source::supported_marker_rate(rate))
+                .and_then(|rate| frames_on(marker.start?, rate).ok()) == Some(frame)
+    });
+    let marker = markers.next()?;
+    let ticks = marker.start?.to_units(TICKS_PER_SECOND)?;
+    if markers.next().is_some() {
+        return None;
+    }
+    let mut candidates = clip.metadata.markers.iter().enumerate().filter(|(_, marker)| marker.start == ticks);
+    let (index, _) = candidates.next()?;
+    candidates.next().is_none().then_some((MarkerDataKey::Source(item.id.clone(), index), marker))
+}
+
+fn prepare_timeline_marks(
+    graph: &SourceGraph,
+    sequence: &SourceSequence,
+) -> Result<(Option<PreparedTimelineMarks>, Vec<Loss>)> {
+    let Some(receipt) = graph.sidecar(ADAPTER, &sequence.id) else {
+        return Ok((None, Vec::new()));
+    };
+    let Some(marks) = receipt.get(timeline_marks::FIELD) else {
+        return Ok((None, Vec::new()));
+    };
+    let Value::Obj(fields) = marks else {
+        return Err(format!("{}: malformed Resolve timeline mark receipt", sequence.id).into());
+    };
+    if fields.iter().any(|(name, _)| !timeline_marks::TAGS.iter().any(|(_, field)| name == field)) {
+        return Err(format!("{}: unknown Resolve timeline mark field", sequence.id).into());
+    }
+    if let Some(Value::Int(length)) = receipt.get("record_length") {
+        if let Ok(Some(marks)) = TimelineMarks::prepare(graph, &sequence.id, *length) {
+            let [start, end, ..] = marks.frames();
+            let invalid = || format!("{}: Resolve timeline marks exceed the exact Premiere tick grid", sequence.id);
+            let frame_ticks = Rational::new(sequence.rate.den().into(), sequence.rate.num().into())
+                .and_then(|period| period.to_units(TICKS_PER_SECOND))
+                .ok_or_else(invalid)?;
+            let in_ticks = start.map(|frame| frame.checked_mul(frame_ticks).ok_or_else(invalid)).transpose()?;
+            let out_ticks = end.map(|frame| {
+                frame.checked_add(1).and_then(|exclusive| exclusive.checked_mul(frame_ticks)).ok_or_else(invalid)
+            }).transpose()?;
+            return Ok((Some(PreparedTimelineMarks { in_ticks, out_ticks }), Vec::new()));
         }
     }
-    Ok(losses)
+    let mut losses = Vec::new();
+    for (_, field) in timeline_marks::TAGS {
+        let Some(value) = marks.get(field) else {
+            continue;
+        };
+        if matches!(value, Value::Str(text) if text.is_empty()) {
+            continue;
+        }
+        let description = match value {
+            Value::Str(frame) if frame.bytes().all(|b| b.is_ascii_digit()) => {
+                format!("{field} at Resolve frame {frame}")
+            }
+            _ => format!("{field} with an unqualified saved value"),
+        };
+        losses.push(Loss {
+            object: sequence.id.clone(),
+            aspect: timeline_marks::LOSS.0.into(),
+            reason: format!("{description} omitted from Premiere"),
+        });
+    }
+    Ok((None, losses))
 }
 
 struct EditLabel {
@@ -445,10 +649,6 @@ fn validate_sequence(
         || fairlight.is_some_and(|r| r.get(DIRECT_PROFILE).is_some())
             && mono_track_pans.is_none() && !mapped_direct_mixer
         || mono_track_pans.is_some() && !has_audio
-        || graph
-            .multicam_uses
-            .iter()
-            .any(|usage| usage.sequence == sequence_id)
     {
         return Err(format!(
             "{sequence_id}: unsupported Resolve-to-Premiere sequence clock, topology or controls"
@@ -534,7 +734,8 @@ fn validate_sequence(
         };
         if !edit.grouped_audio.is_empty()
             || !qualified_effects
-            || edit.frame_map.is_some()
+            || edit.frame_map.is_some() && (lane != 0 || edit.speed.is_some()
+                || edit.transform.is_some() || !edit.effects.is_empty())
             || (has_audio || has_linear_motion) && edit.speed.is_some()
             || edit.gain_db != 0.0
             || edit.track_gains_db.iter().any(Option::is_some)
@@ -543,6 +744,7 @@ fn validate_sequence(
                     || !edit.volume_keys.is_empty()
                     || !edit.track_pans.is_empty())
             || graph.sidecar(crate::grade::ADAPTER, &edit.id).is_some()
+            || graph.sidecar(crate::grade::CDL_ADAPTER, &edit.id).is_some()
             || graph
                 .sidecar(crate::audio::UNQUALIFIED_FADE_ADAPTER, &edit.id)
                 .is_some()
@@ -739,6 +941,10 @@ fn verify_originals(graph: &mut SourceGraph, ffprobe: &Path) -> Result<VerifiedF
         .map(|r| (r.object.as_str(), &r.data))
         .collect();
     let mut verified = VerifiedFiles::new();
+    let cameras: std::collections::HashSet<_> = graph.media.iter().filter(|source| {
+        source.kind == StreamKind::Video && source.codec.as_deref() == Some("avc1")
+            && source.rate == Some(Rational::integer(24)) && source.frame_size == Some((4096, 2160))
+    }).flat_map(|source| source.locations.clone()).collect();
     for source in &mut graph.media {
         let [locator] = source.locations.as_slice() else {
             return Err(format!("{}: Resolve original needs one saved locator", source.id).into());
@@ -747,14 +953,15 @@ fn verify_originals(graph: &mut SourceGraph, ffprobe: &Path) -> Result<VerifiedF
         let file_error =
             |error: Box<dyn std::error::Error>| format!("{} ({locator}): {error}", source.id);
         if !verified.contains_key(locator) {
+            let camera = cameras.contains(locator);
             let spec = MediaSpec {
                 item_id: String::new(),
                 bin_id: String::new(),
                 path: path.to_owned(),
-                sha256: hex::encode(media_digest(path).map_err(file_error)?),
+                sha256: if camera { String::new() } else { hex::encode(media_digest(path).map_err(file_error)?) },
                 streams: vec![],
             };
-            let binding = linked::probe(&spec, ffprobe, String::new(), 0).map_err(file_error)?;
+            let binding = linked::probe_resolve_original(&spec, ffprobe, camera).map_err(file_error)?;
             if let Profile::Wav {
                 bits,
                 channels,
@@ -766,10 +973,21 @@ fn verify_originals(graph: &mut SourceGraph, ffprobe: &Path) -> Result<VerifiedF
             verified.insert(locator.clone(), binding);
         }
         let (media, time_base, duration_ts) = &verified[locator];
+        let camera = media.profile.timecoded_camera_pcm();
         let (container, channel, channels, representation) = match (&media.profile, source.kind) {
+            (Profile::Mov { .. }, StreamKind::Video) if camera => ("mov", None, None, None),
+            (Profile::Mov { .. }, StreamKind::Audio) if camera => {
+                let channel = match receipts.get(source.id.as_str())
+                    .map(|r| (r.get("saved_cache_track"), r.get("saved_channel"))) {
+                    Some((Some(Value::Int(0)), Some(Value::Int(channel @ (0 | 1)))))
+                        if source.stream == Some(channel + 1) => *channel,
+                    _ => return Err(format!("{}: unresolved embedded PCM physical selector", source.id).into()),
+                };
+                ("mov", Some(channel), Some(2), Some("pcm16be".into()))
+            }
             (
                 Profile::Mov {
-                    h264: false,
+                    video: crate::linked::MovieVideo::ProResHq,
                     aac: false,
                     ..
                 },
@@ -808,22 +1026,39 @@ fn verify_originals(graph: &mut SourceGraph, ffprobe: &Path) -> Result<VerifiedF
                 .into())
             }
         };
+        let (index, time_base, duration_ts) = if camera && source.kind == StreamKind::Audio {
+            let time_base = Rational::new(1, 48_000).unwrap();
+            (1, time_base, source.duration.to_units(48_000).ok_or("invalid embedded PCM extent")?)
+        } else {
+            (0, *time_base, *duration_ts)
+        };
         let selector = StreamSelector {
             media_id: source.id.clone(),
-            index: 0,
+            index,
             channel: channel.map(|c| c as usize),
         };
-        linked::check_stream(source, &selector, media, *time_base, *duration_ts)
+        linked::check_stream(source, &selector, media, time_base, duration_ts)
             .map_err(file_error)?;
+        if camera && source.kind == StreamKind::Video {
+            let expected = match media.profile {
+                Profile::Mov { quicktime_timecode: Some(start), .. } => u64::try_from(start)?,
+                _ => return Err("missing verified original MOV clock".into()),
+            };
+            let clock = source.clock.as_mut().filter(|clock| {
+                clock.effective_count == expected && !clock.drop && clock.rate == Rational::integer(24)
+                    && clock.exact_start() == source.start
+            }).ok_or("saved Resolve camera timecode contradicts the verified MOV clock")?;
+            clock.provenance.route = graph::source::VERIFIED_LINKED_MOV_TIMECODE.into();
+        }
         let original = OriginalStream {
             saved_locators: source.locations.clone(),
             container: container.into(),
-            stream_index: 0,
+            stream_index: index as i64,
             channel_index: channel,
             channels,
-            time_base: *time_base,
+            time_base,
             start_pts: 0,
-            duration_ts: *duration_ts,
+            duration_ts,
             sample_representation: representation,
         };
         if source
@@ -838,7 +1073,114 @@ fn verify_originals(graph: &mut SourceGraph, ffprobe: &Path) -> Result<VerifiedF
     Ok(verified)
 }
 
-fn prepare_discrete_tracks(graph: &mut SourceGraph) -> Result<Vec<(String, PictureEffect)>> {
+enum PremiereSampling {
+    FrameSampling,
+    SourceIn(Rational),
+    TimeRemapping,
+}
+
+fn verify_premiere_sampling(
+    edit: &Placement,
+    map: &[i64],
+    source: &SourceMedia,
+    record_rate: Rational,
+    verified: &VerifiedFiles,
+    timing: Option<&Value>,
+) -> Result<PremiereSampling> {
+    let refuse = || {
+        format!("{}: Premiere mixed-rate picture requires a verified Frame Sampling map and picture-only ProRes HQ original or qualified timecoded AVC camera original", edit.id)
+    };
+    let [locator] = source.locations.as_slice() else {
+        return Err(refuse().into());
+    };
+    let (media, ..) = verified.get(locator).ok_or_else(refuse)?;
+    let Profile::Mov { rate, frames, .. } = &media.profile else {
+        return Err(refuse().into());
+    };
+    let prores = matches!(&media.profile, Profile::Mov {
+        video: crate::linked::MovieVideo::ProResHq, aac: false, pcm: None,
+        quicktime_timecode: None | Some(0), avid_source_timecode: None, raster: (1920, 1080), ..
+    });
+    if !prores && !media.profile.timecoded_camera_pcm() {
+        return Err(refuse().into());
+    }
+    let cadence = Cadence::for_resolve_source(*rate, record_rate).ok_or_else(refuse)?;
+    let length = frames_on(edit.duration, record_rate).map_err(|_| refuse())?;
+    if source.rate != Some(*rate) {
+        return Err(refuse().into());
+    }
+    if let Ok(source_in) = frames_on(edit.source_in, record_rate) {
+        if cadence.agrees(map, source_in, length)
+            && cadence.last_frame(source_in, length).is_some_and(|last| last < *frames)
+        {
+            return Ok(PremiereSampling::FrameSampling);
+        }
+    }
+    if map.last().is_some_and(|last| *last < *frames) {
+        if let Some(in_point) = cadence.premiere_default_in(edit.source_in, map, length) {
+            return Ok(PremiereSampling::SourceIn(in_point));
+        }
+        if prores && matches!(cadence, Cadence::DropFrames) && (2..=16_384).contains(&length) {
+            if let Some(trim) = native_conform_receipt(timing, &edit.id, cadence, record_rate) {
+                if trim.source_in() == edit.source_in && trim.agrees(map, length) {
+                    return Ok(PremiereSampling::TimeRemapping);
+                }
+            }
+        }
+    }
+    Err(refuse().into())
+}
+
+fn native_conform_receipt(
+    timing: Option<&Value>,
+    edit: &str,
+    cadence: Cadence,
+    record_rate: Rational,
+) -> Option<crate::mixed_rate::DefaultConform> {
+    use crate::nests::string;
+    let Value::Arr(rows) = timing? else { return None };
+    let mut rows = rows.iter().filter(|row| {
+        matches!(row.get("occurrence"), Some(Value::Str(id)) if id == edit)
+    });
+    let row = rows.next()?;
+    if rows.next().is_some()
+        || Rational::parse(string(row, "source_rate")?)? != cadence.source_rate()
+        || Rational::parse(string(row, "record_rate")?)? != record_rate
+    {
+        return None;
+    }
+    match cadence.resolve_trim(string(row, "saved_in")?, true)? {
+        ResolveTrim::DefaultConform(trim) => Some(trim),
+        ResolveTrim::Adjusted(..) => None,
+    }
+}
+
+fn prepare_frame_hold(edit: &Placement, map: &[i64], rate: Rational, has_audio: bool) -> Result<i64> {
+    let refuse = || format!("{}: Premiere frame hold requires a constant map at source In on linked picture-only 1080p24 ProRes HQ", edit.id);
+    if rate != Rational::integer(24) || has_audio || edit.video_track != Some(1) {
+        return Err(refuse().into());
+    }
+    let source_in = frames_on(edit.source_in, rate).map_err(|_| refuse())?;
+    let length = frames_on(edit.duration, rate).map_err(|_| refuse())?;
+    if crate::retime::hold_count(length) != Some(map.len())
+        || map.iter().any(|&frame| frame != source_in)
+    {
+        return Err(refuse().into());
+    }
+    edit.source_in.to_units(TICKS_PER_SECOND).ok_or_else(|| refuse().into())
+}
+
+#[derive(Default)]
+struct PictureControls {
+    holds: HashMap<String, i64>,
+    motions: Vec<(String, PictureEffect)>,
+}
+
+fn prepare_discrete_tracks(
+    graph: &mut SourceGraph,
+    verified: &VerifiedFiles,
+    trim_losses: &mut Vec<Loss>,
+) -> Result<PictureControls> {
     let media: HashMap<_, _> = graph.media.iter().map(|m| (m.id.as_str(), m)).collect();
     let mut routes = HashMap::new();
     for item in &mut graph.items {
@@ -858,6 +1200,18 @@ fn prepare_discrete_tracks(graph: &mut SourceGraph) -> Result<Vec<(String, Pictu
         }
         match first.kind {
             StreamKind::Video if item.media.len() == 1 && item.stream_groups.is_empty() => {}
+            StreamKind::Video if verified.get(&first.locations[0]).is_some_and(|(media, ..)| {
+                media.profile.timecoded_camera_pcm()
+            }) => {
+                if item.media.len() != 3 || !item.stream_groups.is_empty()
+                    || !streams.enumerate().all(|(index, source)| {
+                        source.kind == StreamKind::Audio && source.locations == first.locations
+                            && source.stream == Some(index as i64 + 1)
+                    })
+                {
+                    return Err(invalid().into());
+                }
+            }
             StreamKind::Audio => {
                 let channels = first.original.as_ref().and_then(|o| o.channels);
                 if channels != Some(item.media.len() as i64)
@@ -875,8 +1229,17 @@ fn prepare_discrete_tracks(graph: &mut SourceGraph) -> Result<Vec<(String, Pictu
         }
         routes.insert(item.id.as_str(), item.media.as_slice());
     }
+    let timing = graph.sidecars.iter()
+        .find(|receipt| receipt.adapter == "resolve.timing" && receipt.object == graph.sequences[0].id)
+        .map(|receipt| &receipt.data);
+    let input_fit: std::collections::HashSet<_> = graph.sidecars.iter()
+        .filter(|receipt| receipt.adapter == "resolve.input_scaling"
+            && matches!(&receipt.data, Value::Str(mode) if mode == "scale_to_fit"))
+        .map(|receipt| receipt.object.as_str())
+        .collect();
     let sequence = &mut graph.sequences[0];
-    let mut motions = Vec::new();
+    let has_audio = sequence.placements.iter().any(|edit| !edit.audio_tracks.is_empty());
+    let mut picture_controls = PictureControls::default();
     for edit in &mut sequence.placements {
         let invalid = || {
             format!(
@@ -898,26 +1261,95 @@ fn prepare_discrete_tracks(graph: &mut SourceGraph) -> Result<Vec<(String, Pictu
                         || m.stream == edit.audio_streams.first().copied())
             })
             .ok_or_else(invalid)?;
+        let mixed = kind == StreamKind::Video && source.rate != Some(sequence.rate);
+        let camera_picture = mixed && verified.get(&source.locations[0])
+            .is_some_and(|(media, ..)| media.profile.timecoded_camera_pcm());
+        let mut hold = false;
+        let mut use_premiere_ticks = false;
+        if let Some(map) = edit.frame_map.take() {
+            if mixed {
+                // Prefer ordinary Frame Sampling when its saved clocks can
+                // reproduce the whole map.
+                match verify_premiere_sampling(edit, &map, source, sequence.rate, verified, timing)? {
+                    PremiereSampling::FrameSampling => {}
+                    PremiereSampling::SourceIn(in_point) => {
+                        edit.source_in = in_point;
+                        use_premiere_ticks = true;
+                    }
+                    PremiereSampling::TimeRemapping => {
+                        edit.frame_map = Some(map);
+                        use_premiere_ticks = true;
+                    }
+                }
+            } else {
+                let ticks = prepare_frame_hold(edit, &map, sequence.rate, has_audio)?;
+                picture_controls.holds.insert(edit.id.clone(), ticks);
+                hold = true;
+            }
+        } else if mixed {
+            return Err(invalid().into());
+        }
         let source_duration = edit
             .speed
             .as_ref()
             .map_or(edit.duration, |speed| speed.source_duration);
-        if kind == StreamKind::Video
-            && edit.speed.as_ref().is_some_and(|speed| speed.ratio == (2, 1))
-            && frames_on(source_duration, time_grid).is_err()
-        {
-            return Err(format!("{}: writing a half-speed edit with a fractional source span in Premiere requires native qualification", edit.id).into());
-        }
+        let playable_duration = if let Some(speed) = edit.speed.as_ref().filter(|speed| {
+            kind == StreamKind::Video && speed.ratio == (2, 1)
+        }) {
+            let length = frames_on(edit.duration, time_grid)?;
+            if time_grid != Rational::integer(24)
+                || PictureSpeed::Half.graph(length).as_ref() != Some(speed)
+            {
+                return Err(invalid().into());
+            }
+            Rational::new(PictureSpeed::Half.sampled_source_frames(length)?.into(), 24)
+                .ok_or_else(invalid)?
+        } else {
+            source_duration
+        };
         let end = edit
             .source_in
-            .checked_add(source_duration)
+            .checked_add(playable_duration)
             .ok_or_else(invalid)?;
-        if kind == StreamKind::Video && source.rate != Some(sequence.rate)
-            || frames_on(edit.source_in, time_grid).is_err()
+        if use_premiere_ticks {
+            if edit.source_in.to_units(TICKS_PER_SECOND).is_none()
+                || end.to_units(TICKS_PER_SECOND).is_none()
+            {
+                return Err(invalid().into());
+            }
+        } else if frames_on(edit.source_in, time_grid).is_err()
             || frames_on(end, time_grid).is_err()
-            || end > source.duration
         {
             return Err(invalid().into());
+        }
+        if end > source.duration {
+            if !hold {
+                return Err(invalid().into());
+            }
+            // Premiere needs an underlying playable edit for the full hold.
+            // Keep its window as close to the saved source In as possible.
+            let last_in = source.duration.checked_sub(edit.duration)
+                .filter(|value| !value.is_negative())
+                .ok_or_else(|| format!("{}: Premiere frame hold is longer than its playable original", edit.id))?;
+            let new_in = frames_on(last_in, time_grid).map_err(|_| invalid())?;
+            let held = frames_on(edit.source_in, time_grid).map_err(|_| invalid())?;
+            trim_losses.push(Loss {
+                object: edit.id.clone(),
+                aspect: "frame_hold_source_in".into(),
+                reason: format!("Premiere holds source frame {held} and uses frame {new_in} as the underlying source In to keep the edit within the original."),
+            });
+            edit.source_in = last_in;
+        }
+        if camera_picture {
+            if !input_fit.contains(edit.id.as_str()) || sequence.frame_size != Some((1920, 1080)) {
+                return Err(format!("{}: unresolved camera input scaling", edit.id).into());
+            }
+            let (width, height) = source.frame_size.ok_or_else(invalid)?;
+            let scale = (1920.0 / width as f64).min(1080.0 / height as f64) * 100.0;
+            edit.transform = Some(graph::Transform {
+                position: (0.0, 0.0), scale: (scale, scale), rotation: 0.0,
+                anchor: (0.0, 0.0), crop: [0.0; 4],
+            });
         }
         if let [effect] = edit.effects.as_slice() {
             let refuse = || format!("{}: unsupported Resolve Linear picture controls", edit.id);
@@ -943,8 +1375,8 @@ fn prepare_discrete_tracks(graph: &mut SourceGraph) -> Result<Vec<(String, Pictu
                 _ => return Err(refuse().into()),
             };
             edit.effects.clear();
-            motions.push((edit.id.clone(), picture));
+            picture_controls.motions.push((edit.id.clone(), picture));
         }
     }
-    Ok(motions)
+    Ok(picture_controls)
 }

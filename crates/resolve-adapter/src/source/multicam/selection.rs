@@ -89,7 +89,7 @@ pub(in crate::source) fn select<'a>(
             if !matches!(selector, 0 | 1)
                 || usage.lane != Some(selector + 1)
                 || selected != 0
-                || crate::nests::string(owner, "reference_audio_angle") != Some(angle)
+                || !is_reference_audio_angle(owner, angle)
             {
                 return None;
             }
@@ -101,6 +101,63 @@ pub(in crate::source) fn select<'a>(
         audio_selector,
         leaf: leaf(usage, group, selected, rate, record)?,
     })
+}
+
+fn is_reference_audio_angle(owner: &Value, angle: &str) -> bool {
+    let Some(reference) = crate::nests::string(owner, "reference_audio_angle") else {
+        return false;
+    };
+    let Some(Value::Arr(angles)) = owner.get("video_angles") else {
+        return false;
+    };
+    let [Value::Str(first), Value::Str(second)] = angles.as_slice() else {
+        return false;
+    };
+    first != second
+        && !first.is_empty()
+        && !second.is_empty()
+        && (reference == first || reference == second)
+        && (angle == first || angle == second)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_audio_accepts_either_proven_angle_and_rejects_an_unknown_angle() {
+        let receipt = |reference: Value, angles: [&str; 2]| {
+            Value::Obj(vec![
+                ("reference_audio_angle".into(), reference),
+                (
+                    "video_angles".into(),
+                    Value::Arr(
+                        angles
+                            .into_iter()
+                            .map(|name| Value::Str(name.into()))
+                            .collect(),
+                    ),
+                ),
+            ])
+        };
+        let reference = Value::Str("Camera 1".into());
+        let complete = receipt(reference.clone(), ["Camera 1", "Camera 2"]);
+        assert!(is_reference_audio_angle(&complete, "Camera 1"));
+        assert!(is_reference_audio_angle(&complete, "Camera 2"));
+        assert!(!is_reference_audio_angle(&complete, "Camera 3"));
+        assert!(!is_reference_audio_angle(
+            &receipt(reference.clone(), ["Camera 1", "Camera 1"]),
+            "Camera 1",
+        ));
+        assert!(!is_reference_audio_angle(
+            &receipt(reference, ["Camera 2", "Camera 3"]),
+            "Camera 2",
+        ));
+        assert!(!is_reference_audio_angle(
+            &receipt(Value::Null, ["Camera 1", "Camera 2"]),
+            "Camera 2",
+        ));
+    }
 }
 
 // None is unqualified. Some(None) is an explicitly saved gap throughout.

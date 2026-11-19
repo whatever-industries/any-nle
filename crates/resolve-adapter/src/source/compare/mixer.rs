@@ -72,6 +72,7 @@ fn in_scope(t: &Timeline<'_>) -> bool {
         .iter()
         .map(|t| (t.kind, t.index))
         .eq(track_state::LANES)
+        && !t.seq.placements.iter().any(crate::stereo::placement)
         && !t.losses.iter().any(|loss| {
             loss.object == t.seq.id && matches!(loss.aspect.as_str(), "track" | "tracks")
         })

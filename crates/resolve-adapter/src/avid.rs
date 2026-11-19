@@ -424,7 +424,7 @@ pub(crate) fn prepare_avid_turnover_with_policy(
             guards.push((input.path,digest));
         }
     }
-    crate::turnover::Turnover::prepare(read.graph, spec, &options.ffprobe, guards, notices, vec![])
+    crate::turnover::Turnover::prepare(read.graph, spec, &options.ffprobe, guards, notices, vec![], None)
         .map(|mut t| { t.proxies = proxies; t })
         .map_err(|error| match problem {
             Some(detail) => format!("{error}\n{detail}").into(),

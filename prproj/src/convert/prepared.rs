@@ -30,6 +30,7 @@ pub enum SampleRepresentation {
     Aac,
     Mp3,
     Pcm16,
+    Pcm16Be,
     Pcm24,
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +104,17 @@ impl OriginalClip {
                     }
             })
     }
+
+    fn is_timecoded_avc_pcm(&self) -> bool {
+        self.container == "mov" && self.proxy_path.is_none() && !self.separate_mono_streams
+            && std::path::Path::new(&self.path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+            && self.video.as_ref().zip(self.audio.as_ref()).is_some_and(|(v, a)| {
+                v.codec == "avc1" && v.rate == Fraction::new(24, 1)
+                    && (v.width, v.height) == (4096, 2160) && a.duration == v.duration
+                    && a.channels == 2 && a.sample_rate == 48_000
+                    && a.representation == SampleRepresentation::Pcm16Be
+            })
+    }
 }
 
 fn is_25_or_2997(rate: Fraction) -> bool {
@@ -154,6 +166,34 @@ fn is_automatic_adapter_picture(c: &OriginalClip, s: &Sequence, e: &Event, map: 
             f == first + (phase + i as i128) * source / span - phase * source / span
                 && (f + 1) * i128::from(source_unit) <= i128::from(v.duration)
         })
+    })
+}
+
+fn is_linked_prores_conform(c: &OriginalClip, s: &Sequence, e: &Event, map: &[i64]) -> bool {
+    let Some(video) = c.video.as_ref() else { return false; };
+    if c.container != "mov" || c.audio.is_some() || video.codec != "apch"
+        || video.width != 1920 || video.height != 1080 || video.source_start != 0
+        || video.rate != Fraction::new(24, 1) || s.rate != Fraction::new(24_000, 1001)
+        || !(2..=16_384).contains(&map.len()) || e.video_track != Some(1)
+        || !e.audio_tracks.is_empty() || !e.stereo.is_empty() || e.speed_ratio.is_some()
+        || e.source_duration.is_some() || e.transform.is_some() || e.matte.is_some()
+        || e.color_correction.is_some()
+    {
+        return false;
+    }
+    let source_unit = ticks_per_unit(video.rate);
+    let record_unit = ticks_per_unit(s.rate);
+    if e.source_in < 0 || e.source_in % source_unit != 0
+        || e.duration != map.len() as i64 * record_unit
+    {
+        return false;
+    }
+    let first = i128::from(e.source_in / source_unit);
+    map.iter().enumerate().all(|(i, &frame)| {
+        let frame = i128::from(frame);
+        let scaled = i as i128 * 1001;
+        (first + (scaled + 1) / 1000..=first + (scaled + 2) / 1000).contains(&frame)
+            && (frame + 1) * i128::from(source_unit) <= i128::from(video.duration)
     })
 }
 
@@ -279,6 +319,7 @@ pub struct PreparedProjectInput {
     pub audio_pans: Vec<PreparedAudioPan>,
     pub audio_mixers: BTreeMap<usize, PreparedAudioMixer>,
     pub track_states: BTreeMap<usize, Vec<PreparedTrackState>>,
+    pub timeline_marks: BTreeMap<usize, PreparedTimelineMarks>,
     /// Same-rate linked 29.97 sequences with an exact non-drop source TC1.
     pub non_drop_sequences: HashSet<usize>,
     pub picture_effects: Vec<PreparedPictureEffect>,
@@ -295,6 +336,8 @@ pub struct PreparedProjectInput {
     /// Verified 23.976 DNxHD LB/PCM24 cameras using the DNxHD media template.
     pub direct_dnxhd_pcm24: HashSet<String>,
     pub constant_speeds: Vec<PreparedConstantSpeed>,
+    /// Held file-relative ticks keyed by the destination sequence and picture edit.
+    pub frame_holds: HashMap<(usize, usize), i64>,
     pub multicams: Vec<super::multicam::PreparedMulticam>,
     pub multicam_uses: Vec<super::multicam::PreparedMulticamUse>,
     pub picture_subclips: Vec<PreparedPictureSubclip>,
@@ -303,6 +346,13 @@ pub struct PreparedProjectInput {
     pub picture_nests: Vec<PreparedPictureNest>,
     pub layered_submasters: Vec<PreparedLayeredSubmaster>,
     pub png_mattes: PreparedPngMattes,
+}
+
+/// Timeline-relative frame-aligned ticks. Out is the first excluded frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedTimelineMarks {
+    pub in_ticks: Option<i64>,
+    pub out_ticks: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1282,6 +1332,7 @@ impl PreparedProjectInput {
             audio_pans: Vec::new(),
             audio_mixers: BTreeMap::new(),
             track_states: BTreeMap::new(),
+            timeline_marks: BTreeMap::new(),
             non_drop_sequences: HashSet::new(),
             picture_effects: Vec::new(),
             source_luts: Vec::new(),
@@ -1291,6 +1342,7 @@ impl PreparedProjectInput {
             direct_dnxhr_origins: Default::default(),
             direct_dnxhd_pcm24: Default::default(),
             constant_speeds: Vec::new(),
+            frame_holds: HashMap::new(),
             multicams: Vec::new(),
             multicam_uses: Vec::new(),
             picture_subclips: Vec::new(),
@@ -1352,6 +1404,24 @@ impl PreparedProjectInput {
             .is_none_or(|s| s.rate != Fraction::new(30_000, 1001)))
         {
             return Err(ModelError("29.97 non-drop display has an incompatible sequence".into()));
+        }
+        for (&index, marks) in &self.timeline_marks {
+            let invalid = || ModelError("prepared timeline marks need an ordered frame-aligned range".into());
+            let sequence = self.sequences.get(index).ok_or_else(invalid)?;
+            if sequence.rate.num <= 0 || sequence.rate.den <= 0 {
+                return Err(invalid());
+            }
+            let frame = ticks_per_unit(sequence.rate);
+            if frame <= 0
+                || i128::from(frame) * i128::from(sequence.rate.num)
+                    != i128::from(TICKS_PER_SECOND) * i128::from(sequence.rate.den)
+                || (marks.in_ticks.is_none() && marks.out_ticks.is_none())
+                || marks.in_ticks.is_some_and(|ticks| ticks < 0 || ticks % frame != 0)
+                || marks.out_ticks.is_some_and(|ticks| ticks <= 0 || ticks % frame != 0)
+                || matches!((marks.in_ticks, marks.out_ticks), (Some(start), Some(end)) if start >= end)
+            {
+                return Err(invalid());
+            }
         }
         self.png_mattes.validate(self)?;
         let mut lut_owners = HashSet::new();
@@ -1566,6 +1636,39 @@ impl PreparedProjectInput {
                 PreparedClip::Legacy(c) => super::model::validate_clip(c, "prepared legacy clip")?,
             }
         }
+        if self.frame_holds.len() > MAX_ITEMS {
+            return Err(fail("prepared frame hold count exceeds limit"));
+        }
+        let dissolves = self.video_dissolves.iter()
+            .flat_map(|d| [(d.sequence, d.outgoing), (d.sequence, d.incoming)])
+            .filter(|owner| self.frame_holds.contains_key(owner))
+            .collect::<HashSet<_>>();
+        for (&owner @ (sequence, event), &held_ticks) in &self.frame_holds {
+            let invalid = || fail("prepared frame hold requires a plain linked 1080p24 ProRes HQ picture edit");
+            let sequence = self.sequences.get(sequence).ok_or_else(invalid)?;
+            let edit = sequence.events.get(event).ok_or_else(invalid)?;
+            let Some(PreparedClip::Original(clip)) = clips.get(edit.clip.as_str()).copied() else {
+                return Err(invalid());
+            };
+            let unit = ticks_per_unit(Fraction::new(24, 1));
+            if clip.container != "mov" || clip.audio.is_some() || clip.proxy_path.is_some()
+                || sequence.rate != Fraction::new(24, 1)
+                || (sequence.width, sequence.height) != (1920, 1080)
+                || clip.video.as_ref().is_none_or(|video| video.codec != "apch"
+                    || video.source_start != 0 || video.rate != sequence.rate
+                    || (video.width, video.height) != (1920, 1080)
+                    || !(0..video.duration).contains(&held_ticks))
+                || held_ticks % unit != 0
+                || edit.video_track != Some(1) || !edit.audio_tracks.is_empty() || !edit.stereo.is_empty()
+                || edit.source_in < 0 || edit.source_in % unit != 0 || edit.duration < 2 * unit
+                || edit.speed_ratio.is_some() || edit.time_remap.is_some() || edit.transform.is_some()
+                || edit.color_correction.is_some() || edit.matte.is_some()
+                || picture_effects.contains(&owner) || lut_owners.contains(&owner)
+                || dissolves.contains(&owner)
+            {
+                return Err(invalid());
+            }
+        }
         validate_picture_effects(&self.picture_effects, &self.sequences, &self.constant_speeds,
             |sequence, event| {
                 matches!(clips.get(event.clip.as_str()),
@@ -1758,9 +1861,12 @@ impl PreparedProjectInput {
                 }
                 if let PreparedClip::Original(c) = c {
                     let exact_retime = constant_speed_edits.contains(&(i, event_index));
-                    if (e.speed_ratio.is_some() && !exact_retime && !is_linked_prores_constant_speed(c, s, e))
+                    let has_speed = e.speed_ratio.is_some();
+                    let linked_retime = has_speed && !exact_retime && is_linked_prores_constant_speed(c, s, e);
+                    if (has_speed && !exact_retime && !linked_retime)
                         || e.time_remap.as_ref().is_some_and(|map| {
                         !is_automatic_adapter_picture(c, s, e, map)
+                                && !is_linked_prores_conform(c, s, e, map)
                     }) {
                         return Err(fail("original-file retiming is not qualified"));
                     }
@@ -1793,7 +1899,11 @@ impl PreparedProjectInput {
                         return Err(fail("original mono event requires a declared mono group"));
                     }
                     // Every selected physical stream must cover this range, not just the longest one.
-                    let span = if exact_retime { e.source_duration.unwrap_or(e.duration) } else { e.duration };
+                    let span = if exact_retime || linked_retime {
+                        e.source_duration.unwrap_or(e.duration)
+                    } else {
+                        e.duration
+                    };
                     let end = i128::from(e.source_in) + i128::from(span);
                     if e.video_track.is_some() && e.time_remap.is_none()
                         && c.video.as_ref().is_none_or(|v| end > v.duration as i128)
@@ -1823,7 +1933,9 @@ fn is_linked_prores_constant_speed(c: &OriginalClip, s: &Sequence, e: &Event) ->
         && e.time_remap.is_none()
         && match e.speed_ratio {
             Some((2, 1)) => e.source_duration.is_some_and(|source|
-                source % frame == 0 && source.checked_mul(2) == Some(e.duration)),
+                source.checked_mul(2) == Some(e.duration)),
+            Some((1, 2)) => e.duration.checked_mul(2)
+                .is_some_and(|span| e.source_duration == Some(span)),
             Some((-1, 1)) => e.source_duration == Some(e.duration),
             _ => false,
         }
@@ -1921,7 +2033,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         require(
             v.source_start >= 0
                 && v.source_start % frame == 0
-                && (v.source_start == 0 || v.codec == "apch"),
+                && (v.source_start == 0 || v.codec == "apch" || c.is_timecoded_avc_pcm()),
             "unqualified original picture source timecode",
         )?;
         super::model::check_ticks(
@@ -1970,6 +2082,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
                     && matches!(a.sample_rate, 44_100 | 48_000) && suffix.is_some_and(|s| s.eq_ignore_ascii_case("mp3")),
                 (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "mov") =>
                     c.proxy_path.is_some() || c.is_same_rate_linked_pcm(),
+                (SampleRepresentation::Pcm16Be, "mov") => c.is_timecoded_avc_pcm(),
                 (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "wav") => true,
                 (SampleRepresentation::Pcm16 | SampleRepresentation::Pcm24, "mxf") => c.is_same_rate_linked_pcm(),
                 _ => false,

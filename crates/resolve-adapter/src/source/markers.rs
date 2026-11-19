@@ -1,13 +1,22 @@
-//! Sequence-owned markers in the 21.2 project lockable blob map.
+//! Sequence, Media Pool and timeline edit markers in the 21.2 lockable blob map.
 use super::*;
 use crate::clip_label::{self, ClipLabel};
 use encoding::{fields, Wire};
 use graph::{
     source::{SourceBinding, SourceMarker},
-    Label, MarkerOwner,
+    Label, MarkerOwner, TrackRef,
 };
 
-pub(super) fn read(project: &Node, graph: &mut SourceGraph, blobs: &mut Blobs) -> Result<()> {
+pub(crate) const POOL_ADAPTER: &str = "resolve.pool_markers";
+pub(crate) const EDIT_ADAPTER: &str = "resolve.edit_markers";
+pub(crate) const EDIT_MARKER_LOSS: &str = "resolve.edit_marker_timing";
+
+pub(super) fn read(
+    project: &Node,
+    graph: &mut SourceGraph,
+    masters: &HashMap<&str, Master>,
+    blobs: &mut Blobs,
+) -> Result<()> {
     let Some(map) = project.optional("LockableBlobMap")? else {
         return Ok(());
     };
@@ -23,17 +32,81 @@ pub(super) fn read(project: &Node, graph: &mut SourceGraph, blobs: &mut Blobs) -
         .enumerate()
         .map(|(i, sequence)| (sequence.id.clone(), i))
         .collect();
-    let placements: HashSet<_> = graph.sequences.iter().flat_map(|s| {
-        s.placements.iter().map(|placement| placement.id.clone())
-    }).collect();
+    let placements: HashMap<_, _> = graph
+        .sequences
+        .iter()
+        .enumerate()
+        .flat_map(|(sequence, s)| {
+            s.placements
+                .iter()
+                .enumerate()
+                .map(move |(edit, placement)| (placement.id.clone(), (sequence, edit)))
+        })
+        .collect();
     let mut seen = HashSet::new();
     let mut colors = HashSet::new();
+    let mut pool_owners = HashSet::new();
+    let mut edit_owners = HashSet::new();
+    let pool = graph
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.id.clone(), index))
+        .collect::<HashMap<_, _>>();
     for entry in set.elements()? {
         let node = entry.entry()?;
+        if node.name == "Sm2MpItemLockableBlob" {
+            let owner = node.get("BlobOwner")?;
+            if let (Some(&index), Some(master)) = (pool.get(owner), masters.get(owner)) {
+                if let Some(rows) = read_rows(node, master.rate, owner, blobs)? {
+                    if !pool_owners.insert(owner) {
+                        return Err("duplicate Resolve source marker owner".into());
+                    }
+                    if !picture_marker_clock(master) && !wav_marker_clock(master) {
+                        for row in rows {
+                            omitted(
+                                graph,
+                                owner,
+                                &row.marker.owner_occurrence,
+                                "marker",
+                                "Resolve source marker clock is outside the qualified profile",
+                            );
+                        }
+                        continue;
+                    }
+                    let (markers, data) = marker_facts(graph, owner, rows);
+                    graph.items[index].markers = markers;
+                    graph.sidecars.push(Sidecar {
+                        adapter: POOL_ADAPTER.into(),
+                        object: owner.into(),
+                        data,
+                    });
+                }
+            }
+            continue;
+        }
         if node.name == "Sm2TiItemLockableBlob" {
             let owner = node.get("BlobOwner")?;
-            if placements.contains(owner) {
-                if let Some(code) = clip_color(node, blobs)? {
+            if let Some(&(sequence, edit)) = placements.get(owner) {
+                let Ok(map) = blobs.qt(node.get("FieldsBlob")?) else {
+                    continue;
+                };
+                let Ok(data) = map.bytes("BlobData") else {
+                    continue;
+                };
+                let mut code = ClipLabel::observed_code(data);
+                if code.is_none() && data.starts_with(&10001u32.to_be_bytes()) {
+                    let body = blobs.marker_data(data)?;
+                    let rate = graph.sequences[sequence].rate;
+                    if let Some(rows) = decode_rows(&body, rate, owner)? {
+                        if !edit_owners.insert(owner) {
+                            return Err("duplicate Resolve edit marker owner".into());
+                        }
+                        code = combined_clip_color(&body)?;
+                        read_edit_rows(graph, sequence, edit, masters, owner, rows)?;
+                    }
+                }
+                if let Some(code) = code {
                     if !colors.insert(owner) {
                         return Err("duplicate Resolve clip label owner".into());
                     }
@@ -42,7 +115,10 @@ pub(super) fn read(project: &Node, graph: &mut SourceGraph, blobs: &mut Blobs) -
                         object: owner.into(),
                         data: Value::Obj(vec![
                             ("saved_code".into(), Value::Int(code)),
-                            ("provenance".into(), text("drpkit:af3cedc0 and pr2resolve:61c8c9ec")),
+                            (
+                                "provenance".into(),
+                                text("drpkit:af3cedc0 and pr2resolve:61c8c9ec"),
+                            ),
                         ]),
                     });
                     loss(graph, owner, "clip_label", clip_label::REASON);
@@ -73,35 +149,12 @@ pub(super) fn read(project: &Node, graph: &mut SourceGraph, blobs: &mut Blobs) -
             );
             continue;
         };
-        let encoded = blobs.qt(node.get("FieldsBlob")?)?;
-        let body = blobs.marker_data(encoded.bytes("BlobData")?)?;
-        let Some(marks) = pb_bytes(&body, 2)? else {
+        let rate = graph.sequences[index].rate;
+        let Some(rows) = read_rows(node, rate, owner, blobs)? else {
             continue;
         };
-        let sequence = &mut graph.sequences[index];
-        let mut decoded = BTreeMap::new();
-        for (_, value) in fields(marks)?.into_iter().filter(|(key, _)| *key == 2) {
-            let Wire::Bytes(value) = value else {
-                return Err("invalid Resolve marker entry".into());
-            };
-            let (frame, marker) = decode(value, sequence.rate, owner)?;
-            if decoded.insert(frame, marker).is_some() {
-                return Err("duplicate Resolve marker frame".into());
-            }
-        }
-        let mut native = Vec::new();
-        let mut unknown = Vec::new();
-        for (frame, (marker, color_bit, custom)) in decoded {
-            if marker.color.is_none() && color_bit != 0 {
-                unknown.push(frame);
-            }
-            native.push(Value::Obj(vec![
-                ("frame".into(), Value::Int(frame)),
-                ("color_bit".into(), Value::Int(color_bit)),
-                ("custom_data".into(), text(custom)),
-            ]));
-            sequence.markers.push(marker);
-        }
+        let (markers, data) = marker_facts(graph, owner, rows);
+        graph.sequences[index].markers.extend(markers);
         let info = graph
             .sidecars
             .iter_mut()
@@ -110,8 +163,184 @@ pub(super) fn read(project: &Node, graph: &mut SourceGraph, blobs: &mut Blobs) -
         let Value::Obj(entries) = &mut info.data else {
             return Err("invalid Resolve sequence receipt".into());
         };
-        entries.push(("markers".into(), Value::Arr(native)));
-        for frame in unknown {
+        entries.push(("markers".into(), data));
+    }
+    Ok(())
+}
+
+fn combined_clip_color(body: &[u8]) -> Result<Option<i64>> {
+    let mut codes = fields(body)?.into_iter().filter(|(field, _)| *field == 5);
+    match (codes.next(), codes.next()) {
+        (None, None) => Ok(None),
+        (Some((_, Wire::Int(code))), None) if code <= u8::MAX.into() => Ok(Some(code as i64)),
+        _ => Err("ambiguous Resolve clip label in edit marker blob".into()),
+    }
+}
+
+pub(crate) fn supported_marker_rate(rate: Rational) -> bool {
+    matches!((rate.num(), rate.den()), (24, 1) | (24000, 1001))
+}
+
+fn picture_marker_clock(master: &Master) -> bool {
+    supported_marker_rate(master.rate)
+        && master.prores_hq
+        && master.audio.is_empty()
+        && master.size == (1920, 1080)
+}
+
+fn wav_marker_clock(master: &Master) -> bool {
+    supported_marker_rate(master.rate)
+        && master.wav_samples.is_some()
+        && !master.standalone_mono_atom
+        && master.start == 0
+}
+
+fn read_edit_rows(
+    graph: &mut SourceGraph,
+    sequence: usize,
+    edit: usize,
+    masters: &HashMap<&str, Master>,
+    owner: &str,
+    mut rows: Vec<MarkerRow>,
+) -> Result<()> {
+    let timeline = &graph.sequences[sequence];
+    let placement = &timeline.placements[edit];
+    let qualified = supported_marker_rate(timeline.rate)
+        && placement.video_track == Some(1)
+        && placement.audio_tracks.is_empty()
+        && placement.speed.is_none()
+        && placement.frame_map.is_none()
+        && masters
+            .get(placement.item.as_str())
+            .is_some_and(|master| master.rate == timeline.rate && picture_marker_clock(master));
+    let mut unresolved = Vec::new();
+    for row in &mut rows {
+        let marker = &mut row.marker;
+        let source = seconds(row.frame, timeline.rate)?;
+        let transform = qualified
+            .then_some(source)
+            .and_then(|source| source.checked_sub(placement.source_in))
+            .filter(|elapsed| !elapsed.is_negative())
+            .filter(|elapsed| {
+                elapsed
+                    .checked_add(marker.duration)
+                    .is_some_and(|end| end <= placement.duration)
+            })
+            .and_then(|elapsed| {
+                placement
+                    .record_start
+                    .checked_add(elapsed)
+                    .map(|record| (elapsed, record))
+            });
+        marker.owner = MarkerOwner::Edit;
+        marker.track = placement.video_track.map(|index| TrackRef {
+            kind: StreamKind::Video,
+            index,
+        });
+        marker.binding.placements.push(owner.into());
+        if let Some((elapsed, record)) = transform {
+            marker.start = Some(record);
+            marker.owner_local = Some(elapsed);
+            marker.source = Some(source);
+        } else {
+            let reason = if qualified {
+                "Resolve edit marker is outside its visible trim"
+            } else {
+                "Resolve edit marker clock is outside the qualified picture profile"
+            };
+            marker.start = None;
+            marker.owner_local = None;
+            marker.owner_rate = None;
+            marker.binding.reason = Some(reason.into());
+            unresolved.push((marker.owner_occurrence.clone(), reason));
+        }
+    }
+    for (occurrence, reason) in unresolved {
+        omitted(graph, owner, &occurrence, EDIT_MARKER_LOSS, reason);
+    }
+    let (mut markers, mut data) = marker_facts(graph, owner, rows);
+    if let Value::Arr(records) = &mut data {
+        for (record, marker) in records.iter_mut().zip(&mut markers) {
+            if let Value::Obj(fields) = record {
+                let duration =
+                    crate::prepare::frames_on(marker.duration, graph.sequences[sequence].rate)?;
+                fields.push(("duration_frames".into(), Value::Int(duration)));
+                if marker.binding.reason.is_some() {
+                    marker.duration = Rational::ZERO;
+                }
+            }
+        }
+    }
+    graph.sequences[sequence].markers.extend(markers);
+    graph.sidecars.push(Sidecar {
+        adapter: EDIT_ADAPTER.into(),
+        object: owner.into(),
+        data,
+    });
+    Ok(())
+}
+
+struct MarkerRow {
+    frame: i64,
+    marker: SourceMarker,
+    color_bit: i64,
+    custom: String,
+}
+
+fn read_rows(
+    node: &Node,
+    rate: Rational,
+    owner: &str,
+    blobs: &mut Blobs,
+) -> Result<Option<Vec<MarkerRow>>> {
+    let encoded = blobs.qt(node.get("FieldsBlob")?)?;
+    let body = blobs.marker_data(encoded.bytes("BlobData")?)?;
+    decode_rows(&body, rate, owner)
+}
+
+fn decode_rows(body: &[u8], rate: Rational, owner: &str) -> Result<Option<Vec<MarkerRow>>> {
+    let Some(marks) = pb_bytes(body, 2)? else {
+        return Ok(None);
+    };
+    let mut decoded = BTreeMap::new();
+    for (_, value) in fields(marks)?.into_iter().filter(|(key, _)| *key == 2) {
+        let Wire::Bytes(value) = value else {
+            return Err("invalid Resolve marker entry".into());
+        };
+        let (frame, (marker, color_bit, custom)) = decode(value, rate, owner)?;
+        if decoded
+            .insert(
+                frame,
+                MarkerRow {
+                    frame,
+                    marker,
+                    color_bit,
+                    custom: custom.into(),
+                },
+            )
+            .is_some()
+        {
+            return Err("duplicate Resolve marker frame".into());
+        }
+    }
+    Ok(Some(decoded.into_values().collect()))
+}
+
+fn marker_facts(
+    graph: &mut SourceGraph,
+    owner: &str,
+    rows: Vec<MarkerRow>,
+) -> (Vec<SourceMarker>, Value) {
+    let mut markers = Vec::with_capacity(rows.len());
+    let mut native = Vec::with_capacity(rows.len());
+    for MarkerRow {
+        frame,
+        marker,
+        color_bit,
+        custom,
+    } in rows
+    {
+        if marker.color.is_none() && color_bit != 0 {
             loss(
                 graph,
                 owner,
@@ -119,17 +348,14 @@ pub(super) fn read(project: &Node, graph: &mut SourceGraph, blobs: &mut Blobs) -
                 &format!("frame {frame}: unqualified Resolve marker color"),
             );
         }
+        native.push(Value::Obj(vec![
+            ("frame".into(), Value::Int(frame)),
+            ("color_bit".into(), Value::Int(color_bit)),
+            ("custom_data".into(), Value::Str(custom)),
+        ]));
+        markers.push(marker);
     }
-    Ok(())
-}
-
-fn clip_color(node: &Node, blobs: &mut Blobs) -> Result<Option<i64>> {
-    let encoded = node.get("FieldsBlob")?;
-    let Ok(map) = blobs.qt(encoded) else { return Ok(None) };
-    let Ok(data) = map.bytes("BlobData") else { return Ok(None) };
-    // Only this exact record is identified as a clip label. Other lockable
-    // item state can use a different encoding or a different protobuf.
-    Ok(ClipLabel::observed_code(data))
+    (markers, Value::Arr(native))
 }
 
 fn decode<'a>(
@@ -185,7 +411,9 @@ fn decode<'a>(
         .transpose()?
         .unwrap_or("");
     let start = seconds(count, rate)?;
-    let color_name = u64::try_from(color).ok().and_then(crate::marker_palette::name);
+    let color_name = u64::try_from(color)
+        .ok()
+        .and_then(crate::marker_palette::name);
     Ok((
         count,
         (

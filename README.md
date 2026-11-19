@@ -86,6 +86,9 @@ Any NLE stands on the work of others:
 - **[pyavb](https://github.com/markreidvfx/pyavb)** by Mark Reid (MIT). `avid-reader`'s bin
   decoding is a partial Rust port of it; see [`avid-reader/NOTICE`](avid-reader/NOTICE) and
   [`avid-reader/LICENSE-pyavb`](avid-reader/LICENSE-pyavb).
+- **pr2resolve** by Ersiter. Its native format notes helped identify Resolve's
+  speed maps, timeline In/Out marks, and linked audio fields. Any NLE checked
+  those fields against native Resolve saves. [Repository](https://github.com/Ersiter/pr2resolve) · [Pinned format notes](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/NATIVE_FORMAT.md)
 
 Original bootstrap contributions: @whatever-industries.
 

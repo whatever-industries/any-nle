@@ -165,6 +165,34 @@ fn read_members(bytes: &[u8], count: usize) -> Result<Members> {
     Ok(members)
 }
 
+pub(crate) fn imported_movie(path: &Path, item_id: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    File::open(path)?.take(MAX_ARCHIVE + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_ARCHIVE {
+        return Err("native import archive exceeds its size budget".into());
+    }
+    let members = read_members(&bytes, 3)?;
+    let pool = members.get("MediaPool/Master/MpFolder.xml").ok_or("missing native Media Pool folder")?;
+    let clip = block(pool, "Sm2MpVideoClip")?;
+    if dbid(&clip)? != item_id {
+        return Err("native import archive has a different Media Pool item".into());
+    }
+    Ok(clip)
+}
+
+pub(crate) fn split_imported_movie_audio(clip: &mut String) -> Result<[String; 2]> {
+    if !clip.contains("<VirtualAudioTracksBA/>") {
+        return Err("native movie has an unqualified pool audio override".into());
+    }
+    let left = linked::mono_selector(0, false)?;
+    let right = linked::mono_selector(1, false)?;
+    set(
+        clip, "VirtualAudioTracksBA",
+        &hex::encode(qt(&[("0", Bytes(&left)), ("1", Bytes(&right))])),
+    )?;
+    Ok([hex::encode(left), hex::encode(right)])
+}
+
 fn xml(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")

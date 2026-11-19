@@ -30,6 +30,14 @@ pub(crate) fn bit(name: &str) -> Option<u64> {
         .find_map(|(bit, saved)| (name == saved).then_some(bit))
 }
 
+pub(crate) fn resolve_only_color(bit: u64) -> Option<&'static str> {
+    name(bit).filter(|color| {
+        matches!(
+            *color,
+            "Pink" | "Purple" | "Fuchsia" | "Rose" | "Sky" | "Mint" | "Lemon" | "Cocoa"
+        )
+    })
+}
 
 // Keep the distinct Premiere color categories when using Resolve's named palette.
 // These three substitutions use swatches observed in a native Resolve export.

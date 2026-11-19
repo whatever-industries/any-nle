@@ -685,13 +685,13 @@ fn marker(
         Some(label) => {
             let destination = match (m.owner, label.palette.as_str(), label.name.as_str()) {
                 (
-                    MarkerOwner::Sequence,
+                    MarkerOwner::Sequence | MarkerOwner::Edit,
                     "resolve",
                     name @ ("Green" | "Red" | "Blue" | "Cyan" | "Yellow"),
                 ) => Some(name),
-                (MarkerOwner::Sequence, "resolve", "Lavender") => Some("Magenta"),
-                (MarkerOwner::Sequence, "resolve", "Sand") => Some("Orange"),
-                (MarkerOwner::Sequence, "resolve", "Cream") => Some("White"),
+                (MarkerOwner::Sequence | MarkerOwner::Edit, "resolve", "Lavender") => Some("Magenta"),
+                (MarkerOwner::Sequence | MarkerOwner::Edit, "resolve", "Sand") => Some("Orange"),
+                (MarkerOwner::Sequence | MarkerOwner::Edit, "resolve", "Cream") => Some("White"),
                 _ => None,
             };
             let change = match destination {
@@ -1274,7 +1274,8 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                         let (Some(codec),Some((width,height)),Some(rate))=(&m.codec,m.frame_size,m.rate)else{return Err(error("original picture facts incomplete"));};
                         let source_start = m.start.filter(|_| m.clock.as_ref().is_some_and(|clock|
                             matches!(clock.provenance.route.as_str(),
-                                graph::source::AVID_SOURCE_COLUMNS_TIMECODE | graph::source::AVID_LINKED_MOV_TIMECODE)))
+                                graph::source::AVID_SOURCE_COLUMNS_TIMECODE | graph::source::AVID_LINKED_MOV_TIMECODE
+                                    | graph::source::VERIFIED_LINKED_MOV_TIMECODE)))
                             .map(|start| ticks(start, "original source timecode"))
                             .transpose()?.unwrap_or_default();
                         if let Some(receipt) = side(&sc, "avid.source", &m.id)
@@ -1295,7 +1296,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                         c.video=Some(OriginalVideo{codec:codec.clone(),width,height,rate:fraction(rate),duration,stream_index:o.stream_index,source_start});
                     },
                     StreamKind::Audio=>{
-                        let representation=match o.sample_representation.as_deref(){Some("aac")=>SampleRepresentation::Aac,Some("mp3")=>SampleRepresentation::Mp3,Some("pcm16")=>SampleRepresentation::Pcm16,Some("pcm24")=>SampleRepresentation::Pcm24,_=>return Err(error("original audio representation unresolved"))};
+                        let representation=match o.sample_representation.as_deref(){Some("aac")=>SampleRepresentation::Aac,Some("mp3")=>SampleRepresentation::Mp3,Some("pcm16")=>SampleRepresentation::Pcm16,Some("pcm16be")=>SampleRepresentation::Pcm16Be,Some("pcm24")=>SampleRepresentation::Pcm24,_=>return Err(error("original audio representation unresolved"))};
                         let channels = o.channels.ok_or_else(|| error("original physical channels unresolved"))?;
                         let source_start = if channels == 8 {
                             let start = m.clock.as_ref().and_then(|clock| clock.exact_start())
@@ -1634,6 +1635,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         audio_pans: Vec::new(),
         audio_mixers: Default::default(),
         track_states: Default::default(),
+        timeline_marks: Default::default(),
         non_drop_sequences: Default::default(),
         picture_effects: Vec::new(),
         source_luts: Vec::new(),
@@ -1643,6 +1645,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         direct_dnxhr_origins,
         direct_dnxhd_pcm24,
         constant_speeds: Vec::new(),
+        frame_holds: Default::default(),
         multicams: Vec::new(),
         multicam_uses: Vec::new(),
         picture_subclips: Vec::new(),

@@ -65,6 +65,22 @@ pub enum TurnoverSource {
 }
 
 impl TurnoverJob {
+    pub fn review_media_links(&self) -> Result<crate::premiere::MediaLinkReview> {
+        let TurnoverSource::PremiereToResolve { premiere, sequence } = &self.source else {
+            return Err("Media linking Review requires a Premiere to Resolve job".into());
+        };
+        crate::premiere::review_media_links(premiere, sequence, &self.ffprobe)
+    }
+
+    pub fn prepare_with_media_progress(
+        &self, progress: &mut dyn FnMut(usize, &Path),
+    ) -> Result<Turnover> {
+        let TurnoverSource::PremiereToResolve { premiere, sequence } = &self.source else {
+            return Err("Media linking Review requires a Premiere to Resolve job".into());
+        };
+        crate::premiere::prepare_with_media_progress(premiere, sequence, &self.ffprobe, progress)
+    }
+
     pub fn prepare(&self) -> Result<Turnover> {
         use avid_adapter::original::{OriginalOptions, RootMapping};
         match &self.source {
@@ -135,6 +151,10 @@ pub struct TurnoverReview {
 }
 
 impl Turnover {
+    pub fn media_counts(&self) -> (usize, usize) {
+        self.prepared.media_counts()
+    }
+
     pub(crate) fn prepare(
         graph: SourceGraph,
         spec: linked::ProjectSpec,
@@ -142,13 +162,14 @@ impl Turnover {
         inputs: Vec<(PathBuf, [u8; 32])>,
         notices: Vec<String>,
         caption_omissions: Vec<graph::Loss>,
+        premiere_files: Option<&linked::FileProbes>,
     ) -> Result<Self> {
         let selected: HashSet<_> = spec.timelines.iter().map(|timeline| timeline.id.as_str()).collect();
         let selected_texts = graph.sequences.iter()
             .filter(|sequence| selected.contains(sequence.id.as_str()))
             .flat_map(|sequence| &sequence.texts)
             .map(|text| text.id.clone()).collect();
-        let prepared = linked::prepare_project(&graph, spec, ffprobe, Some(&caption_omissions))?;
+        let prepared = linked::prepare_project(&graph, spec, ffprobe, Some(&caption_omissions), premiere_files)?;
         let caption_omissions = caption_omissions.into_iter()
             .filter(|loss| !prepared.writes_caption(&loss.object)).collect();
         Ok(Self {
@@ -175,8 +196,10 @@ impl Turnover {
             .losses
             .iter()
             .filter(|loss| is_reviewable_loss(loss)
+                && !self.prepared.recovers_premiere_mark(loss)
                 && (loss.aspect != "text_appearance" || self.selected_texts.contains(&loss.object)))
             .chain(&self.caption_omissions)
+            .chain(&self.prepared.destination_losses)
     }
 
     /// Check the destination plan without staging or publishing any output.
@@ -203,7 +226,7 @@ impl Turnover {
             && (!self.omitted_markers().is_empty() || self.reviewable_losses().next().is_some())
         {
             return Err(
-                "review all omitted occurrences and explicitly accept losses before publication"
+                "review all reported losses and explicitly accept losses before publication"
                     .into(),
             );
         }

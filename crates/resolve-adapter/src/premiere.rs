@@ -1,13 +1,23 @@
-//! Same-rate Premiere straight cuts into the shared Resolve turnover path.
+//! Premiere source capture into the shared Resolve turnover path.
 mod capture;
+pub(crate) mod color_mode;
 mod components;
 pub use capture::read_premiere_media_graph;
 mod controls;
 mod fades;
+mod frame_hold;
+mod marker_provenance;
+pub(crate) use marker_provenance::{
+    ADAPTER as EDIT_MARKER_PROVENANCE, CROSSES_SPLIT, CROSSES_SPLIT_REASON,
+};
 mod markers;
+pub(crate) use markers::{SEQUENCE_MARKER_DATA_ADAPTER, SOURCE_MARKER_DATA_ADAPTER};
 mod metadata;
 mod mixer;
+mod multicam;
+pub(crate) use multicam::CAMERA as MULTICAM_CAMERA;
 mod source_capture;
+mod transitions;
 pub(crate) use metadata::{LABEL_LOSS as CLIP_LABEL_LOSS, LOSS as CLIP_METADATA_LOSS,
     SYNC_LOCK_LOSS, TIMELINE_MARK_LOSS};
 
@@ -17,19 +27,20 @@ use self::source_capture::{
 use crate::{
     linked::{self, MediaSpec, Profile, ProjectSpec, TimelineSpec},
     media::media_digest,
+    mixed_rate,
     turnover::Turnover,
     Result, StreamSelector,
 };
 use graph::{
     source::{
         OriginalStream, SourceClock, SourceGraph, SourceItem,
-        SourceBinding, SourceItemMedia, SourceMedia, SourceSequence, SourceTrack, SourceText, SourceTransition, TextKind,
+        SourceItemMedia, SourceMedia, SourceTrack, SourceText, TextKind,
     },
     Loss, Placement, Rational, Sidecar, StreamKind, Value,
 };
 use prproj::{
     build::time::TICKS_PER_SECOND,
-    model::{ItemId, Project, SequenceId, TrackData, TrackId, TrackItemId},
+    model::{ItemId, Project, SequenceId, TrackId, TrackItemId},
     xml::{NodeId, PremiereDocument},
 };
 use serde::Serialize;
@@ -120,16 +131,243 @@ fn select_sequence(project: &Project, selector: &str) -> Result<SequenceId> {
     })
 }
 
+fn capture_input_scaling(
+    project: &Project, item: ItemId, clip: TrackItemId, edit: &str, graph: &mut SourceGraph,
+) -> Result<()> {
+    let node = project.track_item(clip).clip;
+    let fit = match project.doc.tree.findtext(node, "ScaleToFramePolicy")?.as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        None => project.scale_to_frame_size(item)?,
+        _ => return Err(format!("{edit}: unqualified Premiere input sizing policy").into()),
+    };
+    let mode = if fit { crate::input_scaling::FIT } else { crate::input_scaling::CENTER_CROP };
+    graph.sidecars.push(crate::input_scaling::receipt(crate::input_scaling::PREMIERE, edit, mode));
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+pub struct MediaLinkReview {
+    pub direct: usize,
+    pub assist: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+/// Inspect selected Premiere locators using the standalone media checks.
+pub(crate) fn review_media_links(path: &Path, selector: &str, ffprobe: &Path) -> Result<MediaLinkReview> {
+    let path = premiere_path(path)?;
+    let (project, _) = read_project(&path)?;
+    let sequence = project.sequence(select_sequence(&project, selector)?);
+    let mut originals = std::collections::BTreeMap::<_, std::collections::BTreeSet<_>>::new();
+    let mut seen = HashSet::new();
+    let mut review = MediaLinkReview::default();
+    for track in sequence.video_tracks.iter().chain(&sequence.audio_tracks) {
+        for &clip in &project.track(*track).clips {
+            let Some(item) = project.track_item_source(clip) else {
+                review.blockers.push("A Premiere edit has no saved source".into());
+                continue;
+            };
+            if !seen.insert(item) {
+                continue;
+            }
+            let name = project.item_name(item);
+            let result = (|| -> Result<_> {
+                let saved = project.item_media_path(item).map(Path::new)
+                    .filter(|path| path.is_absolute())
+                    .ok_or("original has no absolute saved locator")?;
+                let media = project.media_element(item)?.ok_or("missing Premiere master media")?;
+                metadata::check_locators(&project.doc.tree, media, saved)?;
+                Ok(std::fs::canonicalize(saved)?)
+            })();
+            match result {
+                Ok(path) => { originals.entry(path).or_default().insert(name); }
+                Err(error) => review.blockers.push(format!("{name}: {error}")),
+            }
+        }
+    }
+    for (path, names) in originals {
+        let label = format!("{} · {}", names.into_iter().collect::<Vec<_>>().join(", "), path.display());
+        match linked::review_original(&path, ffprobe, sequence.frame_size) {
+            Ok(false) => review.direct += 1,
+            Ok(true) => review.assist.push(label),
+            Err(error) => review.blockers.push(format!("{label}: {error}")),
+        }
+    }
+    Ok(review)
+}
+
 pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) -> Result<Turnover> {
+    prepare_selection(path, &[selector.to_owned()], false, ffprobe, &mut |_, _| {})
+}
+
+pub fn prepare_premiere_project(path: &Path, selectors: &[String], ffprobe: &Path) -> Result<Turnover> {
+    prepare_selection(path, selectors, true, ffprobe, &mut |_, _| {})
+}
+
+pub(crate) fn prepare_with_media_progress(
+    path: &Path, selector: &str, ffprobe: &Path, progress: &mut dyn FnMut(usize, &Path),
+) -> Result<Turnover> {
+    prepare_selection(path, &[selector.into()], false, ffprobe, progress)
+}
+
+fn prepare_selection(
+    path: &Path, selectors: &[String], exact: bool, ffprobe: &Path,
+    progress: &mut dyn FnMut(usize, &Path),
+) -> Result<Turnover> {
+    if !(1..=64).contains(&selectors.len()) {
+        return Err("Premiere project requires between 1 and 64 sequence IDs".into());
+    }
     let path = premiere_path(path)?;
     let (project, digest) = read_project(&path)?;
-    let project = &project;
-    let sequence = select_sequence(project, selector)?;
+    let sequence_ids = project.sequences();
+    let mut selection = Vec::with_capacity(selectors.len());
+    let mut seen = HashSet::new();
+    for selector in selectors {
+        let sequence = if exact {
+            let mut matches = sequence_ids.iter().copied()
+                .filter(|&s| project.sequence_id(s).as_deref() == Some(selector));
+            let first = matches.next()
+                .ok_or_else(|| format!("Premiere sequence ObjectUID is absent: {selector}"))?;
+            if matches.next().is_some() {
+                return Err(format!("Ambiguous Premiere sequence ObjectUID: {selector}").into());
+            }
+            first
+        } else {
+            select_sequence(&project, selector)?
+        };
+        if !seen.insert(sequence) {
+            return Err(format!("Duplicate Premiere sequence selection: {selector}").into());
+        }
+        selection.push(sequence);
+    }
+    let first = project.sequence(selection[0]);
+    if selection.iter().any(|&id| {
+        let row = project.sequence(id);
+        row.frame_size != first.frame_size || row.timebase != first.timebase
+    }) {
+        return Err("Premiere project selection requires a common timeline rate and canvas".into());
+    }
+    if selection.len() > 1
+        && (first.frame_size != Some((1920, 1080)) || first.timebase != Some(TICKS_PER_SECOND / 24))
+    {
+        return Err("Multiple Premiere timelines require the 1080p24 profile".into());
+    }
+    let root = project.root_item().ok_or("Premiere project root is absent")?;
+    let first_panel = project.sequence_item(selection[0]).ok_or("Premiere sequence panel owner is missing")?;
+    let mut capture = SelectionCapture {
+        graph: GraphCapture::new(&project, &path, root, first_panel)?,
+        items: HashMap::new(),
+        files: HashMap::new(),
+        spec: ProjectSpec {
+            root_bin_id: Some(ROOT_BIN_ID.into()),
+            timelines: vec![],
+            media: vec![],
+            atom_media: vec![],
+            proxy_audio: Default::default(),
+        },
+        notices: vec![],
+        caption_omissions: vec![],
+        sampled_frame_count: 0,
+    };
+    let capture_components = components::is_current_project(&project)?;
+    for sequence in selection {
+        let result = capture_sequence(&project, sequence, ffprobe, capture_components, &mut capture, progress);
+        if exact {
+            result.map_err(|e| format!("Premiere sequence {}: {e}", project.sequence_id(sequence).unwrap_or_default()))?;
+        } else {
+            result?;
+        }
+    }
+    let provenance = marker_provenance::read(&project, &capture.graph.graph)?;
+    if !provenance.is_empty() {
+        capture.recover_marker_parents(&project, ffprobe, &provenance)?;
+        let removed = marker_provenance::restore(&mut capture.graph.graph, provenance)?;
+        capture.spec.media.retain(|binding| !removed.contains(&binding.item_id));
+    }
+    Turnover::prepare(
+        capture.graph.graph, capture.spec, ffprobe, vec![(path, digest)],
+        capture.notices, capture.caption_omissions, Some(&capture.files),
+    )
+}
+
+struct SelectionCapture {
+    graph: GraphCapture,
+    items: HashMap<ItemId, (usize, Option<capture::VerifiedBinding>)>,
+    files: linked::FileProbes,
+    spec: ProjectSpec,
+    notices: Vec<String>,
+    caption_omissions: Vec<Loss>,
+    sampled_frame_count: usize,
+}
+
+impl SelectionCapture {
+    fn recover_marker_parents(
+        &mut self,
+        project: &Project,
+        ffprobe: &Path,
+        records: &[marker_provenance::Record],
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        for record in records {
+            let item = record.original;
+            if self.items.contains_key(&item) || !seen.insert(item)
+                || marker_provenance::is_dedicated_item(project, item)?
+                || project.clip_element_tags(item) != ["VideoClip"]
+            {
+                continue;
+            }
+            let (Some(media), Some(saved)) =
+                (project.media_element(item)?, project.item_media_path(item).map(Path::new))
+            else { continue };
+            if !saved.is_absolute() || metadata::check_locators(&project.doc.tree, media, saved).is_err() {
+                continue;
+            }
+
+            // Keep an unplaced original out of the selection until the normal
+            // media checks and at least one copy agree with its saved state.
+            let mut candidate = GraphCapture::empty_graph(self.graph.graph.project.name.clone());
+            let Ok((mut binding, _)) = bind(
+                project, item, media, saved, StreamKind::Video, record.rate, (1920, 1080),
+                ffprobe, 0, &mut candidate, &mut self.files,
+            ) else { continue };
+            if !candidate.losses.is_empty() {
+                continue;
+            }
+            let mut used = false;
+            for sibling in records.iter().filter(|sibling| sibling.original == item) {
+                if marker_provenance::matches_original(&self.graph.graph, &candidate, sibling)? {
+                    used = true;
+                    break;
+                }
+            }
+            if !used {
+                continue;
+            }
+            let graph = &mut self.graph.graph;
+            let bin = owning_bin(project, item, &mut self.graph.folder_ids, &mut graph.bins)?;
+            binding.bin_id.clone_from(&graph.bins[bin].id);
+            graph.bins[bin].items.push(binding.item_id.clone());
+            graph.items.extend(candidate.items);
+            graph.media.extend(candidate.media);
+            graph.sidecars.extend(candidate.sidecars);
+            self.spec.media.push(binding);
+        }
+        Ok(())
+    }
+}
+
+fn capture_sequence(
+    project: &Project,
+    sequence: SequenceId,
+    ffprobe: &Path,
+    capture_components: bool,
+    capture: &mut SelectionCapture,
+    progress: &mut dyn FnMut(usize, &Path),
+) -> Result<()> {
     let id = project
         .sequence_id(sequence)
         .ok_or("Premiere sequence lacks ObjectUID")?;
     let data = project.sequence(sequence);
-    let capture_components = components::is_current_project(project)?;
     let bus_fader = mixer::read_mix_bus(project, data.element, capture_components)?;
     let frame_ticks = data
         .timebase
@@ -137,23 +375,32 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         .ok_or("missing Premiere sequence frame timebase")?;
     let rate = Rational::new(TICKS_PER_SECOND.into(), frame_ticks.into())
         .ok_or("invalid sequence rate")?;
-    if !matches!((rate.num(), rate.den()), (24, 1) | (24000, 1001))
-        || data.frame_size != Some((1920, 1080))
-    {
-        return Err("Premiere turnover requires same-rate 1080p24 or 1080p23.976".into());
+    let canvas = match data.frame_size {
+        Some((1920, 1080)) if linked::avc_rate(rate) || rate == crate::prepare::rate() => (1920, 1080),
+        Some((3840, 2160)) if linked::uhd_rate(rate) => (3840, 2160),
+        _ => return Err("Premiere turnover requires a qualified same-rate HD or UHD timeline".into()),
+    };
+    let base = linked::display_base(rate);
+    if base == 25 && (!capture_components || project.video_display_format(sequence)? != Some(101)) {
+        return Err("Premiere 25 fps turnover requires the saved 25-frame display clock".into());
+    }
+    let drop = linked::is_2997(rate);
+    if drop && (!capture_components || project.video_display_format(sequence)? != Some(102)) {
+        return Err("Premiere 29.97 turnover requires the saved drop-frame display clock".into());
     }
     let zero = project
         .sequence_bag_int(sequence, "MZ.ZeroPoint")?
         .ok_or("explicit Premiere sequence start required")?;
     let origin = u64::try_from(zero / frame_ticks)?;
-    if zero < 0 || zero % frame_ticks != 0 || origin >= 2_073_600 {
+    let frames_per_day = u64::from(base) * 86_400 - if drop { 2592 } else { 0 };
+    if zero < 0 || zero % frame_ticks != 0 || origin >= frames_per_day {
         return Err("Premiere sequence origin is off-frame or outside one day".into());
     }
     let clock = source_clock(
         origin,
         rate,
-        24,
-        false,
+        base,
+        drop,
         &id,
         "MZ.ZeroPoint",
         "Premiere sequence ticks",
@@ -161,40 +408,55 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
     let sequence_panel_item = project
         .sequence_item(sequence)
         .ok_or("Premiere sequence panel owner is missing")?;
-    let root = project
-        .root_item()
-        .ok_or("Premiere project root is absent")?;
-    let GraphCapture {
-        mut graph,
-        mut folder_ids,
-        sequence_bin,
-    } = GraphCapture::new(project, &path, root, sequence_panel_item)?;
+    let sequence_bin = owning_bin(project, sequence_panel_item, &mut capture.graph.folder_ids,
+        &mut capture.graph.graph.bins)?;
     let mut out = source_sequence(
         id.clone(),
         project.sequence_name(sequence),
         data.frame_size,
         clock,
     );
-    let mut seen_items = HashMap::new();
+    if let Some(group) = multicam::source(project, sequence)? {
+        if !capture_components || canvas != (1920, 1080) || rate != crate::prepare::rate()
+            || bus_fader != 0
+        {
+            return Err("Premiere multicam requires a current 1080p23.976 project with a neutral Mix bus".into());
+        }
+        let group = multicam::capture(project, sequence, group, ffprobe, capture, &mut out)?;
+        let graph = &mut capture.graph.graph;
+        let bin_id = graph.bins[sequence_bin].id.clone();
+        graph.sidecars.push(source_receipt(id.clone(), &bin_id, frame_ticks, zero, []));
+        graph.sequences.push(out);
+        capture.spec.timelines.push(TimelineSpec {
+            id, bin_id, canvas, group: Some(group),
+        });
+        return Ok(());
+    }
+    let SelectionCapture { graph: capture, items: seen_items, files, spec, notices: all_notices,
+        caption_omissions: all_caption_omissions, sampled_frame_count } = capture;
+    let GraphCapture { graph, folder_ids, .. } = capture;
     let mut component_budget = components::Budget::default();
     let mut track_state = metadata::TrackStateCapture::default();
     let mut muted_tracks = Vec::new();
     let mut track_pans = [0; 2];
-    let mut spec = ProjectSpec {
-        root_bin_id: Some(ROOT_BIN_ID.into()),
-        timelines: vec![TimelineSpec {
-            id: id.clone(),
-            bin_id: graph.bins[sequence_bin].id.clone(),
-            canvas: (1920, 1080),
-            group: None,
-        }],
-        media: vec![],
-        atom_media: vec![],
-        proxy_audio: Default::default(),
-    };
+    let mut stereo_edits = 0;
+    let mut has_mono_wav = false;
+    let active = |tracks: &[TrackId], index| tracks.iter().any(|&id| {
+        let track = project.track(id);
+        track.index == index && !track.clips.is_empty()
+    });
+    let wide = rate == Rational::integer(24)
+        && active(&data.video_tracks, 1)
+        && active(&data.audio_tracks, 2);
+    spec.timelines.push(TimelineSpec {
+        id: id.clone(),
+        bin_id: graph.bins[sequence_bin].id.clone(),
+        canvas,
+        group: None,
+    });
     for (kind, tracks, expected) in [
-        (StreamKind::Video, &data.video_tracks, 1),
-        (StreamKind::Audio, &data.audio_tracks, 2),
+        (StreamKind::Video, &data.video_tracks, if wide { 2 } else { 1 }),
+        (StreamKind::Audio, &data.audio_tracks, if wide { 3 } else { 2 }),
     ] {
         let mut track_indexes = HashSet::new();
         for &track_id in tracks {
@@ -212,7 +474,11 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                 .checked_add(1)
                 .ok_or("Premiere track index overflow")?;
             if !(1..=expected).contains(&index) || !track_indexes.insert(index) {
-                return Err("expected active V1 and independent A1/A2 Premiere tracks".into());
+                return Err(if wide {
+                    "expected active V1/V2 and independent A1/A2/A3 Premiere tracks"
+                } else {
+                    "expected active V1 and independent A1/A2 Premiere tracks"
+                }.into());
             }
             if !capture_components && project.is_muted(track_id)? {
                 return Err("muted Premiere track requires a verified Resolve mix mapping".into());
@@ -224,10 +490,14 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
             let level_db = if kind == StreamKind::Audio {
                 let fader = mixer::read_track(project, track.element, capture_components)
                     .map_err(|error| format!("{id}: Premiere A{index} mixer: {error}"))?;
+                if let Some(slot) = track_pans.get_mut(index as usize - 1) {
+                    *slot = fader.pan;
+                } else if fader.pan != 0 || fader.tenths_db != 0 || fader.muted {
+                    return Err(format!("{id}: Premiere A{index} requires a neutral Resolve mixer").into());
+                }
                 if fader.muted {
                     muted_tracks.push(Value::Int(index));
                 }
-                track_pans[index as usize - 1] = fader.pan;
                 (fader.tenths_db != 0).then(|| f64::from(fader.tenths_db) / 10.0)
             } else {
                 None
@@ -242,40 +512,68 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                         "disabled Premiere edit requires a verified Resolve enable mapping".into(),
                     );
                 }
+                let tree = &project.doc.tree;
+                let native = project.track_item(clip);
+                let occurrence = tree
+                    .get(native.element, "ObjectID")
+                    .ok_or("Premiere edit lacks ObjectID")?;
+                let placement_id = format!("premiere:edit:{occurrence}");
                 let source = project
                     .track_item_source(clip)
                     .ok_or("unresolved Premiere source item")?;
-                let (media, saved_path) = clip_media(project, clip, source, kind)?;
-                let channel = if kind == StreamKind::Audio {
-                    Some(channel(project, clip)?)
-                } else {
-                    None
-                };
-                let item = if let Some(&index) = seen_items.get(&source) {
-                    index
-                } else {
-                    if seen_items.len() == 256 {
-                        return Err("Premiere sequence exceeds linked media limit".into());
+                let (item, verified) = match seen_items.entry(source) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let index = spec.media.len();
+                        if index == 256 {
+                            return Err("Premiere sequence exceeds linked media limit".into());
+                        }
+                        let bin = owning_bin(project, source, folder_ids, &mut graph.bins)?;
+                        let media = project.media_element(source)?
+                            .ok_or("Premiere source has no primary Media")?;
+                        let saved = project.item_media_path(source)
+                            .map(Path::new)
+                            .filter(|path| path.is_absolute())
+                            .ok_or("Premiere media requires an absolute saved path")?;
+                        let previous_count = files.len();
+                        let (binding, verified) = bind(
+                            project, source, media, saved, kind, rate, canvas, ffprobe, bin, graph, files,
+                        )?;
+                        if files.len() != previous_count {
+                            progress(files.len(), &binding.path);
+                        }
+                        spec.media.push(binding);
+                        entry.insert((index, verified))
                     }
-                    let bin = owning_bin(project, source, &mut folder_ids, &mut graph.bins)?;
-                    let index = graph.items.len();
-                    let binding = bind(
-                        project,
-                        source,
-                        media,
-                        &saved_path,
-                        kind,
-                        rate,
-                        ffprobe,
-                        bin,
-                        &mut graph,
-                    )?;
-                    spec.media.push(binding);
-                    seen_items.insert(source, index);
-                    index
                 };
-                let binding = &spec.media[item];
-                if !binding.streams.iter().any(|s| s.channel == channel) {
+                let binding = &spec.media[*item];
+                if kind == StreamKind::Video && binding.streams.iter().filter(|stream| stream.channel.is_none())
+                    .filter_map(|stream| graph.media.iter().find(|row| row.id == stream.media_id))
+                    .any(|media| media.frame_size.is_some() && media.frame_size != data.frame_size)
+                {
+                    capture_input_scaling(project, source, clip, &placement_id, graph)?;
+                }
+                let channels = if let Some(verified) = verified {
+                    verified.channels(project, clip, kind)
+                } else {
+                    clip_media(project, clip, source, kind)?;
+                    (kind == StreamKind::Audio).then(|| channel(project, clip))
+                        .transpose()
+                        .and_then(|channel| channel.into_iter().map(|c| {
+                            i64::try_from(c)?.checked_add(1).ok_or("Premiere channel index overflows".into())
+                        }).collect::<Result<Vec<_>>>())
+                }
+                .map_err(|error| format!("{placement_id}: {error}"))?;
+                let stereo = channels == crate::stereo::STREAMS
+                    && index == 1 && verified.is_some()
+                    && data.frame_size.is_some_and(|size| crate::stereo::clock(rate, size));
+                if kind == StreamKind::Audio && channels.len() != 1 && !stereo {
+                    return Err(format!("{placement_id}: Premiere audio edit is not a qualified mono or stereo selection").into());
+                }
+                if channels.is_empty() && !binding.streams.iter().any(|s| s.channel.is_none())
+                    || channels.iter().any(|&label| !binding.streams.iter().any(|s|
+                        s.channel.is_some_and(|value| i64::try_from(value) == Ok(label - 1))))
+                {
                     return Err(
                         "Premiere clip selects a nonexistent channel on its saved media".into(),
                     );
@@ -288,19 +586,22 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                     (0.5, false) if capture_components && kind == StreamKind::Video && rate == Rational::integer(24) => {
                         Some(PictureSpeed::Half)
                     }
+                    (2.0, false) if capture_components && kind == StreamKind::Video && rate == Rational::integer(24) => {
+                        if project.time_interpolation_type(clip)? != prproj::model::enums::TimeInterpolationType::FrameSampling {
+                            return Err(format!("{placement_id}: 200% Resolve picture speed requires Premiere Frame Sampling").into());
+                        }
+                        Some(PictureSpeed::Double)
+                    }
                     (1.0, true) if capture_components && kind == StreamKind::Video && rate == Rational::integer(24) => {
                         Some(PictureSpeed::Reverse)
                     }
                     _ => return Err("Premiere clip speed or direction is outside the Resolve picture profile".into()),
                 };
-                let tree = &project.doc.tree;
-                let native = project.track_item(clip);
-                let occurrence = tree
-                    .get(native.element, "ObjectID")
-                    .ok_or("Premiere edit lacks ObjectID")?;
-                let placement_id = format!("premiere:edit:{occurrence}");
                 if capture_components {
-                    metadata::capture_edit_label(project, native.clip, source, &placement_id, &mut graph)
+                    metadata::capture_edit_label(
+                        project, native.clip, source, &placement_id,
+                        metadata::ClipLabelCapture::IncludeDefaults, graph,
+                    )
                         .map_err(|error| format!("Premiere label on {placement_id}: {error}"))?;
                 }
                 let mut effects = Vec::new();
@@ -331,8 +632,16 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                     .transpose()?;
                 let source_span = match picture_speed {
                     Some(PictureSpeed::Half) => span / 2,
+                    Some(PictureSpeed::Double) => span.checked_mul(2).ok_or("Premiere speed span overflow")?,
                     _ => span,
                 };
+                let fractional_half = picture_speed == Some(PictureSpeed::Half)
+                    && source_span % frame_ticks != 0;
+                if fractional_half
+                    && project.time_interpolation_type(clip)? != prproj::model::enums::TimeInterpolationType::FrameSampling
+                {
+                    return Err(format!("{placement_id}: odd-length half-speed picture requires Premiere Frame Sampling").into());
+                }
                 let (source_in, source_out) = if let Some(mode) = picture_speed {
                     let original = binding.streams.iter().find(|s| s.channel.is_none())
                         .and_then(|s| graph.media.iter().find(|m| m.id == s.media_id))
@@ -348,18 +657,37 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                     if a < 0 || b > file_end {
                         return Err("Premiere speed trim exceeds the verified original".into());
                     }
+                    if mode == PictureSpeed::Double {
+                        if a.checked_add(source_span).is_none_or(|end| end > file_end) {
+                            return Err(format!("{placement_id}: 200% Premiere speed span exceeds the verified original").into());
+                        }
+                        graph.sidecars.push(Sidecar {
+                            adapter: "premiere.picture_speed".into(),
+                            object: placement_id.clone(),
+                            data: Value::Obj(vec![
+                                ("in_ticks".into(), Value::Int(a)),
+                                ("out_ticks".into(), Value::Int(b)),
+                            ]),
+                        });
+                    }
                     match mode {
-                        PictureSpeed::Half => (a,b),
+                        PictureSpeed::Half | PictureSpeed::Double => (a,b),
                         PictureSpeed::Reverse => (file_end - b,file_end - a),
                     }
                 } else {
                     (project.in_point(clip)?.ticks, project.out_point(clip)?.ticks)
                 };
+                let saved_span = source_out.checked_sub(source_in);
+                // Premiere can save Out just after the last sampled picture
+                // at 200%, omitting the final skipped source frame.
+                let shortened_double = picture_speed == Some(PictureSpeed::Double)
+                    && saved_span == source_span.checked_sub(frame_ticks);
                 if span <= 0
                     || start < 0
                     || source_in < 0
-                    || source_out.checked_sub(source_in) != Some(source_span)
-                    || [start, end, source_in, source_out]
+                    || (saved_span != Some(source_span) && !shortened_double)
+                    || (!fractional_half && source_out % frame_ticks != 0)
+                    || [start, end, source_in]
                         .into_iter()
                         .any(|v| v % frame_ticks != 0)
                 {
@@ -367,10 +695,60 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                         "Premiere record and source spans disagree with the saved speed or frame grid".into(),
                     );
                 }
-                let mut mapped = false;
+                let hold = frame_hold::FrameHold::read(project, clip)
+                    .map_err(|err| format!("{placement_id}: {err}"))?;
+                let cadence = binding.streams.iter().find(|stream| kind == StreamKind::Video && stream.channel.is_none())
+                    .and_then(|stream| graph.media.iter().find(|m| m.id == stream.media_id))
+                    .and_then(|original| original.rate)
+                    .and_then(|source_rate| mixed_rate::Cadence::between(source_rate, rate));
+                let frame_map = if let Some(cadence) = cadence {
+                    if !capture_components || index != 1 || canvas != (1920, 1080) || has_components
+                        || speed.is_some() || hold.is_some()
+                        || project.time_interpolation_type(clip)? != prproj::model::enums::TimeInterpolationType::FrameSampling
+                    {
+                        return Err(format!("{placement_id}: mixed-rate Premiere capture requires plain V1 Frame Sampling").into());
+                    }
+                    Some(cadence.capture(source_in / frame_ticks, span / frame_ticks, sampled_frame_count)
+                        .map_err(|err| format!("{placement_id}: {err}"))?)
+                } else if let Some(hold) = hold {
+                    let unsupported = || format!("{placement_id}: unsupported Premiere Frame Hold mode, clock, or source");
+                    if !capture_components || kind != StreamKind::Video || index != 1
+                        || rate != Rational::integer(24) || canvas != (1920, 1080)
+                        || speed.is_some() || has_components
+                    {
+                        return Err(unsupported().into());
+                    }
+                    let original = binding.streams.iter().find(|stream| stream.channel.is_none())
+                        .and_then(|stream| graph.media.iter().find(|m| m.id == stream.media_id))
+                        .filter(|m| m.kind == StreamKind::Video && m.codec.as_deref() == Some("prores")
+                            && m.rate == Some(rate) && m.frame_size == Some((1920, 1080))
+                            && m.start.is_none_or(|start| start == Rational::ZERO))
+                        .ok_or_else(unsupported)?;
+                    let extent = crate::prepare::frames_on(original.duration, rate)?;
+                    if binding.streams.len() != 1 || source_out / frame_ticks > extent {
+                        return Err(unsupported().into());
+                    }
+                    Some(hold.capture(&placement_id, span, frame_ticks, extent, sampled_frame_count, graph)
+                        .map_err(|err| format!("{placement_id}: {err}"))?)
+                } else {
+                    None
+                };
+                let mut appearance_loss = has_components.then_some(
+                    "Premiere clip components are omitted from the Resolve turnover",
+                );
                 let mut transform = None;
                 let mut volume_db = None;
                 let mut picture_effects = Vec::new();
+                if capture_components && kind == StreamKind::Video {
+                    if let Some(saved) =
+                        color_mode::capture(project, data.element, clip, source, &placement_id)?
+                    {
+                        appearance_loss = color_mode::qualified_exposure(&saved.data).is_none().then_some(
+                            "Premiere Color Mode Adjust is retained in graph/2. The saved controls or color pipeline are outside the qualified Resolve mapping",
+                        );
+                        graph.sidecars.push(saved);
+                    }
+                }
                 if capture_components {
                     if let Some(saved) = components::capture(
                         project,
@@ -390,29 +768,35 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                             source_out,
                             frame_ticks,
                         )? {
+                            appearance_loss = None;
                             match control {
                                 controls::ClipControl::StaticMotion(motion) => {
                                     transform = Some(motion);
                                 }
                                 controls::ClipControl::MonoVolume(db) => volume_db = Some(db),
+                                controls::ClipControl::MonoVolumeKeys(keys) => {
+                                    graph.sidecars.push(controls::volume_key_receipt(&placement_id, keys));
+                                    appearance_loss = Some("Premiere Linear clip volume is retained in graph/2; Resolve's linear-dB curve differs");
+                                }
                                 controls::ClipControl::LinearMotion(keys) => picture_effects
                                     .push(graph::picture_motion::linear_effect(keys)),
                                 controls::ClipControl::LinearRoll(roll) => picture_effects
                                     .push(roll.readback()),
                             }
-                            mapped = true;
                         }
                         graph.sidecars.push(saved);
                     }
                 }
-                if has_components && !mapped {
+                if let Some(reason) = appearance_loss {
                     graph.losses.push(Loss {
                         object: placement_id.clone(),
                         aspect: "premiere.appearance".into(),
-                        reason: "Premiere clip components are omitted from the Resolve turnover"
-                            .into(),
+                        reason: reason.into(),
                     });
                 }
+                stereo_edits += usize::from(stereo);
+                has_mono_wav |= kind == StreamKind::Audio
+                    && verified.as_ref().is_some_and(capture::VerifiedBinding::mono_wav);
                 out.placements.push(Placement {
                     id: placement_id,
                     item: binding.item_id.clone(),
@@ -420,16 +804,16 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
                     source_in: ticks(source_in)?,
                     duration: ticks(span)?,
                     video_track: (kind == StreamKind::Video).then_some(index),
-                    audio_tracks: channel.map(|_| vec![index]).unwrap_or_default(),
-                    audio_streams: channel.map(|ch| vec![ch as i64 + 1]).unwrap_or_default(),
-                    grouped_audio: vec![],
+                    audio_tracks: if kind == StreamKind::Audio && !stereo { vec![index] } else { vec![] },
+                    audio_streams: if stereo { vec![] } else { channels },
+                    grouped_audio: if stereo { vec![crate::stereo::group()] } else { vec![] },
                     gain_db: 0.0,
                     volume_db,
                     volume_keys: vec![],
                     track_gains_db: vec![],
                     track_pans: vec![],
                     speed,
-                    frame_map: None,
+                    frame_map,
                     transform,
                     effects: picture_effects,
                 });
@@ -437,13 +821,27 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
             let edge_fades = kind == StreamKind::Audio && capture_components
                 && fades::capture(project, track, frame_ticks, &mut graph.sidecars)?;
             if !edge_fades && !track.transitions.is_empty() {
-                read_dissolve(project, track, kind, &mut out, frame_ticks)?;
+                transitions::capture(project, track, kind, &mut out, frame_ticks)?;
             }
         }
+        let stereo_layout = kind == StreamKind::Audio && stereo_edits > 0
+            && out.placements.iter().filter(|edit|
+                edit.video_track.is_none() && edit.audio_tracks.as_slice() != [2]
+            ).count() == stereo_edits;
+        if kind == StreamKind::Audio && stereo_edits > 0 && !stereo_layout {
+            return Err("Premiere A1 cannot mix mono and stereo edits".into());
+        }
+        if kind == StreamKind::Audio && has_mono_wav && !stereo_layout {
+            return Err("Premiere 25 fps standalone mono WAV requires stereo A1 and mono A2".into());
+        }
         if track_indexes.len() != expected as usize
-            && !(kind == StreamKind::Audio && track_indexes.is_empty())
+            && !(kind == StreamKind::Audio && track_indexes.is_empty()) && !stereo_layout
         {
-            return Err("Premiere profile requires picture and two nonempty mono lanes".into());
+            return Err(if wide {
+                "Premiere wider layout requires two picture tracks and three nonempty mono lanes"
+            } else {
+                "Premiere profile requires picture and two nonempty mono lanes"
+            }.into());
         }
     }
     let mut captions = Vec::new();
@@ -514,9 +912,9 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
     if markers.len() > MAX_EDITS {
         return Err("Premiere marker count exceeds edit limit".into());
     }
-    markers::capture(&project.doc.tree, markers, &mut out, &mut graph.sidecars, &mut graph.losses);
+    markers::capture(&project.doc.tree, data.element, markers, &mut out, graph)?;
     if capture_components {
-        metadata::capture_timeline_marks(project, data.element, &id, frame_ticks, &mut graph)?;
+        metadata::capture_timeline_marks(project, data.element, &id, frame_ticks, graph)?;
     }
     graph.losses.extend(track_state.losses);
     for (adapter, rows) in [
@@ -574,135 +972,9 @@ pub fn prepare_premiere_turnover(path: &Path, selector: &str, ffprobe: &Path) ->
         }
     }
     graph.sequences.push(out);
-    Turnover::prepare(graph, spec, ffprobe, vec![(path, digest)], notices, caption_omissions)
-}
-
-fn read_dissolve(
-    project: &Project,
-    track: &TrackData,
-    kind: StreamKind,
-    sequence: &mut SourceSequence,
-    frame_ticks: i64,
-) -> Result<()> {
-    use prproj::model::transition::*;
-    let [transition] = track.transitions.as_slice() else {
-        return Err("Resolve preparation requires exactly one Premiere dissolve".into());
-    };
-    let tree = &project.doc.tree;
-    let id = tree.get(*transition, "ObjectID").ok_or("Premiere transition lacks ObjectID")?;
-    let refuse = |reason| format!("Premiere transition {id}: {reason}");
-    if track.index != 0 || sequence.transitions.iter().any(|t| t.kind == kind) {
-        return Err(refuse("expected one transition per supported lane on V1 or A1").into());
-    }
-    let start = transition_start(tree, *transition)?.ticks;
-    let end = transition_end(tree, *transition)?.ticks;
-    let offset = transition_cut_point_offset(tree, *transition)?.ticks;
-    let duration = end.checked_sub(start).ok_or_else(|| refuse("duration overflow"))?;
-    let match_name = transition_match_name(tree, *transition)?;
-    let style = match kind {
-        StreamKind::Video if tree.tag(*transition) == "VideoTransitionTrackItem"
-            && crate::dissolve::supported_rate(sequence.rate)
-            && (offset == duration || offset.checked_mul(2) == Some(duration))
-            && match_name == "ADBE Cross Dissolve" => "premiere.ADBE Cross Dissolve",
-        StreamKind::Audio if tree.tag(*transition) == "AudioTransitionTrackItem"
-            && sequence.rate == Rational::integer(24)
-            && offset.checked_mul(2) == Some(duration)
-            && match_name == "Constant Gain"
-            && constant_gain_fields(tree, *transition)? => crate::dissolve::PREMIERE_AUDIO_STYLE,
-        StreamKind::Video => return Err(refuse("expected the eight-frame left-aligned or centered Cross Dissolve profile").into()),
-        StreamKind::Audio => return Err(refuse("expected the eight-frame centered 24 fps A1 Constant Gain profile").into()),
-    };
-    if start < 0
-        || start % frame_ticks != 0
-        || duration != frame_ticks.checked_mul(8).ok_or("transition duration overflow")?
-        || transition_is_reversed(tree, *transition)?
-        || transition_border_width(tree, *transition)? != 0
-        || !transition_has_incoming_clip(tree, *transition)?
-        || !transition_has_outgoing_clip(tree, *transition)?
-    {
-        return Err(refuse("expected an eight-frame transition with two clip endpoints").into());
-    }
-    let cut = ticks(start.checked_add(offset).ok_or_else(|| refuse("cut overflow"))?)?;
-    let duration = ticks(duration)?;
-    let before = ticks(offset)?;
-    let after = duration.checked_sub(before).ok_or_else(|| refuse("invalid alignment"))?;
-    let begin = ticks(start)?;
-    let on_lane = |p: &Placement| match kind {
-        StreamKind::Video => p.video_track == Some(1),
-        StreamKind::Audio => p.audio_tracks.as_slice() == [1],
-    };
-    let mut outgoing = sequence.placements.iter_mut().filter(|p| {
-        on_lane(p) && p.record_start <= begin
-            && p.record_start.checked_add(p.duration) == Some(cut)
-    });
-    let out = outgoing.next().ok_or_else(|| refuse("missing outgoing edit"))?;
-    if outgoing.next().is_some() {
-        return Err(refuse("ambiguous outgoing edit").into());
-    }
-    let outgoing_id = out.id.clone();
-    out.duration = out.duration.checked_add(after).ok_or_else(|| refuse("outgoing extent overflow"))?;
-    let mut incoming = sequence.placements.iter_mut()
-        .filter(|p| on_lane(p) && p.record_start == cut);
-    let input = incoming.next().ok_or_else(|| refuse("missing incoming edit"))?;
-    if incoming.next().is_some() {
-        return Err(refuse("ambiguous incoming edit").into());
-    }
-    let incoming_id = input.id.clone();
-    for &clip in &track.clips {
-        let element = project.track_item(clip).element;
-        let object = tree
-            .get(element, "ObjectID")
-            .ok_or("Premiere edit lacks ObjectID")?;
-        for (field, endpoint) in [
-            ("ClipTrackItem/TailTransition", outgoing_id.as_str()),
-            ("ClipTrackItem/HeadTransition", incoming_id.as_str()),
-        ] {
-            let refs = tree.findall(element, field)?;
-            let expected = endpoint.strip_prefix("premiere:edit:") == Some(object);
-            match refs.as_slice() {
-                [] if !expected => {}
-                [link] if expected && project.doc.resolve(*link).is_ok_and(|id| id == *transition) => {}
-                _ => {
-                    return Err(refuse(
-                        "saved clip transition references disagree with the cut endpoints",
-                    )
-                    .into());
-                }
-            }
-        }
-    }
-    input.source_in = input.source_in.checked_sub(before).filter(|time| !time.is_negative())
-        .ok_or_else(|| refuse("insufficient incoming preroll"))?;
-    input.record_start = begin;
-    input.duration = input.duration.checked_add(before).ok_or_else(|| refuse("edit range overflow"))?;
-    sequence.transitions.push(SourceTransition {
-        id: format!("premiere:transition:{id}"),
-        kind,
-        track: 1,
-        cut,
-        duration,
-        cut_offset: before,
-        style: style.into(),
-        outgoing: SourceBinding { placements: vec![outgoing_id], reason: None },
-        incoming: SourceBinding { placements: vec![incoming_id], reason: None },
-    });
+    all_notices.extend(notices);
+    all_caption_omissions.extend(caption_omissions);
     Ok(())
-}
-
-fn constant_gain_fields(tree: &prproj::xml::Tree, transition: NodeId) -> Result<bool> {
-    // The saved transition has a stereo render layout even on a mono lane.
-    for (field, expected) in [
-        ("FadeShapeType", "0"),
-        ("FadeShapeValue", "0"),
-        ("AudioChannelLayout", r#"[{"channellabel":100},{"channellabel":101}]"#),
-    ] {
-        let refs = tree.findall(transition, field)?;
-        let [value] = refs.as_slice() else { return Ok(false) };
-        if !tree.is_childless(*value) || tree.text(*value) != Some(expected) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn premiere_path(path: &Path) -> Result<PathBuf> {
@@ -779,7 +1051,6 @@ fn clip_media(
     if Some(media) != project.media_element(source)? {
         return Err("Premiere edit and master media disagree".into());
     }
-    metadata::check_source_origin(tree, media)?;
     let locator = project
         .item_media_path(source)
         .ok_or("Premiere media locator is missing")?;
@@ -824,10 +1095,12 @@ fn bind(
     saved: &Path,
     kind: StreamKind,
     rate: Rational,
+    canvas: (u16, u16),
     ffprobe: &Path,
     bin: usize,
     graph: &mut SourceGraph,
-) -> Result<MediaSpec> {
+    files: &mut linked::FileProbes,
+) -> Result<(MediaSpec, Option<capture::VerifiedBinding>)> {
     let path = std::fs::canonicalize(saved)?;
     let tree = &project.doc.tree;
     let uid = tree
@@ -839,22 +1112,75 @@ fn bind(
         item_id: item_id.clone(),
         bin_id: graph.bins[bin].id.clone(),
         path: path.clone(),
-        sha256: hex::encode(media_digest(&path)?),
+        sha256: String::new(),
         streams: vec![],
     };
-    let (verified, tb, count) = linked::probe(&spec, ffprobe, name.clone(), bin)?;
+    let (verified, tb, count) = match files.entry(path.clone()) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            spec.sha256 = hex::encode(media_digest(&path)?);
+            entry.insert(linked::probe(&spec, ffprobe, name.clone(), bin, canvas)?)
+        }
+    };
+    spec.sha256 = verified.digest_hex()?;
+    let (tb, count) = (*tb, *count);
+    if let Some(native) = &verified.native {
+        if native.rate() != rate || !components::is_current_project(project)? {
+            return Err("Premiere native import requires a current same-rate project".into());
+        }
+        let binding = capture::VerifiedBinding::bind_native(project, item, saved, &mut spec, native, bin, graph)?;
+        return Ok((spec, Some(binding)));
+    }
+    if let Profile::Mov { rate: file_rate, video: linked::MovieVideo::ProResHq,
+        pcm: None, quicktime_timecode: Some(start), .. } = &verified.profile
+    {
+        if *start != 0 {
+            if kind != StreamKind::Video || !crate::source::supported_marker_rate(*file_rate) || *file_rate != rate
+                || !components::is_current_project(project)?
+            {
+                return Err("nonzero Premiere source timecode requires the qualified same-rate 24 or 23.976 fps ProRes HQ picture profile".into());
+            }
+            let binding = capture::VerifiedBinding::bind_standalone_movie(
+                project, item, saved, &mut spec, verified, tb, count, bin, graph,
+            )?;
+            return Ok((spec, Some(binding)));
+        }
+    }
+    metadata::check_source_origin(tree, media)?;
+    if let Profile::Mov { rate: file_rate, video: linked::MovieVideo::Avc | linked::MovieVideo::HevcMain10, .. } = &verified.profile {
+        if *file_rate != rate || !components::is_current_project(project)? {
+            return Err("Premiere AVC or HEVC turnover requires a current same-rate project".into());
+        }
+        let binding = capture::VerifiedBinding::bind_standalone_movie(
+                project, item, saved, &mut spec, verified, tb, count, bin, graph,
+            )?;
+        return Ok((spec, Some(binding)));
+    }
+    if rate == Rational::integer(25)
+        && kind == StreamKind::Audio
+        && matches!(verified.profile, Profile::Wav { channels: 1 | 2, .. })
+        && components::is_current_project(project)?
+    {
+        let binding = capture::VerifiedBinding::bind(project, item, saved, &mut spec, ffprobe, bin, graph)?;
+        return Ok((spec, Some(binding)));
+    }
+    if rate == Rational::integer(25) || linked::is_2997(rate) {
+        return Err("Premiere 25 and 29.97 fps turnover requires the qualified AVC MOV or MP4 media profile".into());
+    }
     let duration = linked::extent(count, tb)?;
-    let (container, codec, frame_size, sample_rate, bits, channels, stream_ref) =
+    let (container, codec, frame_size, sample_rate, bits, channels, stream_ref, original_rate) =
         match (&verified.profile, kind) {
             (
                 Profile::Mov {
                     rate: file_rate,
-                    h264: false,
+                    video: linked::MovieVideo::ProResHq,
                     aac: false,
+                    pcm,
                     ..
                 },
                 StreamKind::Video,
-            ) if *file_rate == rate => (
+            ) if *file_rate == rate || (mixed_rate::Cadence::between(*file_rate, rate).is_some() && pcm.is_none()
+                && components::is_current_project(project)?) => (
                 "mov",
                 "prores",
                 Some((1920, 1080)),
@@ -862,6 +1188,7 @@ fn bind(
                 None,
                 None,
                 "VideoStream",
+                *file_rate,
             ),
             (Profile::Wav { bits, channels, .. }, StreamKind::Audio) => (
                 "wav",
@@ -875,6 +1202,7 @@ fn bind(
                 Some(*bits),
                 Some(*channels),
                 "AudioStream",
+                rate,
             ),
             _ => {
                 return Err(
@@ -897,7 +1225,7 @@ fn bind(
         .parse()?;
     if ticks(saved_ticks)? != duration
         || (kind == StreamKind::Video
-            && Rational::new(TICKS_PER_SECOND.into(), saved_frame_ticks.into()) != Some(rate))
+            && Rational::new(TICKS_PER_SECOND.into(), saved_frame_ticks.into()) != Some(original_rate))
         || (kind == StreamKind::Audio && saved_frame_ticks != TICKS_PER_SECOND / 48_000)
     {
         return Err(
@@ -910,18 +1238,20 @@ fn bind(
         .ok_or("invalid saved media locator")?
         .to_owned();
     let tape = metadata::capture(project, item, media, &item_id, Some(&spec.sha256), graph)?;
-    let clock = matches!(verified.profile, Profile::Mov { quicktime_timecode: true, .. })
-        .then(|| {
+    let clock = match &verified.profile {
+        Profile::Mov { quicktime_timecode: Some(start), .. } => Some(
             source_clock(
-                0,
-                rate,
+                u64::try_from(*start)?,
+                original_rate,
                 24,
                 false,
                 &item_id,
                 "QuickTime tmcd",
                 "verified original MOV timecode",
             )
-        });
+        ),
+        _ => None,
+    };
     let mut item_media = Vec::new();
     for n in 0..channels.unwrap_or(1) {
         let id = format!("{item_id}/media/{n}");
@@ -932,7 +1262,7 @@ fn bind(
             locations: vec![locator.clone()],
             codec: Some(codec.into()),
             frame_size,
-            rate: (kind == StreamKind::Video).then_some(rate),
+            rate: (kind == StreamKind::Video).then_some(original_rate),
             sample_rate,
             bits,
             duration,
@@ -969,6 +1299,8 @@ fn bind(
             channel: channel.map(|n| n as usize),
         });
     }
+    let item_rate = (kind == StreamKind::Video).then_some(original_rate);
+    let source_markers = markers::capture_item(project, item, &item_id, item_rate, graph)?;
     graph.bins[bin].items.push(item_id.clone());
     graph.items.push(SourceItem {
         id: item_id,
@@ -976,14 +1308,14 @@ fn bind(
         media: item_media,
         umid: None,
         tape,
-        rate: (kind == StreamKind::Video).then_some(rate),
+        rate: item_rate,
         color_rgb16: None,
         stream_groups: if channels == Some(2) {
             vec![vec![1, 2]]
         } else {
             vec![]
         },
-        markers: vec![],
+        markers: source_markers,
     });
-    Ok(spec)
+    Ok((spec, None))
 }

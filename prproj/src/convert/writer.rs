@@ -368,12 +368,20 @@ pub struct PreparedProject {
     assets_published: bool,
     published: bool,
     retained: Vec<PathBuf>,
+    saved_marker_data: HashSet<MarkerDataKey>,
+    saved_marker_colors: HashSet<MarkerDataKey>,
 }
 impl PreparedProject {
     pub fn report(&self) -> &Report { &self.report }
     pub fn output_path(&self) -> &Path { &self.out_path }
     pub fn retained_paths(&self) -> &[PathBuf] { &self.retained }
     pub fn is_published(&self) -> bool { self.published }
+    pub fn has_marker_custom_data(&self, key: &MarkerDataKey) -> bool {
+        self.saved_marker_data.contains(key)
+    }
+    pub fn has_marker_original_color(&self, key: &MarkerDataKey) -> bool {
+        self.saved_marker_colors.contains(key)
+    }
     /// Reserve another conversion output against both LUT files and their directory.
     /// Existing parents are resolved, so aliases cannot evade the preparation check.
     pub fn check_reserved_output(&self, path: &Path) -> Result<()> {
@@ -572,6 +580,7 @@ impl LegacyClips<'_> {fn values(&self)->impl Iterator<Item=&Clip>{self.order.ite
 impl std::ops::Index<&str> for LegacyClips<'_>{type Output=Clip;fn index(&self,id:&str)->&Clip{self.get(id).expect("validated legacy clip reference")}}
 struct WriterInput<'a> {
     options:&'a super::model::Options,
+    marker_provenance: Option<MarkerProvenance<'a>>,
     clips:LegacyClips<'a>,
     originals:HashMap<&'a str,&'a super::prepared::OriginalClip>,
     bins:&'a [super::model::Bin], sequences:&'a [Sequence],
@@ -582,11 +591,13 @@ struct WriterInput<'a> {
     audio_pans: &'a [super::prepared::PreparedAudioPan],
     audio_mixers: &'a BTreeMap<usize, super::prepared::PreparedAudioMixer>,
     track_states: &'a BTreeMap<usize, Vec<super::prepared::PreparedTrackState>>,
+    timeline_marks: &'a BTreeMap<usize, super::prepared::PreparedTimelineMarks>,
     non_drop_sequences: &'a HashSet<usize>,
     picture_effects: &'a [PreparedPictureEffect],
     source_luts: &'a [super::prepared::PreparedSourceLut],
     extended_sdr_grades: &'a HashSet<(usize, usize)>,
     edit_labels: &'a [super::prepared::PreparedEditLabel],
+    frame_holds: &'a HashMap<(usize, usize), i64>,
     disabled_edits: &'a HashSet<(usize, usize)>,
     direct_dnxhr_origins: &'a HashMap<String, i64>,
     direct_dnxhd_pcm24: Option<&'a HashSet<String>>,
@@ -629,6 +640,8 @@ struct Writer<'a> {
     media: MediaTable,
     ids: &'a mut dyn UuidSource,
     report: Report,
+    saved_marker_data: HashSet<MarkerDataKey>,
+    saved_marker_colors: HashSet<MarkerDataKey>,
     root: ItemId,
     sequence_parent: Option<ItemId>,
     out_path: PathBuf,
@@ -708,8 +721,59 @@ impl Writer<'_> {
         Ok(filename)
     }
 
-    fn add_clip_marker(&mut self, item: ItemId, marker: &Marker, start: i64) -> Result<()> {
-        mk::add_clip_marker(&mut self.project, item, marker, start, &self.model.options, &mut self.report.notes, self.ids)?;
+    fn add_clip_marker(&mut self, item: ItemId, marker: &Marker, start: i64) -> Result<crate::xml::NodeId> {
+        Ok(mk::add_clip_marker_node(&mut self.project, item, marker, start, &self.model.options, &mut self.report.notes, self.ids)?)
+    }
+
+    fn original_markers(&mut self, item: ItemId, metadata: &super::prepared::ClipMetadata) -> Result<()> {
+        let mut custom_data = Vec::new();
+        let mut source_colors = Vec::new();
+        let mut budget = mk::MAX_MARKER_CUSTOM_DATA;
+        for (index, marker) in metadata.markers.iter().enumerate() {
+            let node = self.add_clip_marker(item, marker, marker.start)?;
+            let Some(rows) = self.model.marker_provenance else { continue };
+            let key = MarkerDataKey::Source(metadata.id.clone(), index);
+            let custom = rows.custom_data.get(&key)
+                .filter(|data| !data.is_empty() && data.len() <= budget && custom_data.len() < 128);
+            let source_color = rows.original_colors.get(&key).filter(|_| source_colors.len() < 128);
+            if custom.is_none() && source_color.is_none() { continue; }
+            let tree = &self.project.doc.tree;
+            let guid = crate::model::marker::marker_guid(tree, node)?;
+            if let Some(data) = custom {
+                custom_data.push(format!("{guid}:{}", crate::hash::hex(data.as_bytes())));
+                budget -= data.len();
+                self.saved_marker_data.insert(key.clone());
+            }
+            if let Some(bit) = source_color {
+                self.save_marker_color(node, &guid, *bit, key, &mut source_colors)?;
+            }
+        }
+        if !custom_data.is_empty() || !source_colors.is_empty() {
+            let tree = &self.project.doc.tree;
+            let element = self.project.item(item).element;
+            let uid = tree.get(element, "ObjectUID")
+                .ok_or_else(|| other("source marker custom data lacks an item UID"))?
+                .to_owned();
+            let props = tree.find1(element, "ProjectItem/Node/Properties")
+                .ok_or_else(|| other("source marker custom data lacks a property bag"))?;
+            for (tag, entries) in [(mk::SOURCE_MARKER_DATA, custom_data), (mk::SOURCE_MARKER_COLORS, source_colors)] {
+                if !entries.is_empty() {
+                    let saved = format!("1 {uid} {}", entries.join(","));
+                    crate::xml::mutations::append_leaf(&mut self.project.doc.tree, props, tag, &saved);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn save_marker_color(
+        &mut self, node: crate::xml::NodeId, guid: &str, bit: u64,
+        key: MarkerDataKey, entries: &mut Vec<String>,
+    ) -> Result<()> {
+        let preview = crate::model::marker::marker_color_index(&self.project.doc.tree, node)?
+            .ok_or_else(|| other("marker fallback color is outside the Premiere palette"))?;
+        entries.push(format!("{guid}:{bit}:{preview}"));
+        self.saved_marker_colors.insert(key);
         Ok(())
     }
 
@@ -796,7 +860,7 @@ impl Writer<'_> {
             let item=imported?;
             metadata::apply(&mut self.project,item,c.metadata.avid.as_ref())?;
             if let Some(rgb)=c.metadata.avid.as_ref().and_then(|a|a.color_rgb16){let label=colors::nearest_label(rgb,&model.options.clip_labels);mk::set_label(&mut self.project,item,label)?;}
-            for m in &c.metadata.markers {self.add_clip_marker(item,m,m.start)?;}
+            self.original_markers(item, &c.metadata)?;
             self.items.insert(clip_id.into(),(c.video.as_ref().map(|_|item),vec![]));
             self.clip_bins.insert(clip_id.into(),target);
             self.placement.insert(clip_id.into(),("original",Payload::Original(item)));
@@ -1036,9 +1100,10 @@ impl Writer<'_> {
     }
 
     /// `marked`: the settled source and own markers on an edit copy.
-    fn marked(&mut self, item: ItemId, source_ms: &[&Marker], own_ms: &[&Marker], base: i64, e: &Event, extra: &mut Vec<Extra>) -> Result<()> {
+    fn marked(&mut self, item: ItemId, source_ms: &[&Marker], own_ms: &[&Marker], base: i64, e: &Event, extra: &mut Vec<Extra>) -> Result<usize> {
         let where_ = py_str_repr(&self.project.item_name(item));
         let (keep_source, keep_own) = self.settle(e, source_ms, own_ms, extra, &where_)?;
+        let source_count = keep_source.len();
         for m in keep_source {
             self.add_clip_marker(item, m, add(base, m.start)?)?;
         }
@@ -1048,6 +1113,62 @@ impl Writer<'_> {
             };
             self.add_clip_marker(item, o, add(base, source)?)?;
         }
+        Ok(source_count)
+    }
+
+    fn save_edit_marker_provenance(
+        &mut self,
+        copy: ItemId,
+        parent: ItemId,
+        sequence: SequenceId,
+        position: (usize, usize),
+        edit: &Event,
+        source_count: usize,
+    ) -> Result<()> {
+        let tree = &self.project.doc.tree;
+        let marks = &self.project.item_markers(copy)[source_count..];
+        if marks.is_empty() || marks.len() > 128 {
+            return Ok(());
+        }
+        let parent = tree.get(self.project.item(parent).element, "ObjectUID")
+            .ok_or_else(|| other("edit marker original lacks ObjectUID"))?;
+        let sequence = self.project.sequence_id(sequence)
+            .ok_or_else(|| other("edit marker sequence lacks ObjectUID"))?;
+        let mut ids = Vec::with_capacity(marks.len());
+        let mut budget = mk::MAX_MARKER_CUSTOM_DATA;
+        let mut version = 1;
+        let (sequence_index, event) = position;
+        for &mark in marks {
+            let mut guid = crate::model::marker::marker_guid(tree, mark)?;
+            let key = MarkerDataKey::Edit(sequence_index, event, crate::model::marker::marker_start(tree, mark)?.ticks);
+            if let Some(rows) = self.model.marker_provenance {
+                let custom = rows.custom_data.get(&key)
+                    .filter(|data| !data.is_empty() && data.len() <= budget);
+                let color = rows.original_colors.get(&key);
+                if custom.is_some() || color.is_some() {
+                    guid.push(':');
+                    if let Some(data) = custom {
+                        guid.push_str(&crate::hash::hex(data.as_bytes()));
+                        budget -= data.len();
+                        self.saved_marker_data.insert(key.clone());
+                        version = version.max(2);
+                    }
+                    if let Some(bit) = color {
+                        let preview = crate::model::marker::marker_color_index(tree, mark)?
+                            .ok_or_else(|| other("marker fallback color is outside the Premiere palette"))?;
+                        guid.push_str(&format!(":{bit}:{preview}"));
+                        self.saved_marker_colors.insert(key);
+                        version = 3;
+                    }
+                }
+            }
+            ids.push(guid);
+        }
+        let data = format!("{version} {parent} {sequence} {} {} {} {}", edit.record_start,
+            edit.source_in, edit.duration, ids.join(","));
+        let props = tree.find1(self.project.item(copy).element, "ProjectItem/Node/Properties")
+            .ok_or_else(|| other("edit marker item lacks a property bag"))?;
+        crate::xml::mutations::append_leaf(&mut self.project.doc.tree, props, mk::EDIT_MARKER_PROVENANCE, &data);
         Ok(())
     }
 
@@ -1058,6 +1179,7 @@ impl Writer<'_> {
     fn edit_copy(
         &mut self,
         seq: &Sequence,
+        sequence: SequenceId,
         position: (usize, usize),
         e: &Event,
         kind: &str,
@@ -1074,7 +1196,18 @@ impl Writer<'_> {
             let copy=super::original::add_item(&mut self.project,c,&name,self.ids);
             self.project.import_target=previous;let copy=copy?;
             metadata::apply(&mut self.project,copy,c.metadata.avid.as_ref())?;
-            self.marked(copy,&c.metadata.markers.iter().collect::<Vec<_>>(),own,0,e,extra)?;
+            let source_count = self.marked(copy, &c.metadata.markers.iter().collect::<Vec<_>>(), own, 0, e, extra)?;
+            if model.marker_provenance.is_some() && e.video_track == Some(1) && e.audio_tracks.is_empty()
+                && e.speed_ratio.is_none() && e.time_remap.is_none() && c.audio.is_none()
+                && matches!((seq.rate.num, seq.rate.den), (24, 1) | (24000, 1001))
+                && c.video.as_ref().is_some_and(|v| v.rate == seq.rate
+                    && v.codec == "apch" && (v.width, v.height) == (1920, 1080))
+            {
+                let Payload::Original(parent) = payload else {
+                    return Err(other("edit marker copy has no original item"));
+                };
+                self.save_edit_marker_provenance(copy, parent, sequence, position, e, source_count)?;
+            }
             move_to_processed_clips(&mut self.project,&[copy],Some(target),self.ids)?;
             return Ok(Payload::Original(copy));
         }
@@ -1516,7 +1649,7 @@ impl Writer<'_> {
             let picture_effect = prepared_picture.map(|(effect, _)| effect);
             let (kind, mut payload) = self.placement[&e.clip].clone();
             if let Some(own) = edit_markers.get(&(i as i64)) {
-                payload = self.edit_copy(seq, (sequence_index, i), e, kind, payload, own, &mut extra_markers)?;
+                payload = self.edit_copy(seq, sequence, (sequence_index, i), e, kind, payload, own, &mut extra_markers)?;
             }
             let start = Time::new(e.record_start);
             if let Some(v) = e.video_track {
@@ -1816,6 +1949,12 @@ impl Writer<'_> {
                 let r = if is_video { rect.as_deref() } else { None };
                 normalize_placement(&mut self.project, t, r)?;
                 if is_video {
+                    if let Some(held_ticks) = self.model.frame_holds.get(&(sequence_index, i)) {
+                        let clip = self.project.track_item(t).clip;
+                        let tree = &mut self.project.doc.tree;
+                        crate::xml::mutations::append_leaf(tree, clip, "FrameHoldStart", &held_ticks.to_string());
+                        crate::xml::mutations::append_leaf(tree, clip, "FrameHold", "5");
+                    }
                     if dissolve_events.contains(&i) && dissolve_items.insert(i, t).is_some() {
                         return Err(other("dissolve endpoint produced more than one picture item"));
                     }
@@ -1850,7 +1989,11 @@ impl Writer<'_> {
                         set_time_remap(&mut self.project, t, &keys)?;
                     }
                 }
-                if original.is_some() {
+                if original.and_then(|clip| clip.video.as_ref()).is_some_and(|video| video.codec == "apch") {
+                    self.report.notes.push(format!(
+                        "sequence {seq_name} event {i}: linked ProRes conform as Premiere Time Remapping from verified source frames"
+                    ));
+                } else if original.is_some() {
                     let direction = if seq.rate == Fraction::new(24, 1) {
                         "23.976 to 24"
                     } else {
@@ -2139,17 +2282,49 @@ impl Writer<'_> {
         }
         let unit = ticks_per_unit(seq.rate);
         let mut filler_video: BTreeMap<i64, Vec<&Marker>> = BTreeMap::new();
-        for m in &seq.markers {
+        let mut custom_data = Vec::new();
+        let mut original_colors = Vec::new();
+        let mut custom_budget = mk::MAX_MARKER_CUSTOM_DATA;
+        for (index, m) in seq.markers.iter().enumerate() {
             let track = m.track.as_deref().unwrap_or("");
             if m.owner == "sequence" {
                 let note = if track.is_empty() { String::new() } else { format!("on {track}") };
-                mk::add_sequence_marker(&mut self.project, sequence, m, m.start, options, &mut self.report.notes, &note, self.ids)?;
+                let marker = mk::add_sequence_marker(&mut self.project, sequence, m, m.start, options, &mut self.report.notes, &note, self.ids)?;
+                let key = MarkerDataKey::Sequence(sequence_index, index);
+                let Some(rows) = model.marker_provenance else { continue };
+                let custom = rows.custom_data.get(&key)
+                    .filter(|data| !data.is_empty() && data.len() <= custom_budget && custom_data.len() < 128);
+                let color = rows.original_colors.get(&key).filter(|_| original_colors.len() < 128);
+                if custom.is_some() || color.is_some() {
+                    let guid = crate::model::marker::marker_guid(&self.project.doc.tree, marker)?;
+                    if let Some(data) = custom {
+                        custom_data.push(format!("{guid}:{}", crate::hash::hex(data.as_bytes())));
+                        custom_budget -= data.len();
+                        self.saved_marker_data.insert(key.clone());
+                    }
+                    if let Some(bit) = color {
+                        self.save_marker_color(marker, &guid, *bit, key, &mut original_colors)?;
+                    }
+                }
             } else if m.owner == "filler" && track.starts_with('V') {
                 filler_video.entry(py_int(&track[1..])?).or_default().push(m);
             } else if m.owner == "filler" {
                 // Adjustment layers are video-only.
                 let note = format!("on empty {}", m.track.as_deref().unwrap_or("None"));
                 mk::add_sequence_marker(&mut self.project, sequence, m, m.start, options, &mut self.report.notes, &note, self.ids)?;
+            }
+        }
+        if !custom_data.is_empty() || !original_colors.is_empty() {
+            let uid = self.project.sequence_id(sequence)
+                .ok_or_else(|| other("sequence marker custom data lacks a sequence UID"))?.to_owned();
+            let props = self.project.doc.tree.find1(
+                self.project.sequence(sequence).element, "Node/Properties",
+            ).ok_or_else(|| other("sequence marker custom data lacks a property bag"))?;
+            for (tag, entries) in [(mk::SEQUENCE_MARKER_DATA, custom_data), (mk::SEQUENCE_MARKER_COLORS, original_colors)] {
+                if !entries.is_empty() {
+                    let saved = format!("1 {uid} {}", entries.join(","));
+                    crate::xml::mutations::append_leaf(&mut self.project.doc.tree, props, tag, &saved);
+                }
             }
         }
         for (m, start, note) in &extra_markers {
@@ -2231,6 +2406,16 @@ impl Writer<'_> {
         }
         order_track_items(&mut self.project, sequence)?;
         self.project.finish_sequence_extent()?;
+        if let Some(marks) = model.timeline_marks.get(&sequence_index) {
+            let end = self.project.sequence_end(sequence)?.ticks;
+            if marks.in_ticks.is_some_and(|ticks| ticks >= end)
+                || marks.out_ticks.is_some_and(|ticks| ticks > end)
+            {
+                return Err(other("prepared timeline marks exceed the destination extent"));
+            }
+            self.project.set_sequence_in_point(sequence, marks.in_ticks.map(Time::new))?;
+            self.project.set_sequence_out_point(sequence, marks.out_ticks.map(Time::new))?;
+        }
         if let Some(states) = model.track_states.get(&sequence_index) {
             for state in states {
                 let track = match state.lane {
@@ -2331,25 +2516,51 @@ pub fn prepare_project_with_effects(model: &Model, editorial: Editorial<'_>,
         })?;
     super::prepared::validate_constant_speeds(constant_speeds, &model.options, &model.sequences,
         |id, seq, event, speed| model.clips.get(id).is_some_and(|clip| speed.raw_trim(seq, event, clip).is_some()))?;
-    let view=WriterInput{options:&model.options,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),non_drop_sequences:&HashSet::new(),picture_effects,source_luts:&[],extended_sdr_grades:&HashSet::new(),edit_labels:&[],disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
+    let view=WriterInput{options:&model.options,marker_provenance:None,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),timeline_marks:&BTreeMap::new(),non_drop_sequences:&HashSet::new(),picture_effects,source_luts:&[],extended_sdr_grades:&HashSet::new(),edit_labels:&[],frame_holds:&HashMap::new(),disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
     prepare_view(&view,model,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new())
 }
 
 /// Validated typed input for mixed original-file and legacy media; model/1 remains strict.
 pub fn prepare_typed_project(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool)->Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new())
+    prepare_typed_project_impl(input,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new(), None)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum MarkerDataKey {
+    /// Destination sequence and marker indices.
+    Sequence(usize, usize),
+    /// Destination original clip ID and its marker index.
+    Source(String, usize),
+    /// Destination sequence index, event index and marker source ticks.
+    Edit(usize, usize, i64),
+}
+
+#[derive(Clone, Copy)]
+pub struct MarkerProvenance<'a> {
+    pub custom_data: &'a HashMap<MarkerDataKey, String>,
+    pub original_colors: &'a HashMap<MarkerDataKey, u64>,
+}
+
+/// Prepare the internal Resolve-linked route with marker identities and provenance.
+pub fn prepare_typed_project_with_marker_provenance(
+    input: &super::prepared::PreparedProjectInput,
+    out_path: impl AsRef<Path>,
+    ids: &mut dyn UuidSource,
+    provenance: MarkerProvenance<'_>,
+) -> Result<PreparedProject> {
+    prepare_typed_project_impl(input, out_path, ids, &[], false, None, &HashSet::new(), &HashSet::new(), Some(provenance))
 }
 
 /// Prepare selected source bins under one import root and their relative folder hierarchy.
 /// Layout validation completes before UUID allocation or project construction.
 pub fn prepare_typed_project_with_layout(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:&DestinationBinLayout)->Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,media,native_av,Some(layout),&HashSet::new(), &HashSet::new())
+    prepare_typed_project_impl(input,out_path,ids,media,native_av,Some(layout),&HashSet::new(), &HashSet::new(), None)
 }
 pub fn prepare_offline_project(
     input: &super::prepared::PreparedProjectInput, out_path: impl AsRef<Path>,
     ids: &mut dyn UuidSource, layout: Option<&DestinationBinLayout>, offline: &HashSet<&str>,
 ) -> Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,&[],false,layout,offline, &HashSet::new())
+    prepare_typed_project_impl(input,out_path,ids,&[],false,layout,offline, &HashSet::new(), None)
 }
 
 /// Use the validated OP1a bin master construction for selected in-place MXFs.
@@ -2359,10 +2570,10 @@ pub fn prepare_linked_op1a_project(
     ids: &mut dyn UuidSource, media: &[super::rewrap::MediaRelink],
     clips: &HashSet<String>, layout: Option<&DestinationBinLayout>, offline: &HashSet<&str>,
 ) -> Result<PreparedProject> {
-    prepare_typed_project_impl(input, out_path, ids, media, false, layout, offline, clips)
+    prepare_typed_project_impl(input, out_path, ids, media, false, layout, offline, clips, None)
 }
 
-fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>,linked_op1a:&HashSet<String>)->Result<PreparedProject> {
+fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>,linked_op1a:&HashSet<String>,marker_provenance:Option<MarkerProvenance<'_>>)->Result<PreparedProject> {
     if let Some(layout) = layout { layout.validate(&input.bins)?; }
     if !native_av && layout.is_some() {
         input.validate_whole_project()?;
@@ -2391,7 +2602,7 @@ fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_p
             sequence
         }).collect();
     }
-    let view=WriterInput{options:&input.options,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,non_drop_sequences:&input.non_drop_sequences,picture_effects:&input.picture_effects,source_luts:&input.source_luts,extended_sdr_grades:&input.extended_sdr_grades,edit_labels:&input.edit_labels,disabled_edits:&input.disabled_edits,direct_dnxhr_origins:&input.direct_dnxhr_origins,direct_dnxhd_pcm24:Some(&input.direct_dnxhd_pcm24),constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,autosync_bins:&input.autosync_bins,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,layered_submasters:&input.layered_submasters,png_mattes:&input.png_mattes};
+    let view=WriterInput{options:&input.options,marker_provenance,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,timeline_marks:&input.timeline_marks,non_drop_sequences:&input.non_drop_sequences,picture_effects:&input.picture_effects,source_luts:&input.source_luts,extended_sdr_grades:&input.extended_sdr_grades,edit_labels:&input.edit_labels,frame_holds:&input.frame_holds,disabled_edits:&input.disabled_edits,direct_dnxhr_origins:&input.direct_dnxhr_origins,direct_dnxhd_pcm24:Some(&input.direct_dnxhd_pcm24),constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,autosync_bins:&input.autosync_bins,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,layered_submasters:&input.layered_submasters,png_mattes:&input.png_mattes};
     prepare_view(&view,&legacy,out_path,ids,media,native_av,layout,offline,linked_op1a)
 }
 fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
@@ -2703,6 +2914,8 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         media: table,
         ids,
         report,
+        saved_marker_data: HashSet::new(),
+        saved_marker_colors: HashSet::new(),
         root,
         sequence_parent: layout.map(|_| root),
         out_path: out_path.clone(),
@@ -2915,7 +3128,8 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
     }
     let saved=writer.project.prepare_new_save(&out_path)?;
     let prepared=PreparedProject {saved:Some(saved),out_path,report:writer.report,assets:writer.assets,
-        assets_attempted:false,assets_published:false,published:false,retained:Vec::new()};
+        assets_attempted:false,assets_published:false,published:false,retained:Vec::new(),
+        saved_marker_data:writer.saved_marker_data,saved_marker_colors:writer.saved_marker_colors};
     prepared.recheck_outputs()?;
     Ok(prepared)
 }

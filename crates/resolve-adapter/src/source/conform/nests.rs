@@ -170,7 +170,7 @@ pub(super) fn add<'a>(
         }
         // A child transition or unsupported edit takes precedence over
         // the projected file edits and empty intervals at those frames.
-        for unknown in child.unqualified.iter().chain(&child.dissolve) {
+        for unknown in child.unqualified.iter().chain(&child.dissolves) {
             let overlap = clipped(unknown);
             if !overlap.is_empty() {
                 let interval = project(&overlap);

@@ -236,6 +236,45 @@ pub(super) fn fields(data: &[u8]) -> Result<Vec<(u64, Wire<'_>)>> {
     Ok(fields)
 }
 
+pub(super) fn default_picture_settings(
+    project: &super::Node,
+    blobs: &mut Blobs,
+) -> Result<(bool, Option<&'static str>)> {
+    let Some(config) = project.optional("CommonConfig")? else { return Ok((false, None)); };
+    let encoded = blobs.qt(config.entry()?.get("FieldsBlob")?)?;
+    let setup = encoded.bytes("SetupBA")?;
+    if setup.len() < 9 || setup[..4] != 1u32.to_be_bytes()
+        || u32::from_be_bytes(setup[4..8].try_into()?) as usize != setup.len() - 8
+        || setup[8] != 0x81
+    {
+        return Ok((false, None));
+    }
+    let decoded = zstd::bulk::decompress(&setup[9..], MAX_BLOB)?;
+    blobs.charge(decoded.len())?;
+    // Resolve Studio 21.2 omits field 180 for the measured Nearest
+    // default. The same setting changed to Frame Blend stores value 2.
+    let config = fields(&decoded)?;
+    let nearest = !config.iter().any(|(field, _)| *field == 180);
+    // The default Scale entire image to fit omits field 98. Choosing
+    // Center crop with no resizing in the same project saved zero there.
+    let mut sizing_fields = config.iter().filter(|(field, _)| *field == 98);
+    let sizing = match (sizing_fields.next(), sizing_fields.next()) {
+        (None, None) => Some(crate::input_scaling::FIT),
+        (Some((_, Wire::Int(0))), None) => Some(crate::input_scaling::CENTER_CROP),
+        _ => None,
+    };
+    Ok((nearest, sizing))
+}
+
+pub(super) fn valid_clip_sizing_state(property: &[u8]) -> Result<bool> {
+    // Reapplying the control changes the second integer. The actual
+    // choice is identified separately by EffectFiltersBA.
+    let properties = fields(property)?;
+    let [(3, Wire::Bytes(state))] = properties.as_slice() else { return Ok(false) };
+    Ok(matches!(fields(state)?.as_slice(),
+        [(1, Wire::Int(1)), (2, Wire::Int(saved))] if *saved > 0))
+}
+
 pub(super) fn pb_bytes(data: &[u8], wanted: u64) -> Result<Option<&[u8]>> {
     let mut found = None;
     for (key, value) in fields(data)? {
@@ -257,17 +296,27 @@ pub(super) fn hex_bytes(encoded: &str) -> Result<Vec<u8>> {
 }
 
 pub(super) fn rate(data: &[u8]) -> Result<Rational> {
-    // The known non-drop encoding stores the exact binary64 rate and zero flags.
-    let [bytes @ .., 0, 0, 0, 0, 0, 0, 0, 0] = data else {
+    Ok(frame_rate(data)?.0)
+}
+
+pub(super) fn frame_rate(data: &[u8]) -> Result<(Rational, bool)> {
+    // Media uses the non-drop representation. Native 29.97 DF timelines
+    // store a one in the final byte of the otherwise identical rate field.
+    let [bytes @ .., 0, 0, 0, 0, 0, 0, 0, drop @ (0 | 1)] = data else {
         return Err("unsupported Resolve frame-rate flags".into());
     };
     let fps = f64::from_le_bytes(bytes.try_into()?);
     let (n, d) = match fps {
         x if x.to_bits() == crate::RATE.to_bits() => (24000, 1001),
         24.0 => (24, 1),
+        25.0 => (25, 1),
+        x if x == 30000.0 / 1001.0 => (30000, 1001),
         _ => return Err("unsupported Resolve source frame rate".into()),
     };
-    Ok(Rational::new(n, d).expect("known rate"))
+    if *drop == 1 && n != 30000 {
+        return Err("unqualified drop-frame flag for Resolve frame rate".into());
+    }
+    Ok((Rational::new(n, d).expect("known rate"), *drop == 1))
 }
 
 pub(super) fn frames(seconds: f64, rate: Rational) -> Result<i64> {
@@ -324,6 +373,50 @@ pub(super) fn raster(data: &[u8]) -> Result<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_sizing_does_not_inherit_an_unknown_or_duplicate_value() {
+        use crate::input_scaling::{CENTER_CROP, FIT};
+
+        let settings = |body: &[u8]| {
+            let mut setup = hex_bytes(&crate::binary::pack(body).unwrap()).unwrap();
+            setup[3] = 1; // Project SetupBA uses the version-one envelope.
+            let qt = crate::binary::qt(&[("SetupBA", crate::binary::Qt::Bytes(&setup))]);
+            let project = super::super::xml::parse(&format!(
+                "<SM_Project><CommonConfig><SM_Config><FieldsBlob>{}</FieldsBlob></SM_Config></CommonConfig></SM_Project>",
+                hex::encode(qt),
+            ), &mut 0).unwrap();
+            default_picture_settings(&project, &mut Blobs::default()).unwrap()
+        };
+        assert_eq!(settings(&[]), (true, Some(FIT)));
+        assert_eq!(settings(&[0x90, 0x06, 0]), (true, Some(CENTER_CROP)));
+        assert_eq!(settings(&[0x90, 0x06, 1]), (true, None));
+        assert_eq!(settings(&[0x90, 0x06, 0, 0x90, 0x06, 0]), (true, None));
+        assert_eq!(settings(&[0xa0, 0x0b, 2]), (false, Some(FIT)));
+    }
+
+    #[test]
+    fn clip_sizing_state_accepts_native_variation_in_the_opaque_value() {
+        for saved in ["1a07080110c4839806", "1a080801108fd7f19601"] {
+            assert!(valid_clip_sizing_state(&hex_bytes(saved).unwrap()).unwrap());
+        }
+        assert!(!valid_clip_sizing_state(&[0x1a, 4, 8, 1, 16, 0]).unwrap());
+        assert!(!valid_clip_sizing_state(&[0x1a, 4, 8, 2, 16, 1]).unwrap());
+    }
+
+    #[test]
+    fn rate_fields_distinguish_the_2997_drop_frame_flag_from_media_rate() {
+        let mut bytes = hex::decode("286b55e253f83d400000000000000001").unwrap();
+        let ntsc = Rational::new(30000, 1001).unwrap();
+        assert_eq!(frame_rate(&bytes).unwrap(), (ntsc, true));
+        bytes[15] = 0;
+        assert_eq!(frame_rate(&bytes).unwrap(), (ntsc, false));
+        bytes[15] = 2;
+        assert!(frame_rate(&bytes).is_err());
+        bytes[..8].copy_from_slice(&25_f64.to_le_bytes());
+        bytes[15] = 1;
+        assert!(frame_rate(&bytes).is_err());
+    }
 
     #[test]
     fn bounded_encodings_reject_ambiguous_fields_and_off_grid_clocks() {

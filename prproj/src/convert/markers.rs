@@ -126,6 +126,19 @@ fn color(marker: &Marker, options: &Options, notes: &mut Vec<String>) -> Option<
     index
 }
 
+/// Project-item property for the bounded internal Resolve marker round trip.
+pub const EDIT_MARKER_PROVENANCE: &str = "AnyNLE.Resolve.EditMarkers";
+/// Sequence property carrying Resolve custom data by Premiere marker GUID.
+pub const SEQUENCE_MARKER_DATA: &str = "AnyNLE.Resolve.SequenceMarkerData";
+/// Sequence property pairing an original Resolve color with its Premiere fallback.
+pub const SEQUENCE_MARKER_COLORS: &str = "AnyNLE.Resolve.SequenceMarkerColors";
+/// Shared source item property carrying Resolve custom data by Premiere marker GUID.
+pub const SOURCE_MARKER_DATA: &str = "AnyNLE.Resolve.SourceMarkerData";
+/// Source item property pairing an original Resolve color with its Premiere fallback.
+pub const SOURCE_MARKER_COLORS: &str = "AnyNLE.Resolve.SourceMarkerColors";
+/// Maximum total UTF-8 bytes of Resolve data on one Premiere metadata owner.
+pub const MAX_MARKER_CUSTOM_DATA: usize = 1024;
+
 /// `add_clip_marker`: a clip marker at `start` ticks of the item's media time.
 pub fn add_clip_marker(
     project: &mut Project,
@@ -136,6 +149,19 @@ pub fn add_clip_marker(
     notes: &mut Vec<String>,
     uuids: &mut dyn UuidSource,
 ) -> Result<()> {
+    add_clip_marker_node(project, item, marker, start, options, notes, uuids)?;
+    Ok(())
+}
+
+pub(super) fn add_clip_marker_node(
+    project: &mut Project,
+    item: ItemId,
+    marker: &Marker,
+    start: i64,
+    options: &Options,
+    notes: &mut Vec<String>,
+    uuids: &mut dyn UuidSource,
+) -> Result<crate::xml::NodeId> {
     let core = project.own_clip_core(item)?;
     ensure_inner_list(&mut project.doc, core)?;
     let comments = comment_for(marker, options, "");
@@ -150,7 +176,7 @@ pub fn add_clip_marker(
     if let Some(index) = color(marker, options, notes) {
         set_color_index(&mut project.doc.tree, m, index, uuids)?;
     }
-    Ok(())
+    Ok(m)
 }
 
 /// `add_sequence_marker`: a comment marker on a sequence (`note` says where it sat in Avid).
@@ -164,7 +190,7 @@ pub fn add_sequence_marker(
     notes: &mut Vec<String>,
     note: &str,
     uuids: &mut dyn UuidSource,
-) -> Result<()> {
+) -> Result<crate::xml::NodeId> {
     let comments = comment_for(marker, options, note);
     let spec = MarkerSpec {
         name: &marker.name,
@@ -177,7 +203,7 @@ pub fn add_sequence_marker(
     if let Some(index) = color(marker, options, notes) {
         set_color_index(&mut project.doc.tree, m, index, uuids)?;
     }
-    Ok(())
+    Ok(m)
 }
 
 /// `xml.sax.saxutils.escape`.

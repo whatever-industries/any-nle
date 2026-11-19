@@ -5,7 +5,7 @@ use crate::{
     video::{centered_crop_profile, roll::LinearRoll, validate_static_geometry},
     Result,
 };
-use graph::{picture_motion::MotionKey, Rational, StreamKind, Transform, Value};
+use graph::{picture_motion::MotionKey, Rational, Sidecar, StreamKind, Transform, Value, VolumeKey};
 use prproj::{
     build::time::TICKS_PER_SECOND,
     model::{
@@ -24,6 +24,7 @@ pub(super) enum ClipControl {
     LinearMotion([MotionKey; 2]),
     LinearRoll(LinearRoll),
     MonoVolume(f64),
+    MonoVolumeKeys([VolumeKey; 2]),
 }
 
 pub(super) fn interpret(
@@ -90,7 +91,10 @@ pub(super) fn interpret(
             })
         }
         (StreamKind::Audio, MONO_VOLUME) if neutral_mute(project, owner)? => {
-            Ok(mono_volume(params).map(ClipControl::MonoVolume))
+            Ok(mono_volume(params).map(ClipControl::MonoVolume).or_else(|| {
+                mono_volume_keys(params, source_in, source_out, frame_ticks)
+                    .map(ClipControl::MonoVolumeKeys)
+            }))
         }
         _ => Ok(None),
     }
@@ -237,13 +241,60 @@ fn mono_volume(params: &[Value]) -> Option<f64> {
             return None;
         }
     }
-    if raw <= 0.0 {
-        return None;
-    }
-    // Premiere's saved Level gives unity at -15 dB in its numeric domain.
-    let db = 20.0 * raw.log10() + 15.0;
+    let db = clip_level_db(raw)?;
     let rounded = (db * 10.0).round() / 10.0;
     ((db - rounded).abs() < 1e-5 && VOLUME_DB.contains(&rounded)).then_some(rounded)
+}
+
+fn clip_level_db(raw: f64) -> Option<f64> {
+    // Premiere's saved Level gives unity at -15 dB in its numeric domain.
+    (raw > 0.0).then(|| 20.0 * raw.log10() + 15.0)
+}
+
+fn mono_volume_keys(
+    params: &[Value],
+    source_in: i64,
+    source_out: i64,
+    frame_ticks: i64,
+) -> Option<[VolumeKey; 2]> {
+    let [param] = params else { return None };
+    if frame_ticks != TICKS_PER_SECOND / 24
+        || !matches!(param.get("parameter"), Some(Value::Str(name)) if name == "level")
+        || !matches!(param.get("is_time_varying")?, Value::Null | Value::Bool(true))
+    {
+        return None;
+    }
+    let [first, last] = keys(param)? else { return None };
+    let parse = |key: &Value| {
+        let Value::Int(ticks) = key.get("ticks")? else { return None };
+        let Value::Arr(aux) = key.get("auxiliary_fields")? else { return None };
+        if !is_linear(key) || aux.len() != 4 || ticks % frame_ticks != 0
+            || !(source_in..source_out).contains(ticks)
+        {
+            return None;
+        }
+        Some(VolumeKey {
+            at: Rational::new((*ticks).into(), TICKS_PER_SECOND.into())?,
+            db: clip_level_db(number(key.get("value")?)?)?,
+        })
+    };
+    let (first, last) = (parse(first)?, parse(last)?);
+    (first.at < last.at).then_some([first, last])
+}
+
+pub(super) fn volume_key_receipt(owner: &str, keys: [VolumeKey; 2]) -> Sidecar {
+    Sidecar {
+        adapter: "premiere.clip_volume".into(),
+        object: owner.into(),
+        data: Value::Obj(vec![
+            ("volume_key_clock".into(), Value::Str("item_source".into())),
+            ("interpolation".into(), Value::Str("premiere_linear_level".into())),
+            ("keys".into(), Value::Arr(keys.into_iter().map(|key| Value::Obj(vec![
+                ("at".into(), Value::Str(key.at.to_string())),
+                ("db".into(), Value::Float(key.db)),
+            ])).collect())),
+        ]),
+    }
 }
 
 fn motion(
