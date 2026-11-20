@@ -45,6 +45,7 @@ for what Any NLE preserves and where equivalent transfer still needs work.
 | Reusable AutoSync, track names, and disabled edits | [AutoSync source sequences](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#reusable-autosync-source-sequences), [timeline track names](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#timeline-track-names), and [disabled edits](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#disabled-clip-occurrences) |
 | Moved files and relinking | [Verified relink](docs/VERIFIED-RELINK.md) |
 | Conversion behavior and coverage by direction | [Decisions explained](docs/DECISIONS-EXPLAINED.md) and [roadmap](docs/ROADMAP.md#linked-media-conversion-parity) |
+| Current implementation and qualification priorities | [Next work](docs/ROADMAP.md#next-work) |
 
 ## Command line
 

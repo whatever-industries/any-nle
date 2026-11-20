@@ -9,6 +9,7 @@ mod clip_label;
 mod dissolve;
 mod generator;
 mod grade;
+mod clip_fusion;
 mod group;
 mod input_scaling;
 pub mod linked;

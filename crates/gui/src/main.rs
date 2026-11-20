@@ -18,6 +18,21 @@ mod storage;
 mod wizard;
 
 fn main() -> eframe::Result {
+    #[cfg(feature = "wizard-automation")]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().is_some_and(|arg| arg == "--automation") {
+            let Some(path) = args.next().filter(|_| args.next().is_none()) else {
+                eprintln!("Usage: any-nle-gui --automation SCENARIO.json");
+                std::process::exit(2);
+            };
+            if let Err(error) = wizard::run_automation(std::path::Path::new(&path)) {
+                eprintln!("Wizard automation: {error}");
+                std::process::exit(2);
+            }
+            return Ok(());
+        }
+    }
     let mut job = None;
     #[cfg(target_os = "macos")]
     let mut resolve_job = None;

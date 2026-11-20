@@ -4,6 +4,8 @@ import argparse,json,os,pathlib,platform,re,subprocess,sys
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 SUITES=[('gui',['-p','anynle-gui','--lib'],6),('inventory',['-p','anynle-app','--lib','job::inventory'],6 if os.name=='nt' else 7),('job_engine',['-p','anynle-app','--lib','job::engine'],9),('backend_bundle',['-p','anynle-app','--lib','backend_bundle'],2),('graph',['-p','anynle-graph','--lib'],27),('avid_adapter',['-p','anynle-avid-adapter','--lib'],27 if os.name=='nt' else 28),('mapping',['-p','anynle-mapping','--lib'],2)]
 APP_TESTS=['rewrap::source::space_tests::available_space_queries_existing_volume','rewrap::source::space_tests::available_space_missing_path_refuses','rewrap::tests::existing_destination_is_refused_before_backend_or_inputs','rewrap::tests::pcm_counter_rejects_truncated_klv_and_counts_payload_bytes','rewrap::tests::private_klv_keys_are_allowed_only_inside_declared_header_metadata','rewrap::tests::exact_timecode_and_invalid_origins','rewrap::tests::mov_lane_admission_refuses_unqualified_width_before_source_access','rewrap::execution::ownership_tests::exclusive_creation_reports_only_the_owned_media_directory']
+APP_TESTS += ['rewrap::mov::tests::prores_alpha_rewrite_changes_only_qualified_sample_depth']
+APP_TESTS += ['rewrap::mono::tests::wide_wav_stores_only_exact_source_sample_references']
 def run(output):
     output=pathlib.Path(output); output.mkdir(parents=True,exist_ok=True)
     results=[]; failures=[]

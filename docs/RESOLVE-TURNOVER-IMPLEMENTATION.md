@@ -773,20 +773,25 @@ within one PCM24 step after accounting for the stereo bus pan and the
 
 ### Require camera originals
 
-Set `source.require_camera_originals` to `true` in an internal Avid job/2
-to require a single verified original for every selected picture edit and
-every camera in a selected editable Group. The option defaults to off.
+In the macOS Avid to Resolve wizard, open **Original locations and proxies**.
+Enable **Prefer camera originals for picture**, then **Require camera originals**.
+This saves `source.require_camera_originals` in job/2 and requires a single
+verified original for every selected picture edit and every camera in a
+selected editable Group. The option defaults to off.
 With it enabled, preparation also looks for originals using the saved Avid
 source columns and any supplied path mappings. Verified existing UME
 picture links qualify. Managed editorial audio, linked WAV audio, and
 explicit proxy attachment keep their respective media policies.
 
-If picture would fall back to managed media, preparation reports the
-affected timelines, tracks, and record positions or camera names. The
+If picture would fall back to managed media or a saved picture edit could
+not produce a placement, preparation reports the affected timelines,
+tracks, and record positions or camera names. The
 report counts all failed bindings and shows up to 16. It fails before
 writing a DRP or proxy. The internal probe has exercised the strict gate
 on the mixed editorial audio control and a picture-only camera original.
-The wizard and saved-path navigation remain pending.
+Choose **Open saved-path mappings** from the blocker to return to the
+original locations with the timeline order and media choices intact.
+Add the saved folder prefix and its current location, then run Review again.
 
 ## Premiere sequence markers
 
@@ -1616,13 +1621,11 @@ mapping. It matched all 48 decoded picture frames and both isolated
 96,000-sample PCM lanes exactly. Both versions exhibited the same short
 edge envelopes and stereo mix coefficient.
 
-The automatic Avid probe reopened a nested, two-timeline split-MXF and
-editable Group project, and separately reopened an H.264 UME project. A
-picture-only Group angle switch changed the picture while both isolated
-PCM lanes remained byte-identical to the Save As copy. A retained combined
-turnover with explicit media bindings also passed Save As and reopen.
-The [project core guide](RESOLVE-PROJECT-CORE.md) records the linked fixtures
-and editor checks. The roadmap tracks the
-[automatic mixed Avid project](ROADMAP.md#avid--resolve), the
+The [automatic combined Avid turnover](RESOLVE-PROJECT-CORE.md#automatic-combined-avid-turnover)
+reopened with nested bins, shared split-MXF media, H.264 UME picture,
+and an editable Group. Switching only Group picture preserved both
+isolated PCM lanes byte for byte. The combined control with explicit
+media bindings also passed File menu Save Project As. The roadmap tracks the
+[remaining Avid editor checks](ROADMAP.md#avid--resolve), the
 [fully native Premiere source](ROADMAP.md#premiere--resolve), and the
 [packaged route gates](ROADMAP.md#resolve-product-exposure).

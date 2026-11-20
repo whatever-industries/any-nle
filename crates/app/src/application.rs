@@ -396,6 +396,7 @@ fn read_avid_source(a: &Args, link_managed_op1a: bool) -> Result<AvidRead, Strin
                 proxy_rewrap_dir: a.proxy_rewrap_dir.clone(),
                 ffmpeg: tools.ffmpeg,
                 allow_media_gaps: link_dry_gain,
+                preserve_managed_audio_without_picture: link_managed_op1a && a.link_originals,
                 collect_blocked_locators: false,
                 verify_linked_imports: false,
             }, a.allow_offline_media, link_dry_gain, &mut |_, _| Ok(()), &mut || Ok(()),
@@ -638,7 +639,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         }
     }
     if a.wants_rewrap() {
-        if let Some(issue) = crate::job::sequence_timing_blocker(&graph) {
+        if let Some(issue) = crate::job::sequence_timing_blocker(&graph, None) {
             return Err(issue.cli_summary());
         }
         crate::offline::check_edit_routes(&graph)?;
@@ -764,6 +765,8 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         .as_ref()
         .map(|p| p.bindings())
         .unwrap_or_default();
+    let dnxhr_444_rgb_sources = preparation.as_ref()
+        .map(|plan| plan.dnxhr_444_rgb_sources()).unwrap_or_default();
     let mut ids: Box<dyn UuidSource> = match &a.seed {
         Some(s) => Box::new(SeededUuids::new(s)),
         None => Box::new(RandomUuids::new()),
@@ -781,6 +784,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             crate::managed_op1a::prepare(&graph, input, &output, ids.as_mut(), None, &offline),
         DirectPremiereInput::Typed { input, .. } => premiere_preparation::prepare_document(
             input, &output, ids.as_mut(), &bindings, matches!(route, PremiereRoute::NativeOp1a | PremiereRoute::NativeMedia), None, &offline,
+            &dnxhr_444_rgb_sources,
         ),
         DirectPremiereInput::Compatibility(p) => route.prepare(
             &p.model, &output, ids.as_mut(), &bindings,
@@ -791,6 +795,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
                 direct_dnxhr_origins: &p.direct_dnxhr_origins,
                 constant_speeds: &p.constant_speeds,
             },
+            &dnxhr_444_rgb_sources,
         ),
     }.map_err(|e| {
         let mut message = format!("Premiere document preparation failed: {e}");

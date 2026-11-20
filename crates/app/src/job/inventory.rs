@@ -1,5 +1,5 @@
 //! Read-only catalog. One decoded bin is live at a time. File presence/identity is not inferred.
-use super::{BinEntry, CancelToken, EffectCapability, EffectMode, Inventory, JobSpec, Progress};
+use super::{BinEntry, BinPath, CancelToken, EffectCapability, EffectMode, Inventory, JobSpec, Progress};
 use avid_reader::bin_nav::BinNavigator;
 use avid_reader::file::{AvbFile, Object};
 use avid_reader::io::MobId;
@@ -108,6 +108,21 @@ fn collect(spec: &JobSpec, cancel: &CancelToken) -> Result<Vec<PathBuf>, String>
         return Err("No Avid bins found in the selection.".into());
     }
     Ok(paths.into_iter().collect())
+}
+
+/// List source bins for the project picker without opening or hashing their contents.
+pub fn bin_catalog(spec: &JobSpec, cancel: &CancelToken) -> Result<Vec<BinPath>, String> {
+    if spec.schema != "anynle.job/1" {
+        return Err("Unsupported job schema.".into());
+    }
+    let paths = collect(spec, cancel)?;
+    let root = spec.project_folder.as_ref().and_then(|path| path.canonicalize().ok());
+    Ok(paths.into_iter().map(|path| {
+        let relative = root.as_ref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .map_or_else(|| PathBuf::from(path.file_name().unwrap_or_default()), Path::to_path_buf);
+        BinPath { path, relative }
+    }).collect())
 }
 #[derive(Default)]
 struct Routes {
@@ -294,10 +309,7 @@ pub fn inventory(
     cancel: &CancelToken,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Inventory, String> {
-    if spec.schema != "anynle.job/1" {
-        return Err("Unsupported job schema.".into());
-    }
-    let paths = collect(spec, cancel)?;
+    let paths = bin_catalog(spec, cancel)?;
     let selected_paths = spec
         .bins
         .iter()
@@ -306,7 +318,7 @@ pub fn inventory(
     let selected = paths
         .iter()
         .enumerate()
-        .filter(|(_, p)| spec.entire_project || selected_paths.contains(*p))
+        .filter(|(_, p)| spec.entire_project || selected_paths.contains(&p.path))
         .map(|(i, _)| i)
         .collect::<BTreeSet<_>>();
     // Every eligible bin is already included in whole-project mode.
@@ -323,7 +335,7 @@ pub fn inventory(
         BTreeMap::<String, usize>::new(),
         HashMap::<MobId, bool>::new(),
     );
-    for (bin, path) in paths.iter().enumerate() {
+    for (bin, BinPath { path, relative }) in paths.iter().enumerate() {
         cancel.check()?;
         progress(Progress {
             stage: "Inventory".into(),
@@ -342,15 +354,9 @@ pub fn inventory(
         let sequences = nav
             .toplevel()
             .map_err(|e| format!("{}: {e:?}", path.display()))?;
-        let relative = spec
-            .project_folder
-            .as_ref()
-            .and_then(|p| std::fs::canonicalize(p).ok())
-            .and_then(|root| path.strip_prefix(root).ok().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from(path.file_name().unwrap_or_default()));
         inv.bins.push(BinEntry {
             path: path.clone(),
-            relative,
+            relative: relative.clone(),
             clips: masters.len(),
             sequences: sequences.len(),
             dependency: false,
@@ -575,9 +581,12 @@ mod tests {
             bins: vec![t.0.join("z.AVB")],
             ..Default::default()
         };
-        let paths = collect(&spec, &CancelToken::default()).unwrap();
-        assert_eq!(paths.len(), 3);
-        assert!(paths.windows(2).all(|w| w[0] < w[1]));
+        // These placeholders cannot be decoded as Avid bins.
+        let paths = bin_catalog(&spec, &CancelToken::default()).unwrap();
+        assert_eq!(
+            paths.into_iter().map(|bin| bin.relative).collect::<Vec<_>>(),
+            ["Attic notes/b.avb", "sub/a.avb", "z.AVB"].map(PathBuf::from),
+        );
         let spec = JobSpec {
             include_trash_attic: true,
             ..spec

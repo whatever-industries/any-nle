@@ -5,6 +5,7 @@ use prproj::convert::model::Model;
 use prproj::convert::rewrap::MediaRelink;
 use prproj::convert::writer::WriteError;
 use prproj::UuidSource;
+use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
 
@@ -23,14 +24,16 @@ impl PremiereRoute {
         ids: &mut dyn UuidSource,
         bindings: &[MediaRelink],
         editorial: prproj::convert::writer::Editorial<'_>,
+        dnxhr_444_rgb_sources: &HashSet<String>,
     ) -> Result<prproj::convert::writer::PreparedProject, WriteError> {
-        prproj::convert::writer::prepare_project_with_effects_for_premiere_27(
+        prproj::convert::writer::prepare_project_with_effects_for_premiere_27_with_rewrap_colors(
             model,
             editorial,
             output,
             ids,
             bindings,
             matches!(self, Self::NativeOp1a | Self::NativeMedia),
+            dnxhr_444_rgb_sources,
         )
     }
     pub fn resolve(native_master: bool, bin_mode: BinMode) -> Self {

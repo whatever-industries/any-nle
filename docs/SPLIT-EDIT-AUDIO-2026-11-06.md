@@ -114,6 +114,26 @@ matched all 144,144 PCM24 sample frames and had distinct content. The straight
 cut's source ranges and paths also matched the linked AAF read-back. The fade
 comparison at that revision used the converter's Constant Power approximation.
 
+### Partial managed media
+
+Premiere 27.0.0 build 88 saved, closed, and reopened six **Separate files**
+variants of the split-edit project and the all-online control. The variants
+keep picture with A1 only, A2 only, or neither audio sibling, and omit
+picture with A1 only, A2 only, or both audio siblings. Each project contains
+the same two 72-frame timelines, one with straight cuts and one with audio
+dissolves. All surviving MXFs stayed online. Read-back preserved sequence
+starts, independent source trims, mono assignments, the Constant Gain
+dissolve on each surviving lane, and the exact gap markers on each timeline.
+
+Each reopened timeline was exported as ProRes 422 HQ and two isolated
+mono 48 kHz PCM24 WAVs. Across the 14 picture exports, all 576 frames with
+linked picture matched the corresponding decoded control frames, and all
+432 frames from timelines with no picture were black. Each surviving
+audio lane matched its all-online control across all 144,144 samples,
+including the fade and gain. All missing lanes rendered digital silence.
+A second reopen and isolated fade export reproduced the A1-only and
+A2-only results. The retained bin and three source MXF hashes matched.
+
 ### Ordinary picture dissolves
 
 A derived Avid bin combines a saved ordinary Dissolve with the online
@@ -1008,18 +1028,16 @@ Grouped, Merged, other audio layouts and rate combinations retain
 their existing managed-media paths.
 CONV-0156
 
-## User's fallback decision and remaining work
+<a id="users-fallback-decision-and-remaining-work"></a>
 
-The User's direction on 2026-11-06 is to offer OP-Atom→OP1a as the sole Avid→Premiere
-method if direct OP-Atom playback cannot be fixed/qualified. OP1a remains the planned
-first/default choice. Record the sole-route fallback as a decision gate, not an
-already implemented removal of the legacy choices.
+## Original fallback decision
 
-Before making that global product change, define handling/refusal for audio-only
-masters and codecs outside the current picture-led DNx/PCM rewrap scope. Never fall
-back silently to a known-unqualified direct route after a rewrap refusal. Held areas
-remain held. User listening, exact fade equivalence, broader native cohorts and
-corrected absolute clocks remain separate qualification tasks.
+On 2026-11-06 a rewrap-only workflow was considered if direct OP-Atom
+playback could not be qualified. Later direct-link controls passed for
+bounded profiles. The current wizard offers both rewrap and linked clip
+modes, and the report identifies unsupported source and playback cases.
+Follow the [media choices by route](ROADMAP.md#media-relinking-and-proxies-by-route)
+and the [direct-link evidence](#premiere-27-direct-linking) for current scope.
 
 ## Mirrored PVOL volume ramps
 

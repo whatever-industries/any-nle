@@ -134,6 +134,12 @@ struct Job {
     rate: Fraction,
     mov: bool,
     separate_mono: bool,
+    wide_audio: Vec<mono::MonoPcm>,
+}
+impl Job {
+    fn packaged_inputs(&self) -> &[usize] {
+        if self.wide_audio.is_empty() { &self.inputs } else { &self.inputs[..1] }
+    }
 }
 pub struct Plan {
     destination: PathBuf,

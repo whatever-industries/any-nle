@@ -1,5 +1,5 @@
 //! Browse full job reports without laying out every note on each repaint.
-use anynle_app::job::ReportNote;
+use anynle_app::job::{ReportNote, ReviewGroup};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -14,6 +14,11 @@ fn contains_lowercase(text: &mut str, query: &str) -> bool {
     }
 }
 
+fn candidate_indices(timeline: Option<&ReviewGroup>, total: usize) -> impl Iterator<Item = usize> + '_ {
+    (0..timeline.map_or(total, |group| group.note_indices.len()))
+        .map(move |index| timeline.map_or(index, |group| group.note_indices[index]))
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Filter {
     #[default]
@@ -26,6 +31,8 @@ pub(crate) enum Filter {
 pub(crate) struct ReportBrowser {
     pub(crate) search: String,
     pub(crate) filter: Filter,
+    pub(crate) timeline: Option<usize>,
+    pub(crate) source_clip: Option<usize>,
     pub(crate) page: usize,
     pub(crate) changes: usize,
     pub(crate) warnings: usize,
@@ -55,29 +62,36 @@ impl ReportBrowser {
         &mut self,
         notes: &[ReportNote],
         subjects: Option<&HashMap<String, String>>,
+        timelines: &[ReviewGroup],
+        sources: &[ReviewGroup],
     ) {
         self.page = 0;
         let query = self.search.trim().to_lowercase();
-        if query.is_empty() && self.filter == Filter::All {
+        let timeline = self.timeline.and_then(|index| timelines.get(index));
+        let source = self.source_clip.and_then(|index| sources.get(index));
+        let group = timeline.or(source);
+        let intersection = timeline.and(source);
+        if group.is_none() && query.is_empty() && self.filter == Filter::All {
             self.matches = None;
             return;
         }
         let mut searchable = String::new();
         self.matches = Some(
-            notes
-                .iter()
-                .enumerate()
-                .filter_map(|(index, note)| {
+            candidate_indices(group, notes.len())
+                .filter(|index| intersection.is_none_or(|source|
+                    source.note_indices.binary_search(index).is_ok()))
+                .filter(|&index| {
+                    let note = &notes[index];
                     let severity_matches = match self.filter {
                         Filter::All => true,
                         Filter::Changes => note.severity == "loss",
                         Filter::Warnings => note.severity == "warning",
                     };
                     if !severity_matches {
-                        return None;
+                        return false;
                     }
                     if query.is_empty() {
-                        return Some(index);
+                        return true;
                     }
                     let subject = subjects
                         .and_then(|names| names.get(&note.object))
@@ -88,21 +102,22 @@ impl ReportBrowser {
                         searchable.push(' ');
                         searchable.push_str(field);
                     }
-                    contains_lowercase(&mut searchable, &query).then_some(index)
+                    contains_lowercase(&mut searchable, &query)
                 })
                 .collect(),
         );
     }
 
-    pub(crate) fn refilter_details(&mut self, details: &[String]) {
+    pub(crate) fn refilter_details(&mut self, details: &[String], timelines: &[ReviewGroup]) {
         self.page = 0;
         let query = self.search.trim().to_lowercase();
-        self.matches = (!query.is_empty()).then(|| {
+        let timeline = self.timeline.and_then(|index| timelines.get(index));
+        self.matches = (timeline.is_some() || !query.is_empty()).then(|| {
             let mut text = String::new();
-            details.iter().enumerate().filter_map(|(index, detail)| {
+            candidate_indices(timeline, details.len()).filter(|&index| {
                 text.clear();
-                text.push_str(detail);
-                contains_lowercase(&mut text, &query).then_some(index)
+                text.push_str(&details[index]);
+                query.is_empty() || contains_lowercase(&mut text, &query)
             }).collect()
         });
     }
@@ -167,36 +182,71 @@ mod tests {
         assert_eq!(browser.change_examples, vec![0, 2, 4]);
         browser.page = 3;
         browser.search = " CAFÉ ".into();
-        browser.refilter(&notes, Some(&names));
+        browser.refilter(&notes, Some(&names), &[], &[]);
         assert_eq!(browser.page, 0);
         assert_eq!(
             browser.page_indices(notes.len()).collect::<Vec<_>>(),
             vec![77, 78]
         );
         browser.filter = Filter::Changes;
-        browser.refilter(&notes, Some(&names));
+        browser.refilter(&notes, Some(&names), &[], &[]);
         assert_eq!(
             browser.page_indices(notes.len()).collect::<Vec<_>>(),
             vec![78]
         );
         browser.filter = Filter::Warnings;
-        browser.refilter(&notes, Some(&names));
+        browser.refilter(&notes, Some(&names), &[], &[]);
         assert_eq!(
             browser.page_indices(notes.len()).collect::<Vec<_>>(),
             vec![77]
         );
         browser.search = "no match".into();
-        browser.refilter(&notes, Some(&names));
+        browser.refilter(&notes, Some(&names), &[], &[]);
         assert_eq!(browser.count(notes.len()), 0);
         browser.filter = Filter::All;
         browser.search = "TIMEWARP_GAP".into();
-        browser.refilter(&notes, Some(&names));
+        browser.refilter(&notes, Some(&names), &[], &[]);
         assert_eq!(
             browser.page_indices(notes.len()).collect::<Vec<_>>(),
             vec![80]
         );
         browser.search.clear();
-        browser.refilter(&notes, Some(&names));
+        browser.refilter(&notes, Some(&names), &[], &[]);
         assert_eq!(browser.count(notes.len()), 81);
+        let timelines = [
+            ReviewGroup {
+                id: "seq-a".into(), name: "Assembly".into(),
+                bin: Some("First/Scenes.avb".into()), note_indices: vec![76, 77],
+            },
+            ReviewGroup {
+                id: "seq-b".into(), name: "Assembly".into(),
+                bin: Some("Second/Scenes.avb".into()), note_indices: vec![78, 79, 80],
+            },
+        ];
+        browser.timeline = Some(1);
+        browser.refilter(&notes, Some(&names), &timelines, &[]);
+        assert_eq!(browser.page_indices(notes.len()).collect::<Vec<_>>(), [78, 79, 80]);
+        browser.filter = Filter::Warnings;
+        browser.refilter(&notes, Some(&names), &timelines, &[]);
+        assert_eq!(browser.page_indices(notes.len()).collect::<Vec<_>>(), [79]);
+        browser.filter = Filter::All;
+        browser.search = "CAfé".into();
+        browser.refilter(&notes, Some(&names), &timelines, &[]);
+        assert_eq!(browser.page_indices(notes.len()).collect::<Vec<_>>(), [78]);
+        let sources = [ReviewGroup {
+            id: "clip".into(), name: "Camera".into(), bin: None,
+            note_indices: vec![76, 78, 79],
+        }];
+        browser.source_clip = Some(0);
+        browser.search.clear();
+        browser.refilter(&notes, Some(&names), &timelines, &sources);
+        assert_eq!(browser.page_indices(notes.len()).collect::<Vec<_>>(), [78, 79]);
+        browser.filter = Filter::Warnings;
+        browser.refilter(&notes, Some(&names), &timelines, &sources);
+        assert_eq!(browser.page_indices(notes.len()).collect::<Vec<_>>(), [79]);
+        browser.filter = Filter::All;
+        browser.timeline = None;
+        browser.refilter(&notes, Some(&names), &timelines, &sources);
+        assert_eq!(browser.page_indices(notes.len()).collect::<Vec<_>>(), [76, 78, 79]);
     }
 }

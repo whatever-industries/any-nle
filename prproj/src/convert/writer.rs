@@ -2136,19 +2136,19 @@ impl Writer<'_> {
                     .ok_or_else(|| other("Ultra Key did not produce one Premiere picture edit"))?;
                 super::ultra_key::apply(&mut self.project, item, rgb)?;
             }
-            if let Some(PictureEffect::VideoToFullRange) = picture_effect {
+            if let Some(effect @ (PictureEffect::VideoToFullRange | PictureEffect::FullToVideoRange)) = picture_effect {
                 let mut picture = placed.iter().copied().filter(|&item|
                     self.project.doc.tree.tag(self.project.track_item(item).element) == "VideoClipTrackItem");
                 let item = picture.next().filter(|_| picture.next().is_none())
-                    .ok_or_else(|| other("range expansion did not produce one Premiere picture edit"))?;
-                super::asc_cdl::apply_video_to_full(&mut self.project, item)?;
+                    .ok_or_else(|| other("range scaling did not produce one Premiere picture edit"))?;
+                super::asc_cdl::apply_range_scale(&mut self.project, item, effect == PictureEffect::VideoToFullRange)?;
             }
             if let Some(lut) = self.source_luts.get(&(sequence_index, i)) {
                 let mut picture = placed.iter().copied().filter(|&item|
                     self.project.doc.tree.tag(self.project.track_item(item).element) == "VideoClipTrackItem");
                 let item = picture.next().filter(|_| picture.next().is_none())
                     .ok_or_else(|| other("source LUT did not produce one Premiere picture edit"))?;
-                if lut.edge == 2 {
+                if lut.edge != super::prepared::PreparedSourceLut::FULL_EDGE {
                     super::color_mode::apply_lut(&mut self.project, item, lut)?;
                 } else {
                     apply_lumetri_lut(&mut self.project, item, &lut.points, lut.edge, Path::new(&lut.filename), self.ids)?;
@@ -2549,7 +2549,7 @@ pub struct Editorial<'a> {
 pub fn prepare_project_with_effects(model: &Model, editorial: Editorial<'_>,
     out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
     media: &[super::rewrap::MediaRelink], native_av: bool) -> Result<PreparedProject> {
-    prepare_project_with_effects_impl(model, editorial, out_path, ids, media, native_av, ProjectVersion::V45)
+    prepare_project_with_effects_impl(model, editorial, out_path, ids, media, native_av, ProjectVersion::V45, &HashSet::new())
 }
 
 /// Prepare graph-derived legacy media for the current Premiere application.
@@ -2558,13 +2558,27 @@ pub fn prepare_project_with_effects_for_premiere_27(
     out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
     media: &[super::rewrap::MediaRelink], native_av: bool,
 ) -> Result<PreparedProject> {
-    prepare_project_with_effects_impl(model, editorial, out_path, ids, media, native_av, ProjectVersion::V46)
+    prepare_project_with_effects_for_premiere_27_with_rewrap_colors(
+        model, editorial, out_path, ids, media, native_av, &HashSet::new(),
+    )
+}
+
+/// Prepare legacy rewrap with source color profiles verified during media planning.
+#[doc(hidden)]
+pub fn prepare_project_with_effects_for_premiere_27_with_rewrap_colors(
+    model: &Model, editorial: Editorial<'_>,
+    out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
+    media: &[super::rewrap::MediaRelink], native_av: bool,
+    dnxhr_444_rgb_sources: &HashSet<String>,
+) -> Result<PreparedProject> {
+    prepare_project_with_effects_impl(model, editorial, out_path, ids, media, native_av, ProjectVersion::V46, dnxhr_444_rgb_sources)
 }
 
 fn prepare_project_with_effects_impl(
     model: &Model, editorial: Editorial<'_>,
     out_path: impl AsRef<Path>, ids: &mut dyn UuidSource,
     media: &[super::rewrap::MediaRelink], native_av: bool, project_version: ProjectVersion,
+    dnxhr_444_rgb_sources: &HashSet<String>,
 ) -> Result<PreparedProject> {
     super::model::validate_model(model)?;
     let Editorial { texts, video_dissolves, picture_effects, direct_dnxhr_origins, constant_speeds } = editorial;
@@ -2577,12 +2591,12 @@ fn prepare_project_with_effects_impl(
     super::prepared::validate_constant_speeds(constant_speeds, &model.options, &model.sequences,
         |id, seq, event, speed| model.clips.get(id).is_some_and(|clip| speed.raw_trim(seq, event, clip).is_some()))?;
     let view=WriterInput{options:&model.options,project_version,marker_provenance:None,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),timeline_marks:&BTreeMap::new(),non_drop_sequences:&HashSet::new(),picture_effects,source_luts:&[],extended_sdr_grades:&HashSet::new(),edit_labels:&[],frame_holds:&HashMap::new(),disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
-    prepare_view(&view,model,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new(), false)
+    prepare_view(&view,model,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new(), false, dnxhr_444_rgb_sources)
 }
 
 /// Validated typed input for mixed original-file and legacy media; model/1 remains strict.
 pub fn prepare_typed_project(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool)->Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new(), None, ProjectVersion::V45, false)
+    prepare_typed_project_impl(input,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new(), None, ProjectVersion::V45, false, &HashSet::new())
 }
 
 pub enum TypedMedia<'a> {
@@ -2608,6 +2622,21 @@ pub fn prepare_typed_project_for_premiere_27(
     media: TypedMedia<'_>,
     layout: Option<&DestinationBinLayout>,
 ) -> Result<PreparedProject> {
+    prepare_typed_project_for_premiere_27_with_rewrap_colors(
+        input, out_path, ids, media, layout, &HashSet::new(),
+    )
+}
+
+/// Prepare typed rewrap with source color profiles verified during media planning.
+#[doc(hidden)]
+pub fn prepare_typed_project_for_premiere_27_with_rewrap_colors(
+    input: &super::prepared::PreparedProjectInput,
+    out_path: impl AsRef<Path>,
+    ids: &mut dyn UuidSource,
+    media: TypedMedia<'_>,
+    layout: Option<&DestinationBinLayout>,
+    dnxhr_444_rgb_sources: &HashSet<String>,
+) -> Result<PreparedProject> {
     let no_offline = HashSet::new();
     let no_op1a = HashSet::new();
     let (bindings, native_av, offline, op1a, selective) = match media {
@@ -2617,7 +2646,7 @@ pub fn prepare_typed_project_for_premiere_27(
         TypedMedia::SelectedRewrap { bindings, clips, offline } => (bindings, false, offline, clips, true),
     };
     prepare_typed_project_impl(input, out_path, ids, bindings, native_av, layout,
-        offline, op1a, None, ProjectVersion::V46, selective)
+        offline, op1a, None, ProjectVersion::V46, selective, dnxhr_444_rgb_sources)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2643,19 +2672,19 @@ pub fn prepare_typed_project_with_marker_provenance(
     ids: &mut dyn UuidSource,
     provenance: MarkerProvenance<'_>,
 ) -> Result<PreparedProject> {
-    prepare_typed_project_impl(input, out_path, ids, &[], false, None, &HashSet::new(), &HashSet::new(), Some(provenance), ProjectVersion::V46, false)
+    prepare_typed_project_impl(input, out_path, ids, &[], false, None, &HashSet::new(), &HashSet::new(), Some(provenance), ProjectVersion::V46, false, &HashSet::new())
 }
 
 /// Prepare selected source bins under one import root and their relative folder hierarchy.
 /// Layout validation completes before UUID allocation or project construction.
 pub fn prepare_typed_project_with_layout(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:&DestinationBinLayout)->Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,media,native_av,Some(layout),&HashSet::new(), &HashSet::new(), None, ProjectVersion::V45, false)
+    prepare_typed_project_impl(input,out_path,ids,media,native_av,Some(layout),&HashSet::new(), &HashSet::new(), None, ProjectVersion::V45, false, &HashSet::new())
 }
 pub fn prepare_offline_project(
     input: &super::prepared::PreparedProjectInput, out_path: impl AsRef<Path>,
     ids: &mut dyn UuidSource, layout: Option<&DestinationBinLayout>, offline: &HashSet<&str>,
 ) -> Result<PreparedProject> {
-    prepare_typed_project_impl(input,out_path,ids,&[],false,layout,offline, &HashSet::new(), None, ProjectVersion::V45, false)
+    prepare_typed_project_impl(input,out_path,ids,&[],false,layout,offline, &HashSet::new(), None, ProjectVersion::V45, false, &HashSet::new())
 }
 
 /// Use the validated OP1a bin master construction for selected in-place MXFs.
@@ -2665,10 +2694,10 @@ pub fn prepare_linked_op1a_project(
     ids: &mut dyn UuidSource, media: &[super::rewrap::MediaRelink],
     clips: &HashSet<String>, layout: Option<&DestinationBinLayout>, offline: &HashSet<&str>,
 ) -> Result<PreparedProject> {
-    prepare_typed_project_impl(input, out_path, ids, media, false, layout, offline, clips, None, ProjectVersion::V45, false)
+    prepare_typed_project_impl(input, out_path, ids, media, false, layout, offline, clips, None, ProjectVersion::V45, false, &HashSet::new())
 }
 
-fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>,linked_op1a:&HashSet<String>,marker_provenance:Option<MarkerProvenance<'_>>,project_version:ProjectVersion,selective:bool)->Result<PreparedProject> {
+fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>,linked_op1a:&HashSet<String>,marker_provenance:Option<MarkerProvenance<'_>>,project_version:ProjectVersion,selective:bool,dnxhr_444_rgb_sources:&HashSet<String>)->Result<PreparedProject> {
     if let Some(layout) = layout { layout.validate(&input.bins)?; }
     if !native_av && layout.is_some() {
         input.validate_whole_project()?;
@@ -2698,7 +2727,7 @@ fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_p
         }).collect();
     }
     let view=WriterInput{options:&input.options,project_version,marker_provenance,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,timeline_marks:&input.timeline_marks,non_drop_sequences:&input.non_drop_sequences,picture_effects:&input.picture_effects,source_luts:&input.source_luts,extended_sdr_grades:&input.extended_sdr_grades,edit_labels:&input.edit_labels,frame_holds:&input.frame_holds,disabled_edits:&input.disabled_edits,direct_dnxhr_origins:&input.direct_dnxhr_origins,direct_dnxhd_pcm24:Some(&input.direct_dnxhd_pcm24),constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,autosync_bins:&input.autosync_bins,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,layered_submasters:&input.layered_submasters,png_mattes:&input.png_mattes};
-    prepare_view(&view,&legacy,out_path,ids,media,native_av,layout,offline,linked_op1a,selective)
+    prepare_view(&view,&legacy,out_path,ids,media,native_av,layout,offline,linked_op1a,selective,dnxhr_444_rgb_sources)
 }
 fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {
     if model.video_dissolves.is_empty() { return Ok(()); }
@@ -2767,11 +2796,12 @@ fn direct_dnxhr_files(
     let mut files = HashMap::new();
     for (id, &origin) in model.direct_dnxhr_origins {
         let c = model.clips.get(id).ok_or_else(|| other("direct DNxHR OP-Atom clip ID is unavailable"))?;
-        let v = c.video.as_ref().ok_or_else(|| other("direct DNxHR OP-Atom clip has no picture"))?;
+        let picture = c.video.as_ref();
         let three_mono = three_mono_cameras.contains(id.as_str());
         let channel_count = if three_mono { 3 }
             else if c.audio.len() == 8 && one_mono_cameras.contains(id.as_str()) { 8 }
             else if c.audio.is_empty() { 0 }
+            else if c.audio.len() == 1 { 1 }
             else { 2 };
         if c.audio.len() != channel_count {
             return Err(other(if three_mono {
@@ -2782,11 +2812,31 @@ fn direct_dnxhr_files(
         }
         let bits = c.audio.first().map_or(24, |a| a.bits);
         let dnxhd_group_camera = model.direct_dnxhd_pcm24.is_some_and(|ids| ids.contains(id));
-        let profile = (v.rate.num, v.rate.den, bits);
-        if matches!(channel_count, 0 | 3 | 8)
+        let (rate, start, duration) = if let Some(v) = picture {
+            (v.rate, v.start, v.duration)
+        } else {
+            let ([first] | [first, _]) = c.audio.as_slice() else {
+                return Err(other("direct DNxHR OP-Atom without picture requires one or two mono siblings"));
+            };
+            if dnxhd_group_camera || model.multicams.iter().any(|group|
+                group.cameras.iter().any(|camera| camera.clip == *id))
+            {
+                return Err(other("direct DNxHR OP-Atom without picture requires a standalone clip"));
+            }
+            (c.rate.ok_or_else(|| other("direct DNxHR OP-Atom audio clock is unavailable"))?,
+                first.start, first.duration)
+        };
+        let profile = (rate.num, rate.den, bits);
+        if picture.is_none() && (profile != (24_000, 1001, 24) || model.options.bin_mode != "separate") {
+            return Err(other("direct DNxHR OP-Atom without picture requires 23.976 Separate files with PCM24"));
+        }
+        if matches!(channel_count, 0 | 1 | 3 | 8)
             && (profile != (24_000, 1001, 24) || model.options.bin_mode != "separate")
         {
             return Err(other("picture-only and wider direct Group profiles require 23.976 Separate files with any audio at PCM24"));
+        }
+        if channel_count == 1 && (dnxhd_group_camera || one_mono_cameras.contains(id.as_str())) {
+            return Err(other("one available mono sibling requires a standalone DNxHR clip"));
         }
         if dnxhd_group_camera && (profile != (24_000, 1001, 24) || model.options.bin_mode != "separate") {
             return Err(other("direct DNxHD LB/PCM24 requires 23.976 Separate files"));
@@ -2799,26 +2849,31 @@ fn direct_dnxhr_files(
             (30_000, 1001, 24) if c.time_display == Some(102) => ("102", false),
             _ => return Err(other("unsupported direct DNx OP-Atom rate or bin mode")),
         };
-        let unit = ticks_per_unit(v.rate);
+        let unit = ticks_per_unit(rate);
         let labels: HashSet<_> = c.audio.iter().filter_map(|a| a.avid_track).collect();
-        let mut paths = HashSet::from([v.path.as_str()]);
-        if v.codec != "AVdn" || (v.width, v.height) != (1920, 1080)
+        let valid_labels = if channel_count == 1 {
+            labels.len() == 1 && (labels.contains(&1) || labels.contains(&2))
+        } else {
+            (1..=channel_count as i64).all(|label| labels.contains(&label))
+        };
+        let mut paths: HashSet<_> = picture.into_iter().map(|v| v.path.as_str()).collect();
+        if picture.is_some_and(|v| v.codec != "AVdn" || (v.width, v.height) != (1920, 1080))
             || origin < 0 || origin % unit != 0
-            || v.start < 0 || v.start % unit != 0 || v.duration <= 0 || v.duration % unit != 0
-            || display == "102" && (origin != v.start || origin / unit >= 2_589_408
-                || v.duration % (super::model::TICKS_PER_SECOND / 48_000) != 0)
-            || bits == 16 && (origin != v.start || origin / unit >= 24 * 60 * 60 * 24)
-            || !(1..=channel_count as i64).all(|label| labels.contains(&label))
+            || start < 0 || start % unit != 0 || duration <= 0 || duration % unit != 0
+            || display == "102" && (origin != start || origin / unit >= 2_589_408
+                || duration % (super::model::TICKS_PER_SECOND / 48_000) != 0)
+            || bits == 16 && (origin != start || origin / unit >= 24 * 60 * 60 * 24)
+            || !valid_labels
             || !c.stereo_pairs.is_empty() || !c.multichannel_groups.is_empty()
-            || c.audio.iter().any(|s| s.sample_rate != 48000 || s.bits != bits || s.start != v.start
-                || s.duration != v.duration || !paths.insert(s.path.as_str()))
+            || c.audio.iter().any(|s| s.sample_rate != 48000 || s.bits != bits || s.start != start
+                || s.duration != duration || !paths.insert(s.path.as_str()))
         {
             return Err(other("invalid direct DNxHR OP-Atom clip profile"));
         }
-        for (path, is_picture) in std::iter::once((&v.path, true))
+        for (path, is_picture) in picture.into_iter().map(|v| (&v.path, true))
             .chain(c.audio.iter().map(|audio| (&audio.path, false)))
         {
-            let profile = (DirectDnxhrFile { origin, picture: is_picture, display, dnxhr }, v.start, v.duration);
+            let profile = (DirectDnxhrFile { origin, picture: is_picture, display, dnxhr }, start, duration);
             if files.insert(path, profile).is_some_and(|prior| prior != profile) {
                 return Err(other("shared direct DNxHR OP-Atom media has conflicting file facts"));
             }
@@ -2833,14 +2888,15 @@ fn direct_dnxhr_files(
     }
     if model.sequences.iter().any(|s| s.events.iter().any(|e| {
         model.direct_dnxhr_origins.contains_key(&e.clip)
-            && model.clips[&e.clip].video.as_ref().is_some_and(|v| s.rate != v.rate)
+            && model.clips[&e.clip].video.as_ref().map(|v| v.rate).or(model.clips[&e.clip].rate)
+                .is_some_and(|rate| s.rate != rate)
     })) {
         return Err(other("direct DNx OP-Atom needs a same-rate sequence"));
     }
     Ok(files.into_iter().map(|(path, (file, _, _))| (path.clone(), file)).collect())
 }
 
-fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>,linked_op1a:&HashSet<String>,selective:bool)->Result<PreparedProject> {
+fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&mut dyn UuidSource,media:&[super::rewrap::MediaRelink],native_av:bool,layout:Option<&DestinationBinLayout>,offline:&HashSet<&str>,linked_op1a:&HashSet<String>,selective:bool,dnxhr_444_rgb_sources:&HashSet<String>)->Result<PreparedProject> {
     let direct_dnxhr = direct_dnxhr_files(model, if linked_op1a.is_empty() { media } else { &[] }, native_av)?;
     let sources: HashSet<_> = media.iter().map(|binding| binding.source_path.as_str()).collect();
     dissolve_handles(model)?;
@@ -3205,12 +3261,10 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         writer.report.notes.push(format!("{} editable two-layer Avid Submaster nest(s)", model.layered_submasters.len()));
         writer.report.unverified.push("Layered Submaster picture parity requires a native Avid render and Premiere reopen comparison.".into());
     }
-    if !media.is_empty() {
-        if native_av || !linked_op1a.is_empty() {
-            super::rewrap::apply_native(&mut writer.project, media)?;
-        } else {
-            super::rewrap::apply(&mut writer.project, media)?;
-        }
+    if !media.is_empty() || !dnxhr_444_rgb_sources.is_empty() {
+        super::rewrap::apply_views(
+            &mut writer.project, media, !native_av && linked_op1a.is_empty(), dnxhr_444_rgb_sources,
+        )?;
         if linked_op1a.is_empty() {
             writer.report.unverified.push("OP1a media binding: explicit flattened source channels; native read-back covers retained fixtures, not every profile or clip-construction mode".into());
         } else if selective {

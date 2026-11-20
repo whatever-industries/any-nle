@@ -117,6 +117,7 @@ impl Plan {
                 j + 1,
                 if job.mov { "mov" } else { "mxf" }
             ));
+            let packaged = job.packaged_inputs();
             let mut hashes = Vec::new();
             let mut inputs = Vec::new();
             for i in &job.inputs {
@@ -238,12 +239,12 @@ impl Plan {
             } else {
                 let mut command = Command::new(&self.ffmpeg);
                 command.args(["-v", "error", "-nostdin", "-n"]);
-                for i in &job.inputs {
+                for i in packaged {
                     command
                         .args(["-protocol_whitelist", "file,pipe", "-f", "mxf", "-i"])
                         .arg(&self.inputs[*i].path);
                 }
-                for (n, i) in job.inputs.iter().enumerate() {
+                for (n, i) in packaged.iter().enumerate() {
                     command.args([
                         "-map",
                         &format!("{n}:{}", self.inputs[*i].probe.stream_indices[0]),
@@ -271,11 +272,11 @@ impl Plan {
                 let output = probe(&self.ffprobe, &partial)?;
                 if output.op != "060e2b34040101010d01020101010900"
                     || output.tc.as_deref() != Some(tc)
-                    || output.streams.len() != job.inputs.len()
+                    || output.streams.len() != packaged.len()
                 {
                     return Err("output OP1a/stream/timecode validation failed".into());
                 }
-                for (s, i) in output.streams.iter().zip(&job.inputs) {
+                for (s, i) in output.streams.iter().zip(packaged) {
                     let mut expected = self.inputs[*i].probe.streams[0].clone();
                     if s.kind == "audio" {
                         expected.packets = s.packets;
@@ -289,14 +290,14 @@ impl Plan {
                 if let Some(tail) = &self.inputs[job.inputs[0]].terminal {
                     tail.verify_output(&partial)?;
                 }
-                let sound_bytes = job.inputs.iter().skip(1).try_fold(0u64, |n, i| {
+                let sound_bytes = packaged.iter().skip(1).try_fold(0u64, |n, i| {
                     pcm_essence_bytes(&self.inputs[*i].path)
                         .and_then(|x| n.checked_add(x).ok_or("PCM size overflow".into()))
                 })?;
                 if pcm_essence_bytes(&partial)? != sound_bytes {
                     return Err("output PCM physical sample count changed".into());
                 }
-                if self.hashes(&partial, &output.stream_indices, None)? != hashes {
+                if self.hashes(&partial, &output.stream_indices, None)? != hashes[..packaged.len()] {
                     return Err("copied essence SHA-256 verification failed".into());
                 }
                 output.raw
@@ -322,17 +323,23 @@ impl Plan {
             fs::hard_link(&partial, &target)
                 .map_err(|e| format!("refusing to replace output {}: {e}", target.display()))?;
             fs::remove_file(&partial).map_err(|e| e.to_string())?;
-            for (n, i) in job.inputs.iter().enumerate() {
-                for path in &self.inputs[*i].aliases {
-                    mappings.push(MediaRelink {
-                        source_path: path.clone(),
-                        target_path: target.to_string_lossy().into_owned(),
-                        audio_stream: if n == 0 { None } else { Some((n - 1) as u32) },
-                        separate_mono: job.separate_mono,
-                    })
+            let mut waves = Vec::new();
+            for (lane, pcm) in job.wide_audio.iter().enumerate() {
+                control(j, total)?;
+                let output = self.wide_audio_path(j, lane);
+                let partial = self.destination.join(format!(".partial-{:04}-audio-{:02}.wav", j + 1, lane + 1));
+                let receipt = pcm.write(&partial, &output)?;
+                if receipt.get("essence_sha256") != Some(&text(&hashes[lane + 1])) {
+                    return Err("wide rewrap WAV payload disagrees with the probed MXF stream".into());
                 }
+                waves.push(receipt);
             }
-            let record=obj(vec![("status",text("verified media; Premiere application read-back pending")),("output",text(target.to_string_lossy())),("output_probe",output_raw),("essence_sha256",strings(&hashes)),("inputs",Value::Arr(inputs)),("masters",Value::Arr(job.clips.clone())),("metadata_losses",text("Container/package identities regenerated. Sidecar preserves source facts. Optional metadata not represented by FFmpeg must be recovered from this receipt; native interpretation remains unqualified."))]);
+            mappings.extend(self.job_bindings(j, &target.to_string_lossy()));
+            let mut fields=vec![("status",text("verified media; Premiere application read-back pending")),("output",text(target.to_string_lossy())),("output_probe",output_raw),("essence_sha256",strings(&hashes[..packaged.len()])),("inputs",Value::Arr(inputs)),("masters",Value::Arr(job.clips.clone())),("metadata_losses",text("Container/package identities regenerated. Sidecar preserves source facts. Optional metadata not represented by FFmpeg must be recovered from this receipt; native interpretation remains unqualified."))];
+            if !waves.is_empty() {
+                fields.push(("linked_mono_wavs", Value::Arr(waves)));
+            }
+            let record=obj(fields);
             self.write_receipt(&format!("media-{:04}.json", j + 1), record.clone())?;
             records.push(record);
             control(j + 1, total)?;
@@ -354,7 +361,7 @@ impl Plan {
         self.write_receipt(
             "manifest.json",
             obj(vec![
-                ("schema", text(if !self.mono.is_empty() || self.jobs.iter().any(|j|j.mov) {"anynle.media-preparation/1"}else{"anynle.op1a/1"})),
+                ("schema", text(if !self.mono.is_empty() || self.jobs.iter().any(|j| j.mov || !j.wide_audio.is_empty()) {"anynle.media-preparation/1"}else{"anynle.op1a/1"})),
                 (
                     "status",
                     text("media prepared; project completion recorded separately"),

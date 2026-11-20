@@ -35,6 +35,8 @@ pub struct OriginalOptions {
     pub proxy_rewrap_dir: Option<PathBuf>,
     pub ffmpeg: PathBuf,
     pub allow_media_gaps: bool,
+    /// Keep the qualified pair of managed mono siblings when their picture is absent.
+    pub preserve_managed_audio_without_picture: bool,
     /// Verify ordinary linked streams for a destination with a native importer.
     pub verify_linked_imports: bool,
     /// Collect saved-path and MXF package details for Review blockers.
@@ -52,6 +54,7 @@ impl Default for OriginalOptions {
             proxy_rewrap_dir: None,
             ffmpeg: "ffmpeg".into(),
             allow_media_gaps: false,
+            preserve_managed_audio_without_picture: false,
             verify_linked_imports: false,
             collect_blocked_locators: false,
         }
@@ -86,6 +89,8 @@ pub struct OriginalIndex {
     pub tracks: HashMap<(String, usize), Selected>,
     pub(crate) allow_offline: bool,
     pub(super) allow_media_gaps: bool,
+    pub(super) preserve_managed_audio_without_picture: bool,
+    pub(super) mixed_rate_managed_audio: HashSet<avid_reader::io::MobId>,
     pub original_inputs: Vec<av::SourceInput>,
     /// Explicit destination defaults, never observations of missing source tags.
     pub notes: Vec<String>,
@@ -784,6 +789,7 @@ fn missing_locator() -> String {
 #[derive(Default)]
 struct LocatorDetails {
     rows: Vec<(usize, String)>,
+    original_tracks: Vec<(usize, usize)>,
     bytes: usize,
     truncated: bool,
 }
@@ -803,15 +809,10 @@ impl LocatorDetails {
 fn blocked_locator_details(
     remaining: &[av::SourceMaster],
     first_track: usize,
-    mappings: &[RootMapping],
+    mappings: &[CheckedRootMapping<'_>],
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<LocatorDetails, SourceReadIssue> {
     let mut details = LocatorDetails::default();
-    // A bad mapping applies to the whole job. Keep that primary diagnostic
-    // without repeating the same settings error for every saved path.
-    let Ok(mappings) = check_root_mappings(mappings) else {
-        return Ok(details);
-    };
     for (index, master) in remaining.iter().enumerate() {
         check()?;
         // Managed and mixed routes have different addressing rules. Only
@@ -831,7 +832,7 @@ fn blocked_locator_details(
             if !seen.insert(raw.locators.as_slice()) || (index == 0 && track == first_track) {
                 continue;
             }
-            let reason = match resolve_with_checked_mappings(&raw.locators, &mappings) {
+            let reason = match resolve_with_checked_mappings(&raw.locators, mappings) {
                 Ok(Some(_)) => continue,
                 Ok(None) => missing_locator(),
                 Err(error) => error,
@@ -841,6 +842,7 @@ fn blocked_locator_details(
             if !details.push(master.master.bin, detail) {
                 return Ok(details);
             }
+            details.original_tracks.push((index, track));
         }
     }
     Ok(details)
@@ -1499,10 +1501,10 @@ pub fn verify_source_lut_picture(
     }
 }
 
-pub fn verify_range_expansion_picture(path: &Path, tool: &Path, frames: i64) -> Result<(), String> {
+pub fn verify_range_scale_picture(path: &Path, tool: &Path, frames: i64) -> Result<(), String> {
     let metadata = probe_metadata(path, tool)?;
     let Some(Value::Arr(streams)) = metadata.get("streams") else {
-        return Err("source range expansion requires a verified ProRes HQ MOV".into());
+        return Err("source range scaling requires a verified ProRes HQ MOV".into());
     };
     qualify_prores_hq(path, &metadata, streams)?;
     let picture = &streams[0];
@@ -1512,7 +1514,33 @@ pub fn verify_range_expansion_picture(path: &Path, tool: &Path, frames: i64) -> 
     {
         Ok(())
     } else {
-        Err("source range expansion requires matching picture extent and explicit Rec.709 video levels".into())
+        Err("source range scaling requires matching picture extent and explicit Rec.709 video levels".into())
+    }
+}
+
+/// Verify the color interpretation of a picture-only AVC MOV after exact media binding.
+pub fn verify_avc_range_scale_picture(
+    path: &Path, tool: &Path, rate: Rational, frames: i64,
+) -> Result<(), String> {
+    let metadata = probe_metadata(path, tool)?;
+    let Some(Value::Arr(streams)) = metadata.get("streams") else {
+        return Err("source range scaling requires a verified picture-only AVC MOV".into());
+    };
+    let [picture] = streams.as_slice() else {
+        return Err("source range scaling requires a verified picture-only AVC MOV".into());
+    };
+    qualify_avc_high(picture, 40)?;
+    qualify_movie_geometry_at_rate(picture, (1920, 1080), rate)?;
+    if qualify_container(path, &metadata)? == "mov"
+        && number(picture, "index") == Some(0)
+        && number(picture, "start_pts") == Some(0)
+        && number(picture, "nb_frames") == Some(frames)
+        && text(picture, "color_range").as_deref() == Some("tv")
+        && text(picture, "color_space").as_deref() == Some("bt709")
+    {
+        Ok(())
+    } else {
+        Err("source range scaling requires matching picture extent and explicit Rec.709 video levels".into())
     }
 }
 
@@ -1678,11 +1706,12 @@ impl OriginalIndex {
                 format!("{:?} · {directory}: {message}", master.master.name),
                 master.master.bin,
             );
-            let (reason, primary_track) = match legacy_mxf::missing_siblings(master, index, check,
+            let (reason, primary_track, mut tracks) = match legacy_mxf::missing_siblings(master, index, check,
                 &mut |path| probe_offline_atom(path, &options.ffprobe)) {
                 Ok(missing) if missing.is_empty() => continue,
                 Ok(missing) => {
-                    let reason = format!("Legacy MXF locators require the saved file packages in a selected media root. Missing: {}.", missing.join(", "));
+                    let names = missing.iter().map(|finding| finding.message.as_str()).collect::<Vec<_>>();
+                    let reason = format!("Legacy MXF locators require the saved file packages in a selected media root. Missing: {}.", names.join(", "));
                     if permits_missing_media_fallbacks {
                         if self.references.as_ref().is_some_and(|refs| refs.can_omit(master)) {
                             self.omit_unused(master, reason, &mut used)?;
@@ -1693,9 +1722,12 @@ impl OriginalIndex {
                             continue;
                         }
                     }
-                    (reason, None)
+                    let tracks = missing.into_iter().map(|finding| (ordinal, finding.track)).collect::<Vec<_>>();
+                    (reason, None, tracks)
                 }
-                Err(legacy_mxf::SiblingIssue::Package { track, message }) => (message, Some(track)),
+                Err(legacy_mxf::SiblingIssue::Package { track, message }) => {
+                    (message, Some(track), vec![(ordinal, track)])
+                }
                 Err(legacy_mxf::SiblingIssue::Check(reason)) => {
                     return Err(SourceReadIssue::OriginalLocator(issue(reason)));
                 }
@@ -1714,11 +1746,13 @@ impl OriginalIndex {
                     let exclude = if offset == 0 { primary_track } else { None };
                     let findings = legacy_mxf::package_index_findings(later, index, exclude);
                     if !findings.is_empty() {
+                        let messages = findings.iter().map(|finding| finding.message.as_str()).collect::<Vec<_>>();
                         let detail = format!("{:?} · {directory}: {} · {}", later.master.name,
-                            findings.join("; "), later.id);
+                            messages.join("; "), later.id);
                         if !details.push(later.master.bin, detail) {
                             break;
                         }
+                        tracks.extend(findings.into_iter().map(|finding| (start + offset, finding.track)));
                     }
                     for track in &later.master.tracks {
                         let package = track.file_mob.umid_hex();
@@ -1736,6 +1770,9 @@ impl OriginalIndex {
                 }
                 issue.additional = details.rows;
                 issue.details_truncated = details.truncated;
+            }
+            if options.collect_blocked_locators {
+                issue.edits = super::locator_uses::collect_tracks(facts, tracks, check)?;
             }
             return Err(SourceReadIssue::OriginalLocator(issue));
         }
@@ -1757,7 +1794,11 @@ impl OriginalIndex {
         mut inspect: impl FnMut(&Path, &mut dyn FnMut() -> Result<(), String>) -> Result<OriginalProbe, String>,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, SourceReadIssue> {
-        let mut out = Self { allow_offline, allow_media_gaps: options.allow_media_gaps, ..Self::default() };
+        let mut out = Self {
+            allow_offline, allow_media_gaps: options.allow_media_gaps,
+            preserve_managed_audio_without_picture: options.preserve_managed_audio_without_picture,
+            ..Self::default()
+        };
         // Keep one additional file for interleaved selections without retaining
         // probe metadata for the entire bin.
         const PROBE_CACHE_FILES: usize = 2;
@@ -1806,13 +1847,26 @@ impl OriginalIndex {
                 };
                 let blocked = |kind, why, check: &mut dyn FnMut() -> Result<(), String>| {
                     let mut issue = locator_issue(kind, why);
-                    if collect_blocked {
-                        let details = blocked_locator_details(
-                            &facts.masters[master_index..], i, &options.root_mappings, check,
-                        )?;
-                        issue.additional = details.rows;
-                        issue.details_truncated = details.truncated;
+                    if !options.collect_blocked_locators {
+                        return Ok(SourceReadIssue::OriginalLocator(issue));
                     }
+                    // A malformed mapping is a job setting, not an edit-specific failure.
+                    let Ok(mappings) = check_root_mappings(&options.root_mappings) else {
+                        return Ok(SourceReadIssue::OriginalLocator(issue));
+                    };
+                    let details = if collect_blocked {
+                        blocked_locator_details(&facts.masters[master_index..], i, &mappings, check)?
+                    } else {
+                        LocatorDetails::default()
+                    };
+                    let tracks = std::iter::once((master_index, i)).chain(
+                        details.original_tracks.into_iter().map(|(offset, track)| {
+                            (master_index + offset, track)
+                        }),
+                    );
+                    issue.edits = super::locator_uses::collect_saved_paths(facts, tracks, check)?;
+                    issue.additional = details.rows;
+                    issue.details_truncated = details.truncated;
                     Ok::<_, SourceReadIssue>(SourceReadIssue::OriginalLocator(issue))
                 };
                 let found = match resolve_with_claim(&raw.locators, &options.root_mappings) {

@@ -77,6 +77,44 @@ fn distinguishes_selected_ambiguous_packages_from_other_scan_diagnostics() {
 }
 
 #[test]
+fn missing_managed_review_uses_the_saved_source_track() {
+    let (mut facts, mut index) = fixture(3);
+    let tracks = &facts.masters[0].master.tracks;
+    let missing = tracks[1].file_mob.umid_hex();
+    let duplicate = tracks[2].file_mob.umid_hex();
+    index.files.remove(&missing);
+    index.files.remove(&duplicate);
+    index.ambiguous.push(duplicate);
+    facts.sequences.push(sequence(vec![
+        event("existing", 3, 1, 0, 12, None),
+        event("missing", 5, 2, 7, 12, None),
+        event("ambiguous", 7, 3, 11, 12, None),
+    ]));
+
+    let originals = original::OriginalIndex::default();
+    let motion = MotionMxf::default();
+    let selected = SelectedMediaIndex::new(&facts, &originals, &index, &mut || Ok(())).unwrap();
+    let build = |review| build_working_graph(
+        &facts, &facts.sequences, &selected, "Synthetic", &["Bin".into()], &originals, &motion,
+        None, review, &mut |_| Ok(()), &mut || Ok(()),
+    ).unwrap();
+    let normal = build(false);
+    let review = build(true);
+    assert_eq!(normal.graph, review.graph);
+    assert_eq!(normal.missing_managed_audio, review.missing_managed_audio);
+    assert!(normal.missing_managed_edits.timelines.is_empty());
+    let [timeline] = review.missing_managed_edits.timelines.as_slice() else {
+        panic!("expected one affected timeline");
+    };
+    let [edit] = timeline.edits.as_slice() else {
+        panic!("only the absent package should be labelled missing");
+    };
+    assert_eq!((edit.id.as_str(), edit.track, edit.master_track), ("missing", 5, 2));
+    assert_eq!(edit.file_package, missing);
+    assert_eq!(edit.offset, Rational::new(7, 24));
+}
+
+#[test]
 fn unused_managed_picture_with_unsupported_rate_gets_reported_omission() {
     let (mut facts, index) = fixture(2);
     let source = &mut facts.masters[0];
@@ -211,6 +249,7 @@ fn blocked_legacy_mxf_review_collects_missing_and_ambiguous_packages_from_index(
     let mut facts = legacy_mxf_fixture();
     let mut later = legacy_mxf_fixture().masters.remove(0);
     later.master.bin = 1;
+    later.master.mob_id = mob(2);
     later.id = "revision/bin/1/item/0".into();
     for (ordinal, track) in later.master.tracks.iter_mut().enumerate() {
         track.file_mob = mob(200 + ordinal as u32);
@@ -225,12 +264,38 @@ fn blocked_legacy_mxf_review_collects_missing_and_ambiguous_packages_from_index(
     facts.masters.push(later);
     let mut all_indexed = legacy_mxf_fixture().masters.remove(0);
     all_indexed.master.bin = 2;
+    all_indexed.master.mob_id = mob(3);
     all_indexed.id = "revision/bin/2/item/0".into();
     for (ordinal, track) in all_indexed.master.tracks.iter_mut().enumerate() {
         track.file_mob = mob(300 + ordinal as u32);
         index.files.insert(track.file_mob.umid_hex(), format!("indexed-{ordinal}.mxf").into());
     }
     facts.masters.push(all_indexed);
+    let rate = facts.masters[0].rate.unwrap();
+    let edit = |id, master, kind, track, label, start| {
+        let mut row = event(id, track, label, start, 12, None);
+        row.event.master = mob(master);
+        row.event.kind = kind;
+        row.range.as_mut().unwrap().record_rate = rate;
+        row
+    };
+    let mut first = sequence(vec![
+        edit("picture", 1, KIND_PICTURE, 1, 1, 0),
+        edit("primary-a2", 1, KIND_SOUND, 3, 2, 7),
+    ]);
+    first.rate = Some(rate);
+    first.clock = Some(av::SequenceClock {
+        count: 86_400, rate, display_base: 24, drop: false, track_ordinal: 0,
+    });
+    let mut second = sequence(vec![
+        edit("duplicate-a1", 2, KIND_SOUND, 3, 1, 12),
+        edit("indexed-a2", 2, KIND_SOUND, 4, 2, 14),
+        edit("other-indexed-a1", 3, KIND_SOUND, 5, 1, 16),
+    ]);
+    second.id = "revision/bin/1/seq".into();
+    second.info.bin = 1;
+    second.rate = Some(rate);
+    facts.sequences = vec![first, second];
 
     let run = |index: &index::MediaIndex, options: &original::OriginalOptions,
                check: &mut dyn FnMut() -> Result<(), String>| {
@@ -263,6 +328,23 @@ fn blocked_legacy_mxf_review_collects_missing_and_ambiguous_packages_from_index(
     assert!(detail.contains("A8 (") && detail.contains("absent from the selected MXF package index"));
     assert!(!detail.contains(&indexed));
     assert!(!detail.contains("indexed-a2.mxf"));
+    let [first, second] = issue.edits.timelines.as_slice() else {
+        panic!("expected two owning timelines");
+    };
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.name, second.name);
+    assert_eq!((first.bin, second.bin), (0, 1));
+    assert_eq!(first.clock, Some((time(86_400, rate).unwrap(), 24, false)));
+    let [picture, audio] = first.edits.as_slice() else {
+        panic!("expected both missing picture and A2");
+    };
+    assert_eq!((picture.id.as_str(), picture.kind), ("picture", StreamKind::Video));
+    assert_eq!((audio.id.as_str(), audio.track, audio.master_track), ("primary-a2", 3, 2));
+    assert_eq!(audio.offset, Some(time(7, rate).unwrap()));
+    let [ambiguous] = second.edits.as_slice() else {
+        panic!("only the ambiguous A1 is affected");
+    };
+    assert_eq!((ambiguous.id.as_str(), ambiguous.track, ambiguous.master_track), ("duplicate-a1", 3, 1));
     let mut checks = 0;
     assert_eq!(run(&index, &options, &mut || {
         checks += 1;
@@ -300,6 +382,8 @@ fn blocked_legacy_mxf_review_collects_missing_and_ambiguous_packages_from_index(
     assert!(issue.additional[1].1.ends_with("2 of 2 indexed paths · a duplicate.mxf · z duplicate.mxf"));
     assert_eq!(issue.additional[2].0, 1);
     assert!(issue.additional[2].1.contains("Ambiguous legacy MXF file package for A1"));
+    assert_eq!(issue.edits.timelines[0].edits[1].id, "primary-a2");
+    assert_eq!(issue.edits.timelines[1].edits[0].id, "duplicate-a1");
 
     let mut calls = 0;
     let cancelled = run(&index, &options, &mut || {
@@ -741,6 +825,7 @@ fn color_adapter_receipt_binds_only_the_owned_picture_placement() {
             subclip_master: None,
             subclip_motion: None,
             picture_file: Observed::Known(file_mob),
+            reordered_picture_file: None,
             transform: RANGE.into(),
             neutral_wrapper: true,
             wrapper_clip_color: Some([48_896; 3]),
@@ -815,6 +900,39 @@ fn color_adapter_receipt_binds_only_the_owned_picture_placement() {
     }
     let adapter = facts.sequences[0].unresolved[0].color_adapter.as_mut().unwrap();
     adapter.subclip_master = None;
+    adapter.master = mob(1);
+    adapter.master_track = 1;
+    adapter.source_in = 8;
+    adapter.picture_file = Observed::Unresolved("different saved source color order".into());
+    adapter.reordered_picture_file = Some(file_mob);
+    adapter.transform = RANGE.replace("</ColorTransformationList>", concat!(
+        "<ColorTransformation><ExternalLut><Name>Chart (3D)</Name><LutFileName>Chart.cube",
+        "</LutFileName><LutDimension>3D</LutDimension><InhibitScaling/></ExternalLut>",
+        "</ColorTransformation></ColorTransformationList>",
+    ));
+    for (owner, expected) in [
+        ("sequence/component/1/component/0", Some("picture")),
+        ("sequence/component/10/component/0", None),
+    ] {
+        facts.sequences[0].events[0].owner = owner.into();
+        let built = run(&facts, &index).graph;
+        let graph = SourceGraph::from_json_text(&built.to_json_text().unwrap()).unwrap();
+        let sidecar = graph.sidecar("avid.source", "revision/seq").unwrap();
+        let Some(Value::Arr(issues)) = sidecar.get("unresolved") else { panic!("expected issues") };
+        let adapter = issues[0].get("color_adapter").unwrap();
+        assert_eq!(adapter.get("placement"), Some(&Value::Null));
+        let reordered = adapter.get("reordered_picture_source").unwrap();
+        assert_eq!(reordered.get("picture_file"), Some(&s(file_mob.urn())));
+        assert_eq!(reordered.get("placement"), Some(&expected.map(s).unwrap_or(Value::Null)));
+        let Some(Value::Arr(steps)) = adapter.get("ordered_steps") else { panic!("expected steps") };
+        assert_eq!(steps[0].get("kind"), Some(&s("linear_range")));
+        assert_eq!(steps[1].get("filename"), Some(&s("Chart.cube")));
+        assert!(graph.losses.iter().any(|loss| loss.aspect == "source_color_adapter"
+            && loss.object == expected.unwrap_or("revision/seq")));
+    }
+    let adapter = facts.sequences[0].unresolved[0].color_adapter.as_mut().unwrap();
+    adapter.transform = RANGE.into();
+    adapter.reordered_picture_file = None;
     adapter.picture_file = Observed::Unresolved("unqualified retimed picture".into());
     adapter.subclip_motion = Some(Box::new(av::SourceSubclipMotion {
         input_mob: mob(1), input_track: 1, input_start: 5, input_length: 99, length: 50,
@@ -997,6 +1115,65 @@ fn native_color_receipt_survives_an_unavailable_picture_route() {
     assert_eq!(payload.get("byte_count"), Some(&Value::Int(4097)));
     assert!(matches!(payload.get("sha256"), Some(Value::Str(hash)) if hash.len() == 64));
     assert!(payload.get("bytes_hex").is_none());
+}
+
+#[test]
+fn saved_warp_compositing_keeps_key_modes_and_distinct_occurrences() {
+    use avid_reader::color::{ColorCorrection, ParamValue};
+    use avid_reader::transform::{Kind, PictureEffect};
+    let (mut facts, index) = fixture(1);
+    let mut events = Vec::new();
+    for (offset, code, opacity) in [(0, 3, 39.0), (24, 5, 14.0)] {
+        let mut picture = event(&format!("picture-{offset}"), 1, 1, offset, 24, None);
+        picture.event.kind = KIND_PICTURE;
+        picture.event.master = mob(2);
+        let mut params = vec![
+            ("f281568d7e84d511935a50f857c10000".into(), ParamValue::Int(1)),
+            ("f381568d7e84d511935a50f857c10000".into(), ParamValue::Int(code)),
+            ("f681568d7e84d511935a50f857c10000".into(), ParamValue::Float(opacity)),
+            ("0682568d7e84d511935a50f857c10000".into(), ParamValue::Int(1)),
+            ("0782568d7e84d511935a50f857c10000".into(), ParamValue::Float(104.0)),
+            ("0882568d7e84d511935a50f857c10000".into(), ParamValue::Float(141.0)),
+            ("f0481979d5ff594184d9f6a6e9b6d3bb".into(), ParamValue::Int(0)),
+        ];
+        if code == 5 {
+            // A repeated setting and an opaque setting both remain in the
+            // raw receipt without becoming one resolved scalar.
+            params.push(("0782568d7e84d511935a50f857c10000".into(), ParamValue::Float(90.0)));
+            params.push(("0982568d7e84d511935a50f857c10000".into(), ParamValue::Other));
+        }
+        picture.event.picture = Some(PictureEffect {
+            kind: Kind::Warp,
+            params: ColorCorrection { params, ..Default::default() },
+            corner_pin: None,
+            compact_affine_warp: false,
+        });
+        events.push(picture);
+    }
+    facts.sequences.push(sequence(events));
+    let graph = run(&facts, &index).graph;
+    let reopened = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    assert_eq!(graph, reopened);
+    let sequence = &reopened.sequences[0];
+    assert!(sequence.placements.is_empty());
+    let source = reopened.sidecar("avid.source", &sequence.id).unwrap();
+    let Some(Value::Arr(events)) = source.get("native_events") else { panic!() };
+    assert_eq!(events.len(), 2);
+    for (event, (code, opacity)) in events.iter().zip([(3, 39.0), (5, 14.0)]) {
+        assert_eq!(event.get("placement_id"), Some(&Value::Null));
+        let picture = event.get("controls").unwrap().get("picture").unwrap();
+        let saved = picture.get("saved_compositing").unwrap();
+        assert_eq!(saved.get("foreground_group_gate"), Some(&Value::Int(1)));
+        assert_eq!(saved.get("key_mode_code"), Some(&Value::Int(code)));
+        assert_eq!(saved.get("foreground_opacity_percent"), Some(&Value::Float(opacity)));
+        assert_eq!(saved.get("background_color_selector"), Some(&Value::Int(1)));
+        assert_eq!(saved.get("background_saturation"), Some(&Value::Float(141.0)));
+        assert_eq!(saved.get("background_limit_to_video_levels"), Some(&Value::Int(0)));
+        assert_eq!(saved.get("background_hue"), (code == 3).then_some(&Value::Float(104.0)));
+        assert!(saved.get("background_luminance").is_none());
+        let Some(Value::Arr(raw)) = picture.get("params") else { panic!() };
+        assert_eq!(raw.len(), if code == 3 { 7 } else { 9 });
+    }
 }
 
 #[test]

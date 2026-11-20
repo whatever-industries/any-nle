@@ -2268,6 +2268,7 @@ fn direct(
     }
     if kind == StreamKind::Video {
         capture_grade(node, &placement.id, graph, blobs)?;
+        capture_clip_fusion(node, &placement.id, graph, blobs)?;
     }
     if let Some(speed) = speed {
         placement.speed = speed.graph(edit.length);
@@ -2409,6 +2410,39 @@ fn direct(
     Ok(Some(placement))
 }
 
+fn capture_clip_fusion(node: &Node, id: &str, graph: &mut SourceGraph, blobs: &mut Blobs) -> Result<()> {
+    let Some(wrapper) = node.optional("CompositionTable")? else { return Ok(()) };
+    if wrapper.children.is_empty() {
+        return Ok(());
+    }
+    let table = wrapper.entry()?;
+    let Some(saved) = table.maybe("CompositionBA")?.filter(|body| !body.is_empty()) else {
+        return Ok(());
+    };
+    use sha2::{Digest, Sha256};
+    let bytes = hex_bytes(saved)?;
+    blobs.charge(bytes.len())?;
+    let mut fields = vec![
+        ("decoded_bytes".into(), Value::Int(bytes.len() as i64)),
+        ("composition_sha256".into(), text(&hex::encode(Sha256::digest(&bytes)))),
+    ];
+    if let Some(saved) = table.maybe("FieldsBlob")? {
+        let fields_blob = hex_bytes(saved)?;
+        blobs.charge(fields_blob.len())?;
+        fields.push(("fields_sha256".into(), text(&hex::encode(Sha256::digest(&fields_blob)))));
+    }
+    if let Some(index) = table.maybe("ActiveCompositionIdx")?.and_then(|index| index.parse::<i64>().ok()) {
+        fields.push(("active_composition_index".into(), Value::Int(index)));
+    }
+    graph.sidecars.push(Sidecar {
+        adapter: crate::clip_fusion::ADAPTER.into(),
+        object: id.into(),
+        data: Value::Obj(fields),
+    });
+    loss(graph, id, "effect", crate::clip_fusion::LOSS);
+    Ok(())
+}
+
 fn capture_grade(node: &Node, id: &str, graph: &mut SourceGraph, blobs: &mut Blobs) -> Result<()> {
     let Some(wrapper) = node.optional("pLmVerTable")? else { return Ok(()) };
     if wrapper.children.is_empty() {
@@ -2456,6 +2490,18 @@ fn capture_grade(node: &Node, id: &str, graph: &mut SourceGraph, blobs: &mut Blo
                         ("version_id".into(), text(version.id()?)),
                         ("slope".into(), Value::Float(f64::from(slope))),
                         ("value_space".into(), text("resolve.cdl")),
+                    ]),
+                });
+                return Ok(());
+            }
+            if let Some(range) = crate::grade::decode_range_cdl(&bytes) {
+                graph.sidecars.push(Sidecar {
+                    adapter: crate::grade::RANGE_ADAPTER.into(),
+                    object: id.into(),
+                    data: Value::Obj(vec![
+                        ("node_id".into(), Value::Int(1)),
+                        ("version_id".into(), text(version.id()?)),
+                        ("direction".into(), text(crate::grade::range_direction(range))),
                     ]),
                 });
                 return Ok(());

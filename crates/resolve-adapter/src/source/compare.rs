@@ -238,7 +238,7 @@ impl<'a> Timeline<'a> {
                 .map(|s| (s.object.as_str(), &s.data))
                 .collect(),
             grades: graph.sidecars.iter()
-                .filter(|row| matches!(row.adapter.as_str(), grade::ADAPTER | grade::CDL_ADAPTER | grade::OPAQUE_ADAPTER)
+                .filter(|row| matches!(row.adapter.as_str(), grade::ADAPTER | grade::CDL_ADAPTER | grade::RANGE_ADAPTER | grade::OPAQUE_ADAPTER)
                     && placements.contains(row.object.as_str()))
                 .map(|row| ((row.object.as_str(), row.adapter.as_str()), &row.data))
                 .collect(),
@@ -920,6 +920,15 @@ fn compare_grade(
         };
         diff.change("edit.cdl_slope", context, slope(old_cdl), slope(new_cdl));
     }
+    let range = |timeline: &Timeline<'_>, edit: &Placement| {
+        match timeline.grades.get(&(edit.id.as_str(), grade::RANGE_ADAPTER))
+            .and_then(|row| row.get("direction"))
+        {
+            Some(Value::Str(value)) => json!(value),
+            _ => Json::Null,
+        }
+    };
+    diff.change("edit.cdl_range", context, range(left, a), range(right, b));
     let saved = |timeline: &Timeline<'_>, edit: &Placement| -> Result<Json> {
         if timeline.unknown_grades.contains(edit.id.as_str())
             || timeline.grades.contains_key(&(edit.id.as_str(), grade::OPAQUE_ADAPTER))

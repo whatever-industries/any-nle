@@ -12,6 +12,7 @@ mod groups;
 mod managed_multistream;
 mod imported_audio;
 mod matte;
+mod param_keys;
 mod source_color;
 mod timewarp;
 pub(super) use timewarp::{direct_input as timewarp_input, is_sampled_effect, uses_editable_position};
@@ -993,7 +994,9 @@ pub(super) struct Capture {
     adapter_issues: Vec<SourceIssue>,
     texts: Vec<TextFact>,
     group_uses: Vec<groups::UseFact>,
+    warp_inputs: Vec<SourceWarpInputs>,
     charged_ops: usize,
+    problem_ops: usize,
     primary_timecode_seen: bool,
     clock: Option<SequenceClock>,
     track_names: Vec<crate::source::SourceTrackName>,
@@ -1080,7 +1083,9 @@ impl Capture {
             adapter_issues: Vec::new(),
             texts: Vec::new(),
             group_uses: Vec::new(),
+            warp_inputs: Vec::new(),
             charged_ops: 0,
+            problem_ops: 0,
             primary_timecode_seen: false,
             clock: None,
             track_names: Vec::new(),
@@ -1877,6 +1882,50 @@ impl Capture {
         }
         plain_layers
     }
+
+    /// Retain the native branch facts and identify direct composites with exact gap timing.
+    pub(super) fn warp_inputs(&mut self, ctx: &Ctx<'_>, effect: &Node, record: i64, track: i64) -> bool {
+        let Some(scope) = self.stack.last().map(|i| &self.scopes[*i]) else { return false };
+        let Some(effect_length) = int(effect, "length").filter(|n| *n > 0) else { return false };
+        if !reserve(&self.budget, &mut self.warp_inputs, 1) {
+            return false;
+        }
+        let position_known = scope.position_known && !scope.retimed
+            && self.stack.iter().rev().skip(1).all(|&i| self.scopes[i].class == *b"SEQU");
+        let (controls, swap_sources) = saved_warp_controls(ctx, effect, &self.budget);
+        let inputs = saved_warp_inputs(ctx, effect);
+        self.warp_inputs.push(SourceWarpInputs {
+            owner: copy_text(&self.budget, &scope.id),
+            track,
+            record_start: position_known.then_some(record),
+            record_length: scope.record_length.filter(|len| position_known && *len > 0),
+            effect_rate: float(effect, "edit_rate").and_then(Rate::from_avid),
+            effect_length,
+            swap_sources,
+            inputs,
+            controls,
+        });
+        position_known && record >= 0 && record.checked_add(effect_length).is_some()
+            && inputs.iter().all(|input| matches!(input, SourceWarpInput::Picture(_)))
+    }
+
+    pub(super) fn unresolved_warp_slots(&mut self, record: i64, track: i64) {
+        let Some(scope) = self.stack.last().map(|i| &self.scopes[*i]) else { return; };
+        let position_known = self.direct_sequence_effect() && !scope.retimed;
+        let position = if position_known {
+            formatted(&self.budget, format_args!(" at record frame {record}"))
+        } else {
+            String::new()
+        };
+        let reason = formatted(&self.budget, format_args!(
+            "{}: V{track}{position}. Avid 3D Warp picture omitted because its input slots are missing or ambiguous.",
+            scope.id,
+        ));
+        add_classified_issue(&IssueContext {
+            owner: &scope.id, record, position_known, rate: self.rate, kind: KIND_PICTURE, track,
+        }, SourceIssueKind::Route, &reason, Vec::new(), &self.budget, &mut self.adapter_issues);
+    }
+
     pub(super) fn unsupported_picture_effect<'a>(
         &mut self, ctx: &Ctx<'a>, node: &'a Node, record: i64, kind: i64, track: i64, effect: &str,
         ambiguous: &HashSet<MobId>,
@@ -1938,9 +1987,9 @@ impl Capture {
         } else if let (Some(span), Some(issue)) = (length, self.adapter_issues.get_mut(index)) {
             if matte::empty_color_adapter(ctx, node).is_some() {
                 issue.picture_profile = Some(SourcePictureProfile::EmptyColorAdapter);
-            } else if self.rate == Rate::new(24, 1) {
+            } else if let Some(rate) = self.rate {
                 issue.color_adapter = source_color::capture_adapter(
-                    ctx, node, span, ambiguous, &self.budget, self.hd_24_still_canvas,
+                    ctx, node, span, rate, ambiguous, &self.budget, self.hd_24_still_canvas,
                 )
                 .filter(|_| charge(&self.budget, size_of::<SourceColorAdapter>()))
                 .map(Box::new);
@@ -2205,6 +2254,7 @@ impl Capture {
             return false;
         }
         self.charged_ops = ops.len() + 1;
+        self.problem_ops += usize::from(matches!(op, Op::Problem { .. }));
         true
     }
     pub(super) fn account_ops(&mut self, ops: &[Op]) {
@@ -2218,6 +2268,111 @@ impl Capture {
         }
         self.charged_ops = ops.len();
     }
+}
+
+fn saved_warp_inputs(ctx: &Ctx<'_>, effect: &Node) -> [SourceWarpInput; 2] {
+    let Some(ordered) = numbered_two_inputs(ctx, effect) else {
+        return [SourceWarpInput::Unresolved; 2];
+    };
+    ordered.map(|component| {
+        let Some(component) = component.filter(|node| int(node, "media_kind_id") == Some(KIND_PICTURE))
+        else {
+            return SourceWarpInput::Unresolved;
+        };
+        if matches!(component.get("components"), Some(Value::RefList(children)) if children.len() > 256) {
+            return SourceWarpInput::Unresolved;
+        }
+        if ctx.is_empty(component) {
+            SourceWarpInput::Filler
+        } else {
+            submaster::picture_source(ctx, effect, component)
+                .map_or(SourceWarpInput::Unresolved, SourceWarpInput::Picture)
+        }
+    })
+}
+
+fn saved_warp_controls(
+    ctx: &Ctx<'_>, effect: &Node, budget: &SharedBudget,
+) -> (Vec<SourceWarpControl>, Option<bool>) {
+    use SourceWarpControlCurve as Curve;
+    use SourceWarpControlValue as Scalar;
+
+    let mut controls = Vec::new();
+    let Some(Value::RefList(items)) = ctx.deref(effect.get("param_list"))
+        .and_then(|list| list.get("items"))
+    else {
+        return (controls, None);
+    };
+    if items.len() > 256 {
+        return (controls, None);
+    }
+    let mut complete = true;
+    for reference in items {
+        let Some((node, id)) = ctx.deref(Some(reference)).and_then(|node| {
+            match node.get("uuid") {
+                Some(Value::Uuid(id)) if node.class == *b"PRIT" => Some((node, id)),
+                _ => None,
+            }
+        }) else {
+            complete = false;
+            continue;
+        };
+        let id = crate::color::file_order_hex(id);
+        let Some(&(parameter_id, name)) = WARP_COMPOSITING_PARAMETERS.iter()
+            .find(|&&(parameter_id, _)| parameter_id == id)
+        else {
+            continue;
+        };
+        let value_type = int(node, "value_type");
+        let value = match (value_type, node.get("value")) {
+            (Some(1), Some(Value::Int(value))) => Scalar::Int(*value),
+            (Some(2), Some(Value::Float(value))) => Scalar::Float(*value),
+            _ => Scalar::Unresolved,
+        };
+        let enabled = match node.get("enable") {
+            Some(Value::Bool(enabled)) => Some(*enabled),
+            _ => None,
+        };
+        if !reserve(budget, &mut controls, 1) {
+            return (controls, None);
+        }
+        let curve = match node.get("control_track") {
+            Some(Value::Null | Value::Ref(0)) => Curve::Absent,
+            reference => ctx.deref(reference).map_or(Curve::Unresolved, |curve| {
+                saved_warp_curve(curve, budget)
+            }),
+        };
+        controls.push(SourceWarpControl { parameter_id, name, value_type, value, enabled, curve });
+    }
+    let mut swap = controls.iter().filter(|control| control.name == "swap_sources");
+    let swap_sources = match (complete, swap.next().map(|control| control.value), swap.next()) {
+        (true, Some(Scalar::Int(0) | Scalar::Float(0.0)), None) => Some(false),
+        (true, Some(Scalar::Int(1) | Scalar::Float(1.0)), None) => Some(true),
+        _ => None,
+    };
+    (controls, swap_sources)
+}
+
+fn saved_warp_curve(curve: &Node, budget: &SharedBudget) -> SourceWarpControlCurve {
+    use SourceWarpControlCurve as Curve;
+
+    let Some(Value::List(points)) = curve.get("control_points").filter(|_| curve.class == *b"PRCL") else {
+        return Curve::Unresolved;
+    };
+    if points.is_empty() {
+        return Curve::Empty;
+    }
+    if !charge(budget, size_of::<SourceWarpCurve>()) {
+        return Curve::Unresolved;
+    }
+    Curve::Keyframed(Box::new(SourceWarpCurve {
+        value_type: int(curve, "value_type"),
+        interpolation: int(curve, "interp_kind"),
+        extrapolation: int(curve, "extrap_kind"),
+        fields: int(curve, "fields"),
+        point_count: points.len(),
+        keys: param_keys::observe(points, budget),
+    }))
 }
 
 struct Piece {
@@ -3514,6 +3669,7 @@ fn finish_source(
         unresolved,
         texts,
         group_uses,
+        warp_inputs: capture.warp_inputs,
     }
 }
 
@@ -3558,6 +3714,7 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
     inputs: &[SourceInput],
     limits: SourceLimits,
     mut open: impl FnMut(&Path) -> crate::io::Result<T>,
+    mut observe: impl FnMut(BinReadProgress<'_>) -> Result<(), String>,
 ) -> Result<SourceProject, SourceReadError> {
     let budget = Rc::new(RefCell::new(Budget {
         limit: limits.max_fact_bytes.min(MAX_SOURCE_FACT_BYTES),
@@ -3584,6 +3741,7 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
     let mut duplicates = Vec::new();
     let mut routes = HashMap::new();
     let mut seen = HashSet::new();
+    let mut sequence_findings = 0;
     for (bin, input) in inputs.iter().enumerate() {
         if input.revision.len() != 64 || !input.revision.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(crate::source::failure(
@@ -3602,6 +3760,9 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
             bin,
             budget: budget.clone(),
         };
+        observe(BinReadProgress::Reading {
+            index: bin, path: &input.path, findings: skipped.len() + sequence_findings,
+        }).map_err(|e| crate::source::failure(&input.path, crate::io::Error::new(e, 0).to_string()))?;
         let file =
             open(&input.path).map_err(|e| crate::source::failure(&input.path, e.to_string()))?;
         let summary = compile_bin_inner(file.borrow(), bin, Some(&context));
@@ -3679,6 +3840,10 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
                     {
                         break;
                     }
+                    sequence_findings += seq.info.problems.len();
+                    if let Some(capture) = &seq.source {
+                        sequence_findings += capture.problem_ops + capture.adapter_issues.len();
+                    }
                     sequences.push(seq);
                 }
                 Item::Subclip(subclip) => {
@@ -3714,6 +3879,9 @@ pub(super) fn read_source_with<T: Borrow<AvbFile>>(
     let last = inputs
         .last()
         .map_or(Path::new("<source>"), |i| i.path.as_path());
+    observe(BinReadProgress::Finished {
+        total: inputs.len(), findings: skipped.len() + sequence_findings,
+    }).map_err(|e| crate::source::failure(last, e))?;
     let mut output = Vec::new();
     let mut referenced = HashSet::new();
     for group in &groups {
@@ -3766,7 +3934,7 @@ pub(crate) fn extract_source_paths(
     inputs: &[SourceInput],
     limits: SourceLimits,
 ) -> Result<SourceProject, SourceReadError> {
-    read_source_with(inputs, limits, AvbFile::open)
+    read_source_with(inputs, limits, AvbFile::open, |_| Ok(()))
 }
 /// Observe the bin immediately before opening it; cancellation never leaves a decoded bin retained.
 pub(crate) fn extract_source_paths_observed(inputs:&[SourceInput],limits:SourceLimits,before:&mut dyn FnMut(usize,&Path)->Result<(),String>)->Result<SourceProject,SourceReadError>{
@@ -3777,14 +3945,22 @@ pub(crate) fn extract_source_paths_inspected(
     before: &mut dyn FnMut(usize, &Path) -> Result<(), String>,
     inspect: &mut dyn FnMut(&AvbFile) -> Result<(), String>,
 ) -> Result<SourceProject, SourceReadError> {
-    let mut n = 0;
+    extract_source_paths_with_progress(inputs, limits, &mut |progress| match progress {
+        BinReadProgress::Reading { index, path, .. } => before(index, path),
+        BinReadProgress::Finished { .. } => Ok(()),
+    }, inspect)
+}
+
+pub(crate) fn extract_source_paths_with_progress(
+    inputs: &[SourceInput], limits: SourceLimits,
+    observe: &mut dyn FnMut(BinReadProgress<'_>) -> Result<(), String>,
+    inspect: &mut dyn FnMut(&AvbFile) -> Result<(), String>,
+) -> Result<SourceProject, SourceReadError> {
     read_source_with(inputs, limits, |path| {
-        before(n, path).map_err(|e| crate::io::Error::new(e, 0))?;
-        n += 1;
         let file = AvbFile::open(path)?;
         inspect(&file).map_err(|e| crate::io::Error::new(e, 0))?;
         Ok(file)
-    })
+    }, observe)
 }
 /// Synthetic/differential helper. Caller-owned decoded files are not opened or copied.
 /// Their input revisions must correspond to `inputs` just as in the path API.
@@ -3804,7 +3980,7 @@ pub(crate) fn extract_source_files(
         let file = files[index];
         index += 1;
         Ok(file)
-    })
+    }, |_| Ok(()))
 }
 
 pub(super) fn route_range_qualified(ctx: &Ctx<'_>, component: &Node) -> bool {
@@ -3929,6 +4105,59 @@ fn master_marker_witnesses(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod warp_input_tests {
+    use super::*;
+    use crate::{document::AvbDocument, io::Uuid};
+
+    #[test]
+    fn saved_warp_inputs_pair_by_track_index_and_reject_duplicates() {
+        let mut bin = AvbDocument::new_empty_bin(35, "Warp input control", 1, false);
+        let mob = |data1| MobId::unique_with_material(Uuid {
+            data1, data2: 0, data3: 0, data4: [0; 8],
+        });
+        let background = bin.create_source_clip(24.0, 1, 48, mob(1), 1, 7).unwrap();
+        let foreground = bin.create_source_clip(24.0, 1, 48, mob(2), 1, 13).unwrap();
+        let wrong_rate = bin.create_source_clip(25.0, 1, 48, mob(2), 1, 13).unwrap();
+        let filler = bin.create_filler(24.0, 1, 48).unwrap();
+        let bytes = bin.to_bytes().unwrap();
+        let file = AvbFile::parse(&bytes).unwrap();
+        let ctx = Ctx { file: &file, mobs: HashMap::new() };
+        let track = |index, component| Value::Node(Box::new(Node {
+            class: [0; 4],
+            type_name: "Track",
+            fields: vec![
+                ("index", Value::Int(index)),
+                ("component", Value::Ref(component)),
+            ],
+        }));
+        let effect = |tracks| Node {
+            class: *b"TKFX",
+            type_name: "Warp",
+            fields: vec![
+                ("edit_rate", Value::Float(24.0)),
+                ("length", Value::Int(48)),
+                ("tracks", Value::List(tracks)),
+            ],
+        };
+        let source = |data1, source_start| SourceWarpInput::Picture(SubmasterPictureInput {
+            mob: mob(data1),
+            track: 1,
+            source_start,
+            local_start: 0,
+            length: 48,
+            local_length: 48,
+            rate: Rate::new(24, 1).unwrap(),
+        });
+        assert_eq!(saved_warp_inputs(&ctx, &effect(vec![track(2, foreground), track(1, background)])),
+            [source(1, 7), source(2, 13)]);
+        assert_eq!(saved_warp_inputs(&ctx, &effect(vec![track(1, background), track(1, foreground)])),
+            [SourceWarpInput::Unresolved; 2]);
+        assert_eq!(saved_warp_inputs(&ctx, &effect(vec![track(1, filler), track(2, wrong_rate)])),
+            [SourceWarpInput::Filler, SourceWarpInput::Unresolved]);
     }
 }
 

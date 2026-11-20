@@ -1,5 +1,7 @@
 //! Read-only preparation followed by one explicit execution of the prepared document.
 use super::*;
+mod media_blocker;
+use media_blocker::{append_media_edit_details, append_unresolved_uses, unresolved_masters};
 use crate::premiere_preparation::timeline_subject;
 use crate::premiere_import::avid;
 use crate::source_input::{original_stamp, recheck_originals, OriginalStamp};
@@ -63,6 +65,10 @@ fn progress(cb: &mut dyn FnMut(Progress), stage: &str, message: &str) {
         total: 0,
         message: message.into(),
     })
+}
+fn reader_findings(count: usize) -> String {
+    let label = if count == 1 { "finding" } else { "findings" };
+    format!("{count} reader {label}")
 }
 fn sidecar(output: &Path, suffix: &str) -> Result<PathBuf, String> {
     let mut name = output
@@ -131,7 +137,7 @@ pub fn save_blocked_preflight_report(
     write_json(path, &blocked_preflight_report(spec, blocker), &mut Vec::new())
 }
 
-pub(crate) fn blocked_preflight_report<'a>(
+pub fn blocked_preflight_report<'a>(
     spec: &'a JobSpec,
     blocker: &'a ReviewBlocker,
 ) -> impl serde::Serialize + 'a {
@@ -221,7 +227,7 @@ impl PreparedJob {
         write_json(path, &self.preflight_report(), &mut Vec::new())
     }
 
-    pub(crate) fn preflight_report(&self) -> impl serde::Serialize + '_ {
+    pub fn preflight_report(&self) -> impl serde::Serialize + '_ {
         #[derive(serde::Serialize)]
         struct PreflightReport<'a> {
             schema: &'static str,
@@ -234,6 +240,10 @@ impl PreparedJob {
             #[serde(skip_serializing_if = "Option::is_none")]
             media_linking: Option<&'a MediaLinking>,
             subjects: std::collections::BTreeMap<&'a str, &'a str>,
+            #[serde(skip_serializing_if = "<[ReviewGroup]>::is_empty")]
+            timeline_groups: &'a [ReviewGroup],
+            #[serde(skip_serializing_if = "<[ReviewGroup]>::is_empty")]
+            source_groups: &'a [ReviewGroup],
             report: &'a [ReportNote],
         }
         let review = &self.review;
@@ -251,6 +261,8 @@ impl PreparedJob {
                 .iter()
                 .map(|(id, name)| (id.as_str(), name.as_str()))
                 .collect(),
+            timeline_groups: &review.timeline_groups,
+            source_groups: &review.source_groups,
             report: &review.notes,
         }
     }
@@ -304,6 +316,11 @@ fn source_read_blocker(
     };
     match issue {
         SourceReadIssue::OriginalLocator(issue) => {
+            let edit_reason = if issue.kind == OriginalLocatorKind::LegacyMxfPackage {
+                "Unresolved MXF package"
+            } else {
+                "Unresolved saved path"
+            };
             let kind = match issue.kind {
                 OriginalLocatorKind::LegacyMxfPackage => LegacyMxfPackage,
                 OriginalLocatorKind::MissingOriginal if !linked => RewrapMissingOriginal,
@@ -319,6 +336,7 @@ fn source_read_blocker(
             if issue.details_truncated {
                 blocker.message.push_str("\nAdditional locator checks reached the diagnostic size limit.");
             }
+            append_media_edit_details(&mut blocker, &issue.edits, inputs, edit_reason, false);
             blocker
         }
         SourceReadIssue::Bin(message) => ReviewBlocker::new(ProjectSource, message),
@@ -326,45 +344,6 @@ fn source_read_blocker(
         SourceReadIssue::MediaScan(message) => ReviewBlocker::new(AvidMedia, message),
         SourceReadIssue::SourceFacts(message) => ReviewBlocker::new(SourceContent, message),
     }
-}
-
-fn unresolved_masters(
-    source: &graph::source::SourceGraph,
-    inputs: &[SourceInput],
-    matte: &crate::png_mattes::Plan,
-) -> Vec<String> {
-    use graph::Value;
-
-    let mut details = Vec::new();
-    for sidecar in source.sidecars.iter().filter(|s| s.adapter == "avid.source") {
-        let Some(Value::Arr(masters)) = sidecar.data.get("unresolved_masters") else {
-            continue;
-        };
-        let bin = sidecar
-            .object
-            .strip_prefix("bin:")
-            .and_then(|index| index.parse::<usize>().ok())
-            .and_then(|index| inputs.get(index));
-        for master in masters {
-            let (Some(Value::Str(name)), Some(Value::Str(reason))) =
-                (master.get("name"), master.get("reason"))
-            else {
-                continue;
-            };
-            let mut detail = format!("{name}: {reason}");
-            if let Some(Value::Str(occurrence)) = master.get("occurrence") {
-                if !matte.keeps_unresolved_master(&sidecar.object, occurrence, reason) {
-                    continue;
-                }
-                detail.push_str(&format!(" · {occurrence}"));
-            }
-            if let Some(bin) = bin {
-                detail.push_str(&format!(" · {}", bin.path.display()));
-            }
-            details.push(detail);
-        }
-    }
-    details
 }
 
 fn media_scan_blocker(
@@ -391,7 +370,10 @@ fn media_scan_blocker(
     }
 }
 
-pub(crate) fn sequence_timing_blocker(source: &graph::source::SourceGraph) -> Option<ReviewBlocker> {
+pub(crate) fn sequence_timing_blocker(
+    source: &graph::source::SourceGraph,
+    review_bins: Option<(&HashMap<String, usize>, &[PathBuf])>,
+) -> Option<ReviewBlocker> {
     let mut blocked = source
         .losses
         .iter()
@@ -408,11 +390,18 @@ pub(crate) fn sequence_timing_blocker(source: &graph::source::SourceGraph) -> Op
         "Conversion would omit edits with unsupported Avid sequence timing",
     );
     let mut seen = HashSet::new();
+    let mut affected_owners = Vec::new();
     for loss in blocked {
         if seen.insert((loss.object.as_str(), loss.reason.as_str())) {
             let name = names.get(loss.object.as_str()).copied().unwrap_or("Selected sequence");
             issue.affected.push(format!("{name} · {}", loss.reason));
+            if review_bins.is_some() {
+                affected_owners.push(loss.object.as_str());
+            }
         }
+    }
+    if let Some((sequence_bins, bins)) = review_bins {
+        issue.timeline_groups = review_timeline_groups(source, affected_owners.iter().copied(), sequence_bins, bins);
     }
     Some(issue)
 }
@@ -517,6 +506,100 @@ fn review_subjects(
         }
     }
     subjects
+}
+
+fn review_timeline_groups<'a>(
+    source: &graph::source::SourceGraph,
+    objects: impl Iterator<Item = &'a str> + Clone,
+    sequence_bins: &HashMap<String, usize>,
+    bins: &[PathBuf],
+) -> Vec<ReviewGroup> {
+    let wanted: HashSet<_> = objects.clone().collect();
+    let sequences: HashMap<_, _> = source.sequences.iter().enumerate()
+        .map(|(index, sequence)| (sequence.id.as_str(), index))
+        .collect();
+    let mut owners = HashMap::new();
+    for (index, sequence) in source.sequences.iter().enumerate() {
+        let ids = sequence.placements.iter().chain(&sequence.disabled_placements).map(|edit| edit.id.as_str())
+            .chain(sequence.transitions.iter().map(|transition| transition.id.as_str()))
+            .chain(sequence.texts.iter().map(|text| text.id.as_str()));
+        owners.extend(ids.filter(|id| wanted.contains(id)).map(|id| (id, index)));
+    }
+    for usage in &source.multicam_uses {
+        if !wanted.contains(usage.id.as_str()) {
+            continue;
+        }
+        if let Some(&index) = sequences.get(usage.sequence.as_str()) {
+            owners.insert(usage.id.as_str(), index);
+        }
+    }
+    let mut indices = vec![Vec::new(); source.sequences.len()];
+    for (note_index, mut id) in objects.enumerate() {
+        loop {
+            if let Some(&index) = owners.get(id).or_else(|| sequences.get(id)) {
+                indices[index].push(note_index);
+                break;
+            }
+            // A native occurrence may have been omitted by the graph. Avid
+            // extends the owner's exact ID with slash-delimited components.
+            let Some((parent, _)) = id.rsplit_once('/') else { break };
+            id = parent;
+        }
+    }
+    source.sequences.iter().zip(indices)
+        .filter(|(_, note_indices)| !note_indices.is_empty())
+        .map(|(sequence, note_indices)| ReviewGroup {
+            id: sequence.id.clone(),
+            name: sequence.name.clone(),
+            bin: sequence_bins.get(&sequence.id).and_then(|&index| bins.get(index)).cloned(),
+            note_indices,
+        })
+        .collect()
+}
+
+fn review_source_groups(
+    source: &graph::source::SourceGraph,
+    notes: &[ReportNote],
+    bins: &[PathBuf],
+) -> Vec<ReviewGroup> {
+    let wanted: HashSet<_> = notes.iter().map(|note| note.object.as_str()).collect();
+    let items: HashMap<_, _> = source.items.iter().enumerate()
+        .map(|(index, item)| (item.id.as_str(), index)).collect();
+    let referenced: HashMap<_, _> = source.sequences.iter()
+        .flat_map(|sequence| sequence.placements.iter().chain(&sequence.disabled_placements))
+        .filter(|edit| wanted.contains(edit.id.as_str()))
+        .filter_map(|edit| Some((edit.id.as_str(), *items.get(edit.item.as_str())?)))
+        .collect();
+    let mut indices: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (note_index, note) in notes.iter().enumerate() {
+        let id = note.object.as_str();
+        if let Some(&index) = items.get(id).or_else(|| referenced.get(id)) {
+            indices.entry(index).or_default().push(note_index);
+        }
+    }
+    let mut owners = HashMap::new();
+    for bin in &source.bins {
+        let path = bin.id.strip_prefix("bin:").and_then(|id| id.parse::<usize>().ok())
+            .and_then(|index| bins.get(index));
+        for id in &bin.items {
+            let Some(&index) = items.get(id.as_str()) else { continue };
+            if indices.contains_key(&index) {
+                // Membership in multiple bins cannot establish one owner.
+                owners.entry(index).and_modify(|path| *path = None).or_insert(path);
+            }
+        }
+    }
+    source.items.iter().enumerate()
+        .filter_map(|(index, item)| {
+            let note_indices = indices.remove(&index)?;
+            Some(ReviewGroup {
+                id: item.id.clone(),
+                name: item.name.clone(),
+                bin: owners.get(&index).copied().flatten().cloned(),
+                note_indices,
+            })
+        })
+        .collect()
 }
 
 fn camera_original_links(source: &graph::source::SourceGraph) -> Vec<CameraOriginalLink> {
@@ -719,6 +802,7 @@ fn prepare_job(
                 proxy_rewrap_dir: spec.proxy_rewrap_dir.clone(),
                 ffmpeg: tools.ffmpeg.clone(),
                 allow_media_gaps: linked,
+                preserve_managed_audio_without_picture: spec.mode == ClipMode::Separate,
                 collect_blocked_locators: for_review,
                 verify_linked_imports: assisted,
             },
@@ -729,12 +813,20 @@ fn prepare_job(
                 use avid_adapter::SourceProgress;
                 cancel.check()?;
                 match event {
-                    SourceProgress::ReadingBin { index, path } => cb(Progress {
+                    SourceProgress::ReadingBin { index, path, findings } => cb(Progress {
                         stage: "source".into(),
                         current_bin: Some(path.into()),
                         completed: index,
                         total: bins.len(),
-                        message: format!("Reading bin {}/{}: {}", index + 1, bins.len(), path.display()),
+                        message: format!("{} · Reading bin {}/{} · {}", reader_findings(findings),
+                            index + 1, bins.len(), path.display()),
+                    }),
+                    SourceProgress::BinsRead { total, findings } => cb(Progress {
+                        stage: "source".into(),
+                        current_bin: None,
+                        completed: total,
+                        total,
+                        message: format!("{} · Finished reading bins", reader_findings(findings)),
                     }),
                     SourceProgress::ResolvingMedia => {
                         progress(cb, "source media", "Checking saved media links and managed files");
@@ -879,6 +971,15 @@ fn prepare_job(
         if for_review {
             issue.affected.append(&mut read.scan_issues);
             issue.affected.append(&mut read.audio_group_issues);
+            append_media_edit_details(&mut issue, &read.package_conflict_edits, &inputs, "Duplicate MXF package", true);
+            let missing = (issue.kind == RewrapMissingMedia).then_some(&read.missing_managed_edits);
+            if let Some(details) = missing {
+                append_media_edit_details(&mut issue, details, &inputs, "Missing MXF package", true);
+            }
+            let reported_edits = std::iter::once(&read.package_conflict_edits).chain(missing)
+                .flat_map(|details| &details.timelines).flat_map(|sequence| &sequence.edits)
+                .map(|edit| edit.id.as_str()).collect();
+            append_unresolved_uses(&mut issue, &read.graph, &read.sequence_bins, &inputs, &matte, &reported_edits);
         }
         return Err(issue);
     }
@@ -891,7 +992,8 @@ fn prepare_job(
         ));
     }
     if !linked {
-        if let Some(issue) = sequence_timing_blocker(&read.graph) {
+        let review_bins = for_review.then_some((&read.sequence_bins, bins.as_slice()));
+        if let Some(issue) = sequence_timing_blocker(&read.graph, review_bins) {
             return Err(issue);
         }
         crate::offline::check_edit_routes(&read.graph).map_err(blocker(SourceContent))?;
@@ -1073,6 +1175,8 @@ fn prepare_job(
         ));
     }
     let bindings = media.as_ref().map(|p| p.bindings()).unwrap_or_default();
+    let dnxhr_444_rgb_sources = media.as_ref()
+        .map(|plan| plan.dnxhr_444_rgb_sources()).unwrap_or_default();
     let mut ids = prproj::RandomUuids::new();
     let layout = if let Some(folder) = &spec.project_folder {
         let root = std::fs::canonicalize(folder)
@@ -1120,10 +1224,10 @@ fn prepare_job(
         if crate::managed_op1a::has_verified_streams(&read.graph) {
             return Err(ReviewBlocker::new(Rewrap, "This selection combines verified managed OP1a masters with selective rewrap candidates. Convert these bins separately."));
         }
-        prproj::convert::writer::prepare_typed_project_for_premiere_27(
+        prproj::convert::writer::prepare_typed_project_for_premiere_27_with_rewrap_colors(
             &input, &spec.output, &mut ids, prproj::convert::writer::TypedMedia::SelectedRewrap {
                 bindings: &bindings, clips: &selected_rewrap_ids, offline: &offline,
-            }, layout.as_ref(),
+            }, layout.as_ref(), &dnxhr_444_rgb_sources,
         )
     } else if crate::managed_op1a::has_verified_streams(&read.graph) {
         crate::managed_op1a::prepare(
@@ -1131,7 +1235,7 @@ fn prepare_job(
         )
     } else {
         premiere_preparation::prepare_document(
-            &input, &spec.output, &mut ids, &bindings, native, layout.as_ref(), &offline,
+            &input, &spec.output, &mut ids, &bindings, native, layout.as_ref(), &offline, &dnxhr_444_rgb_sources,
         )
     }
     .map_err(|e| {
@@ -1250,6 +1354,12 @@ fn prepare_job(
         },
         media_linking,
         subjects: review_subjects(&read.graph, &notes),
+        timeline_groups: if for_review {
+            review_timeline_groups(&read.graph, notes.iter().map(|note| note.object.as_str()), &read.sequence_bins, &bins)
+        } else { Vec::new() },
+        source_groups: if for_review {
+            review_source_groups(&read.graph, &notes, &bins)
+        } else { Vec::new() },
         notes,
         cli_equivalent: cli_command(&spec).map_err(blocker(Retry))?,
     };
@@ -1647,6 +1757,10 @@ mod tests {
             note("loss", "dissolve", "Approximated transition", "transition"),
             note("warning", "edit", "Unapplied pan", "pan"),
             note("loss", "picture", "Unapplied effect", "effect"),
+            note("loss", "seq:second/component/0/event/2", "Omitted picture edit", "source_route"),
+            note("info", "writer", "Unscoped information", ""),
+            note("loss", "seq:seconder/component/0/event/2", "Different ID", "source_route"),
+            note("loss", "edit", "Another finding about this edit", "effect"),
         ];
         let mut source = SourceGraph {
             project: Project { name: "Synthetic".into() },
@@ -1659,6 +1773,58 @@ mod tests {
         assert_eq!(labels["dissolve"], "Same name · V5 · frame 1 from sequence start");
         assert_eq!(labels["edit"], "Same name · A7");
         assert_eq!(labels["picture"], "Same name · V9 · frame 24 from sequence start");
+        let sequence_bins = HashMap::from([("seq:first".into(), 0), ("seq:second".into(), 1)]);
+        let bins = [PathBuf::from("Reel 1/Edit.avb"), PathBuf::from("Reel 2/Edit.avb")];
+        let groups = review_timeline_groups(&source, notes.iter().map(|note| note.object.as_str()), &sequence_bins, &bins);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].id, "seq:second");
+        assert_eq!(groups[0].bin.as_ref(), Some(&bins[1]));
+        assert_eq!(groups[0].note_indices, [2, 3]);
+        assert_eq!(groups[1].id, "seq:first");
+        assert_eq!(groups[1].bin.as_ref(), Some(&bins[0]));
+        assert_eq!(groups[1].note_indices, [0, 1, 6]);
+
+        source.losses = [2, 3, 5, 2, 1].into_iter().map(|i| graph::Loss {
+            object: notes[i].object.clone(),
+            aspect: avid_adapter::UNQUALIFIED_ROUTE_TIMING.into(),
+            reason: notes[i].message.clone(),
+        }).collect();
+        let blocked = sequence_timing_blocker(&source, Some((&sequence_bins, &bins))).unwrap();
+        let direct = sequence_timing_blocker(&source, None).unwrap();
+        assert_eq!(blocked.affected, direct.affected);
+        assert_eq!(blocked.affected.len(), 4);
+        assert_eq!(blocked.timeline_groups[0].id, "seq:second");
+        assert_eq!(blocked.timeline_groups[0].note_indices, [0, 1]);
+        assert_eq!(blocked.timeline_groups[1].id, "seq:first");
+        assert_eq!(blocked.timeline_groups[1].note_indices, [3]);
+        assert_eq!(blocked.cli_summary(), direct.cli_summary());
+
+        use graph::source::{SourceItem, SourceItemMedia};
+        let item = |id: &str| SourceItem {
+            id: id.into(), name: "Same clip".into(), umid: None, tape: None, rate: None,
+            color_rgb16: None, stream_groups: vec![], markers: vec![],
+            media: vec![SourceItemMedia {
+                media: "same-file".into(), gain_db: 0.0, source_offset: Some(Rational::ZERO),
+            }],
+        };
+        source.items = vec![item("item"), item("another-item")];
+        source.sequences[0].placements[0].item = "another-item".into();
+        source.bins = ["item", "another-item"].into_iter().enumerate()
+            .map(|(index, id)| graph::Bin {
+                id: format!("bin:{index}"), name: "Edit".into(), parent: None, items: vec![id.into()],
+            }).collect();
+        let notes = notes.into_iter().chain([note("warning", "item", "Source finding", "source")])
+            .collect::<Vec<_>>();
+        let clips = review_source_groups(&source, &notes, &bins);
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].id, "item");
+        assert_eq!(clips[0].bin.as_ref(), Some(&bins[0]));
+        assert_eq!(clips[0].note_indices, [1, 6, 7]);
+        assert_eq!(clips[1].id, "another-item");
+        assert_eq!(clips[1].bin.as_ref(), Some(&bins[1]));
+        assert_eq!(clips[1].note_indices, [2]);
+        source.bins[1].items.push("item".into());
+        assert!(review_source_groups(&source, &notes, &bins)[0].bin.is_none());
     }
 
     #[test]
@@ -1721,6 +1887,7 @@ mod tests {
                     kind,
                     additional: vec![(1, "Second locator unavailable".into())],
                     details_truncated: true,
+                    edits: Default::default(),
                 }),
                 linked,
                 &inputs,
@@ -1758,7 +1925,7 @@ mod tests {
             multicam_uses: vec![],
         };
         source.losses.push(source.losses[0].clone());
-        let issue = sequence_timing_blocker(&source).unwrap();
+        let issue = sequence_timing_blocker(&source, None).unwrap();
         assert_eq!(issue.affected.len(), 10);
         let summary = issue.clone().cli_summary();
         assert!(summary.ends_with(
@@ -1849,6 +2016,8 @@ mod tests {
                 media_linking: None,
                 notes: vec![],
                 subjects: HashMap::new(),
+                timeline_groups: vec![],
+                source_groups: vec![],
                 cli_equivalent: String::new(),
             },
             document,

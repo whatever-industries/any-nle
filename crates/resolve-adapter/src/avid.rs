@@ -6,10 +6,10 @@ use crate::{
     prepare::{prepare_bindings, MAX_CORE_MEDIA_ITEMS},
     Result, StreamSelector,
 };
-use avid_reader::source::SourceInput;
+use avid_reader::{extract::KIND_PICTURE, source::SourceInput};
 use graph::{
     source::{SourceGraph, SourceItem, SourceSequence},
-    StreamKind,
+    StreamKind, Value,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -526,6 +526,26 @@ pub(crate) fn plan_avid_turnover(
     Ok(AvidTurnoverPlan { graph: read.graph, spec, inputs: guards, notices, problem, proxies })
 }
 
+#[derive(Debug)]
+pub struct CameraOriginalsRequired {
+    count: usize,
+    affected: Vec<String>,
+}
+
+impl std::fmt::Display for CameraOriginalsRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Require camera originals blocked {} picture binding(s). Check saved paths and path mappings. Showing {}:\n{}",
+            self.count,
+            self.affected.len(),
+            self.affected.join("\n"),
+        )
+    }
+}
+
+impl std::error::Error for CameraOriginalsRequired {}
+
 fn check_camera_originals(
     graph: &SourceGraph,
     timelines: &[crate::linked::TimelineSpec],
@@ -571,6 +591,33 @@ fn check_camera_originals(
                 ));
             }
         }
+        // Native events still identify edits that could not produce a graph
+        // placement. Strict picture selection applies to those edits too.
+        if let Some(Value::Arr(events)) = graph.sidecar("avid.source", &sequence.id)
+            .and_then(|receipt| receipt.get("native_events"))
+        {
+            for event in events.iter().filter(|event|
+                matches!(event.get("kind"), Some(Value::Int(KIND_PICTURE)))
+                    && matches!(event.get("placement_id"), Some(Value::Null))
+            ) {
+                let track = match event.get("track") {
+                    Some(Value::Int(track)) if *track > 0 => format!("V{track}"),
+                    _ => "unknown video track".into(),
+                };
+                let position = match event.get("range").and_then(|range| range.get("record_start")) {
+                    Some(Value::Int(frame)) => format!("record frame {frame}"),
+                    _ => "unknown record position".into(),
+                };
+                let occurrence = match event.get("id") {
+                    Some(Value::Str(id)) => id.as_str(),
+                    _ => "unknown occurrence",
+                };
+                record_missing(format!(
+                    "{} · {track} · {position} · picture edit unavailable ({occurrence})",
+                    sequence.name,
+                ));
+            }
+        }
         if let Some(group) = &timeline.group {
             for camera in group.cameras.iter().filter(|camera| !is_original(camera)) {
                 record_missing(format!(
@@ -584,12 +631,7 @@ fn check_camera_originals(
     if count == 0 {
         return Ok(());
     }
-    Err(format!(
-        "Require camera originals blocked {count} picture binding(s). Check saved paths and path mappings. Showing {}:\n{}",
-        missing.len(),
-        missing.join("\n")
-    )
-    .into())
+    Err(CameraOriginalsRequired { count, affected: missing }.into())
 }
 
 fn group_selection<'a>(

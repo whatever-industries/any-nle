@@ -11,6 +11,7 @@ mod sequence;
 mod spool;
 mod pcm_prefix;
 mod multicam;
+mod locator_uses;
 pub mod managed_multistream;
 mod subclips;
 mod unused;
@@ -58,10 +59,12 @@ pub struct ReadResult {
     pub scan_issues: Vec<String>,
     /// Optional file-path evidence for Review. Kept out of graph and CLI diagnostics.
     pub package_conflict_details: Vec<String>,
+    pub package_conflict_edits: MediaEditDetails,
     /// Scan diagnostics for ambiguous native packages needed by the selected bin tracks.
     pub ambiguous_managed_packages: Vec<String>,
     pub missing_native_picture: bool,
     pub missing_managed_audio: Vec<String>,
+    pub missing_managed_edits: MediaEditDetails,
     pub unused_proof_issue: Option<String>,
     pub files_scanned: usize,
     receipt_spool: Option<spool::ReceiptSpool>,
@@ -87,13 +90,41 @@ pub enum SourceReadIssue {
     SourceFacts(String),
 }
 
-/// A primary locator refusal and any subsequent path-only Review findings.
+/// A primary locator refusal and any subsequent read-only Review findings.
 pub struct OriginalLocatorIssue {
     pub message: String,
     pub bin: usize,
     pub kind: OriginalLocatorKind,
     pub additional: Vec<(usize, String)>,
     pub details_truncated: bool,
+    pub edits: MediaEditDetails,
+}
+
+#[derive(Default)]
+pub struct MediaEditDetails {
+    pub timelines: Vec<OriginalLocatorTimeline>,
+    pub truncated: bool,
+}
+
+pub struct OriginalLocatorTimeline {
+    pub id: String,
+    pub name: String,
+    pub bin: usize,
+    pub rate: Option<Rational>,
+    /// Exact saved start, display base, and drop-frame flag.
+    pub clock: Option<(Rational, u16, bool)>,
+    pub edits: Vec<OriginalLocatorEdit>,
+}
+
+pub struct OriginalLocatorEdit {
+    pub id: String,
+    pub kind: StreamKind,
+    pub track: i64,
+    pub offset: Option<Rational>,
+    pub master_id: String,
+    pub master_name: String,
+    pub master_track: i64,
+    pub file_package: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +142,7 @@ impl OriginalLocatorIssue {
             kind,
             additional: Vec::new(),
             details_truncated: false,
+            edits: MediaEditDetails::default(),
         }
     }
 }
@@ -266,14 +298,15 @@ pub fn read_with_media_policy(
 ) -> Result<ReadResult, SourceReadIssue> {
     read_with_media_policy_spooled(inputs, media_roots, project, bin_names, options, allow_offline,
         skip_unused, false, &mut |event| match event {
-            SourceProgress::ReadingBin { index, path } => before(index, path),
+            SourceProgress::ReadingBin { index, path, .. } => before(index, path),
             _ => Ok(()),
         }, check)
 }
 
 /// Source preparation checkpoints for a job's progress display.
 pub enum SourceProgress<'a> {
-    ReadingBin { index: usize, path: &'a Path },
+    ReadingBin { index: usize, path: &'a Path, findings: usize },
+    BinsRead { total: usize, findings: usize },
     ResolvingMedia,
     BuildingTimelines { completed: usize, total: usize },
     ValidatingGraph,
@@ -285,14 +318,19 @@ pub fn read_with_media_policy_spooled(
     observe: &mut dyn FnMut(SourceProgress<'_>) -> Result<(), String>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<ReadResult, SourceReadIssue> {
-    let mut before = |index, path: &Path| observe(SourceProgress::ReadingBin { index, path });
     let mut references = skip_unused.then(unused::References::default);
-    let mut facts = if let Some(references) = &mut references {
-        av::extract_source_paths_inspected(inputs, av::SourceLimits::default(), &mut before,
-            &mut |file| references.observe(file, check))
-    } else {
-        av::extract_source_paths_observed(inputs, av::SourceLimits::default(), &mut before)
-    }.map_err(|e| SourceReadIssue::Bin(e.to_string()))?;
+    let mut facts = av::extract_source_paths_with_progress(inputs, av::SourceLimits::default(),
+        &mut |event| match event {
+            av::BinReadProgress::Reading { index, path, findings } =>
+                observe(SourceProgress::ReadingBin { index, path, findings }),
+            av::BinReadProgress::Finished { total, findings } =>
+                observe(SourceProgress::BinsRead { total, findings }),
+        },
+        &mut |file| match &mut references {
+            Some(references) => references.observe(file, check),
+            None => Ok(()),
+        },
+    ).map_err(|e| SourceReadIssue::Bin(e.to_string()))?;
     observe(SourceProgress::ResolvingMedia).map_err(SourceReadIssue::SourceFacts)?;
     let mut originals = original::OriginalIndex::scan_for_review_with_policy(
         &facts, options, allow_offline, references.as_ref(), check).map_err(|issue| {
@@ -359,15 +397,29 @@ fn resolve_media_and_build(
     if options.link_managed_op1a {
         managed_multistream::bind(facts, &index, &mut originals, &options.ffprobe, check)?;
     }
+    if originals.preserve_managed_audio_without_picture && !originals.allow_offline {
+        let rate = Rate::new(24_000, 1001);
+        for sequence in facts.sequences.iter().filter(|sequence| sequence.rate != rate) {
+            check().map_err(SourceReadIssue::SourceFacts)?;
+            originals.mixed_rate_managed_audio.extend(sequence.events.iter().map(|edit| edit.event.master));
+        }
+    }
     let motion_mxf =
         verify_motion_mxf(facts, &index, &options.ffprobe, options.link_dry_gain, check)
             .map_err(SourceReadIssue::MediaScan)?;
+    let package_conflict_edits = if options.collect_blocked_locators && !index.ambiguous.is_empty() {
+        locator_uses::collect_package_conflicts(facts, &originals, &selected_media, &motion_mxf, check)
+            .map_err(SourceReadIssue::MediaScan)?
+    } else {
+        MediaEditDetails::default()
+    };
     let graph = if receipt_spool.is_some() {
         validate_rates(facts).map_err(SourceReadIssue::SourceFacts)?;
         let sequences = std::mem::take(&mut facts.sequences);
-        build_working_graph(facts, sequences, &selected_media, project, bin_names, &originals, &motion_mxf, receipt_spool, observe, check)
+        build_working_graph(facts, sequences, &selected_media, project, bin_names, &originals, &motion_mxf, receipt_spool, false, observe, check)
     } else {
-        build_working_graph(facts, &facts.sequences, &selected_media, project, bin_names, &originals, &motion_mxf, None, observe, check)
+        let collect_missing = options.collect_blocked_locators && !options.allow_media_gaps;
+        build_working_graph(facts, &facts.sequences, &selected_media, project, bin_names, &originals, &motion_mxf, None, collect_missing, observe, check)
     };
     let mut read = graph
         .map_err(|error| {
@@ -388,6 +440,7 @@ fn resolve_media_and_build(
     if options.collect_blocked_locators && !read.ambiguous_managed_packages.is_empty() {
         read.package_conflict_details = index.package_conflict_details(&wanted, check)
             .map_err(SourceReadIssue::MediaScan)?;
+        read.package_conflict_edits = package_conflict_edits;
     }
     Ok(read)
 }
@@ -586,7 +639,7 @@ fn build_selected(
     motion_mxf: &MotionMxf,
 ) -> Result<ReadResult, String> {
     let selected_media = SelectedMediaIndex::new(facts, originals, index, &mut || Ok(()))?;
-    build_working_graph(facts, &facts.sequences, &selected_media, project, bin_names, originals, motion_mxf, None, &mut |_| Ok(()), &mut || Ok(()))
+    build_working_graph(facts, &facts.sequences, &selected_media, project, bin_names, originals, motion_mxf, None, false, &mut |_| Ok(()), &mut || Ok(()))
 }
 
 fn build_working_graph(
@@ -598,6 +651,7 @@ fn build_working_graph(
     originals: &original::OriginalIndex,
     motion_mxf: &MotionMxf,
     receipt_spool: Option<spool::ReceiptSpool>,
+    collect_missing: bool,
     observe: &mut dyn FnMut(SourceProgress<'_>) -> Result<(), String>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<ReadResult, String> {
@@ -671,9 +725,11 @@ fn build_working_graph(
         audio_group_issues: vec![],
         scan_issues: vec![],
         package_conflict_details: vec![],
+        package_conflict_edits: MediaEditDetails::default(),
         ambiguous_managed_packages: vec![],
         missing_native_picture: false,
         missing_managed_audio: vec![],
+        missing_managed_edits: MediaEditDetails::default(),
         unused_proof_issue: originals.references.as_ref().and_then(unused::References::incomplete)
             .map(|reason| format!("Skip unused clips is unavailable for this selection: {reason}.")),
         files_scanned: index.files_scanned,
@@ -756,10 +812,15 @@ fn build_working_graph(
     let mut missing_pcm_prefix = HashSet::new();
     let mut omitted_media = MediaOmissions::new();
     let mut source_masters = Vec::new();
+    let mut partial_managed_sources = HashMap::new();
     for input in &motion_mxf.fallbacks.inputs {
         budget.charge(size_of::<av::SourceInput>() + input.path.as_os_str().len() + input.revision.len())?;
         out.original_inputs.push(input.clone());
     }
+    let mut missing_tracks = Vec::new();
+    let mut master_missing = Vec::new();
+    let permit_partial_managed = originals.allow_media_gaps && !originals.allow_offline
+        && permits_missing_media_fallbacks;
     for (n, source) in facts.masters.iter().enumerate() {
         if motion_mxf.fallbacks.omitted_caches.contains(&source.master.mob_id) {
             continue;
@@ -785,8 +846,32 @@ fn build_working_graph(
         );
         let missing_audio_before = out.missing_managed_audio.len();
         let diagnostics_before = out.diagnostics.len();
-        match master(source, index, &id, &mut out, &mut budget, originals, motion_mxf) {
+        master_missing.clear();
+        let missing = if permit_partial_managed {
+            missing_managed_siblings(source, index, originals)
+        } else { None };
+        match master(source, index, &id, &mut out, &mut budget, originals, motion_mxf,
+            collect_missing.then_some(&mut master_missing),
+            missing.is_some_and(|missing| missing.picture.is_some())) {
             Ok(item) => {
+                if let Some(missing) = missing.filter(|missing| item.media.len() + missing.tracks().count() == 3) {
+                    let receipt = |track: &extract::MediaTrack| obj(vec![
+                        ("track", Value::Int(track.index)),
+                        ("file_package", s(track.file_mob.umid_hex())),
+                    ]);
+                    if let Some(track) = missing.picture {
+                        sidecar(&mut out, &mut budget, "avid.missing_managed_picture", &item.id, receipt(track))?;
+                    }
+                    let mono = match missing.mono {
+                        [Some(a1), Some(a2)] => Some(obj(vec![("tracks", Value::Arr(vec![receipt(a1), receipt(a2)]))])),
+                        [Some(track), None] | [None, Some(track)] => Some(receipt(track)),
+                        [None, None] => None,
+                    };
+                    if let Some(facts) = mono {
+                        sidecar(&mut out, &mut budget, "avid.missing_managed_mono", &item.id, facts)?;
+                    }
+                    partial_managed_sources.insert(out.graph.items.len(), (source, missing));
+                }
                 let bin = out
                     .graph
                     .bins
@@ -848,6 +933,10 @@ fn build_working_graph(
                     .push(format!("{:?}: skipped ({e})", source.master.name));
             }
         }
+        missing_tracks.extend(master_missing.iter().map(|&track| (n, track)));
+    }
+    if !missing_tracks.is_empty() {
+        out.missing_managed_edits = locator_uses::collect_tracks(facts, missing_tracks, check)?;
     }
     let multicams = multicam::append(&facts.groups, &copies, &mut out, &mut budget)?;
     for group in &facts.groups {
@@ -985,6 +1074,7 @@ fn build_working_graph(
                 pcm_prefix: source_masters.get(index).and_then(|source| source.pcm_prefix),
                 subclip_pcm,
                 timewarp_picture: timewarp_picture.filter(|_| square_pixels),
+                missing_managed_siblings: partial_managed_sources.get(&index).copied(),
             }
         })
         .collect();
@@ -1041,6 +1131,86 @@ fn build_working_graph(
         out.graph.encoded_len().map_err(|e| e.to_string())?;
     }
     Ok(out)
+}
+
+#[derive(Clone, Copy)]
+struct MissingManagedSiblings<'a> {
+    picture: Option<&'a extract::MediaTrack>,
+    mono: [Option<&'a extract::MediaTrack>; 2],
+}
+
+impl<'a> MissingManagedSiblings<'a> {
+    fn tracks(self) -> impl Iterator<Item = &'a extract::MediaTrack> {
+        self.picture.into_iter().chain(self.mono.into_iter().flatten())
+    }
+}
+
+// Recognize the saved three-package layout independently of the destination.
+// The Premiere adapter still verifies the available streams and clocks.
+fn missing_managed_siblings<'a>(
+    source: &'a av::SourceMaster,
+    index: &index::MediaIndex,
+    originals: &original::OriginalIndex,
+) -> Option<MissingManagedSiblings<'a>> {
+    let master = &source.master;
+    if source.rate != Rate::new(24_000, 1001) || master.tracks.len() != 3
+        || !master.stereo_pairs.is_empty() || !master.other_groups.is_empty()
+        || source.managed_multistream.is_some() || source.pcm_prefix.is_some()
+        || source.imported_audio.is_some() || source.originals.iter().any(Option::is_some)
+        || source.offsets.len() != 3 || source.offsets.iter().any(|offset| *offset != Observed::Known(0))
+        || (0..3).any(|i| originals.tracks.contains_key(&(source.id.clone(), i)))
+    {
+        return None;
+    }
+    let v = master.tracks.iter().find(|t| t.kind == KIND_PICTURE && t.index == 1)?;
+    let a1 = master.tracks.iter().find(|t| t.kind == KIND_SOUND && t.index == 1)?;
+    let a2 = master.tracks.iter().find(|t| t.kind == KIND_SOUND && t.index == 2)?;
+    let packages = [v, a1, a2].map(|t| t.file_mob.umid_hex());
+    if packages[0] == packages[1] || packages[0] == packages[2] || packages[1] == packages[2]
+        || !matches!(v.essence.as_ref(), Some(Essence::Picture {
+            compression, width: 1920, height: 1080, display_aspect: Some((16, 9)), ..
+        }) if compression == "RI00")
+        || [a1, a2].iter().any(|t| !matches!(t.essence, Some(Essence::Sound {
+            sample_rate: 48_000.0, bits: 24, channels: 1,
+        })) || t.edit_rate != 48_000.0 || t.length != v.length.saturating_mul(2002))
+    {
+        return None;
+    }
+    let [picture_online, a1_online, a2_online] = packages.map(|package| index.files.contains_key(&package));
+    if picture_online && a1_online && a2_online {
+        return None;
+    }
+    if !picture_online {
+        if !originals.preserve_managed_audio_without_picture
+            || originals.mixed_rate_managed_audio.contains(&master.mob_id) {
+            return None;
+        }
+        match (a1_online, a2_online) {
+            (true, true) if managed_audio_clock(index, a1).is_some_and(|a1| managed_audio_clock(index, a2) == Some(a1)) => {}
+            (true, false) if managed_audio_clock(index, a1).is_some() => {}
+            (false, true) if managed_audio_clock(index, a2).is_some() => {}
+            _ => return None,
+        }
+    }
+    Some(MissingManagedSiblings {
+        picture: (!picture_online).then_some(v),
+        mono: [(!a1_online).then_some(a1), (!a2_online).then_some(a2)],
+    })
+}
+
+fn managed_audio_clock(index: &index::MediaIndex, track: &extract::MediaTrack) -> Option<(u64, u64, i64)> {
+    let package = track.file_mob.umid_hex();
+    let file = index.identity(index.files.get(&package)?).ok()?;
+    let clock = file.qualified_file_clock()?;
+    if file.file_packages != [package] || file.file_essence_tracks != 1
+        || !file.file_tracks.contains(&(48_000, 1, track.length))
+        || clock.rate != (24_000, 1001) || clock.rounded_base != 24 || clock.drop
+        || clock.source_rate != (48_000, 1)
+        || clock.route != "file_source_clip_to_physical_timecode_track"
+    {
+        return None;
+    }
+    Some((clock.origin_count, clock.effective_count, track.length))
 }
 
 #[derive(Clone, Copy)]
@@ -1843,6 +2013,8 @@ fn master(
     budget: &mut Budget,
     originals: &original::OriginalIndex,
     motion_mxf: &MotionMxf,
+    mut review_missing: Option<&mut Vec<usize>>,
+    keep_audio_without_picture: bool,
 ) -> Result<SourceItem, MasterError> {
     let m = &source.master;
     if let Some(prefix) = source.pcm_prefix {
@@ -2125,7 +2297,11 @@ fn master(
         }
         let rate = Rate::from_avid(t.edit_rate)
             .ok_or_else(|| unsupported_managed_track_rate(source, tindex))?;
-        let Some(path) = index.files.get(&t.file_mob.umid_hex()) else {
+        let package = t.file_mob.umid_hex();
+        let Some(path) = index.files.get(&package) else {
+            if t.kind == KIND_PICTURE && keep_audio_without_picture {
+                continue;
+            }
             if source.pcm_prefix.is_some() && t.kind == KIND_PICTURE {
                 loss(out, budget, id, "media", "The picture sibling is offline. The verified PCM section remains linked.")
                     .map_err(MasterError::Budget)?;
@@ -2146,20 +2322,25 @@ fn master(
                 ]));
                 continue;
             }
+            if let Some(tracks) = &mut review_missing {
+                if index.ambiguous.binary_search(&package).is_err() {
+                    tracks.push(tindex);
+                }
+            }
             if t.kind == KIND_SOUND {
                 budget.charge(m.name.len()*4 + 160).map_err(MasterError::Budget)?;
                 out.missing_managed_audio.push(format!("{:?} A{}: missing file package {}",
-                    m.name, t.index, t.file_mob.umid_hex()));
+                    m.name, t.index, package));
                 out.diagnostics.push(format!(
                     "{:?} audio A{}: media for file mob {} not found; converted without it",
                     m.name,
                     t.index,
-                    t.file_mob.umid_hex()
+                    package
                 ));
                 continue;
             }
             return Err(MasterError::MissingPicture(format!(
-                "media for file mob {} not found", t.file_mob.umid_hex()
+                "media for file mob {package} not found"
             )));
         };
         let identity = index.identity(path)?;

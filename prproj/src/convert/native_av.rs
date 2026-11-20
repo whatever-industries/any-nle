@@ -303,15 +303,28 @@ pub fn validate_bindings(model: &Model, mappings: &[MediaRelink]) -> Result<()> 
         }
         let mut ordered: Vec<_> = c.audio.iter().collect();
         ordered.sort_by_key(|a| a.avid_track);
+        let wide_wavs = vm.separate_mono && v.codec == "AVdn"
+            && vm.target_path.to_ascii_lowercase().ends_with(".mxf")
+            && (33..=64).contains(&ordered.len())
+            && c.stereo_pairs.is_empty() && c.multichannel_groups.is_empty()
+            && matches!(ordered[0].bits, 16 | 24)
+            && ordered.iter().all(|a| a.start == v.start && a.bits == ordered[0].bits);
+        let mut wav_targets = HashSet::new();
         for (i, a) in ordered.iter().enumerate() {
             let am = paths
                 .get(a.path.as_str())
                 .ok_or_else(|| invalid("missing audio binding"))?;
+            if wide_wavs && am.is_separate_mono_wav() && wav_targets.insert(&am.target_path) {
+                continue;
+            }
             if am.target_path != vm.target_path || am.audio_stream != Some(i as u32) {
                 return Err(invalid(
                     "audio binding disagrees with Avid-label-sorted output ordinals",
                 ));
             }
+        }
+        if !wav_targets.is_empty() && wav_targets.len() != ordered.len() {
+            return Err(invalid("wide rewrap needs one separate PCM16 WAV per saved mono lane"));
         }
     }
     Ok(())

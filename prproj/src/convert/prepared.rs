@@ -783,6 +783,7 @@ pub enum PictureEffect {
     StaticMotion,
     UltraKey { rgb: [u8; 3] },
     VideoToFullRange,
+    FullToVideoRange,
     Resize([MotionKey; 2]),
     WarpRoll { keys: [WarpRollKey; 3], interpolation: WarpRollInterpolation },
     TrimmedWarp(TrimmedMotion),
@@ -841,6 +842,8 @@ pub struct PreparedSourceLut {
 impl PreparedSourceLut {
     pub const FULL_EDGE: u32 = 33;
     pub const MAX_FULL_GRID_EDITS: usize = 32;
+    pub const ORDERED_EDGE: u32 = 65;
+    pub const MAX_ORDERED_EDITS: usize = 8;
 
     pub fn valid_filename(name: &str) -> bool {
         name.strip_suffix(".cube").is_some_and(|stem| !stem.is_empty())
@@ -895,17 +898,21 @@ pub(super) fn validate_picture_effects(
                 && event.matte.is_none() && event.color_correction.is_none()
                 && event.speed_ratio.is_none() && event.time_remap.is_none() => {}
             PictureEffect::UltraKey { .. } => return Err(fail("Ultra Key needs a green key and one static 1080p23.976 Motion stage")),
-            PictureEffect::VideoToFullRange if sequence.rate == Fraction::new(24, 1)
+            PictureEffect::VideoToFullRange | PictureEffect::FullToVideoRange
+                if (sequence.rate == Fraction::new(24, 1)
+                    || (supports_picture_motion_clock(sequence.rate)
+                        && event.speed_ratio.is_none()
+                        && picture_geometry(event) == Some((sequence.rate, (1920, 1080)))))
                 && (sequence.width, sequence.height) == (1920, 1080)
                 && p.reflection_before_motion == [false; 2]
                 && event.transform.is_none() && event.matte.is_none() && event.color_correction.is_none()
                 && event.time_remap.is_none()
-                && (event.speed_ratio.is_none() || speeds.iter().any(|s|
+                && (event.speed_ratio.is_none() || (p.effect == PictureEffect::VideoToFullRange && speeds.iter().any(|s|
                     s.sequence == p.sequence && s.event == p.event
                         && s.ratio.0 > 0 && s.ratio.1 > 0
-                        && event.speed_ratio == Some((s.ratio.1, s.ratio.0)))) => {}
-            PictureEffect::VideoToFullRange =>
-                return Err(fail("range expansion needs one plain 1080p24 picture edit")),
+                        && event.speed_ratio == Some((s.ratio.1, s.ratio.0))))) => {}
+            PictureEffect::VideoToFullRange | PictureEffect::FullToVideoRange =>
+                return Err(fail("range scaling needs one qualified 1080p picture edit")),
             PictureEffect::WarpRoll { keys, .. } => {
                 if !supports_picture_motion_clock(sequence.rate) {
                     return Err(fail("invalid Warp Rotation keys or picture stack"));
@@ -1430,10 +1437,13 @@ impl PreparedProjectInput {
         let picture_effects: HashSet<_> = self.picture_effects.iter()
             .map(|effect| (effect.sequence, effect.event)).collect();
         let mut full_grid_edits = 0;
+        let mut ordered_edits = 0;
         for lut in &self.source_luts {
             let key = (lut.sequence, lut.event);
             let full_grid = lut.edge == PreparedSourceLut::FULL_EDGE;
+            let ordered = lut.edge == PreparedSourceLut::ORDERED_EDGE;
             full_grid_edits += usize::from(full_grid);
+            ordered_edits += usize::from(ordered);
             let valid_edit = self.sequences.get(lut.sequence).is_some_and(|sequence|
                 sequence.rate == Fraction::new(24, 1) && (sequence.width, sequence.height) == (1920, 1080)
                 && sequence.events.get(lut.event).is_some_and(|event|
@@ -1449,11 +1459,16 @@ impl PreparedProjectInput {
                     })
                     && event.time_remap.is_none()));
             if !valid_edit || !lut_owners.insert(key) || picture_effects.contains(&key)
-                || !(lut.edge == 2 || full_grid) || lut.points.len() != (lut.edge as usize).pow(3)
+                || !(lut.edge == 2 || full_grid || ordered) || lut.points.len() != (lut.edge as usize).pow(3)
                 || full_grid_edits > PreparedSourceLut::MAX_FULL_GRID_EDITS
+                || ordered_edits > PreparedSourceLut::MAX_ORDERED_EDITS
                 || !PreparedSourceLut::valid_filename(&lut.filename)
                 || lut.points.iter().any(|&(r, g, b)| [r, g, b].iter()
-                    .any(|v| !(0.0..=1.0).contains(v)))
+                    .any(|v| if ordered {
+                        !(-64.0 / 876.0..=959.0 / 876.0).contains(v)
+                    } else {
+                        !(0.0..=1.0).contains(v)
+                    }))
             {
                 return Err(ModelError("invalid prepared source LUT or unqualified picture stack".into()));
             }
@@ -1971,8 +1986,8 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         let mut keys = HashSet::new();
         for (k, v) in &avid.columns {
             require(keys.insert(k), "duplicate original metadata column")?;
-            super::model::check_text(k, "original metadata column", 256, false)?;
-            super::model::check_text(v, "original metadata value", 4096, true)?;
+            super::model::check_text(k, "original metadata column", super::model::AVID_COLUMN_NAME_LIMIT, false)?;
+            super::model::check_text(v, "original metadata value", super::model::AVID_COLUMN_VALUE_LIMIT, true)?;
         }
         require(
             avid.color_rgb16

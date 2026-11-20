@@ -446,6 +446,7 @@ fn capture_sequence(
         caption_omissions: all_caption_omissions, sampled_frame_count } = capture;
     let GraphCapture { graph, folder_ids, .. } = capture;
     let mut component_budget = components::Budget::default();
+    let mut color_payloads = color_mode::SavedPayloads::default();
     let mut track_state = metadata::TrackStateCapture::default();
     let mut muted_tracks = Vec::new();
     let mut track_pans = [0; 2];
@@ -794,10 +795,10 @@ fn capture_sequence(
                 let mut picture_effects = Vec::new();
                 if capture_components && kind == StreamKind::Video {
                     if let Some(saved) =
-                        color_mode::capture(project, data.element, clip, source, &placement_id)?
+                        color_mode::capture(project, data.element, clip, source, &placement_id, &mut color_payloads)?
                     {
                         appearance_loss = color_mode::qualified_exposure(&saved.data).is_none().then_some(
-                            "Premiere Color Mode Adjust is retained in graph/2. The saved controls or color pipeline are outside the qualified Resolve mapping",
+                            color_mode::ADJUST_LOSS,
                         );
                         graph.sidecars.push(saved);
                     }

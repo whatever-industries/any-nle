@@ -119,6 +119,7 @@ pub fn read_premiere_media_graph(
     let mut files = HashMap::new();
     let mut items = HashMap::new();
     let mut component_budget = components::Budget::default();
+    let mut color_payloads = super::color_mode::SavedPayloads::default();
     let mut sampled_frame_count = 0usize;
     let mut track_state = metadata::TrackStateCapture::default();
     for (kind, tracks) in [
@@ -243,7 +244,7 @@ pub fn read_premiere_media_graph(
                     graph.sidecars.push(saved);
                 }
                 let color = if kind == StreamKind::Video {
-                    super::color_mode::capture(&project, data.element, clip, source, &occurrence)?
+                    super::color_mode::capture(&project, data.element, clip, source, &occurrence, &mut color_payloads)?
                 } else {
                     None
                 };

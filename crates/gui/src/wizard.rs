@@ -1,29 +1,41 @@
-use crate::model::{Choices, ClipMode, Page, Preset, RequiredInput, Wizard};
+use crate::model::{Choices, ClipMode, Page, Preset, RequiredInput, Snapshot, Wizard};
 use crate::report::{Filter, PAGE_SIZE, ReportBrowser};
-use crate::{direction, palette, storage};
+use crate::{direction, icons::Glyph, palette, storage};
 use anynle_app::job::{
-    self, BlockerKind, CancelToken, Completion, CompletionStatus, Inventory, JobSpec, PreparedJob,
+    self, BinPath, BlockerKind, CancelToken, Completion, CompletionStatus, Inventory, JobSpec, PreparedJob,
     Progress, ReviewBlocker,
 };
 use eframe::egui::{self, Color32, RichText};
 use mapping::{AvidToPremiere, BinMode};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::Duration;
 
-const CANVAS: Color32 = Color32::from_gray(24);
-const RAIL: Color32 = Color32::from_gray(29);
-const SURFACE: Color32 = Color32::from_gray(33);
-const BORDER: Color32 = Color32::from_gray(57);
-const INK: Color32 = Color32::from_gray(236);
-const MUTED: Color32 = Color32::from_gray(172);
-const ACCENT: Color32 = Color32::from_rgb(155, 199, 248);
-const SELECTED: Color32 = Color32::from_rgb(37, 49, 63);
-const PRIMARY: Color32 = Color32::from_rgb(48, 77, 112);
+#[cfg(feature = "wizard-automation")]
+#[path = "automation.rs"]
+mod automation;
+#[cfg(feature = "wizard-automation")]
+pub(super) use automation::run as run_automation;
+
+const CANVAS: Color32 = Color32::from_rgb(27, 28, 39);
+const RAIL: Color32 = Color32::from_rgb(37, 37, 52);
+const SURFACE: Color32 = Color32::from_rgb(40, 41, 56);
+const CONTROL: Color32 = Color32::from_rgb(52, 53, 71);
+const BORDER: Color32 = Color32::from_rgb(60, 61, 80);
+const INK: Color32 = Color32::from_rgb(241, 239, 251);
+const MUTED: Color32 = Color32::from_rgb(176, 175, 195);
+const ACCENT: Color32 = Color32::from_rgb(196, 186, 255);
+const SELECTED: Color32 = Color32::from_rgb(59, 54, 89);
+const PRIMARY: Color32 = Color32::from_rgb(201, 190, 255);
+const PRIMARY_INK: Color32 = Color32::from_rgb(35, 29, 69);
 const GOOD: Color32 = Color32::from_rgb(133, 222, 190);
 const AMBER: Color32 = Color32::from_rgb(244, 199, 137);
-const ERROR_SURFACE: Color32 = Color32::from_rgb(63, 35, 43);
+const ERROR_SURFACE: Color32 = Color32::from_rgb(61, 41, 54);
+const ERROR_INK: Color32 = Color32::from_rgb(255, 187, 201);
+const SOURCE_LIST_HEIGHT: f32 = 196.;
+const PROJECT_TAIL_SPACE: f32 = 156.;
 const CONVERTING: &str = "Converting project";
 const SAVING_PREFLIGHT: &str = "Saving preflight report";
 const WHY: &str = include_str!("../../../docs/DECISIONS-EXPLAINED.md");
@@ -47,6 +59,7 @@ enum Pick {
 }
 enum Event {
     Progress(Progress),
+    Catalog(u64, Result<Vec<BinPath>, String>),
     Inventory(u64, Result<Inventory, String>),
     Prepared(u64, Result<Box<PreparedJob>, ReviewBlocker>),
     PreflightReportSaved(PreflightReportSource, PathBuf, Result<(), String>),
@@ -70,22 +83,73 @@ enum ReviewAction {
     Choose(Pick),
     Media(MediaJump),
     SwitchToSeparate { enable_offline_media: bool },
+    Recheck,
 }
 #[derive(Default)]
 struct Tree {
-    folders: BTreeMap<String, Tree>,
+    relative: PathBuf,
+    folders: BTreeMap<OsString, Tree>,
     files: Vec<usize>,
 }
+
+#[derive(Default)]
+struct FolderExpansion {
+    browse: BTreeMap<PathBuf, bool>,
+    search: BTreeMap<PathBuf, bool>,
+}
+
+impl FolderExpansion {
+    fn is_open(&self, path: &Path, bin_count: usize, filtering: bool) -> bool {
+        let state = if filtering { &self.search } else { &self.browse };
+        state.get(path).copied().unwrap_or(filtering || bin_count <= 16)
+    }
+
+    fn set_open(&mut self, path: &Path, filtering: bool, open: bool) {
+        let state = if filtering { &mut self.search } else { &mut self.browse };
+        state.insert(path.to_path_buf(), open);
+    }
+}
+
+struct BinSelection<'a> {
+    paths: &'a mut Vec<PathBuf>,
+    checked: HashSet<PathBuf>,
+}
+
+impl<'a> BinSelection<'a> {
+    fn new(paths: &'a mut Vec<PathBuf>) -> Self {
+        let checked = paths.iter().cloned().collect();
+        Self { paths, checked }
+    }
+
+    fn set<'p>(&mut self, bins: impl Iterator<Item = &'p PathBuf>, checked: bool) {
+        if checked {
+            for bin in bins {
+                if self.checked.insert(bin.clone()) {
+                    self.paths.push(bin.clone());
+                }
+            }
+        } else {
+            for bin in bins {
+                self.checked.remove(bin);
+            }
+            self.paths.retain(|path| self.checked.contains(path));
+        }
+    }
+}
+
 impl Tree {
-    fn build(inv: &Inventory) -> Self {
+    fn build(bins: &[BinPath]) -> Self {
         let mut tree = Self::default();
-        for (i, bin) in inv.bins.iter().enumerate() {
+        for (i, bin) in bins.iter().enumerate() {
             let relative = &bin.relative;
             let mut node = &mut tree;
             if let Some(parent) = relative.parent() {
                 for part in parent.components() {
-                    let name = part.as_os_str().to_string_lossy().into_owned();
-                    node = node.folders.entry(name).or_default();
+                    let name = part.as_os_str().to_owned();
+                    node = node.folders.entry(name.clone()).or_insert_with(|| Self {
+                        relative: node.relative.join(name),
+                        ..Default::default()
+                    });
                 }
             }
             node.files.push(i);
@@ -102,99 +166,171 @@ impl Tree {
     fn show(
         &self,
         ui: &mut egui::Ui,
-        inventory: &Inventory,
-        selected: &mut Vec<PathBuf>,
-        search: &str,
+        catalog: &[BinPath],
+        selected: &mut BinSelection<'_>,
+        matches: Option<&[bool]>,
         entire: bool,
-        prefix: &str,
+        expansion: &mut FolderExpansion,
     ) {
         for (name, node) in &self.folders {
             let indices = node.indices();
-            if !indices.iter().any(|i| {
-                inventory.bins[*i]
-                    .relative
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains(search)
-            }) {
+            if matches.is_some_and(|matches| !indices.iter().any(|&i| matches[i])) {
                 continue;
             }
-            let key = format!("{prefix}/{name}");
-            ui.horizontal(|ui| {
-                let mut all = entire
-                    || indices
-                        .iter()
-                        .all(|i| selected.contains(&inventory.bins[*i].path));
-                if ui
-                    .checkbox(&mut all, "")
-                    .on_hover_text("Select this folder's bins")
-                    .changed()
-                {
-                    for i in &indices {
-                        let path = &inventory.bins[*i].path;
-                        if all {
-                            if !selected.contains(path) {
-                                selected.push(path.clone());
-                            }
-                        } else {
-                            selected.retain(|p| p != path);
-                        }
+            let filtering = matches.is_some();
+            let id = ui.make_persistent_id(("bin-folder", name, filtering));
+            let open = expansion.is_open(&node.relative, catalog.len(), filtering);
+            let mut state =
+                egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, open);
+            state.set_open(open);
+            let header = state
+                .show_header(ui, |ui| {
+                    let bins = || indices.iter().map(|&i| &catalog[i].path);
+                    let mut all = entire || bins().all(|path| selected.checked.contains(path));
+                    let partial = !all && bins().any(|path| selected.checked.contains(path));
+                    let checkbox = egui::Checkbox::new(&mut all, name.to_string_lossy())
+                        .indeterminate(partial);
+                    if ui
+                        .add_enabled(!entire, checkbox)
+                        .on_hover_text("Select every bin in this folder and its subfolders")
+                        .changed()
+                    {
+                        selected.set(bins(), all);
                     }
-                }
-                egui::CollapsingHeader::new(format!("{name}  ·  {} bins", indices.len()))
-                    .id_salt(&key)
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        node.show(ui, inventory, selected, search, entire, &key)
-                    });
+                    ui.label(
+                        RichText::new(counted(indices.len(), "bin", "bins"))
+                            .small()
+                            .color(MUTED),
+                    );
+                });
+            let now_open = header.is_open();
+            if now_open != open {
+                expansion.set_open(&node.relative, filtering, now_open);
+            }
+            let (toggle, _, _) = header.body(|ui| {
+                node.show(ui, catalog, selected, matches, entire, expansion);
             });
+            let action = if now_open { "Collapse" } else { "Expand" };
+            let label = format!("{action} {}", name.to_string_lossy());
+            toggle.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
+            toggle.on_hover_text(label);
         }
         for i in &self.files {
-            let bin = &inventory.bins[*i];
-            if !bin
-                .relative
-                .to_string_lossy()
-                .to_lowercase()
-                .contains(search)
-            {
+            let bin = &catalog[*i];
+            if matches.is_some_and(|matches| !matches[*i]) {
                 continue;
             }
-            ui.horizontal(|ui| {
-                let mut value = entire || selected.contains(&bin.path);
-                if ui
-                    .checkbox(
-                        &mut value,
-                        bin.path.file_name().unwrap_or_default().to_string_lossy(),
-                    )
-                    .changed()
-                {
-                    if value {
-                        selected.push(bin.path.clone());
-                    } else {
-                        selected.retain(|p| p != &bin.path);
+            ui.push_id(&bin.path, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.spacing().indent);
+                    let mut value = entire || selected.checked.contains(&bin.path);
+                    if ui
+                        .add_enabled(
+                            !entire,
+                            egui::Checkbox::new(&mut value, path_name(&bin.path)),
+                        )
+                        .on_hover_text(bin.path.display().to_string())
+                        .changed()
+                    {
+                        selected.set(std::iter::once(&bin.path), value);
                     }
-                }
-                ui.label(
-                    RichText::new(format!(
-                        "{} clips  ·  {} sequences{}",
-                        bin.clips,
-                        bin.sequences,
-                        if bin.dependency {
-                            "  ·  dependency"
-                        } else {
-                            ""
-                        }
-                    ))
-                    .small()
-                    .color(MUTED),
-                );
+                });
             });
         }
     }
 }
 
+#[derive(Default)]
+struct Activity {
+    errors: VecDeque<String>,
+    unread: bool,
+    open: bool,
+    critical: bool,
+}
+
+impl Activity {
+    fn record(&mut self, error: String, critical: bool) {
+        if self.errors.back() != Some(&error) {
+            if self.errors.len() == 64 {
+                self.errors.pop_front();
+            }
+            self.errors.push_back(error);
+        }
+        self.unread = !self.open;
+        self.critical |= critical;
+    }
+
+    fn button(&mut self, ui: &mut egui::Ui) {
+        let color = if self.unread { ERROR_INK } else { MUTED };
+        let icon = Glyph::Activity.image(ui, 15., color);
+        let text = if self.unread { "Activity · Error" } else { "Activity" };
+        let mut button = egui::Button::image_and_text(icon, RichText::new(text).color(color))
+            .right_text("")
+            .min_size(egui::vec2(ui.available_width(), 31.))
+            .corner_radius(8)
+            .frame_when_inactive(false);
+        if self.unread {
+            button = button.fill(ERROR_SURFACE).frame_when_inactive(true);
+        }
+        if ui.add(button).clicked() {
+            self.open = true;
+            self.unread = false;
+        }
+    }
+
+    fn show(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Activity")
+            .open(&mut self.open)
+            .default_width(480.)
+            .show(ctx, |ui| {
+                if self.errors.is_empty() {
+                    ui.label("No errors in this session.");
+                    return;
+                }
+                if ui.button("Copy error log").clicked() {
+                    ctx.copy_text(self.errors.iter().rev().map(String::as_str).collect::<Vec<_>>().join("\n\n"));
+                }
+                egui::ScrollArea::vertical().max_height(380.).show(ui, |ui| {
+                    for error in self.errors.iter().rev() {
+                        ui.add(egui::Label::new(error).wrap().selectable(true));
+                        ui.add_space(8.);
+                    }
+                });
+            });
+        if self.critical {
+            let response = egui::Modal::new(egui::Id::unique("critical-conversion-error"))
+                .backdrop_color(Color32::from_black_alpha(150))
+                .show(ctx, |ui| {
+                    ui.set_min_width(285.);
+                    ui.label(RichText::new("Conversion stopped").font(semibold(19.)));
+                    ui.label("See Activity for the error details.");
+                    ui.add_space(6.);
+                    ui.horizontal(|ui| {
+                        (ui.button("Open Activity").clicked(), ui.button("Close").clicked())
+                    }).inner
+                });
+            let (open, close) = response.inner;
+            if open {
+                self.open = true;
+                self.unread = false;
+                ctx.request_repaint();
+            }
+            self.critical = !(open || close || response.should_close());
+        }
+    }
+}
+
+fn semibold(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name("Inter Semibold".into()))
+}
+
 pub struct App {
     wizard: Wizard,
+    remember_choices: bool,
+    catalog: Option<Vec<BinPath>>,
+    expansion: FolderExpansion,
+    #[cfg(feature = "wizard-automation")]
+    source_viewport: Option<egui::Rect>,
     inventory: Option<Inventory>,
     prepared: Option<PreparedJob>,
     rewrap_size: crate::rewrap_size::SizeControl,
@@ -209,6 +345,7 @@ pub struct App {
     task: String,
     progress: Option<Progress>,
     error: Option<String>,
+    activity: Activity,
     highlight_required_input: bool,
     notice: Option<String>,
     search: String,
@@ -234,27 +371,43 @@ pub struct App {
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, replay: Option<PathBuf>) -> Self {
-        Self::theme(&cc.egui_ctx);
-        let (tx, rx) = mpsc::sync_channel(32);
-        let mut wizard = Wizard::default();
-        let mut error = None;
+        let mut app = Self::session(&cc.egui_ctx);
+        app.remember_choices = true;
         match storage::load() {
-            Ok(Some(c)) => wizard.choices = c,
+            Ok(Some(c)) => app.wizard.choices = c,
             Ok(None) => {}
-            Err(e) => error = Some(e),
+            Err(e) => app.error = Some(e),
         }
-        let mut app = Self {
-            wizard,
+        #[cfg(target_os = "macos")]
+        {
+            app.resolve_templates =
+                anynle_app::resolve_job::local_templates().unwrap_or_else(|error| {
+                    eprintln!("Resolve templates: {error}");
+                    None
+                });
+        }
+        if let Some(path) = replay {
+            app.load_job(&path);
+        }
+        app
+    }
+    fn session(ctx: &egui::Context) -> Self {
+        Self::theme(ctx);
+        let (tx, rx) = mpsc::sync_channel(32);
+        Self {
+            wizard: Wizard::default(),
+            remember_choices: false,
+            catalog: None,
+            expansion: FolderExpansion::default(),
+            #[cfg(feature = "wizard-automation")]
+            source_viewport: None,
             inventory: None,
             prepared: None,
             rewrap_size: Default::default(),
             #[cfg(target_os = "macos")]
             resolve_wizard: None,
             #[cfg(target_os = "macos")]
-            resolve_templates: anynle_app::resolve_job::local_templates().unwrap_or_else(|error| {
-                eprintln!("Resolve templates: {error}");
-                None
-            }),
+            resolve_templates: None,
             review_blocker: None,
             media_jump: None,
             completion: None,
@@ -265,7 +418,8 @@ impl App {
             busy: false,
             task: String::new(),
             progress: None,
-            error,
+            error: None,
+            activity: Default::default(),
             highlight_required_input: false,
             notice: None,
             search: String::new(),
@@ -284,19 +438,28 @@ impl App {
             relink: Default::default(),
             #[cfg(target_os = "macos")]
             premiere_status: Default::default(),
-        };
-        if let Some(path) = replay {
-            app.load_job(&path);
         }
-        app
     }
     fn theme(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+        for (name, data) in [
+            ("Inter", include_bytes!("../resources/inter/Inter-Regular.ttf").as_slice()),
+            ("Inter Semibold", include_bytes!("../resources/inter/Inter-SemiBold.ttf").as_slice()),
+        ] {
+            fonts.font_data.insert(name.into(), egui::FontData::from_static(data).into());
+        }
+        let regular = fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap();
+        regular.insert(0, "Inter".into());
+        let mut bold = regular.clone();
+        bold[0] = "Inter Semibold".into();
+        fonts.families.insert(semibold(13.).family, bold);
+        ctx.set_fonts(fonts);
         let mut style = egui::Style::default();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = CANVAS;
         style.visuals.window_fill = SURFACE;
         style.visuals.window_stroke = egui::Stroke::new(1., BORDER);
-        style.visuals.extreme_bg_color = Color32::from_gray(19);
+        style.visuals.extreme_bg_color = Color32::from_rgb(22, 23, 33);
         style.visuals.faint_bg_color = SURFACE;
         style.visuals.selection.bg_fill = SELECTED;
         style.visuals.selection.stroke = egui::Stroke::new(1., ACCENT);
@@ -304,16 +467,17 @@ impl App {
         let widgets = &mut style.visuals.widgets;
         widgets.noninteractive.fg_stroke.color = INK;
         widgets.noninteractive.bg_stroke.color = BORDER;
-        widgets.inactive.weak_bg_fill = Color32::from_gray(41);
-        widgets.inactive.bg_fill = Color32::from_gray(41);
+        widgets.inactive.weak_bg_fill = CONTROL;
+        widgets.inactive.bg_fill = CONTROL;
+        widgets.inactive.bg_stroke = egui::Stroke::NONE;
         widgets.inactive.fg_stroke.color = INK;
-        widgets.hovered.weak_bg_fill = Color32::from_gray(52);
-        widgets.hovered.bg_fill = Color32::from_gray(52);
+        widgets.hovered.weak_bg_fill = BORDER;
+        widgets.hovered.bg_fill = BORDER;
         widgets.hovered.bg_stroke.color = MUTED;
         widgets.active.weak_bg_fill = SELECTED;
         widgets.active.bg_fill = SELECTED;
         widgets.active.bg_stroke.color = ACCENT;
-        style.spacing.item_spacing = egui::vec2(8., 6.);
+        style.spacing.item_spacing = egui::vec2(8., 7.);
         style.spacing.button_padding = egui::vec2(8., 4.);
         style
             .text_styles
@@ -323,7 +487,10 @@ impl App {
             .insert(egui::TextStyle::Button, egui::FontId::proportional(13.));
         style
             .text_styles
-            .insert(egui::TextStyle::Heading, egui::FontId::proportional(22.));
+            .insert(egui::TextStyle::Heading, semibold(30.));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(11.));
         ctx.set_theme(egui::Theme::Dark);
         ctx.set_style_of(egui::Theme::Dark, style);
     }
@@ -404,6 +571,16 @@ impl App {
         self.completion_subjects = HashMap::new();
         self.report = ReportBrowser::default();
     }
+    fn apply_settings_changes(&mut self, before: &Snapshot) -> bool {
+        if !self.wizard.changed_since(before) {
+            return false;
+        }
+        self.invalidate();
+        if before.choices.include_trash_attic != self.wizard.choices.include_trash_attic {
+            self.catalog = None;
+        }
+        true
+    }
     fn start(&mut self, label: &str) {
         self.busy = true;
         self.task = label.into();
@@ -411,6 +588,21 @@ impl App {
         self.notice = None;
         self.progress = None;
         self.cancel = CancelToken::default();
+    }
+    fn find_bins(&mut self, ctx: &egui::Context) {
+        if self.busy {
+            return;
+        }
+        let spec = self.spec();
+        let revision = self.wizard.revision();
+        self.start("Finding source bins");
+        let (tx, cancel, ctx) = (self.tx.clone(), self.cancel.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| job::bin_catalog(&spec, &cancel))
+                .unwrap_or_else(|_| Err("The bin catalog worker stopped unexpectedly.".into()));
+            let _ = tx.send(Event::Catalog(revision, result));
+            ctx.request_repaint();
+        });
     }
     fn scan(&mut self, ctx: &egui::Context) {
         if self.busy {
@@ -662,6 +854,8 @@ impl App {
                 self.ffprobe = s.ffprobe;
                 self.wizard.invalidate();
                 self.invalidate();
+                self.catalog = None;
+                self.expansion = FolderExpansion::default();
                 self.inventory = None;
                 self.notice = Some(
                     "Job settings loaded. Check the paths, then run a fresh pre-flight.".into(),
@@ -671,8 +865,11 @@ impl App {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        self.receive_events(ctx, None);
+    }
+    fn receive_events(&mut self, ctx: &egui::Context, mut first: Option<Event>) {
         for _ in 0..64 {
-            let Ok(event) = self.rx.try_recv() else {
+            let Some(event) = first.take().or_else(|| self.rx.try_recv().ok()) else {
                 break;
             };
             match event {
@@ -681,13 +878,25 @@ impl App {
                     self.busy = false;
                     self.wizard.invalidate();
                     self.invalidate();
-                    self.error = Some(message);
+                    self.activity.record(message, true);
                 }
                 Event::Progress(p) => self.progress = Some(p),
+                Event::Catalog(revision, result) => {
+                    self.busy = false;
+                    if self.cancel.is_cancelled() {
+                        self.notice = Some("Cancelled.".into());
+                    } else if revision == self.wizard.revision() {
+                        match result {
+                            Ok(catalog) => self.catalog = Some(catalog),
+                            Err(error) => self.error = Some(error),
+                        }
+                    }
+                }
                 Event::Inventory(revision, result) => {
                     self.busy = false;
                     if self.cancel.is_cancelled() {
-                        self.notice = Some("Cancelled; no project was published.".into());
+                        self.notice = Some("Cancelled.".into());
+                        continue;
                     }
                     match result {
                         Ok(i) if revision == self.wizard.revision() => {
@@ -721,6 +930,9 @@ impl App {
                     self.busy = false;
                     self.wizard.invalidate();
                     self.report = ReportBrowser::new(&c.report);
+                    if c.status == CompletionStatus::Failed {
+                        self.activity.record(c.message.clone(), true);
+                    }
                     self.completion = Some(c);
                 }
                 Event::PreflightReportSaved(source, path, result) => {
@@ -740,6 +952,7 @@ impl App {
                 Event::Picked(kind, paths) => {
                     self.busy = false;
                     let before = self.wizard.snapshot();
+                    let mut find_bins = false;
                     if let Some(paths) = paths {
                         if let Some(path) = paths.first() {
                             match kind {
@@ -747,13 +960,20 @@ impl App {
                                     self.wizard.inputs.project_folder = None;
                                     self.wizard.inputs.entire_project = false;
                                     self.wizard.inputs.add_bins(paths.clone());
+                                    self.catalog = None;
+                                    self.expansion = FolderExpansion::default();
+                                    self.search.clear();
                                     self.inventory = None;
                                 }
                                 Pick::Project => {
                                     self.wizard.inputs.project_folder = Some(path.clone());
                                     self.wizard.inputs.entire_project = true;
                                     self.wizard.inputs.bins.clear();
+                                    self.catalog = None;
+                                    self.expansion = FolderExpansion::default();
+                                    self.search.clear();
                                     self.inventory = None;
+                                    find_bins = true;
                                 }
                                 Pick::Output => self.wizard.inputs.output = path.clone(),
                                 Pick::Media => {
@@ -851,9 +1071,11 @@ impl App {
                             }
                         }
                     }
-                    if self.wizard.changed_since(&before) {
-                        self.invalidate();
+                    if self.apply_settings_changes(&before) && self.remember_choices {
                         let _ = storage::save(&self.wizard.choices);
+                    }
+                    if find_bins {
+                        self.find_bins(ctx);
                     }
                 }
             }
@@ -868,18 +1090,21 @@ impl App {
         }
     }
     fn title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+        if !subtitle.is_empty() {
+            ui.label(RichText::new(subtitle).color(MUTED).small());
+            ui.add_space(3.);
+        }
         ui.heading(RichText::new(title).strong());
-        ui.label(RichText::new(subtitle).color(MUTED));
-        ui.add_space(6.);
+        ui.add_space(5.);
     }
     fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
         Self::card_with_fill(ui, SURFACE, content);
     }
     fn card_with_fill(ui: &mut egui::Ui, fill: Color32, content: impl FnOnce(&mut egui::Ui)) {
-        egui::Frame::group(ui.style())
+        egui::Frame::new()
             .fill(fill)
-            .inner_margin(10.)
-            .corner_radius(8)
+            .inner_margin(12.)
+            .corner_radius(10)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 content(ui);
@@ -894,6 +1119,10 @@ impl App {
         ready
     }
     fn direction(&mut self, ui: &mut egui::Ui) {
+        #[cfg(feature = "wizard-automation")]
+        {
+            self.source_viewport = None;
+        }
         let required_input = if self.highlight_required_input {
             self.wizard.inputs.check_required_paths().err()
         } else {
@@ -905,125 +1134,134 @@ impl App {
             Some(RequiredInput::Output | RequiredInput::OutputExtension) => (SURFACE, ERROR_SURFACE),
             None => (SURFACE, SURFACE),
         };
-        Self::title(
-            ui,
-            "Project",
-            "Choose the Avid source and where to save the Premiere project.",
-        );
-        #[cfg(target_os = "macos")]
-        let resolve_available = self.resolve_templates.is_some() && !self.busy;
-        #[cfg(not(target_os = "macos"))]
-        let resolve_available = false;
-        Self::card(ui, |ui| {
-            let _resolve_selected = direction::show(ui, resolve_available);
-            #[cfg(target_os = "macos")]
-            if _resolve_selected {
-                if let Some(templates) = &self.resolve_templates {
-                    self.resolve_wizard = Some(crate::avid_resolve::Wizard::new(
-                        templates.clone(), &self.wizard.inputs, self.ffmpeg.clone(), self.ffprobe.clone(),
-                    ));
-                }
-            }
-        });
-        #[cfg(target_os = "macos")]
-        if ui.button("Relink media in an existing project…").clicked() {
-            self.relink.open = true;
-        }
-        ui.add_space(8.);
         Self::card_with_fill(ui, source_fill, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.strong("Source");
+                ui.label(RichText::new("Source bins").font(semibold(14.)));
                 if ui.button("Choose project folder…").clicked() {
                     self.pick(Pick::Project, ui.ctx());
                 }
-                ui.label(RichText::new("or").color(MUTED));
                 if ui.button("Choose bins…").clicked() {
                     self.pick(Pick::Bins, ui.ctx());
                 }
+                ui.menu_button("Source options", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.wizard.choices.include_trash_attic,
+                            "Include Trash / Attic",
+                        );
+                        self.why_button(ui, "Project-folder import");
+                    });
+                    ui.checkbox(
+                        &mut self.wizard.choices.include_dependencies,
+                        "Also import clips these sequences use",
+                    );
+                });
             });
             if let Some(path) = &self.wizard.inputs.project_folder {
-                ui.label(path.display().to_string());
-                ui.checkbox(
-                    &mut self.wizard.inputs.entire_project,
-                    "Import entire project",
-                );
-            } else {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(path_name(path)).small().color(MUTED))
+                        .on_hover_text(path.display().to_string());
+                    ui.checkbox(
+                        &mut self.wizard.inputs.entire_project,
+                        "Import entire project",
+                    );
+                });
+            } else if self.catalog.is_none() && !self.wizard.inputs.bins.is_empty() {
                 ui.label(
                     RichText::new(format!("{} selected", counted(self.wizard.inputs.bins.len(), "bin", "bins")))
                         .color(MUTED),
                 );
             }
-            ui.horizontal(|ui| {
-                ui.checkbox(
-                    &mut self.wizard.choices.include_trash_attic,
-                    "Include Trash / Attic",
-                );
-                self.why_button(ui, "Project-folder import");
-            });
-            ui.checkbox(
-                &mut self.wizard.choices.include_dependencies,
-                "Also import clips these sequences use",
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Read bin tree & counts").clicked() {
-                    self.scan(ui.ctx());
-                }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search bins and folders")
-                        .desired_width(260.),
-                );
-            });
-            if let Some(inv) = &self.inventory {
-                let tree = Tree::build(inv);
-                let search = self.search.to_lowercase();
-                egui::ScrollArea::vertical()
-                    .id_salt("bin-tree-scroll")
-                    .max_height(220.)
-                    .show(ui, |ui| {
-                        ui.add_enabled_ui(!self.wizard.inputs.entire_project, |ui| {
-                            tree.show(
-                                ui,
-                                inv,
-                                &mut self.wizard.inputs.bins,
-                                &search,
-                                self.wizard.inputs.entire_project,
-                                "root",
-                            )
-                        });
+            if self.wizard.inputs.project_folder.is_some() || !self.wizard.inputs.bins.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    let action = if self.catalog.is_some() { "Refresh bins" } else { "Find bins" };
+                    if ui.button(action).clicked() {
+                        self.find_bins(ui.ctx());
+                    }
+                    if self.catalog.is_some() {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search)
+                                .hint_text("Search bins and folders")
+                                .desired_width(220.),
+                        );
+                    }
+                });
+            }
+            if let Some(catalog) = &self.catalog {
+                let inputs = &mut self.wizard.inputs;
+                let search = self.search.trim().to_lowercase();
+                let matches: Option<Vec<_>> = (!search.is_empty()).then(|| {
+                    catalog.iter()
+                        .map(|bin| {
+                            bin.relative
+                                .to_string_lossy()
+                                .to_lowercase()
+                                .contains(&search)
+                        })
+                        .collect()
+                });
+                if catalog.is_empty() {
+                    ui.small("No bins found.");
+                } else if matches
+                    .as_ref()
+                    .is_none_or(|matches| matches.iter().any(|&matched| matched))
+                {
+                    let height = ui.available_height() - PROJECT_TAIL_SPACE;
+                    let _list = source_list(ui, ("bin-tree", &inputs.project_folder), Some(height), |ui| {
+                        ui.spacing_mut().indent = 14.;
+                        ui.visuals_mut().indent_has_left_vline = false;
+                        let mut selected = BinSelection::new(&mut inputs.bins);
+                        Tree::build(catalog).show(
+                            ui,
+                            catalog,
+                            &mut selected,
+                            matches.as_deref(),
+                            inputs.entire_project,
+                            &mut self.expansion,
+                        );
                     });
+                    #[cfg(feature = "wizard-automation")]
+                    {
+                        let mut visible = _list.inner_rect;
+                        visible.set_height(visible.height().min(_list.content_size.y));
+                        self.source_viewport = Some(visible);
+                    }
+                } else {
+                    ui.small("No bins match your search.");
+                }
                 ui.small(format!(
                     "{} bins available · {} selected",
-                    inv.bins.len(),
+                    catalog.len(),
                     if self.wizard.inputs.entire_project {
-                        inv.bins.len()
+                        catalog.len()
                     } else {
                         self.wizard.inputs.bins.len()
                     }
                 ));
             } else if !self.wizard.inputs.bins.is_empty() {
                 let mut remove = None;
-                egui::ScrollArea::vertical()
-                    .max_height(160.)
-                    .show(ui, |ui| {
-                        for (i, p) in self.wizard.inputs.bins.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("×").clicked() {
-                                    remove = Some(i);
-                                }
-                                ui.label(p.display().to_string());
-                            });
-                        }
-                    });
+                let height = ui.available_height() - PROJECT_TAIL_SPACE;
+                source_list(ui, "picked-bins", Some(height), |ui| {
+                    for (i, p) in self.wizard.inputs.bins.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("×").clicked() {
+                                remove = Some(i);
+                            }
+                            ui.add(egui::Label::new(path_name(p)).truncate())
+                                .on_hover_text(p.display().to_string());
+                        });
+                    }
+                });
                 if let Some(i) = remove {
                     self.wizard.inputs.bins.remove(i);
                 }
             }
+
         });
         ui.add_space(8.);
         Self::card_with_fill(ui, destination_fill, |ui| {
             ui.horizontal(|ui| {
-                ui.strong("Destination");
+                ui.label(RichText::new("Destination").font(semibold(14.)));
                 if ui.button("New Premiere project…").clicked() {
                     self.pick(Pick::Output, ui.ctx());
                 }
@@ -1049,8 +1287,6 @@ impl App {
                 };
             }
 
-            ui.colored_label(GOOD, "Your Avid project is only read, never changed.");
-            ui.small("Existing destination files and media folders are never replaced.");
         });
     }
     fn saved_path_mappings(&mut self, ui: &mut egui::Ui) {
@@ -1092,11 +1328,6 @@ impl App {
 
     fn clips(&mut self, ui: &mut egui::Ui) {
         let jump = self.media_jump.take();
-        Self::title(
-            ui,
-            "Clips & media",
-            "Your timeline follows the same construction as your bin clips.",
-        );
         if let Some(inv) = &self.inventory {
             if inv.native_media == 0 && inv.ume_originals > 0 {
                 Self::card(ui, |ui| {
@@ -1105,56 +1336,42 @@ impl App {
                 });
             }
         }
-        for mode in ClipMode::ALL {
-            let selected = self.wizard.choices.mode == mode;
-            egui::Frame::group(ui.style())
-                .fill(if selected {
-                    SELECTED
-                } else {
-                    SURFACE
-                })
-                .stroke(egui::Stroke::new(
-                    1.,
-                    if selected {
-                        ACCENT
-                    } else {
-                        BORDER
-                    },
-                ))
-                .inner_margin(10.)
-                .corner_radius(8)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.radio_value(
-                            &mut self.wizard.choices.mode,
-                            mode,
-                            RichText::new(mode.label()).strong(),
-                        );
-                        if mode == ClipMode::Rewrap {
-                            ui.label(RichText::new("RECOMMENDED").small().color(ACCENT));
-                        }
+        Self::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Clip layout").font(semibold(14.)));
+                if self.wizard.choices.mode != ClipMode::Rewrap
+                    && ui.link("Use recommended mode").clicked()
+                {
+                    self.wizard.choices.mode = ClipMode::Rewrap;
+                }
+                self.why_button(ui, "How clips are built");
+            });
+            for mode in ClipMode::ALL {
+                let selected = self.wizard.choices.mode == mode;
+                egui::Frame::new()
+                    .fill(if selected { SELECTED } else { SURFACE })
+                    .corner_radius(7)
+                    .inner_margin(egui::Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            let choice = ui.radio_value(&mut self.wizard.choices.mode, mode, mode.label());
+                            let (summary, limitation) = mode.explanation();
+                            choice.on_hover_text(format!("{summary} {limitation}"));
+                            if mode == ClipMode::Rewrap {
+                                ui.label(RichText::new("Recommended").small().color(ACCENT));
+                            }
+                        });
                     });
-                    let (pro, con) = mode.explanation();
-                    ui.label(pro);
-                    ui.label(
-                        RichText::new(con)
-                            .small()
-                            .color(if mode == ClipMode::Merged {
-                                AMBER
-                            } else {
-                                MUTED
-                            }),
-                    );
-                    if mode != ClipMode::Rewrap {
-                        let mut allow = self.wizard.choices.allow_offline_media && selected;
-                        if ui.checkbox(&mut allow, "Allow offline media").changed() {
-                            self.wizard.choices.mode = mode;
-                            self.wizard.choices.allow_offline_media = allow;
-                        }
-                    }
-                });
-        }
+            }
+            let mode = self.wizard.choices.mode;
+            let (summary, limitation) = mode.explanation();
+            ui.label(RichText::new(summary).small());
+            ui.label(RichText::new(limitation).small().color(MUTED));
+            if mode != ClipMode::Rewrap {
+                ui.checkbox(&mut self.wizard.choices.allow_offline_media, "Allow offline media");
+            }
+        });
         if self.wizard.choices.mode != ClipMode::Rewrap {
             Self::card(ui, |ui| {
                 ui.strong("Primary media");
@@ -1181,12 +1398,6 @@ impl App {
                 }
             });
         }
-        ui.horizontal(|ui| {
-            ui.small(
-                "Avid MultiGroups and qualified linked originals follow their supported routes.",
-            );
-            self.why_button(ui, "How clips are built");
-        });
         let native_needed = self.inventory.as_ref().is_none_or(|i| i.native_media > 0);
         if self.wizard.choices.mode == ClipMode::Rewrap && native_needed {
             Self::card(ui, |ui| {
@@ -1208,7 +1419,7 @@ impl App {
             });
         }
         if self.wizard.choices.mode != ClipMode::Rewrap {
-            ui.colored_label(AMBER,"Direct OP-Atom options have limited native qualification. ProRes OP-Atom has known Premiere import failures; rewrapping is recommended.");
+            ui.colored_label(AMBER, "Some ProRes OP-Atom files need rewrapping for Premiere.");
         }
         let locations = matches!(jump, Some(MediaJump::Locations | MediaJump::OriginalMappings));
         let locations_panel = egui::CollapsingHeader::new("Media locations & linking")
@@ -1267,11 +1478,6 @@ impl App {
         }
     }
     fn markers(&mut self, ui: &mut egui::Ui) {
-        Self::title(
-            ui,
-            "Markers & colors",
-            "Choose marker conflict rules and map Avid colors to Premiere's palettes.",
-        );
         let mut policy =
             AvidToPremiere::from_json_text(&self.wizard.choices.policy_json).unwrap_or_default();
         Self::card(ui, |ui| {
@@ -1316,11 +1522,6 @@ impl App {
         self.wizard.choices.policy_json = policy.to_json_text();
     }
     fn effects(&mut self, ui: &mut egui::Ui) {
-        Self::title(
-            ui,
-            "Effects",
-            "See how effects in the selected Avid bins will translate.",
-        );
         if !self.wizard.choices.effects.is_empty()
             && ui.button("Clear saved effect choices").clicked()
         {
@@ -1406,138 +1607,176 @@ impl App {
         browser: &mut ReportBrowser,
     ) -> Option<ReviewAction> {
         use BlockerKind::*;
-        let (title, next, button) = match issue.kind {
+        let (title, next, (label, target)) = match issue.kind {
             ProjectSource => (
                 "Check the Avid source",
                 "Check the selected bins or project folder on Project, then return here to run preflight.",
-                Some(("Go to Project", ReviewAction::Step(Page::Direction))),
+                ("Go to Project", ReviewAction::Step(Page::Direction)),
             ),
             ProjectOutput => (
                 "Choose a project destination",
                 "Select a new .prproj file in an available folder, then check again.",
-                Some(("Choose project file…", ReviewAction::Choose(Pick::Output))),
+                ("Choose project file…", ReviewAction::Choose(Pick::Output)),
             ),
             AvidMedia => (
                 "Check Avid media",
                 "Add or correct the Avid media folders. If there are duplicate copies, select the intended source folders. Then return to Review.",
-                Some(("Open media locations", ReviewAction::Media(MediaJump::Locations))),
+                (
+                    "Open media locations",
+                    ReviewAction::Media(MediaJump::Locations),
+                ),
             ),
             RewrapMissingMedia => (
                 "Required media is missing",
                 "Locate the source media to rewrap, or switch to Separate files to preserve the edits as offline clips.",
-                Some(("Locate media", ReviewAction::Media(MediaJump::Locations))),
+                ("Locate media", ReviewAction::Media(MediaJump::Locations)),
             ),
             RewrapMissingOriginal => (
                 "Required linked original is missing",
                 "Reconnect the original drive or map the saved path to its current folder. You can switch to Separate files to review offline links.",
-                Some(("Open saved-path mappings", ReviewAction::Media(MediaJump::OriginalMappings))),
+                (
+                    "Open saved-path mappings",
+                    ReviewAction::Media(MediaJump::OriginalMappings),
+                ),
             ),
             LegacyMxfPackage => (
                 "Check legacy MXF packages",
                 "Use the package IDs and lanes below to check the files in the selected Avid media folders. If several copies claim the same package ID, select only the intended source folders.",
-                Some(("Open media locations", ReviewAction::Media(MediaJump::Locations))),
+                (
+                    "Open media locations",
+                    ReviewAction::Media(MediaJump::Locations),
+                ),
             ),
             OriginalLocator => (
                 "Locate the linked original",
                 "Reconnect the original drive or map the saved path prefix to its current folder. Then return to Review.",
-                Some(("Open saved-path mappings", ReviewAction::Media(MediaJump::OriginalMappings))),
+                (
+                    "Open saved-path mappings",
+                    ReviewAction::Media(MediaJump::OriginalMappings),
+                ),
             ),
             OriginalMedia => (
                 "Linked original could not be used",
                 "Check the file and the reason below. If its format is unsupported, select a bin with compatible originals or prepare compatible media in Avid.",
-                Some(("Review selected bins", ReviewAction::Step(Page::Direction))),
+                ("Review selected bins", ReviewAction::Step(Page::Direction)),
             ),
             NewMedia => (
                 "Choose a new media folder",
                 "Choose a parent folder with room for the new media, then check again.",
-                Some(("Choose media parent…", ReviewAction::Choose(Pick::NewMedia))),
+                ("Choose media parent…", ReviewAction::Choose(Pick::NewMedia)),
             ),
             ProxyMedia => (
                 "Check the proxy output folder",
                 "Choose an existing folder with space for the rewrapped proxies, or use the existing proxies only.",
-                Some(("Choose proxy folder…", ReviewAction::Choose(Pick::ProxyMedia))),
+                (
+                    "Choose proxy folder…",
+                    ReviewAction::Choose(Pick::ProxyMedia),
+                ),
             ),
             MediaTools => (
                 "Check the media tools",
                 "Review the FFmpeg and ffprobe paths, or reset them to the bundled tools. Then return to Review.",
-                Some(("Open media tools", ReviewAction::Media(MediaJump::Tools))),
+                ("Open media tools", ReviewAction::Media(MediaJump::Tools)),
             ),
             Effects => (
                 "Check saved effect choices",
                 "Clear saved effect choices to use the supported settings for these bins, then return to Review.",
-                Some(("Go to Effects", ReviewAction::Step(Page::Effects))),
+                ("Go to Effects", ReviewAction::Step(Page::Effects)),
             ),
             Rewrap => (
                 "Media preparation blocked",
                 "Check the reason below. Review the clip mode and new media folder, or change the selected bins if the source is unsupported.",
-                Some(("Go to Clips & media", ReviewAction::Step(Page::Clips))),
+                ("Go to Clips & media", ReviewAction::Step(Page::Clips)),
             ),
             GroupClipMode => (
                 "Use Separate files for editable Avid Groups",
                 "Switch clip mode, then return to Review to check the Group and its original media.",
-                Some(("Switch to Separate files", ReviewAction::SwitchToSeparate { enable_offline_media: false })),
+                (
+                    "Switch to Separate files",
+                    ReviewAction::SwitchToSeparate {
+                        enable_offline_media: false,
+                    },
+                ),
             ),
             SourceContent => (
                 "Selected content could not be converted",
                 "Check the affected source below. Adjust the source in Avid or narrow the bin selection, then run preflight again.",
-                Some(("Review selected bins", ReviewAction::Step(Page::Direction))),
+                ("Review selected bins", ReviewAction::Step(Page::Direction)),
             ),
             SequenceTiming => (
                 "Sequence timing could not be translated",
                 "In a copy of the Avid sequence, replace the affected edits with media at the sequence frame rate. You can also select bins that do not contain the affected sequence.",
-                Some(("Review selected bins", ReviewAction::Step(Page::Direction))),
+                ("Review selected bins", ReviewAction::Step(Page::Direction)),
             ),
             Retry => (
                 "Run preflight again",
-                "Wait for any changes to finish, then select Check again.",
-                None,
+                "Wait for any changes to finish before checking again.",
+                ("Check again", ReviewAction::Recheck),
             ),
         };
         let mut action = None;
-        Self::card(ui, |ui| {
-            ui.colored_label(Color32::LIGHT_RED, RichText::new("Conversion blocked").strong());
-            ui.strong(title);
-            ui.label(next);
-            ui.horizontal_wrapped(|ui| {
-                if let Some((label, target)) = button {
-                    if ui.button(label).clicked() {
-                        action = Some(target);
-                    }
-                }
-                if matches!(issue.kind, RewrapMissingMedia | RewrapMissingOriginal)
-                    && ui.button("Switch to Separate files").clicked()
-                {
-                    action = Some(ReviewAction::SwitchToSeparate { enable_offline_media: true });
-                }
-                if ui.button("Copy details").clicked() {
-                    let mut details = vec![issue.message.as_str()];
-                    details.extend(issue.affected.iter().map(String::as_str));
-                    ui.ctx().copy_text(details.join("\n"));
-                }
-                if ui.button("Save preflight report").clicked() {
-                    action = Some(ReviewAction::Choose(Pick::SavePreflightReport));
-                }
-            });
-            ui.separator();
-            ui.label(&issue.message);
-            Self::blocker_details(ui, &issue.affected, browser);
+        Self::card_with_fill(ui, ERROR_SURFACE, |ui| {
+            let description = |ui: &mut egui::Ui| {
+                ui.colored_label(ERROR_INK, RichText::new(title).font(semibold(14.)));
+                ui.small(next);
+            };
+            if recovery_button(ui, label, description) {
+                action = Some(target);
+            }
+            if matches!(issue.kind, RewrapMissingMedia | RewrapMissingOriginal)
+                && ui.button("Switch to Separate files").clicked()
+            {
+                action = Some(ReviewAction::SwitchToSeparate {
+                    enable_offline_media: true,
+                });
+            }
+            let details_label = if issue.affected.is_empty() {
+                "Blocker details".into()
+            } else {
+                format!("Affected details · {}", issue.affected.len())
+            };
+            egui::CollapsingHeader::new(details_label)
+                .id_salt(("blocker-details", title))
+                .show(ui, |ui| {
+                    ui.label(&issue.message);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Copy details").clicked() {
+                            let mut details = vec![issue.message.as_str()];
+                            details.extend(issue.affected.iter().map(String::as_str));
+                            ui.ctx().copy_text(details.join("\n"));
+                        }
+                        if ui.button("Save preflight report").clicked() {
+                            action = Some(ReviewAction::Choose(Pick::SavePreflightReport));
+                        }
+                    });
+                    Self::blocker_details(ui, &issue.affected, &issue.timeline_groups, browser);
+                });
         });
         action
     }
-    fn blocker_details(ui: &mut egui::Ui, details: &[String], browser: &mut ReportBrowser) {
-        if details.len() <= 8 {
+    fn blocker_details(
+        ui: &mut egui::Ui,
+        details: &[String],
+        timelines: &[job::ReviewGroup],
+        browser: &mut ReportBrowser,
+    ) {
+        if details.len() <= 8 && timelines.is_empty() {
             for detail in details {
                 ui.label(detail);
             }
             return;
         }
-        let changed = ui.add(
-            egui::TextEdit::singleline(&mut browser.search)
-                .hint_text("Search affected details")
-                .desired_width(220.),
-        ).changed();
+        let changed = ui.horizontal_wrapped(|ui| {
+            let changed = Self::report_group_filter(ui, timelines, &mut browser.timeline,
+                "report-timeline", "All timelines");
+            ui.add(
+                egui::TextEdit::singleline(&mut browser.search)
+                    .hint_text("Search affected details")
+                    .desired_width(220.),
+            ).changed() || changed
+        }).inner;
         if changed {
-            browser.refilter_details(details);
+            browser.refilter_details(details, timelines);
         }
         if browser.count(details.len()) == 0 {
             ui.label("No affected details match your search.");
@@ -1570,6 +1809,7 @@ impl App {
                 self.media_jump = Some(jump);
                 self.wizard.page = Page::Clips;
             }
+            ReviewAction::Recheck => self.prepare(ctx),
         }
     }
     fn review(&mut self, ui: &mut egui::Ui) {
@@ -1578,24 +1818,28 @@ impl App {
             return;
         }
         if self.busy && matches!(self.task.as_str(), CONVERTING | SAVING_PREFLIGHT) {
-            Self::title(ui, &self.task, "Avid Media Composer to Premiere Pro");
             return;
         }
-        Self::title(ui, "Review & convert", "Avid Media Composer to Premiere Pro");
-        let blocked = self.review_blocker.is_some();
-        if let Some(issue) = &self.review_blocker {
-            self.rewrap_size.show(ui, &issue.rewrap_sources);
-            if let Some(action) = Self::blocker_card(ui, issue, &mut self.report) {
-                self.take_review_action(action, ui.ctx());
-            }
+        let width = ui.available_width();
+        if width >= 600. {
+            let output_width = 196.;
+            ui.horizontal_top(|ui| {
+                let findings_width = width - output_width - ui.spacing().item_spacing.x;
+                column(ui, findings_width, |ui| self.review_findings(ui));
+                column(ui, output_width, |ui| self.review_output(ui));
+            });
+        } else {
+            self.review_findings(ui);
+            ui.add_space(10.);
+            self.review_output(ui);
         }
-        let media_ready = self.media_linking_ready();
+    }
+    fn review_output(&mut self, ui: &mut egui::Ui) {
         let i = &self.wizard.inputs;
         let choices = &self.wizard.choices;
         let rewrap = choices.mode == ClipMode::Rewrap;
         let review = self.prepared.as_ref().map(PreparedJob::review);
         let creates_media = review.is_some_and(|review| review.estimated_bytes.is_some());
-
         Self::card(ui, |ui| {
             ui.strong("Output");
             if i.output.as_os_str().is_empty() {
@@ -1603,16 +1847,13 @@ impl App {
             } else {
                 review_path(ui, "Premiere project", &i.output);
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Clips").color(MUTED));
-                ui.label(choices.mode.label());
-                ui.separator();
-                ui.label(RichText::new("Source").color(MUTED));
-                ui.label(if i.entire_project {
-                    "Entire project".into()
-                } else {
-                    counted(i.bins.len(), "bin", "bins")
-                });
+            ui.small("Clips");
+            ui.label(choices.mode.label());
+            ui.small("Source");
+            ui.label(if i.entire_project {
+                "Entire project".into()
+            } else {
+                counted(i.bins.len(), "bin", "bins")
             });
             if !rewrap {
                 ui.label(if choices.uses_camera_originals() {
@@ -1645,12 +1886,26 @@ impl App {
                 self.rewrap_size.show(ui, &review.rewrap_sources);
             }
         });
+    }
+    fn review_findings(&mut self, ui: &mut egui::Ui) {
+        let blocked = self.review_blocker.is_some();
+        if let Some(issue) = &self.review_blocker {
+            if let Some(action) = Self::blocker_card(ui, issue, &mut self.report) {
+                self.take_review_action(action, ui.ctx());
+                return;
+            }
+            self.rewrap_size.show(ui, &issue.rewrap_sources);
+        }
+        let media_ready = self.media_linking_ready();
+        let choices = &self.wizard.choices;
+        let review = self.prepared.as_ref().map(PreparedJob::review);
+        let creates_media = review.is_some_and(|review| review.estimated_bytes.is_some());
 
         let mut save_report = false;
         let mut choose_rewrap = false;
         let mut clear_rewrap = false;
         if !blocked {
-            Self::card(ui, |ui| {
+            ui.vertical(|ui| {
                 if let Some(review) = review {
                     let inv = &review.inventory;
                     let changes = self.report.changes;
@@ -1677,7 +1932,7 @@ impl App {
                         ui.label("Links to available originals in place.");
                     }
                     if let Some(media) = &review.media_linking {
-                        ui.separator();
+                        ui.add_space(6.);
                         ui.strong("Media linking");
                         if !media.rewrap_available.is_empty() {
                             ui.colored_label(AMBER, format!("Rewrap available for {} managed clips.", media.rewrap_available.len()));
@@ -1715,8 +1970,7 @@ impl App {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("Space reserved for preparation").color(MUTED));
                             ui.strong(bytes(review.estimated_bytes));
-                            ui.separator();
-                            ui.label(RichText::new("Available").color(MUTED));
+                            ui.label(RichText::new("· Available").color(MUTED));
                             ui.label(bytes(review.available_bytes));
                         });
                     }
@@ -1742,21 +1996,27 @@ impl App {
                                     if let Some(proxy) = &link.proxy {
                                         review_path(ui, "Proxy", proxy);
                                     }
-                                    ui.separator();
+                                    ui.add_space(5.);
                                 }
                             });
                         }
                     }
                     if changes > 0 {
-                        ui.separator();
-                        ui.strong(format!("Translation changes · {changes}"));
-                        for &index in &self.report.change_examples {
-                            let note = &review.notes[index];
-                            if let Some(name) = review.subjects.get(&note.object) {
-                                ui.strong(name);
-                            }
-                            ui.label(&note.message);
-                        }
+                        ui.add_space(7.);
+                        ui.colored_label(AMBER, RichText::new(
+                            counted(changes, "translation change", "translation changes")
+                        ).strong());
+                        egui::CollapsingHeader::new("Affected edits")
+                            .id_salt("preflight-affected-edits")
+                            .show(ui, |ui| {
+                                for &index in &self.report.change_examples {
+                                    let note = &review.notes[index];
+                                    if let Some(name) = review.subjects.get(&note.object) {
+                                        ui.strong(name);
+                                    }
+                                    ui.label(&note.message);
+                                }
+                            });
                     }
                     if self.report.warnings > 0 {
                         ui.colored_label(AMBER, counted(self.report.warnings, "warning", "warnings"));
@@ -1765,7 +2025,8 @@ impl App {
                     egui::CollapsingHeader::new(label)
                         .id_salt("preflight-report")
                         .show(ui, |ui| {
-                            Self::report(ui, &review.notes, Some(&review.subjects), &mut self.report, &mut self.why);
+                            Self::report(ui, &review.notes, Some(&review.subjects),
+                                &review.timeline_groups, &review.source_groups, &mut self.report, &mut self.why);
                             if !inv.notes.is_empty() {
                                 egui::CollapsingHeader::new(format!("Inventory notes · {}", inv.notes.len()))
                                     .show(ui, |ui| {
@@ -1830,10 +2091,43 @@ impl App {
             self.pick(Pick::SavePreflightReport, ui.ctx());
         }
     }
+    fn report_group_filter(
+        ui: &mut egui::Ui,
+        groups: &[job::ReviewGroup],
+        selection: &mut Option<usize>,
+        id: &str,
+        all: &str,
+    ) -> bool {
+        if groups.is_empty() {
+            return false;
+        }
+        let label = |group: &job::ReviewGroup| match &group.bin {
+            Some(bin) => format!("{} · {}", group.name, bin.display()),
+            None => group.name.clone(),
+        };
+        let selected = selection.and_then(|index| groups.get(index))
+            .map_or_else(|| all.to_owned(), label);
+        let mut changed = false;
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(selected)
+            .wrap_mode(egui::TextWrapMode::Truncate)
+            .height(240.)
+            .show_ui(ui, |ui| {
+                changed |= ui.selectable_value(selection, None, all).changed();
+                for (index, group) in groups.iter().enumerate() {
+                    changed |= ui.selectable_value(selection, Some(index), label(group))
+                        .on_hover_text(&group.id)
+                        .changed();
+                }
+            });
+        changed
+    }
     fn report(
         ui: &mut egui::Ui,
         notes: &[job::ReportNote],
         subjects: Option<&HashMap<String, String>>,
+        timelines: &[job::ReviewGroup],
+        sources: &[job::ReviewGroup],
         browser: &mut ReportBrowser,
         why: &mut Option<String>,
     ) {
@@ -1847,6 +2141,10 @@ impl App {
             for (filter, label) in filters {
                 changed |= ui.selectable_value(&mut browser.filter, filter, label).changed();
             }
+            changed |= Self::report_group_filter(ui, timelines, &mut browser.timeline,
+                "report-timeline", "All timelines");
+            changed |= Self::report_group_filter(ui, sources, &mut browser.source_clip,
+                "report-source-clip", "All source clips");
             let search_changed = ui.add(
                 egui::TextEdit::singleline(&mut browser.search)
                     .hint_text("Search report")
@@ -1855,7 +2153,7 @@ impl App {
             changed || search_changed
         }).inner;
         if changed {
-            browser.refilter(notes, subjects);
+            browser.refilter(notes, subjects, timelines, sources);
         }
         let count = browser.count(notes.len());
         if count == 0 {
@@ -1941,7 +2239,11 @@ impl App {
             "Review the project, retained files and conversion report.",
         );
         Self::card(ui, |ui| {
-            ui.colored_label(color, &c.message);
+            if c.status == CompletionStatus::Failed {
+                ui.colored_label(color, "See Activity for details.");
+            } else {
+                ui.colored_label(color, &c.message);
+            }
             if let Some(path) = &c.output {
                 review_path(ui, "Premiere project", path);
                 ui.horizontal(|ui| {
@@ -1997,7 +2299,7 @@ impl App {
             "Conversion report · {}",
             counted(c.report.len(), "note", "notes")
         ))
-        .show(ui, |ui| Self::report(ui, &c.report, Some(&self.completion_subjects),
+        .show(ui, |ui| Self::report(ui, &c.report, Some(&self.completion_subjects), &[], &[],
             &mut self.report, &mut self.why));
         if ui.button("Convert another project").clicked() {
             self.invalidate();
@@ -2005,116 +2307,179 @@ impl App {
             self.wizard.invalidate();
         }
     }
-    fn navigation(&mut self, ui: &mut egui::Ui) {
-        if self.busy {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.strong(&self.task);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !self.task.starts_with("Choosing")
-                        && self.task != SAVING_PREFLIGHT
-                        && ui.add_enabled(!self.cancel.is_cancelled(), egui::Button::new("Cancel")).clicked()
-                    {
-                        self.cancel.cancel();
-                        self.notice = Some("Cancellation requested. Waiting for the current safe boundary.".into());
-                    }
+    fn page_header(&mut self, ui: &mut egui::Ui) {
+        let page = self.wizard.page;
+        let (title, subtitle) = match page {
+            Page::Direction => ("Choose what to transfer", ""),
+            Page::Clips => ("Choose how to link media", "Avid Media Composer to Premiere Pro"),
+            Page::Markers => (
+                "Markers & colors",
+                "Choose marker conflict rules and map Avid colors to Premiere's palettes.",
+            ),
+            Page::Effects => ("Effects", "See how effects in the selected Avid bins will translate."),
+            Page::Review => ("Review conversion", "Avid Media Composer to Premiere Pro"),
+        };
+        if page == Page::Direction {
+            #[cfg(target_os = "macos")]
+            let resolve_available = self.resolve_templates.is_some() && !self.busy;
+            #[cfg(not(target_os = "macos"))]
+            let resolve_available = false;
+            let _resolve_selected = direction::show(ui, resolve_available);
+            #[cfg(target_os = "macos")]
+            if _resolve_selected && let Some(templates) = &self.resolve_templates {
+                self.resolve_wizard = Some(crate::avid_resolve::Wizard::new(
+                    templates.clone(),
+                    &self.wizard.inputs,
+                    self.ffmpeg.clone(),
+                    self.ffprobe.clone(),
+                ));
+            }
+        } else {
+            ui.label(RichText::new(subtitle).color(MUTED).small());
+        }
+        ui.add_space(3.);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 32.),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                self.navigation(ui, page);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(title).heading().strong()).truncate());
                 });
-            });
-            if let Some(p) = &self.progress {
-                if !p.message.is_empty() {
-                    let message = p.current_bin.as_ref().map_or_else(
-                        || p.message.clone(),
-                        |path| p.message.replace(&*path.to_string_lossy(), &path_name(path)),
-                    );
-                    ui.add(egui::Label::new(RichText::new(message).small().color(MUTED)).truncate())
-                        .on_hover_text(&p.message);
-                }
-                if p.total > 0 {
-                    let fraction = (p.completed as f32 / p.total as f32).clamp(0., 1.);
-                    ui.add(egui::ProgressBar::new(fraction).fill(ACCENT).desired_height(3.))
-                        .on_hover_text(format!("{} · {} / {}", p.stage, p.completed, p.total));
-                }
+            },
+        );
+        if self.busy {
+            self.show_progress(ui);
+        }
+        ui.add_space(5.);
+    }
+
+    fn show_progress(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.strong(&self.task);
+        });
+        if let Some(p) = &self.progress {
+            if !p.message.is_empty() {
+                let message = p.current_bin.as_ref().map_or_else(
+                    || p.message.clone(),
+                    |path| p.message.replace(&*path.to_string_lossy(), &path_name(path)),
+                );
+                ui.add(egui::Label::new(RichText::new(message).small().color(MUTED)).truncate())
+                    .on_hover_text(&p.message);
+            }
+            if p.total > 0 {
+                let fraction = (p.completed as f32 / p.total as f32).clamp(0., 1.);
+                ui.add(egui::ProgressBar::new(fraction).fill(ACCENT).desired_height(3.))
+                    .on_hover_text(format!("{} · {} / {}", p.stage, p.completed, p.total));
+            }
+        }
+    }
+
+    fn navigation(&mut self, ui: &mut egui::Ui, page: Page) {
+        if self.busy {
+            if !self.task.starts_with("Choosing")
+                && self.task != SAVING_PREFLIGHT
+                && ui.add_enabled(!self.cancel.is_cancelled(), egui::Button::new("Cancel")).clicked()
+            {
+                self.cancel.cancel();
+                self.notice = Some("Cancellation requested. Waiting for the current safe boundary.".into());
             }
             return;
         }
-
-        ui.horizontal(|ui| {
-            if self.wizard.page != Page::Direction && ui.button("‹ Back").clicked() {
-                self.wizard.page = self.wizard.page.back();
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let primary = |label| {
-                    egui::Button::new(RichText::new(label).strong())
-                        .fill(PRIMARY)
-                        .min_size(egui::vec2(92., 28.))
-                        .corner_radius(6)
-                };
-                if self.wizard.page == Page::Review {
-                    if self.wizard.can_convert() && self.prepared.is_some() {
-                        if ui.add_enabled(self.media_linking_ready(), primary("Convert")).clicked() {
-                            self.convert(ui.ctx());
-                        }
-                        if !self.busy && ui.button("Check again").clicked() {
-                            self.prepare(ui.ctx());
-                        }
-                    } else if ui.add_enabled(
-                        self.wizard.inputs.check_required_paths().is_ok(),
-                        primary(if self.review_blocker.is_some() { "Check again" } else { "Run preflight" }),
-                    ).clicked() {
-                        self.prepare(ui.ctx());
-                    }
-                } else {
-                    if ui.add(primary("Next ›")).clicked() && self.require_project_paths() {
-                        self.wizard.page = self.wizard.page.next();
-                        if self.wizard.page == Page::Review {
-                            self.prepare(ui.ctx());
-                        }
-                    }
-                    if self.wizard.page != Page::Review
-                        && ui.link("Use recommended settings").clicked()
-                        && self.require_project_paths()
-                    {
-                        self.wizard.recommended();
-                        if let Err(e) = storage::save(&self.wizard.choices) {
-                            self.error = Some(e);
-                        }
-                        self.invalidate();
-                        self.prepare(ui.ctx());
-                    }
+        let primary = |label| {
+            egui::Button::new(RichText::new(label).strong().color(PRIMARY_INK))
+                .fill(PRIMARY)
+                .min_size(egui::vec2(94., 32.))
+                .corner_radius(9)
+        };
+        if page == Page::Review {
+            if self.wizard.can_convert() && self.prepared.is_some() {
+                if ui.add_enabled(self.media_linking_ready(), primary("Convert")).clicked() {
+                    self.convert(ui.ctx());
                 }
-            });
-        });
+                if !self.busy && ui.button("Check again").clicked() {
+                    self.prepare(ui.ctx());
+                }
+            } else if ui
+                .add_enabled(
+                    self.wizard.inputs.check_required_paths().is_ok(),
+                    primary(if self.review_blocker.is_some() { "Check again" } else { "Run review" }),
+                )
+                .clicked()
+            {
+                self.prepare(ui.ctx());
+            }
+        } else {
+            let (label, next) = if page == Page::Direction {
+                ("Continue", Page::Clips)
+            } else {
+                ("Run review", Page::Review)
+            };
+            if ui.add(primary(label)).clicked() {
+                self.open_step(next, ui.ctx());
+            }
+        }
+        if !self.busy && page != Page::Direction && ui.button("Back").clicked() {
+            self.wizard.page = if page == Page::Clips { Page::Direction } else { Page::Clips };
+        }
+    }
+
+    fn open_step(&mut self, page: Page, ctx: &egui::Context) {
+        if page == Page::Direction || self.require_project_paths() {
+            self.wizard.page = page;
+            if page == Page::Review && self.prepared.is_none() && self.review_blocker.is_none() {
+                self.prepare(ctx);
+            }
+        }
+    }
+
+    fn step(&mut self, ui: &mut egui::Ui, page: Page, name: &str, icon: Option<Glyph>) {
+        let active = self.wizard.page == page;
+        let color = if active { ACCENT } else { MUTED };
+        let label = RichText::new(name).color(color);
+        let label = if active { label.font(semibold(13.)) } else { label };
+        let button = match icon {
+            Some(icon) => egui::Button::image_and_text(icon.image(ui, 16., color), label),
+            None => egui::Button::new(label),
+        };
+        if ui
+            .add_enabled(
+                !self.busy && self.completion.is_none(),
+                button.selected(active)
+                    .frame_when_inactive(active)
+                    .right_text("")
+                    .min_size(egui::vec2(ui.available_width(), 31.))
+                    .corner_radius(8),
+            )
+            .clicked()
+        {
+            self.open_step(page, ui.ctx());
+        }
     }
 
     fn steps(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            egui::Frame::new().fill(SELECTED).corner_radius(7).inner_margin(6.).show(ui, |ui| {
+                ui.add(Glyph::Layers.image(ui, 15., ACCENT));
+            });
+            ui.label(RichText::new("Any NLE").font(semibold(14.)));
+        });
+        ui.add_space(13.);
         ui.spacing_mut().item_spacing.y = 4.;
-        for page in Page::ALL {
-            let active = self.wizard.page == page;
-            let name = if page == Page::Review { "Review" } else { page.label() };
-            let label = RichText::new(format!("{}  {name}", page.index() + 1))
-                .size(12.)
-                .color(if active { INK } else { MUTED });
-            let response = ui.add_enabled(
-                !self.busy && self.completion.is_none(),
-                egui::Button::selectable(active, label)
-                    .right_text("")
-                    .min_size(egui::vec2(ui.available_width(), 29.))
-                    .corner_radius(6),
-            );
-            if active {
-                ui.painter().vline(
-                    response.rect.left() + 1.,
-                    response.rect.y_range().shrink(7.),
-                    egui::Stroke::new(2., ACCENT),
-                );
-            }
-            if response.clicked() && (page == Page::Direction || self.require_project_paths()) {
-                self.wizard.page = page;
-            }
-        }
+        self.step(ui, Page::Direction, "Project", Some(Glyph::Project));
+        self.step(ui, Page::Clips, "Media", Some(Glyph::Media));
+        self.step(ui, Page::Review, "Review", Some(Glyph::Review));
+
         ui.add_space(10.);
-        ui.separator();
-        ui.add_space(4.);
+        let advanced = matches!(self.wizard.page, Page::Markers | Page::Effects);
+        egui::CollapsingHeader::new("Advanced settings")
+            .open(advanced.then_some(true))
+            .show_unindented(ui, |ui| {
+                self.step(ui, Page::Markers, Page::Markers.label(), None);
+                self.step(ui, Page::Effects, Page::Effects.label(), None);
+            });
+        ui.add_space(6.);
         ui.add_enabled_ui(!self.busy, |ui| {
             egui::CollapsingHeader::new("Saved settings").show(ui, |ui| {
                 if ui.button("Load preset…").clicked() {
@@ -2126,7 +2491,7 @@ impl App {
                 if ui.button("Save preset…").clicked() {
                     self.pick(Pick::SavePreset, ui.ctx());
                 }
-                ui.separator();
+                ui.add_space(6.);
                 if ui.button("Save job settings…").clicked() {
                     self.pick(Pick::SaveJob, ui.ctx());
                 }
@@ -2134,6 +2499,14 @@ impl App {
                     self.pick(Pick::LoadJob, ui.ctx());
                 }
             });
+            #[cfg(target_os = "macos")]
+            if ui
+                .link("Relink media…")
+                .on_hover_text("Relink media in an existing project")
+                .clicked()
+            {
+                self.relink.open = true;
+            }
         });
     }
     fn help_window(&mut self, ctx: &egui::Context) {
@@ -2167,7 +2540,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "macos")]
         if let Some(resolve) = &mut self.resolve_wizard {
-            if resolve.show(ui, _frame) {
+            if resolve.show(ui, true) {
                 self.resolve_wizard = None;
             }
             return;
@@ -2182,6 +2555,9 @@ impl eframe::App for App {
             }
         }
         self.poll(&ctx);
+        if let Some(error) = self.error.take() {
+            self.activity.record(error, false);
+        }
         if self.wizard.page == Page::Review {
             self.require_project_paths();
             #[cfg(target_os = "macos")]
@@ -2191,22 +2567,20 @@ impl eframe::App for App {
                 }
             }
         }
-        if self.completion.is_none() || self.busy {
-            egui::Panel::bottom("navigation")
-                .frame(egui::Frame::new()
-                    .fill(RAIL)
-                    .inner_margin(egui::Margin::symmetric(18, 10)))
-                .show_separator_line(true)
-                .show(ui, |ui| self.navigation(ui));
-        }
         egui::Panel::left("steps")
             .resizable(false)
-            .exact_size(156.)
-            .frame(egui::Frame::new()
-                .fill(RAIL)
-                .inner_margin(egui::Margin::symmetric(9, 14)))
-            .show_separator_line(true)
+            .exact_size(162.)
+            .frame(
+                egui::Frame::new()
+                    .fill(RAIL)
+                    .inner_margin(egui::Margin::symmetric(11, 18)),
+            )
+            .show_separator_line(false)
             .show(ui, |ui| {
+                egui::Panel::bottom("activity-footer")
+                    .show_separator_line(false)
+                    .frame(egui::Frame::new().fill(RAIL))
+                    .show(ui, |ui| self.activity.button(ui));
                 egui::ScrollArea::vertical()
                     .id_salt("step-scroll")
                     .show(ui, |ui| self.steps(ui));
@@ -2215,27 +2589,20 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::new()
                     .fill(CANVAS)
-                    .inner_margin(egui::Margin::symmetric(16, 14)),
+                    .inner_margin(egui::Margin::symmetric(25, 16)),
             )
             .show(ui, |ui| {
-                if let Some(error) = self.error.clone() {
-                    egui::Frame::group(ui.style())
-                        .fill(ERROR_SURFACE)
-                        .inner_margin(12.)
-                        .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.colored_label(Color32::LIGHT_RED, &error);
-                                if ui.small_button("Dismiss").clicked() {
-                                    self.error = None;
-                                }
-                            });
-                        });
-                }
                 if let Some(notice) = &self.notice {
                     ui.label(RichText::new(notice).color(AMBER));
                 }
                 let before = self.wizard.snapshot();
-                egui::ScrollArea::vertical()
+                if self.completion.is_none() || self.busy {
+                    self.page_header(ui);
+                }
+                if self.wizard.page == Page::Direction {
+                    ui.add_enabled_ui(!self.busy, |ui| self.direction(ui));
+                } else {
+                    egui::ScrollArea::vertical()
                     .id_salt((
                         "page-scroll",
                         self.wizard.page.index(),
@@ -2243,27 +2610,85 @@ impl eframe::App for App {
                     ))
                     .show(ui, |ui| {
                         ui.add_enabled_ui(!self.busy, |ui| match self.wizard.page {
-                            Page::Direction => self.direction(ui),
+                            Page::Direction => unreachable!(),
                             Page::Clips => self.clips(ui),
                             Page::Markers => self.markers(ui),
                             Page::Effects => self.effects(ui),
                             Page::Review => self.review(ui),
                         });
                     });
-                if self.wizard.changed_since(&before) {
-                    self.invalidate();
-                    if before.choices != self.wizard.choices {
-                        if let Err(e) = storage::save(&self.wizard.choices) {
-                            self.error = Some(e);
-                        }
-                    }
+                }
+                if self.apply_settings_changes(&before)
+                    && self.remember_choices
+                    && before.choices != self.wizard.choices
+                    && let Err(e) = storage::save(&self.wizard.choices)
+                {
+                    self.error = Some(e);
                 }
             });
+        if let Some(error) = self.error.take() {
+            self.activity.record(error, false);
+            ctx.request_repaint();
+        }
+        self.activity.show(&ctx);
         self.help_window(&ctx);
         #[cfg(target_os = "macos")]
         self.relink.show(&ctx, self.ffmpeg.as_deref(), self.ffprobe.as_deref());
     }
 }
+fn column(ui: &mut egui::Ui, width: f32, content: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(width);
+            content(ui);
+        },
+    );
+}
+
+fn recovery_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    description: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text_width = ui.fonts_mut(|fonts| fonts.layout_no_wrap(label.into(), font, INK).size().x);
+    let button_width = text_width + 2. * ui.spacing().button_padding.x + 2.;
+    let body_width = ui.available_width() - button_width - ui.spacing().item_spacing.x;
+    if body_width >= 160. {
+        ui.horizontal_top(|ui| {
+            column(ui, body_width, description);
+            ui.button(label).clicked()
+        })
+        .inner
+    } else {
+        description(ui);
+        ui.button(label).clicked()
+    }
+}
+
+pub(crate) fn source_list<R>(
+    ui: &mut egui::Ui,
+    id: impl egui::AsIdSalt,
+    height: Option<f32>,
+    rows: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    ui.scope(|ui| {
+        let spacing = ui.spacing_mut();
+        spacing.item_spacing.y = 2.;
+        spacing.interact_size.y = 18.;
+        spacing.scroll.floating = false;
+        spacing.scroll.bar_width = 7.;
+        egui::ScrollArea::vertical()
+            .id_salt(id)
+            .max_height(height.map_or(SOURCE_LIST_HEIGHT, |height| height.clamp(48., 300.)))
+            .auto_shrink([false, true])
+            .show(ui, rows)
+    })
+    .inner
+}
+
 fn counted(n: usize, singular: &str, plural: &str) -> String {
     format!("{n} {}", if n == 1 { singular } else { plural })
 }
@@ -2273,7 +2698,7 @@ fn path_name(path: &Path) -> std::borrow::Cow<'_, str> {
         .to_string_lossy()
 }
 fn review_path(ui: &mut egui::Ui, label: &str, path: &Path) {
-    ui.horizontal(|ui| {
+    let show_path = |ui: &mut egui::Ui| {
         ui.label(RichText::new(label).color(MUTED));
         let full = path.display().to_string();
         ui.add(egui::Label::new(path_name(path)).truncate())
@@ -2284,7 +2709,12 @@ fn review_path(ui: &mut egui::Ui, label: &str, path: &Path) {
                     ui.close();
                 }
             });
-    });
+    };
+    if ui.available_width() < 220. {
+        ui.vertical(show_path);
+    } else {
+        ui.horizontal(show_path);
+    }
 }
 fn path_edit(ui: &mut egui::Ui, path: &mut PathBuf, hint: &str) {
     let mut text = path.to_string_lossy().into_owned();
@@ -2304,10 +2734,15 @@ fn path_list(ui: &mut egui::Ui, label: &str, paths: &mut Vec<PathBuf>) {
     for (i, p) in paths.iter().enumerate() {
         ui.horizontal(|ui| {
             ui.label(RichText::new(label).small().color(MUTED));
-            ui.label(p.display().to_string());
-            if ui.small_button("Remove").clicked() {
-                remove = Some(i);
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(i);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let full = p.display().to_string();
+                    ui.add(egui::Label::new(&full).truncate()).on_hover_text(full);
+                });
+            });
         });
     }
     if let Some(i) = remove {
@@ -2470,23 +2905,23 @@ pub(crate) mod report_view_tests {
             })
         };
         let initial = draw(&mut app, egui::RawInput::default());
-        assert!(!highlighted(&initial, "Source"));
+        assert!(!highlighted(&initial, "Source bins"));
         assert!(!highlighted(&initial, "Destination"));
 
-        for button in ["Next ›", "Use recommended settings", "5  Review"] {
+        for button in ["Continue", "Review"] {
             app.highlight_required_input = false;
             let current = draw(&mut app, egui::RawInput::default());
             let blocked = draw(&mut app, click(text_center(&current, button).unwrap()));
             assert_eq!(app.wizard.page, Page::Direction);
             assert!(app.error.is_none());
-            assert!(highlighted(&blocked, "Source"), "{button}");
+            assert!(highlighted(&blocked, "Source bins"), "{button}");
             assert!(!highlighted(&blocked, "Destination"), "{button}");
             assert!(text_center(&blocked, RequiredInput::Bins.message()).is_none());
         }
 
         app.wizard.inputs.bins.push(PathBuf::from("source.avb"));
         let missing_output = draw(&mut app, egui::RawInput::default());
-        assert!(!highlighted(&missing_output, "Source"));
+        assert!(!highlighted(&missing_output, "Source bins"));
         assert!(highlighted(&missing_output, "Destination"));
         assert!(text_center(&missing_output, RequiredInput::Output.message()).is_none());
 
@@ -2495,10 +2930,19 @@ pub(crate) mod report_view_tests {
         assert!(highlighted(&wrong_extension, "Destination"));
         app.wizard.inputs.output.set_extension("prproj");
         let ready = draw(&mut app, egui::RawInput::default());
-        assert!(!highlighted(&ready, "Source"));
+        assert!(!highlighted(&ready, "Source bins"));
         assert!(!highlighted(&ready, "Destination"));
-        draw(&mut app, click(text_center(&ready, "Next ›").unwrap()));
+        draw(&mut app, click(text_center(&ready, "Continue").unwrap()));
         assert_eq!(app.wizard.page, Page::Clips);
+
+        let media = draw(&mut app, egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760., 520.))),
+            ..Default::default()
+        });
+        let title = text_center(&media, "Choose how to link media").unwrap();
+        let back = text_center(&media, "Back").unwrap();
+        let review = text_center(&media, "Run review").unwrap();
+        assert!(title.x < back.x && back.x < review.x && (title.y - review.y).abs() < 6.);
     }
 
     #[test]
@@ -2525,6 +2969,11 @@ pub(crate) mod report_view_tests {
                 matches!(kind, BlockerKind::RewrapMissingMedia | BlockerKind::RewrapMissingOriginal)
             );
             let button_center = text_center(&initial, button).expect("recovery button");
+            assert!(text_center(&initial, "Synthetic preflight issue").is_none());
+            assert!(initial.shapes.iter().any(|shape| matches!(
+                &shape.shape, egui::Shape::Rect(rect)
+                    if rect.fill == ERROR_SURFACE && rect.rect.contains(button_center)
+            )), "{kind:?}");
             let mut selected = None;
             let mut output = ctx.run_ui(click(button_center), |ui| {
                 selected = App::blocker_card(ui, &issue, &mut browser);
@@ -2535,12 +2984,221 @@ pub(crate) mod report_view_tests {
     }
 
     #[test]
+    fn source_bin_tree_indents_and_selects_duplicate_names_by_path() {
+        let relative = ["Editorial/Sequences/Selects.avb", "Sound/Selects.avb"];
+        let catalog: Vec<_> = relative
+                .iter()
+                .map(|path| BinPath {
+                    path: Path::new("project").join(path),
+                    relative: path.into(),
+                })
+                .collect();
+        let ctx = egui::Context::default();
+        App::theme(&ctx);
+        let tree = Tree::build(&catalog);
+        let mut expansion = FolderExpansion::default();
+        let mut render = |raw, paths: &mut Vec<PathBuf>| {
+            let mut frame = ctx.run_ui(raw, |ui| {
+                let mut selected = BinSelection::new(paths);
+                source_list(ui, "test-tree", None, |ui| {
+                    tree.show(ui, &catalog, &mut selected, None, false, &mut expansion);
+                });
+            });
+            frame.textures_delta.clear();
+            frame
+        };
+        let mut bins = vec![];
+        let first = render(egui::RawInput::default(), &mut bins);
+        let editorial = text_center(&first, "Editorial").unwrap();
+        let duplicate_labels: Vec<_> = first
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(shape) if shape.galley.job.text == "Selects.avb" => {
+                    Some(shape.pos + shape.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(duplicate_labels.len(), 2);
+        assert!(duplicate_labels[0].x > duplicate_labels[1].x);
+        render(click(duplicate_labels[1]), &mut bins);
+        assert_eq!(bins, [catalog[1].path.clone()]);
+        render(click(editorial), &mut bins);
+        assert_eq!(
+            bins,
+            [
+                catalog[1].path.clone(),
+                catalog[0].path.clone()
+            ]
+        );
+        render(click(editorial), &mut bins);
+        assert_eq!(bins, [catalog[1].path.clone()]);
+    }
+
+    #[test]
+    fn large_bin_tree_preserves_space_and_can_scroll_filtered_results() {
+        let catalog: Vec<_> = (0..40)
+                .map(|i| {
+                    let relative = PathBuf::from(format!("Editorial/Reels/Bin {i:02}.avb"));
+                    BinPath {
+                        path: Path::new("project").join(&relative),
+                        relative,
+                    }
+                })
+                .collect();
+        let ctx = egui::Context::default();
+        App::theme(&ctx);
+        let tree = Tree::build(&catalog);
+        let mut bins = vec![];
+        let mut layout = None;
+        let mut expansion = FolderExpansion::default();
+        let matching = [true; 40];
+        let mut draw = |input, matches| {
+            let mut frame = ctx.run_ui(input, |ui| {
+                let mut selected = BinSelection::new(&mut bins);
+                layout = Some(source_list(ui, "test-scroll-tree", None, |ui| {
+                    tree.show(ui, &catalog, &mut selected, matches, false, &mut expansion);
+                }));
+            });
+            frame.textures_delta.clear();
+            (frame, layout.take().unwrap())
+        };
+        let (folded, short) = draw(egui::RawInput::default(), None);
+        assert!(text_center(&folded, "Editorial").is_some());
+        assert!(text_center(&folded, "Bin 00.avb").is_none());
+        assert!(short.content_size.y <= short.inner_rect.height());
+        let (expanded, long) = draw(egui::RawInput::default(), Some(matching.as_slice()));
+        assert!(text_center(&expanded, "Bin 00.avb").is_some());
+        assert!(long.inner_rect.height() <= SOURCE_LIST_HEIGHT);
+        assert!(long.content_size.y > SOURCE_LIST_HEIGHT);
+        let (_, scrolled) = draw(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(long.inner_rect.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0., -100.),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            Some(matching.as_slice()),
+        );
+        assert!(scrolled.state.clamped_offset().y > 0.);
+    }
+
+    #[test]
+    fn review_places_output_beside_findings_when_the_window_has_room() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), None);
+        app.wizard = Wizard::default();
+        app.wizard.page = Page::Review;
+        app.wizard.inputs.bins = vec!["Source.avb".into()];
+        app.wizard.inputs.output = "Converted.prproj".into();
+        app.review_blocker = Some(ReviewBlocker::new(
+            BlockerKind::RewrapMissingMedia,
+            "The source file is missing.",
+        ));
+        app.error = None;
+        let mut frame = eframe::Frame::_new_kittest();
+        for (width, side_by_side) in [(880., true), (760., false)] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 620.),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            output.textures_delta.clear();
+            let finding = text_center(&output, "Required media is missing").unwrap();
+            let summary = text_center(&output, "Output").unwrap();
+            let fix = text_center(&output, "Locate media").unwrap();
+            let title = text_center(&output, "Review conversion").unwrap();
+            let recheck = text_center(&output, "Check again").unwrap();
+            assert_eq!(summary.x > finding.x, side_by_side);
+            if side_by_side {
+                assert!((summary.y - finding.y).abs() < 4.);
+            } else {
+                assert!(summary.y > finding.y);
+            }
+            assert!(fix.x > finding.x && (fix.y - finding.y).abs() < 6.);
+            assert!(recheck.x > title.x && (recheck.y - title.y).abs() < 6.);
+            assert!(recheck.y < finding.y);
+        }
+    }
+
+    #[test]
+    fn populated_project_fits_destination_at_minimum_window_height() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), None);
+        app.wizard = Wizard::default();
+        app.wizard.inputs.project_folder = Some("project".into());
+        app.catalog = Some((0..40).map(|i| {
+            let relative = PathBuf::from(format!("Reels {i:02}/Source.avb"));
+            BinPath { path: Path::new("project").join(&relative), relative }
+        }).collect());
+        app.error = None;
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760., 520.))),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+        output.textures_delta.clear();
+        let destination = text_center(&output, "Project name (optional)").unwrap();
+        let heading = text_center(&output, "Choose what to transfer").unwrap();
+        let next = text_center(&output, "Continue").unwrap();
+        assert!(next.x > heading.x && (next.y - heading.y).abs() < 6.);
+        assert!(destination.y > next.y + 22. && destination.y < 500.);
+        assert!(text_center(&output, "Use recommended mode").is_none());
+    }
+
+    #[test]
+    fn cancellation_skips_error_log_and_only_critical_failure_opens_modal() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), None);
+        app.error = None;
+        app.cancel.cancel();
+        app.tx.send(Event::Inventory(app.wizard.revision(), Err("private path: cancelled".into()))).unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.notice.as_deref(), Some("Cancelled."));
+        assert!(app.error.is_none() && app.activity.errors.is_empty());
+        app.activity.record("Ordinary failure".into(), false);
+        assert!(app.activity.unread && !app.activity.critical);
+        app.tx.send(Event::WorkerFailed("Critical failure".into())).unwrap();
+        app.poll(&ctx);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut draw = |time| {
+            let input = egui::RawInput {
+                time: Some(time),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(880., 620.))),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            output.textures_delta.clear();
+            output
+        };
+        draw(0.);
+        let output = draw(0.25);
+        assert!(app.activity.critical);
+        assert!(text_center(&output, "Conversion stopped").is_some());
+        assert!(text_center(&output, "Critical failure").is_none());
+    }
+
+    #[test]
     fn blocked_preflight_report_searches_all_pages_and_copies_complete_details() {
         let mut issue = ReviewBlocker::new(BlockerKind::AvidMedia, "Resolve missing media");
         issue.affected = (1..=53).map(|index| format!("Missing file {index}")).collect();
         let target = "MXF Café slate package 52";
         issue.affected[51] = target.into();
         let ctx = egui::Context::default();
+        ctx.style_mut_of(egui::Theme::Dark, |style| style.animation_time = 0.);
+        ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.);
         let mut browser = ReportBrowser::default();
         let mut frame = |raw| {
             let mut output = ctx.run_ui(raw, |ui| {
@@ -2550,10 +3208,14 @@ pub(crate) mod report_view_tests {
             output
         };
         let initial = frame(egui::RawInput::default());
-        assert!(text_center(&initial, "Save preflight report").is_some());
-        assert!(text_center(&initial, "Details 1–25 of 53").is_some());
+        assert!(text_center(&initial, "Details 1–25 of 53").is_none());
         assert!(text_center(&initial, target).is_none());
-        let second = frame(click(text_center(&initial, "Next").unwrap()));
+        let expanded = frame(click(
+            text_center(&initial, "Affected details · 53").unwrap(),
+        ));
+        assert!(text_center(&expanded, "Save preflight report").is_some());
+        assert!(text_center(&expanded, "Details 1–25 of 53").is_some());
+        let second = frame(click(text_center(&expanded, "Next").unwrap()));
         assert!(text_center(&second, "Details 26–50 of 53").is_some());
 
         frame(click(text_center(&second, "Search affected details").unwrap()));
@@ -2576,6 +3238,45 @@ pub(crate) mod report_view_tests {
     }
 
     #[test]
+    fn blocked_timing_report_filters_short_lists_and_copies_every_detail() {
+        let mut issue = ReviewBlocker::new(BlockerKind::SequenceTiming, "Unsupported timing");
+        issue.affected = vec!["First edit · V1 · frame 12".into(), "Second edit · V2 · frame 18".into()];
+        issue.timeline_groups = ["First/Scenes.avb", "Second/Scenes.avb"].into_iter().enumerate()
+            .map(|(index, bin)| job::ReviewGroup {
+                id: bin.into(),
+                name: "Assembly".into(),
+                bin: Some(bin.into()),
+                note_indices: vec![index],
+            }).collect();
+        let mut browser = ReportBrowser::default();
+        let ctx = egui::Context::default();
+        ctx.style_mut_of(egui::Theme::Dark, |style| style.animation_time = 0.);
+        ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.);
+        let mut frame = |input| {
+            let mut output = ctx.run_ui(input, |ui| {
+                App::blocker_card(ui, &issue, &mut browser);
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let initial = frame(egui::RawInput::default());
+        frame(click(text_center(&initial, "Affected details · 2").unwrap()));
+        let expanded = frame(egui::RawInput::default());
+        frame(click(text_center(&expanded, "All timelines").unwrap()));
+        let menu = frame(egui::RawInput::default());
+        assert!(text_center(&menu, "Assembly · First/Scenes.avb").is_some());
+        frame(click(text_center(&menu, "Assembly · Second/Scenes.avb").unwrap()));
+        let filtered = frame(egui::RawInput::default());
+        assert!(text_center(&filtered, "First edit · V1 · frame 12").is_none());
+        assert!(text_center(&filtered, "Second edit · V2 · frame 18").is_some());
+        let copied = frame(click(text_center(&filtered, "Copy details").unwrap()));
+        let expected = format!("{}\n{}", issue.message, issue.affected.join("\n"));
+        assert!(copied.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == &expected)
+        }));
+    }
+
+    #[test]
     fn report_view_draws_only_the_selected_page() {
         let notes: Vec<_> = (1..=53).map(|index| job::ReportNote {
             severity: "loss".into(),
@@ -2592,7 +3293,7 @@ pub(crate) mod report_view_tests {
         ] {
             report.page = page;
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                App::report(ui, &notes, None, &mut report, &mut why);
+                App::report(ui, &notes, None, &[], &[], &mut report, &mut why);
             });
             output.textures_delta.clear();
             let shown = |text| output.shapes.iter().any(|shape| {
@@ -2602,6 +3303,50 @@ pub(crate) mod report_view_tests {
             assert!(shown(visible));
             assert!(!shown(hidden));
         }
+    }
+
+    #[test]
+    fn preflight_report_timeline_menu_distinguishes_matching_names() {
+        let notes = ["First timeline finding", "Second timeline finding"].map(|message| job::ReportNote {
+            severity: "loss".into(),
+            object: message.into(),
+            message: message.into(),
+            why: String::new(),
+        });
+        let timelines = ["First/Scenes.avb", "Second/Scenes.avb"].map(|bin| job::ReviewGroup {
+            id: bin.into(),
+            name: "Assembly".into(),
+            bin: Some(bin.into()),
+            note_indices: vec![usize::from(bin.starts_with("Second"))],
+        });
+        let sources = [job::ReviewGroup {
+            id: "source".into(), name: "Camera A".into(), bin: None, note_indices: vec![0],
+        }];
+        let mut browser = ReportBrowser::new(&notes);
+        let mut why = None;
+        let ctx = egui::Context::default();
+        ctx.style_mut_of(egui::Theme::Dark, |style| style.animation_time = 0.);
+        ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.);
+        let mut frame = |input| {
+            let mut output = ctx.run_ui(input, |ui| {
+                App::report(ui, &notes, None, &timelines, &sources, &mut browser, &mut why);
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let initial = frame(egui::RawInput::default());
+        frame(click(text_center(&initial, "All timelines").unwrap()));
+        let menu = frame(egui::RawInput::default());
+        assert!(text_center(&menu, "Assembly · First/Scenes.avb").is_some());
+        frame(click(text_center(&menu, "Assembly · Second/Scenes.avb").unwrap()));
+        let filtered = frame(egui::RawInput::default());
+        assert!(text_center(&filtered, "First timeline finding").is_none());
+        assert!(text_center(&filtered, "Second timeline finding").is_some());
+        frame(click(text_center(&filtered, "All source clips").unwrap()));
+        let source_menu = frame(egui::RawInput::default());
+        frame(click(text_center(&source_menu, "Camera A").unwrap()));
+        let combined = frame(egui::RawInput::default());
+        assert!(text_center(&combined, "No notes match these filters.").is_some());
     }
 }
 

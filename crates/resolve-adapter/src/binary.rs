@@ -7,6 +7,7 @@ pub(crate) enum Qt<'a> {
     Long(i64),
     Double(f64),
     Text(&'a str),
+    EmptyStringList,
     Bytes(&'a [u8]),
     ByteList(&'a [&'a [u8]]),
 }
@@ -31,6 +32,7 @@ pub(crate) fn qt(fields: &[(&str, Qt<'_>)]) -> Vec<u8> {
             Qt::Long(_) => 4,
             Qt::Double(_) => 6,
             Qt::Text(_) => 10,
+            Qt::EmptyStringList => 11,
             Qt::Bytes(_) => 12,
             Qt::ByteList(_) => 9,
         };
@@ -42,6 +44,7 @@ pub(crate) fn qt(fields: &[(&str, Qt<'_>)]) -> Vec<u8> {
             Qt::Long(n) => out.extend_from_slice(&n.to_be_bytes()),
             Qt::Double(n) => out.extend_from_slice(&n.to_be_bytes()),
             Qt::Text(text) => sized(&mut out, &utf16(text)),
+            Qt::EmptyStringList => out.extend_from_slice(&0u32.to_be_bytes()),
             Qt::Bytes(bytes) => sized(&mut out, bytes),
             Qt::ByteList(rows) => {
                 out.extend_from_slice(&(rows.len() as u32).to_be_bytes());

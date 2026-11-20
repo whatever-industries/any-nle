@@ -3,7 +3,7 @@ use anynle_app::resolve_job;
 use anynle_resolve_adapter::{
     MediaLinkReview,
     native_import::{self, WorkerStatus},
-    turnover::{AvidTurnoverPlan, Turnover, TurnoverJob, TurnoverSource},
+    turnover::{AvidTurnoverPlan, CameraOriginalsRequired, Turnover, TurnoverJob, TurnoverSource},
 };
 use eframe::egui::{self, Color32};
 use std::{
@@ -17,11 +17,16 @@ use std::{
 
 enum Event {
     Media(Result<MediaLinkReview, String>),
-    AvidMedia(Result<(MediaLinkReview, AvidTurnoverPlan, Vec<Vec<PathBuf>>), String>),
+    AvidMedia(Result<(MediaLinkReview, AvidTurnoverPlan, Vec<Vec<PathBuf>>), AvidMediaError>),
     Worker(bool, WorkerStatus),
     Progress(String),
     Prepared(Result<Prepared, String>),
     Published(Result<Option<String>, String>),
+}
+
+enum AvidMediaError {
+    CameraOriginals(String),
+    Other(String),
 }
 
 enum Prepared {
@@ -91,7 +96,13 @@ pub(crate) fn run(path: PathBuf, options: eframe::NativeOptions) -> eframe::Resu
         "Any NLE — Resolve Review",
         options,
         Box::new(move |cc| {
-            let mut review = Review::new(read_job(&path));
+            let job = match read_job(&path) {
+                Ok(job) if matches!(job.source, TurnoverSource::AvidToResolve { .. }) => {
+                    return Ok(Box::new(crate::avid_resolve::Wizard::from_job(job, &cc.egui_ctx)));
+                }
+                other => other,
+            };
+            let mut review = Review::with_rewrap(job, false);
             review.check_media(&cc.egui_ctx);
             Ok(Box::new(review))
         }),
@@ -115,19 +126,13 @@ pub(crate) struct Review {
     progress: String,
     done: bool,
     issue: Option<String>,
+    camera_blocker: Option<String>,
     warning: Option<String>,
     send: mpsc::Sender<Event>,
     receive: mpsc::Receiver<Event>,
 }
 
 impl Review {
-    fn new(job: Result<TurnoverJob, String>) -> Self {
-        let primary = job.as_ref().is_ok_and(|job| matches!(
-            job.source, TurnoverSource::AvidToResolve { op1a_rewrap_dir: Some(_), .. }
-        ));
-        Self::with_rewrap(job, primary)
-    }
-
     pub(crate) fn with_rewrap(job: Result<TurnoverJob, String>, primary_rewrap: bool) -> Self {
         let (send, receive) = mpsc::channel();
         let (job, issue) = match job {
@@ -137,6 +142,7 @@ impl Review {
         Self {
             job,
             issue,
+            camera_blocker: None,
             send,
             receive,
             installed: installed_resolve(),
@@ -159,9 +165,24 @@ impl Review {
 
     pub(crate) fn busy(&self) -> bool { self.busy }
 
+    #[cfg(test)]
+    pub(crate) fn report_camera_blocker_for_test(&self) {
+        self.send.send(Event::AvidMedia(Err(AvidMediaError::CameraOriginals(
+            "Test timeline · V1 · record frame 12 · Managed picture".into(),
+        )))).unwrap();
+    }
+
+    pub(crate) fn op1a_rewrap_dir(&self) -> Option<&Path> {
+        let TurnoverSource::AvidToResolve { op1a_rewrap_dir, .. } = &self.job.as_ref()?.source else {
+            return None;
+        };
+        op1a_rewrap_dir.as_deref()
+    }
+
     pub(crate) fn check_media(&mut self, ctx: &egui::Context) {
         let Some(job) = self.job.clone() else { return };
         self.issue = None;
+        self.camera_blocker = None;
         self.prepared = None;
         self.media = None;
         self.avid_source = None;
@@ -179,7 +200,14 @@ impl Review {
                         let report = source.review_links(&job.ffprobe, primary);
                         let sources = source.rewrap_sources(primary);
                         (report, source, sources)
-                    }).map_err(|error| error.to_string())),
+                    }).map_err(|error| {
+                        let message = error.to_string();
+                        if error.is::<CameraOriginalsRequired>() {
+                            AvidMediaError::CameraOriginals(message)
+                        } else {
+                            AvidMediaError::Other(message)
+                        }
+                    })),
                 TurnoverSource::PremiereToResolve { .. } => Event::Media(
                     job.review_media_links().map_err(|error| error.to_string())),
             };
@@ -402,7 +430,15 @@ fn status_message(
 
 impl eframe::App for Review {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
+    }
+}
+
+impl Review {
+    /// Return true when the user asks to edit the saved-path mappings.
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> bool {
         let ctx = ui.ctx().clone();
+        let mut open_mappings = false;
         while let Ok(event) = self.receive.try_recv() {
             match event {
                 Event::Media(result) => {
@@ -428,7 +464,10 @@ impl eframe::App for Review {
                             self.avid_source = Some(source);
                             self.rewrap_sources = recipes;
                         }
-                        Err(error) => self.issue = Some(error),
+                        Err(AvidMediaError::CameraOriginals(message)) => {
+                            self.camera_blocker = Some(message);
+                        }
+                        Err(AvidMediaError::Other(message)) => self.issue = Some(message),
                     }
                 }
                 Event::Worker(running, status) => {
@@ -589,6 +628,20 @@ impl eframe::App for Review {
                             ui.label(issue);
                         });
                 }
+                if let Some(issue) = &self.camera_blocker {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(114, 35, 36))
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.strong("Camera originals couldn’t be verified");
+                            if ui.button("Open saved-path mappings").clicked() {
+                                open_mappings = true;
+                            }
+                            ui.collapsing("Affected picture edits and Group cameras", |ui| {
+                                ui.label(issue);
+                            });
+                        });
+                }
                 if !self.busy && self.prepared.is_none() {
                     if action == Action::Launch && ui.button("Launch Resolve Studio").clicked() {
                         self.launch(&ctx);
@@ -667,6 +720,7 @@ impl eframe::App for Review {
                 }
             });
         });
+        open_mappings
     }
 }
 

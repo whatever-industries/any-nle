@@ -285,10 +285,8 @@ frames. Samples 10,000 onward were identical across the switch and
 within one PCM24 code of the expected sibling samples after the measured
 native stereo-bus gain. The startup envelope differed on A2.
 
-The retained combined project later passed Save Project As, reopen, timeline
-switching, and re-export. That archive uses explicit media bindings. The
-[automatic mixed Avid test](ROADMAP.md#avid--resolve) assembles the cohort
-from saved Avid input.
+The retained combined project passed Save Project As, reopen, timeline
+switching, and re-export using explicit media bindings.
 
 The retained linked MOV/WAV project was saved and reopened through
 Resolve scripting. Fresh PCM16 and PCM24 stereo insertions with explicit
@@ -305,6 +303,36 @@ and RESOLVE-0014 at
 `d9a4130d43cc51c0c59f9e760827443f6231709439de07a293fced65c46c68a3`.
 The private same-build split MXF reference Group archive has SHA-256
 `d3670d1c665f200fd36182090707bc0f504d0e9c1a66069fa517a8d00a3adeb2`.
+
+### Automatic combined Avid turnover
+
+A disposable two-bin fixture uses the retained fixed-audio Avid Group and
+a straight-cut sequence whose middle picture edit points to a linked
+1080p23.976 H.264 MOV. The saved bins place the sequences in separate
+subfolders and let both timelines reference the same two managed
+masters. Job/2 Review finds seven direct files, including six MXF
+siblings and the mapped MOV. The two timelines start at 01:00:00:01
+and 01:00:00:00.
+
+Resolve Studio 21.2.0.6 imported the generated DRP as a named test
+project, saved, closed, reopened and re-exported it. The returned archive
+kept all eighteen edits, both starts, physical paths and source clocks,
+and one shared pool item per managed master. The saved reel metadata
+on each managed source matches the picture MXF's reel tag. Media Pool reel
+display remains a UI check. The missing exact-file mapping, missing PCM
+sibling, and occupied output controls refused publication.
+
+The 24 MOV frames matched a fresh native Resolve import and trim at
+full decoded resolution. Frame comparisons also covered the managed
+picture on both timelines. In a separate archive copy, switching only
+the first 48 frames of Group picture to camera B changed exactly those
+frames after native reopen. The Group's two isolated lanes were
+byte-identical through the switch over 290,290 samples per channel.
+The straight-cut timeline retained 144,144 samples per channel and
+matched its direct mono siblings within one PCM24 code outside
+Resolve's measured 72-sample edit-edge windows. The Group matched
+the direct samples within one code away from its known startup and
+edge envelopes. File menu Save Project As for this cohort remains pending.
 
 ### Static picture controls
 
@@ -528,14 +556,16 @@ The native cache witnesses are pinned by SHA-256
 and `5e9344f0d9c27ecc4ab60a133833405bfed7530fe13cc0c6662054e6860cb6cc`
 for the untagged and Rec.709 cohorts, respectively.
 
-## Pending editor checks
+<a id="pending-editor-checks"></a>
 
-These recipes cover the retained linked-project fixtures. Use the
-[Resolve roadmap](ROADMAP.md#davinci-resolve-user-2026-10-26-bookmark-and-research)
-for their qualification status and the
-[Avid → Resolve route](ROADMAP.md#avid--resolve) for the automatic mixed
-project. The private linked-project return packet identifies the exact
-projects, hashes, filenames and output directory.
+## Native replay recipes
+
+The private linked-project return packet identifies the projects,
+hashes, filenames, and output directory. Check the
+[Avid → Resolve route](ROADMAP.md#avid--resolve) for the remaining
+File menu Save Project As and timing work. The
+[Resolve qualification index](ROADMAP.md#davinci-resolve-user-2026-10-26-bookmark-and-research)
+has current status for other fixtures.
 
 1. Open `Final-linked-23976.drp` and Save Project As a new disposable project.
    Close and reopen it, switch between both timelines and export a new DRP.
@@ -547,11 +577,11 @@ projects, hashes, filenames and output directory.
    to separate mono tracks. Save and reopen. Export isolated PCM24 lane
    references to the packet's `native-return` folder. Compare with the original
    physical channels, including nonzero trims and both clip boundaries.
-3. Author one isolated, editable mixed-rate timing control per direction.
-   The retained default Resolve controls differ from Avid's phase-aware
-   floor sampling. Export the saved control and full numbered-frame picture,
-   then isolated audio. Verify every selected source frame, first sample and
-   playable tail before admitting an editable mapping.
+3. For the Avid Motion Adapter check, author one isolated, editable
+   mixed-rate timing control per direction. The retained default
+   Resolve controls differ from Avid's phase-aware floor sampling.
+   Export numbered picture and isolated audio. Verify every selected
+   source frame, first sample, and playable tail.
 
 Resolve authority revision 6eaa0e747ee98f679d9677d24a102fe033447eb9. Finding content pins:
 

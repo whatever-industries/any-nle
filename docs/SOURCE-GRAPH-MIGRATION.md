@@ -302,8 +302,9 @@ cases for this route.
 ## Avid source ColorAdapter ownership
 
 The physical picture source's saved input transform remains in the item's
-`avid.source.input_color_transforms` receipt. A top-level 24 fps
-`EFF2_LUTSFX` edit with one full-span picture input can carry a separate
+`avid.source.input_color_transforms` receipt. A top-level
+`EFF2_LUTSFX` edit with one full-span picture input on the sequence's
+saved clock can carry a separate
 `color_adapter` record in the owning sequence's `avid.source.unresolved`
 receipt. It retains the exact edit-side text, input master and track, and
 saved source in-point. When that text matches the directly referenced
@@ -312,14 +313,34 @@ range, the record names the picture file package and that placement.
 A missing or contradictory source match retains its reason and a null
 placement. A plain edit of the same master has no ColorAdapter record.
 
+For direct same-rate picture, capture uses the saved rational edit rate
+instead of requiring 24 fps. The master, selected picture track, and
+file must agree on that clock, and the requested trim must fit the
+saved source extent. The 24 fps subclip, retime, still-image and
+managed-cache profiles retain their scoped checks. Destination writers
+qualify coverage separately.
+
 The exact standalone 10-bit LinearLut lists also retain a `linear_range`
 record on each saved file or edit owner. It gives the direction, bit
 depth, and 64/940 video endpoints alongside the original XML. The
 full-to-video list requires Avid's saved `Inverted` flag. A stacked or
-unrecognized list retains its raw XML. The range receipt describes the
-saved instruction. The physical file's own color tags and whether the
-destination applies the instruction remain independent. Premiere's
-Separate files preparation can translate video-to-full scaling on a
+unrecognized list retains its raw XML. For an exact manual video-to-full
+adjustment paired with an external 3D cube, `ordered_steps` records both
+stages in saved order. If the direct picture file saves the same two
+stages in reverse order, `reordered_picture_source` records the package
+and the uniquely owned placement when it resolves. The ordinary source
+match stays unresolved. Avid re-exported the earlier edit identically
+after the file's saved order changed, so the earlier edit keeps its own
+order. The range receipt describes the saved instruction. The physical
+file's own color tags and whether the
+destination applies the instruction remain independent. Premiere
+preparation uses both receipts for the qualified managed ProRes LT
+rewrap. It checks the selected package, edit trim, and project-local
+cube, then composes the edit's two steps into one clip Color Mode LUT
+without changing their order in graph/2.
+[Composition and render checks](PREMIERE-27-COLOR-MODE.md#ordered-avid-color-adapters)
+
+Premiere's Separate files preparation can translate video-to-full scaling on a
 plain 1080p24 picture edit of the qualified picture-only ProRes HQ original
 with an editable ASC CDL. It uses per-channel slope (1023/876) and
 offset (-64/876) in Premiere's normalized video-level space. The
@@ -327,6 +348,29 @@ master clip retains the linked original. A plain timeline occurrence
 of that master does not get an ASC CDL. The qualified edit can be on a
 higher picture lane alongside a separate video dissolve.
 An edit that is a transition endpoint still requires its own qualification.
+
+The standalone 10-bit full-to-video list also writes an editable ASC CDL
+on the same plain linked ProRes HQ profile. In Premiere's video-normalized
+RGB space, the slope is 876/1023 and the offset is 64/1023 on all three
+channels, with unity power and saturation. Preparation requires the saved
+`Inverted` flag and matching source and edit text. The effect belongs to
+one timeline edit. Nested retimes and managed rewraps remain outside this
+direction's verified profile.
+
+Both directions use the same graph/2 interpretation at 24, 23.976,
+25, and 29.97 fps. For plain same-rate 1080p picture-only AVC MOV, the
+writers verify the source clock, trim, and physical color tags separately
+from the adapter. Premiere applies an editable ASC CDL on the timeline
+clip. Resolve applies one editable clip Color node and records the saved
+direction as `resolve.cdl_range` on read-back. The Resolve mapping also
+covers qualified 24 fps picture-only ProRes HQ MOV and requires an
+unretimed V1 edit outside a transition. Neither writer changes the linked
+original.
+
+For legal-to-full grades in Resolve, set Deliver data levels to **Video**
+and enable **Retain sub-black and super-white data** to preserve
+excursions in the exported picture. The default export clipped them in
+the chart test. [Resolve reference manual](https://documents.blackmagicdesign.com/UserManuals/DaVinci_Resolve_21.1_Reference_Manual.pdf)
 
 The source receipt leaves color-space and cube asset qualification to
 destination preparation. Unapplied transforms keep an occurrence loss.
@@ -705,7 +749,25 @@ field means zero crop. Premiere 27 writes editable Corner Pin and, for
 nonzero margins, Rounded Crop. The Rounded Crop offset places the matte
 around the intended source rectangle. The two effects render in the
 measured order, with the saved component list placing Corner Pin first.
-Resolve writing remains open.
+Resolve writes an isolated static pin as an editable Fusion Corner
+Positioner on the linked 1080p24 Rec.709 ProRes HQ picture-only profile.
+The writer uses the same graph coordinates and converts Y to Fusion's
+upward axis. For nonzero crop margins, a Rectangle mask and Matte Control
+remove the outside in the original source raster before the pin. Both
+controls remain editable. In Resolve Studio 21.2 build 00006, 48 frames
+across two trimmed edits matched the native control after save and reopen.
+The linked Avid job retained the crop and pin, and all 16 sampled crop
+edges matched the retained Avid TIFF. The writer also supports one static
+Flop before or after the pin in the same profile. It adds a Fusion
+Transform at the saved position in the graph/2 chain. A preceding Flop
+feeds the source matte when present. A following Flop reflects the
+projected picture and its alpha together. The composition and MediaIn
+share one-based frame timing so Resolve keeps the source trims after
+archive reopen and inspection in Fusion. The combined native Avid render,
+animation and tracking remain open.
+[Blackmagic's Fusion matte guide](https://documents.blackmagicdesign.com/UserManuals/DaVinci-Resolve-20-Fusion-Visual-Effects.pdf)
+· [Fusion Transform controls](https://documents.blackmagicdesign.com/UserManuals/FusionManual.pdf)
+
 CONV-0099 through CONV-0101
 
 Premiere uses matched 1920×1080 geometry or verified square-pixel linked
@@ -742,6 +804,125 @@ Avid scales the Axis pivot with the image, rotates around that pivot
 in Z/X/Y order, and adds Position before projection. The same
 `projected_corners` receipt retains the result alongside the original
 controls. CONV-0103
+
+### Saved Avid 3D Warp compositing controls
+
+The owning Warp receipt in `avid.source` includes `saved_compositing`
+when saved numeric controls can be identified by their full parameter IDs.
+This records the foreground group gate, numeric key mode, foreground
+opacity in percent, background color selector, saved hue, saturation
+and luminance, and the separate background video-level control. The
+receipt retains the underlying parameter values and types alongside the
+named fields. Missing, duplicate, nonnumeric and nonfinite values stay
+unresolved. The saved scalars can be cached values on animated controls.
+The receipt leaves effect-time evaluation, the actual background input
+and the resulting alpha open.
+
+Four retained media-offline bins verified the 39% and 14% opacity values,
+the background settings, and distinct key codes 1, 3 and 5. The destination
+mapping still needs native controls with contrasting inputs and verified
+renders. CONV-0193 ·
+[Avid foreground controls](https://resources.avid.com/SupportFiles/attach/FXReference.pdf)
+
+The sequence's `avid.source` sidecar also stores `warp_inputs` by Warp
+occurrence. Each receipt keeps the track, exact record bounds when known,
+effect clock and length, and saved Swap Sources setting. `slots` follows
+the native track indices 1 and 2. Each slot stores filler, an exact
+same-rate picture reference with its Mob ID and trim, or an unresolved
+binding. The retained checkbox pair changes the saved flag while both
+slots stay the same. An offline two-source control preserves both trims
+when the track records are reordered. Duplicate indices and mixed-rate
+branches remain unresolved where the saved bindings are ambiguous or
+outside the verified scope. Effective foreground and background,
+including any picture coming from the track below, still need a native
+render comparison. CONV-0194 ·
+[Avid Effects and Color Correction Guide](https://resources.avid.com/SupportFiles/attach/Media_Composer_Effects_and_CC_Guide_2024.x.pdf)
+
+Each Warp occurrence also retains its saved compositing `controls` under
+`warp_inputs`. These observations survive when the input branches cannot
+produce a picture edit. They keep the full parameter ID, typed scalar,
+saved enable flag and whether the curve reference is absent, empty,
+populated or unresolved. The record covers foreground and background
+settings, Invert Key, Swap Sources, Show Alpha, Reverse Animation and
+the Luma Key range, threshold and softness controls. The checkbox
+replays preserve the exact single-control changes. A two-source control
+keeps the saved key and background settings without a portable Warp
+edit. Duplicate controls remain separate observations. The receipt
+keeps the scalar and enable flag separate from the curve. CONV-0195
+
+A populated curve adds `curve_data` with its saved value type,
+interpolation and extrapolation codes, field setting, and point count.
+For up to 64 readable numeric keys, graph/2 retains the original offset pair,
+timescale, value, handles, anchor and flags. The two-source opacity
+control preserves the pair `[-7, 2]` before the edit and `[11, 2]`
+after its visible span. The keys stay in the effect's saved coordinates.
+A duplicate property, invalid offset or oversized curve leaves the
+key list unresolved while retaining the curve summary. Runtime curve
+evaluation and destination opacity remain open. CONV-0197
+
+A Warp with two resolved picture slots and an exact record interval
+uses the existing `effect_gap` fallback. The sequence marker identifies
+the lane and omitted occurrence. Lower tracks and adjacent edits keep
+their own ranges. A 24 fps linked control writes a five-frame gap on V2
+starting at record frame 3 while retaining one V1 edit and two adjacent
+V2 edits. Reordered input records give the same gap. Duplicate indices,
+a mixed-rate branch and nested timing without a verified record range
+keep their original omission behavior. The gap check also rejects an
+overlap with another edit or transition. CONV-0196
+
+The same Warp receipt keeps Border width, softness, color and style
+code, Shadow position and opacity, and the Defocus mode and amounts.
+Retained saves show that selecting FG Only with amounts 87 and 174
+leaves the Internal amounts 2 and 6 intact. Both sets remain in the
+graph even when Defocus is turned off. The explicit Plain border code
+is distinct from a save that omits the style field. Background Color's
+level-limit checkbox has its own ID. The corresponding Border checkbox
+and the rendering measurements remain open. CONV-0198
+
+The reader also uses the saved slot numbers when routing a single-picture
+Warp with filler in slot 1. Reversing the two track records preserves
+the same picture source, trims, Corner Pin and reflection order, and
+Linear, Shelf, Bezier and Spline roll keys. The six reordered fixtures
+write byte-identical seeded Premiere projects to their ordinary-order
+controls. A repeated slot number or missing reference omits the affected
+picture and reports its occurrence in Review. Neighboring edits remain
+in the project. CONV-0199
+
+#### Native Full Key calibration
+
+Use two 48-frame 1920×1080/24 ProRes HQ sources with video-range Rec.709
+and a six-bit frame stamp. Each has three neutral luma bands. The lower
+source uses 10-bit codes 128, 320 and 576. The upper uses 768, 512 and
+256. Use distinct nonzero source timecodes and trim the lower source
+at file frame 4. Begin the upper source at file frame 10 on record frame
+4. This gives the upper source a file-to-record offset of six frames.
+
+Put the lower source on V1 for 36 frames. Use V2 for the nine four-frame
+intervals below, starting with an empty V2 interval. Keep other picture
+controls neutral. Use a fixed rather than animated opacity for each
+Warp and verify the saved mode and toggle values before export.
+
+| Record frames | V2 control |
+| --- | --- |
+| `[0, 4)` | Lower source visible alone |
+| `[4, 8)` | Neutral upper source |
+| `[8, 12)` | Full Key at 0% |
+| `[12, 16)` | Full Key at 25% |
+| `[16, 20)` | Full Key at 50% |
+| `[20, 24)` | Full Key at 100% |
+| `[24, 28)` | Full Key at 25% with Swap Sources enabled |
+| `[28, 32)` | Full Key at 100% with centered 50% scale and Background Color off |
+| `[32, 36)` | Same as the preceding edit with Background Color on and Hue, Saturation and Lum at zero |
+
+Save the bin, reopen it, and export the full sequence as legal-range
+10-bit ProRes HQ. Read both unwarped frame stamps before comparing
+opacity. Sample the three band centers at x=320, 960 and 1600 on
+row 540. Compare code-value blending and a blend after undoing the
+BT.709 transfer characteristic. Test the swapped source choice at 25%,
+where the two assignments give different values. Compare the outer
+samples of the two scaled edits to isolate generated background color.
+The offline harness discriminates these cases on synthetic output.
+Native Avid render evidence is pending. [ITU-R BT.709](https://www.itu.int/rec/R-REC-BT.709-6-201506-I/en)
 
 ### Animated 3D Warp Z Rotation
 

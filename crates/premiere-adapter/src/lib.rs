@@ -482,7 +482,7 @@ fn direct_opatom_clocks(
     exact_24_pcm16: bool,
     group_camera: bool,
 ) -> Option<(i64, i64, &'static str, bool)> {
-    direct_opatom_profile(item, media, sc, separate, exact_24_pcm16, group_camera, 2)
+    direct_opatom_profile(item, media, sc, separate, exact_24_pcm16, group_camera, 2, false)
 }
 
 fn direct_opatom_profile(
@@ -493,6 +493,7 @@ fn direct_opatom_profile(
     exact_24_pcm16: bool,
     group_camera: bool,
     mono_lanes: usize,
+    allow_partial: bool,
 ) -> Option<(i64, i64, &'static str, bool)> {
     let rate = item.rate?;
     let pcm16 = (rate.num(), rate.den()) == (24_000, 1001)
@@ -531,7 +532,33 @@ fn direct_opatom_profile(
     {
         return None;
     }
-    if item.media.len() != mono_lanes + 1 || !item.stream_groups.is_empty()
+    let (missing_mono, missing_picture) = if allow_partial && separate && !group_camera && mono_lanes == 2
+        && compression == "RI00" && (rate.num(), rate.den()) == (24_000, 1001)
+        && item.media.len() < 3
+    {
+        let mono = match side(sc, "avid.missing_managed_mono", &item.id) {
+            Some(receipt) => {
+                let (track, package) = missing_managed_track(receipt)?;
+                let slot = match track { 1 => 0, 2 => 1, _ => return None };
+                Some((slot, package))
+            }
+            None => None,
+        };
+        let picture = match side(sc, "avid.missing_managed_picture", &item.id) {
+            Some(receipt) => {
+                let (1, package) = missing_managed_track(receipt)? else { return None };
+                Some(package)
+            }
+            None => None,
+        };
+        (mono, picture)
+    } else {
+        (None, None)
+    };
+    let absent_packages = [missing_picture, missing_mono.map(|(_, package)| package)];
+    let absent_count = absent_packages.iter().flatten().count();
+    if item.media.len() + absent_count != mono_lanes + 1 || !item.stream_groups.is_empty()
+        || matches!(absent_packages, [Some(picture), Some(mono)] if picture.eq_ignore_ascii_case(mono))
         || side(sc, "avid.source", &item.id).and_then(|v| key(v, "raw_groups"))
             .is_some_and(|v| !matches!(v, Value::Arr(groups) if groups.is_empty()))
     {
@@ -554,12 +581,14 @@ fn direct_opatom_profile(
         let descriptor = key(facts, "descriptor")?;
         let package = key(facts, "file_package").and_then(str_value)?;
         let offline = mono_lanes == 2 && m.online == Some(false) && !drop && !pcm16 && !exact_24_pcm16 && !dnxhd_group_camera
+            && missing_picture.is_none()
             && clock.provenance.route == "avid_saved_file_to_physical_timecode";
         if m.original.is_some() || (!offline && m.online != Some(true))
             || binding.source_offset != Some(Rational::ZERO)
             || !path.to_ascii_lowercase().ends_with(".mxf") || !paths.insert(path)
             || package.is_empty() || !packages.insert(package.to_ascii_lowercase())
-            || ((mono_lanes == 3 || wide_or_picture_only) && !subclips::mob_id(package))
+            || absent_packages.iter().flatten().any(|absent| absent.eq_ignore_ascii_case(package))
+            || ((mono_lanes == 3 || wide_or_picture_only || absent_count != 0) && !subclips::mob_id(package))
             || clock.rate != rate || clock.display_base != base || clock.drop != drop
             || (!offline && clock.provenance.route != "file_source_clip_to_physical_timecode_track")
             || m.start != Some(start)
@@ -600,7 +629,7 @@ fn direct_opatom_profile(
             StreamKind::Audio if m.sample_rate == Some(48_000) && m.bits == Some(bits)
                 && clock.provenance.source_rate == Rational::integer(48_000)
                 && (!(pcm16 || exact_24_pcm16) || key(descriptor, "bits").and_then(integer) == Some(16))
-                && (!(dnxhd_group_camera || mono_lanes >= 3)
+                && (!(dnxhd_group_camera || mono_lanes >= 3 || missing_picture.is_some())
                     || key(descriptor, "bits").and_then(integer) == Some(24))
                 && key(descriptor, "channels").and_then(integer) == Some(1) =>
             {
@@ -616,11 +645,25 @@ fn direct_opatom_profile(
             return None;
         }
     }
-    let (start, origin, duration) = picture?;
-    if audio[..mono_lanes].iter().any(|lane| *lane != Some((start, origin, duration))) {
+    let (start, origin, duration) = if missing_picture.is_some() {
+        if picture.is_some() { return None; }
+        audio[..mono_lanes].iter().flatten().copied().next()?
+    } else {
+        picture?
+    };
+    if audio[..mono_lanes].iter().enumerate().any(|(index, lane)| {
+        let absent = missing_mono.is_some_and(|(missing, _)| missing == index);
+        *lane != if absent { None } else { Some((start, origin, duration)) }
+    }) {
         return None;
     }
     Some((start.to_units(TICKS_PER_SECOND)?, origin.to_units(TICKS_PER_SECOND)?, profile, dnxhd_group_camera))
+}
+
+fn missing_managed_track(receipt: &Value) -> Option<(i64, &str)> {
+    let track = integer(key(receipt, "track")?)?;
+    let package = str_value(key(receipt, "file_package")?).filter(|package| subclips::mob_id(package))?;
+    Some((track, package))
 }
 
 fn linked_package_key<'a>(
@@ -1239,6 +1282,9 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             }
             same_rate_aac_channels += 1;
         }
+        let picture_missing = sc.contains_key(&("avid.missing_managed_picture", item.id.as_str()));
+        let track_count = group_cameras.get(item.id.as_str()).copied()
+            .unwrap_or(if item.media.len() == 1 && !picture_missing { 0 } else { 2 });
         let direct_clocks = if clock == ClockProfile::LegacyImport && !keep_mono {
             let combined_24 = combined_mode
                 && item.rate == Some(Rational::integer(24))
@@ -1247,12 +1293,17 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 group_cameras.contains_key(item.id.as_str()) || layered_sources.contains(id.as_str())
                     || (!layered_packages.is_empty()
                         && linked_package_key(item, &media).is_some_and(|key| layered_packages.contains(&key))),
-                group_cameras.get(item.id.as_str()).copied()
-                    .unwrap_or(if item.media.len() == 1 { 0 } else { 2 }))
+                track_count, allow_originals)
                 .filter(|&(start, origin, _, _)| !combined_24 || (start == 0 && origin == 0))
         } else {
             None
         };
+        if picture_missing && direct_clocks.is_none() {
+            return Err(error(format!(
+                "{}: retaining managed audio without picture requires verified PCM24 MXF siblings with matching file clocks and extents",
+                item.name
+            )));
+        }
         if item.media.iter().any(|im| {
             let m = media[im.media.as_str()];
             m.online == Some(false) && m.original.is_none()
@@ -1282,11 +1333,13 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             if item.rate == Rational::new(30_000, 1001) {
                 direct_drop_frame_items.insert(item.id.as_str());
             }
-            let track_count = group_cameras.get(item.id.as_str()).copied().unwrap_or(if item.media.len() == 1 { 0 } else { 2 });
             let lanes = match track_count {
                 0 => "picture only",
                 3 => "discrete A1/A2/A3",
                 8 => "discrete A1–A8",
+                _ if picture_missing && item.media.len() == 1 => "one available mono sibling with missing picture",
+                _ if picture_missing => "discrete A1/A2 with missing picture",
+                _ if item.media.len() == 2 => "one available mono sibling",
                 _ => "discrete A1/A2",
             };
             diagnostics.push(format!("{}: direct {profile} OP-Atom with {lanes}, separate file origin and clip timecode, and no new media", item.name));
@@ -1422,9 +1475,21 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 }),
             }
         }
-        let avid = side(&sc, "avid", &item.id)
+        let mut avid = side(&sc, "avid", &item.id)
             .map(|v| bridge::avid_from_sidecar(v, item.color_rgb16))
             .transpose()?;
+        if let Some(avid) = &mut avid {
+            avid.columns.retain(|(name, value)| {
+                let Some(issue) = model::avid_column_text_issue(name, value) else { return true };
+                let mut chars = name.chars();
+                let preview: String = chars.by_ref().take(96).collect();
+                let suffix = if chars.next().is_some() { "…" } else { "" };
+                loss(&mut losses, &item.id, "avid_logging_column", format!(
+                    "Avid logging column {preview:?}{suffix} has an invalid {issue} and was omitted in Premiere. The original column is retained in graph/2."
+                ));
+                false
+            });
+        }
         if item.color_rgb16.is_some() && avid.is_none() {
             loss(&mut losses,&item.id,"color","item label has no Avid metadata block for the current writer; source color retained only in graph");
         }
@@ -1825,7 +1890,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
     let linear_fade_clips: HashSet<_> = if options.bin_mode == "separate" {
         model.clips.iter().filter_map(|clip| match clip {
             PreparedClip::Legacy(clip) if model.direct_dnxhr_origins.contains_key(&clip.id)
-                && clip.video.as_ref().is_some_and(|v| v.rate == Fraction::new(24_000, 1001))
+                && clip.video.as_ref().map(|v| v.rate).or(clip.rate) == Some(Fraction::new(24_000, 1001))
                 && clip.audio.iter().all(|a| a.bits == 24) =>
                 Some(clip.id.as_str()),
             _ => None,

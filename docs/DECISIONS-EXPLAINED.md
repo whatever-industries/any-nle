@@ -24,7 +24,7 @@ Most of the choices below follow from a few basic differences:
 | **Clip settings** | Settings such as gain live on the master clip and apply to every use. | Settings live on each clip and each edit; a master clip's settings are copied into new edits. | Any NLE writes the setting on the master clip *and* on each edit. |
 | **Timecode and frame rate** | Every clip, including audio-only ones, is counted at the project frame rate. | Audio-only clips have no frame rate of their own and are counted at a preference rate (23.976 by default). | Audio-only clips are given Avid's frame rate so their timecode reads the same as in Avid. |
 | **Metadata** | Bin columns, including custom ones, are stored in the bin. | A fixed set of logging fields plus a few custom ones. | Avid columns are mapped to the closest Premiere fields; the rest go into the Log Note. |
-| **Original media** | Usually works from transcoded MXF copies of the camera files, remembering the original Source File. | Can attach a proxy and a full-resolution file to the same clip. | *(planned)* The Avid MXF can come in as the proxy, with the original source file as full resolution. |
+| **Original media** | A transcode may retain the camera file's saved locator. | Can attach a proxy and a full-resolution file to the same clip. | Optional camera-original linking and proxy attachment use verified paths, clocks, and channel layouts. |
 
 ---
 
@@ -42,25 +42,27 @@ reports identify losses by clip or edit when the source provides that identity.
 
 ## Import options
 
-### How clips are built: OP1a rewrap, Grouped, Merged, or Separate
+<a id="how-clips-are-built-op1a-rewrap-grouped-merged-or-separate"></a>
+
+### How clips are built
 
 **What you choose.** In Avid, one master clip can hold a video file and several audio files
 (OP-Atom: `V01`, `A01`, `A02`…). Premiere imports each of those files as its own clip. Any NLE
-can present those sources in four ways. The native Avid → Premiere wizard uses this
-order, with **OP1a rewrap selected by default** for new or reset settings (User,
-2026-11-05). An explicitly remembered choice or preset remains selected.
+can present those sources in four ways. The native Avid → Premiere wizard
+recommends **Rewrap to native clips** for new or reset settings. It also
+remembers an explicit choice or preset.
 
 | Option | You get in the bin | Good for | Trade-off |
 |---|---|---|---|
-| **1. OP1a rewrap — default** | one native file-backed AV master per Avid clip, using a new OP1a MXF | keeps supported bin audio groups and channel assignments together in ordinary clips | **Creates new media.** Requires an output folder, additional disk space and supported media |
+| **1. Rewrap to native clips** | a native file-backed AV master for supported rewraps | keeps supported bin audio groups and channel assignments together in ordinary clips | **Creates new media.** Requires an output folder, additional disk space and supported media |
 | **2. Grouped clips** | one multicamera clip per Avid clip, referencing original files | keeps video and all audio together; audio channels stay switchable; can carry stereo | it is a multicam clip: some clip-level tools behave differently |
 | **3. Merged clips** | one merged clip per Avid clip, referencing original files | the familiar "merged clip" workflow | Premiere drops most metadata on merged clips (User report) and **cannot carry stereo** (Adobe: merging breaks audio into mono channels) |
 | **4. Separate files** | the original video and each audio file as their own clips | simplest; nothing hidden | on the timeline, picture and sound are separate (linked) clips |
 
-The native wizard exposes all four choices. Its OP1a choice selects both media rewrapping
-and native AV-master construction; it is not rewrapping under Grouped/Merged construction.
-Current CLI commands still require explicit rewrap flags. Selecting the wizard default
-must still lead through the folder choice and media review before writing anything.
+The native wizard exposes all four choices. **Rewrap to native clips**
+selects media preparation and native AV-master construction together.
+The CLI uses explicit rewrap flags. Review verifies the output folder
+and source media before writing.
 
 Notes shown with the choice:
 - The native rewrap route preserves [qualified two-camera Avid Groups](EDITABLE-GROUPS-2026-11-08.md)
@@ -69,7 +71,9 @@ Notes shown with the choice:
 - Qualified linked-original clips use ordinary file-backed masters. Descriptor,
   codec and path limits still apply; general AMA compatibility is not established.
 
-### Rewrap Avid OP-Atom as OP1a MXF *(CLI and macOS folder prompt implemented; wider qualification pending)*
+<a id="rewrap-avid-op-atom-as-op1a-mxf-cli-and-macos-folder-prompt-implemented-wider-qualification-pending"></a>
+
+### Managed media rewrap
 
 **What you choose.** The first, default choice in the native Avid → Premiere clip
 menu. The option and conversion review must display **“Creates new media.”** The CLI
@@ -81,11 +85,11 @@ estimated additional space and available space. Cancel creates no outputs. Expli
 `--rewrap-op1a NEW_DIR` remains available for scripts. The native wizard offers its own
 folder selection and pre-flight review.
 
-**What Any NLE does.** Writes new OP1a MXF files in your chosen output folder from the
-qualified Avid media set, then links the Premiere project to those files. The original
-Avid media stays in place. Rewrapping is intended to preserve the existing media without
-re-encoding; unsupported inputs must be reported, with no silent transcode. Multiple
-OP-Atom files must be joined from verified identities and source tracks, not filenames.
+**What Any NLE does.** Rewraps verified DNx picture to OP1a and qualified
+ProRes to MOV. The wide DNx profile writes picture-only OP1a and independent
+WAVs. The project links the new files and leaves the Avid originals in
+place. Package identities and physical source tracks determine which
+streams belong together. [Media profiles](MEDIA-REWRAP.md)
 
 **Why.** It offers a file-based alternative to rebuilding picture and sound from separate
 OP-Atom sources. Creating the new files takes additional disk space and processing time;
@@ -138,12 +142,17 @@ media can be stereo in one Avid clip and mono in another; each keeps its own set
 A checkbox, off by default. Avid keeps deleted bins in `Trash/` and
 automatic backups in the Attic; most imports do not want them.
 
-### Video as proxies; link to source files *(planned)*
+<a id="video-as-proxies-link-to-source-files-planned"></a>
 
-Avid video media (MXF) is usually a transcode of the original camera file. By default Any NLE
-imports the Avid video as the **proxy** and links the original **Source File** as the
-full-resolution media when it can be found. A separate option, **Link Audio to source file (if
-found)**, does the same for audio.
+### Camera originals and optional proxies
+
+The primary-media default uses the media in the Avid edit. **Prefer
+camera originals for picture** checks Avid's saved locator, then uses
+qualified Avid media when the camera file cannot be verified. **Attach
+matching Avid media as proxies** is a separate option. Review checks
+identity, timecode, and channel layout before attachment. The rewrap
+option creates a compatible proxy for the supported audio layouts.
+[Wizard controls](GUI-WIZARD.md) · [Verified profiles](VERIFIED-RELINK.md#automatic-avid-proxy-attachment)
 
 ---
 
@@ -656,12 +665,12 @@ and linked originals retain separate clip identities, including copies in differ
 A qualified source graph is distinct from destination construction and native read-back.
 The original-file writer input is a typed union; legacy model/1 remains strict and unchanged.
 
-**Initial movie admission scope.** MP4/MOV picture must be H.264 High level 4.0
-(`avc1`, 8-bit `yuv420p`), square-pixel progressive 1920×1080 at exactly 24 fps.
-Video-only sources remain admissible; any present movie audio must be AAC LC (`mp4a`),
-48,000 Hz stereo. The whole physical movie is checked, including streams not selected by
-an individual Avid track. Higher bit depth, other profiles/levels, raster/rate variants,
-HE-AAC and other movie-audio configurations refuse. PCM16/24 WAV admission is unchanged.
+**Original 24 fps qualification.** The first MP4/MOV controls used H.264
+High level 4.0 (`avc1`, 8-bit `yuv420p`), square-pixel progressive
+1920×1080 at exactly 24 fps, with picture only or 48 kHz stereo AAC-LC.
+The [media evidence](AVID-PREMIERE-EVIDENCE.md#multi-reel-feature-cut-audit)
+records the later raster, rate, PCM, and codec cases. Physical stream
+geometry and clocks still govern each route's admission.
 
 Explicit picture color tags must be BT.709, with limited (`tv`) range if tagged.
 Absent, `unknown` or `unspecified` color/range tags produce a report note: the writer's

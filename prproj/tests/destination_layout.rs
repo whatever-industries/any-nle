@@ -85,6 +85,47 @@ fn load(p: &Path) -> Project {
 fn names(p: &Project, id: ItemId) -> Vec<String> {
     p.children(id).iter().map(|&id| p.item_name(id)).collect()
 }
+
+#[test]
+fn new_placement_preserves_the_exact_source_pixel_aspect_ratio() {
+    use prproj::model::{footage::ParInput, validators::Num};
+
+    let scratch = Scratch::new();
+    let out = scratch.0.join("pixel-aspect.prproj");
+    let mut ids = SeededUuids::new("place-interpreted-source");
+    prepare_project(&fixture(false), &out, &mut ids, &[], false)
+        .unwrap()
+        .publish()
+        .unwrap();
+    let mut project = load(&out);
+    let sequence = project.sequences()[0];
+    let track = project.sequence(sequence).video_tracks[0];
+    let source = project.track_item_source(project.track_clips(track)[0]).unwrap();
+    let footage = project.footage_interpretation(source).unwrap().unwrap();
+    let original = project.doc.tree.sub_element(footage.stream, "OriginalPAR", &[]);
+    project.doc.tree.set_text(original, Some("768,702"));
+
+    let start = project.sequence_end(sequence).unwrap();
+    project.add_clip(track, source, start, &mut ids).unwrap();
+    footage
+        .set_pixel_aspect_ratio(&mut project.doc.tree, ParInput::Pair(Num::Int(16), Num::Int(15)))
+        .unwrap();
+    let start = project.sequence_end(sequence).unwrap();
+    project.add_clip(track, source, start, &mut ids).unwrap();
+    let saved = scratch.0.join("placed.prproj");
+    project.save(&saved).unwrap();
+
+    let reopened = load(&saved);
+    let sequence = reopened.sequences()[0];
+    let track = reopened.sequence(sequence).video_tracks[0];
+    let clips = reopened.track_clips(track);
+    let aspects: Vec<_> = clips[clips.len() - 2..]
+        .iter()
+        .map(|&clip| reopened.doc.tree.findtext(reopened.track_item(clip).element, "PixelAspectRatio").unwrap().unwrap())
+        .collect();
+    assert_eq!(aspects, ["768,702", "16,15"]);
+}
+
 #[test]
 fn mirrored_parents_dedupe_without_collapsing_same_named_bins_and_sequences_use_import_root() {
     let scratch = Scratch::new();

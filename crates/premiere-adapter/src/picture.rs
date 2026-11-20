@@ -1,5 +1,5 @@
 use super::*;
-use graph::picture_chain::{Chain, Reflection};
+use graph::picture_chain::{is_corner_pin_stage, read_ordered_corner_pin, Chain, Reflection};
 use prproj::convert::prepared::{supports_picture_motion_clock, CornerPin, MotionKey, PictureEffect, TrimmedMotion, TrimmedMotionKey, WarpRollInterpolation};
 
 fn number(value: &Value) -> Option<f64> {
@@ -25,15 +25,9 @@ fn numbers<const N: usize>(value: &Value) -> Option<[f64; N]> {
 }
 
 pub(super) fn corner_pin(params: &Value) -> Option<CornerPin> {
-    let Value::Obj(fields) = params else { return None };
-    let Value::Arr(points) = params.get("target_corners_tl_tr_br_bl")? else { return None };
-    let [tl, tr, br, bl] = points.as_slice() else { return None };
-    let source_crop = params.get("source_crop_ltrb");
-    let pin = CornerPin {
-        corners: [numbers(tl)?, numbers(tr)?, numbers(br)?, numbers(bl)?],
-        source_crop: match source_crop { Some(value) => numbers(value)?, None => [0.0; 4] },
-    };
-    (fields.len() == 1 + usize::from(source_crop.is_some()) && pin.is_valid()).then_some(pin)
+    let (corners, source_crop) = graph::picture_chain::corner_pin_geometry(params)?;
+    let pin = CornerPin { corners, source_crop };
+    pin.is_valid().then_some(pin)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -103,7 +97,7 @@ pub(super) fn prepare_chain(
                 "SpectraMatte uses editable Premiere Ultra Key before static Motion. Matte edges and spill can differ from Avid.");
             return Ok((Some(motion), Some(PictureEffect::UltraKey { rgb }), [false; 2]));
         }
-        if stages.iter().any(is_pin_stage) {
+        if stages.iter().any(is_corner_pin_stage) {
             let Some(native) = prepare_pin_chain(stages, &effect.params)
                 .map_err(|()| error(format!("malformed ordered Corner Pin at {}", placement.id)))?
             else {
@@ -196,36 +190,13 @@ fn spectramatte_motion(stages: &[Value]) -> Option<([u8; 3], graph::Transform)> 
         .then_some((rgb, motion))
 }
 
-fn is_pin_stage(stage: &Value) -> bool {
-    matches!(stage.get("kind"), Some(Value::Str(kind)) if kind == "picture.corner_pin")
-}
-
 fn prepare_pin_chain(stages: &[Value], params: &Value) -> Result<Option<PictureEffect>, ()> {
-    if !matches!(params, Value::Obj(fields) if fields.len() == 1)
-        || !(2..=16).contains(&stages.len())
-    {
-        return Err(());
-    }
-    let [first, second] = stages else { return Ok(None); };
-    let (pin, reflection, flop_before_pin) = if is_pin_stage(first) {
-        (first, second, false)
-    } else {
-        (second, first, true)
-    };
-    if !matches!(pin, Value::Obj(fields) if fields.len() == 2) {
-        return Err(());
-    }
-    let pin = corner_pin(pin.get("params").ok_or(())?).ok_or(())?;
-    let Some(Value::Str(kind)) = reflection.get("kind") else { return Err(()); };
-    if !Reflection::is_effect_kind(kind) {
+    let Some(chain) = read_ordered_corner_pin(stages, params).map_err(|_| ())? else {
         return Ok(None);
-    }
-    if !matches!(reflection, Value::Obj(fields) if fields.len() == 2) {
-        return Err(());
-    }
-    let axes = Reflection::from_params(reflection.get("params").ok_or(())?).ok_or(())?;
-    Ok((axes.horizontal && !axes.vertical).then_some(PictureEffect::CornerPinWithFlop {
-        pin, flop_before_pin,
+    };
+    let pin = corner_pin(chain.pin_params).ok_or(())?;
+    Ok(chain.reflection.filter(|axes| axes.horizontal && !axes.vertical).map(|_| PictureEffect::CornerPinWithFlop {
+        pin, flop_before_pin: chain.reflection_before_pin,
     }))
 }
 

@@ -681,8 +681,11 @@ pub enum SourceTimewarpPoints {
     Keys(Vec<SourceTimewarpKey>),
 }
 
+pub type SourceTimewarpKey = SourceParamKey;
+
+/// Saved numeric Avid curve point in its owner's native time coordinates.
 #[derive(Debug)]
-pub struct SourceTimewarpKey {
+pub struct SourceParamKey {
     pub time: (i64, i64),
     pub timescale: i64,
     pub value: f64,
@@ -701,6 +704,8 @@ pub struct SourceColorAdapter {
     /// Saved controls for a nested motion effect whose rendered cadence is unqualified.
     pub subclip_motion: Option<Box<SourceSubclipMotion>>,
     pub picture_file: Observed<MobId>,
+    /// Same picture package, with the same saved color steps in a different order.
+    pub reordered_picture_file: Option<MobId>,
     pub transform: String,
     pub neutral_wrapper: bool,
     /// Saved edit-side clip color on the effect wrapper, separate from the transform.
@@ -719,16 +724,12 @@ pub enum SourceColorRange {
 impl SourceColorRange {
     pub fn from_saved_xml(text: &str) -> Option<Self> {
         // Match the entire native list, including the direction flag.
-        match text {
+        match color_list_body(text)? {
+            VIDEO_TO_FULL_STEP => Some(Self::VideoToFull),
             concat!(
-                "<ColorTransformationList><ColorTransformation><LinearLut>",
-                "<Name>Levels scaling (video levels to full range)</Name><BitDepth>10</BitDepth>",
-                "<Black>64</Black><White>940</White></LinearLut></ColorTransformation></ColorTransformationList>",
-            ) => Some(Self::VideoToFull),
-            concat!(
-                "<ColorTransformationList><ColorTransformation><LinearLut>",
+                "<LinearLut>",
                 "<Name>Levels scaling (full range to video levels)</Name><BitDepth>10</BitDepth>",
-                "<Black>64</Black><White>940</White><Inverted/></LinearLut></ColorTransformation></ColorTransformationList>",
+                "<Black>64</Black><White>940</White><Inverted/></LinearLut>",
             ) => Some(Self::FullToVideo),
             _ => None,
         }
@@ -741,13 +742,56 @@ impl SourceColorRange {
 
 /// The single 3D .cube descriptor saved on the qualified Avid effect wrapper.
 pub fn is_canonical_external_cube(xml: &str) -> bool {
-    let Some(body) = xml.strip_prefix("<ColorTransformationList><ColorTransformation><ExternalLut><Name>")
-        .and_then(|s| s.strip_suffix("</LutFileName><LutDimension>3D</LutDimension><InhibitScaling/></ExternalLut></ColorTransformation></ColorTransformationList>"))
-    else { return false };
-    let Some((name, file)) = body.split_once("</Name><LutFileName>") else { return false };
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b" ._()-".contains(&b))
+    color_list_body(xml).and_then(external_cube).is_some()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceColorStack<'a> {
+    pub range: SourceColorRange,
+    pub cube_name: &'a str,
+    pub cube_file: &'a str,
+    pub cube_first: bool,
+}
+
+const VIDEO_TO_FULL_STEP: &str = concat!(
+    "<LinearLut><Name>Levels scaling (video levels to full range)</Name>",
+    "<BitDepth>10</BitDepth><Black>64</Black><White>940</White></LinearLut>",
+);
+
+impl<'a> SourceColorStack<'a> {
+    /// A manual 10-bit video-to-full adjustment and a 3D cube with native scaling disabled.
+    pub fn from_saved_xml(xml: &'a str) -> Option<Self> {
+        let (first, second) = color_list_body(xml)?.split_once(
+            "</ColorTransformation><ColorTransformation>",
+        )?;
+        let (cube, cube_first) = match (first, second) {
+            (VIDEO_TO_FULL_STEP, cube) => (cube, false),
+            (cube, VIDEO_TO_FULL_STEP) => (cube, true),
+            _ => return None,
+        };
+        let (cube_name, cube_file) = external_cube(cube)?;
+        Some(Self { range: SourceColorRange::VideoToFull, cube_name, cube_file, cube_first })
+    }
+
+    pub fn is_reordered(self, other: Self) -> bool {
+        self.cube_first != other.cube_first
+            && Self { cube_first: other.cube_first, ..self } == other
+    }
+}
+
+fn color_list_body(xml: &str) -> Option<&str> {
+    xml.strip_prefix("<ColorTransformationList><ColorTransformation>")?
+        .strip_suffix("</ColorTransformation></ColorTransformationList>")
+}
+
+fn external_cube(body: &str) -> Option<(&str, &str)> {
+    let body = body.strip_prefix("<ExternalLut><Name>")?
+        .strip_suffix("</LutFileName><LutDimension>3D</LutDimension><InhibitScaling/></ExternalLut>")?;
+    let (name, file) = body.split_once("</Name><LutFileName>")?;
+    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b" ._()-".contains(&b))
         && file.len() <= 128 && file.strip_suffix(".cube").is_some_and(|stem| !stem.is_empty())
-        && file.bytes().all(|b| b.is_ascii_alphanumeric() || b" ._()-".contains(&b))
+        && file.bytes().all(|b| b.is_ascii_alphanumeric() || b" ._()-".contains(&b)))
+        .then_some((name, file))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -808,6 +852,101 @@ pub enum SourcePictureProfile {
     EmptyColorAdapter,
     PlainLayeredSubmaster,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceWarpInput {
+    Filler,
+    Picture(SubmasterPictureInput),
+    Unresolved,
+}
+
+/// File-order parameter IDs with saved-control names established in AVB-0009.
+pub const WARP_COMPOSITING_PARAMETERS: &[(&str, &str)] = &[
+    ("f281568d7e84d511935a50f857c10000", "foreground_group_gate"),
+    ("f381568d7e84d511935a50f857c10000", "key_mode_code"),
+    ("f681568d7e84d511935a50f857c10000", "foreground_opacity_percent"),
+    ("0682568d7e84d511935a50f857c10000", "background_color_selector"),
+    ("0782568d7e84d511935a50f857c10000", "background_hue"),
+    ("0882568d7e84d511935a50f857c10000", "background_saturation"),
+    ("0982568d7e84d511935a50f857c10000", "background_luminance"),
+    ("f0481979d5ff594184d9f6a6e9b6d3bb", "background_limit_to_video_levels"),
+    ("f481568d7e84d511935a50f857c10000", "invert_key"),
+    ("f581568d7e84d511935a50f857c10000", "swap_sources"),
+    ("1a82568d7e84d511935a50f857c10000", "show_alpha"),
+    ("1b82568d7e84d511935a50f857c10000", "reverse_animation"),
+    ("fe81568d7e84d511935a50f857c10000", "key_threshold"),
+    ("ff81568d7e84d511935a50f857c10000", "key_softness"),
+    ("0082568d7e84d511935a50f857c10000", "key_lum_range_enabled"),
+    ("0182568d7e84d511935a50f857c10000", "key_range"),
+    ("d081568d7e84d511935a50f857c10000", "border_group_gate"),
+    ("d181568d7e84d511935a50f857c10000", "border_style_code"),
+    ("d281568d7e84d511935a50f857c10000", "border_width"),
+    ("d381568d7e84d511935a50f857c10000", "border_softness"),
+    ("d481568d7e84d511935a50f857c10000", "border_hue"),
+    ("d581568d7e84d511935a50f857c10000", "border_saturation"),
+    ("d681568d7e84d511935a50f857c10000", "border_luminance"),
+    ("e281568d7e84d511935a50f857c10000", "shadow_group_gate"),
+    ("e381568d7e84d511935a50f857c10000", "shadow_x"),
+    ("e481568d7e84d511935a50f857c10000", "shadow_y"),
+    ("e681568d7e84d511935a50f857c10000", "shadow_opacity_percent"),
+    ("df81568d7e84d511935a50f857c10000", "defocus_group_gate"),
+    ("1c82568d7e84d511935a50f857c10000", "defocus_mode_code"),
+    ("e081568d7e84d511935a50f857c10000", "defocus_internal_horizontal"),
+    ("e181568d7e84d511935a50f857c10000", "defocus_internal_vertical"),
+    ("1d82568d7e84d511935a50f857c10000", "defocus_fg_only_horizontal"),
+    ("1e82568d7e84d511935a50f857c10000", "defocus_fg_only_vertical"),
+];
+
+#[derive(Clone, Copy, Debug)]
+pub enum SourceWarpControlValue {
+    Int(i64),
+    Float(f64),
+    Unresolved,
+}
+
+#[derive(Debug)]
+pub enum SourceWarpControlCurve {
+    Absent,
+    Empty,
+    Keyframed(Box<SourceWarpCurve>),
+    Unresolved,
+}
+
+#[derive(Debug)]
+pub struct SourceWarpCurve {
+    pub value_type: Option<i64>,
+    pub interpolation: Option<i64>,
+    pub extrapolation: Option<i64>,
+    pub fields: Option<i64>,
+    pub point_count: usize,
+    pub keys: Option<Vec<SourceParamKey>>,
+}
+
+/// The saved PRIT scalar is separate from both its enable flag and its curve.
+#[derive(Debug)]
+pub struct SourceWarpControl {
+    pub parameter_id: &'static str,
+    pub name: &'static str,
+    pub value_type: Option<i64>,
+    pub value: SourceWarpControlValue,
+    pub enabled: Option<bool>,
+    pub curve: SourceWarpControlCurve,
+}
+
+/// Saved input slots and controls on a Warp occurrence, before evaluation.
+#[derive(Debug)]
+pub struct SourceWarpInputs {
+    pub owner: String,
+    pub track: i64,
+    pub record_start: Option<i64>,
+    pub record_length: Option<i64>,
+    pub effect_rate: Option<Rate>,
+    pub effect_length: i64,
+    pub swap_sources: Option<bool>,
+    pub inputs: [SourceWarpInput; 2],
+    pub controls: Vec<SourceWarpControl>,
+}
+
 #[derive(Debug)]
 pub struct SourceSequence {
     pub id: String,
@@ -827,6 +966,7 @@ pub struct SourceSequence {
     pub unresolved: Vec<SourceIssue>,
     pub texts: Vec<SourceText>,
     pub group_uses: Vec<SourceGroupUse>,
+    pub warp_inputs: Vec<SourceWarpInputs>,
 }
 
 #[derive(Debug)]
@@ -962,6 +1102,7 @@ impl SourceSequence {
             unresolved: Vec::new(),
             texts: Vec::new(),
             group_uses: Vec::new(),
+            warp_inputs: Vec::new(),
         }
     }
 }
@@ -983,6 +1124,22 @@ pub fn extract_source_paths_inspected(
     inspect: &mut dyn FnMut(&crate::file::AvbFile) -> Result<(), String>,
 ) -> Result<SourceProject, SourceReadError> {
     crate::extract::project::extract_source_paths_inspected(inputs, limits, before, inspect)
+}
+
+/// Reader findings from bins already decoded. Later source and media checks can
+/// resolve or add findings when the full selection is known.
+pub enum BinReadProgress<'a> {
+    Reading { index: usize, path: &'a Path, findings: usize },
+    Finished { total: usize, findings: usize },
+}
+
+/// Observe progress on the calling thread and inspect each bin during its only decode.
+pub fn extract_source_paths_with_progress(
+    inputs: &[SourceInput], limits: SourceLimits,
+    observe: &mut dyn FnMut(BinReadProgress<'_>) -> Result<(), String>,
+    inspect: &mut dyn FnMut(&crate::file::AvbFile) -> Result<(), String>,
+) -> Result<SourceProject, SourceReadError> {
+    crate::extract::project::extract_source_paths_with_progress(inputs, limits, observe, inspect)
 }
 
 pub(crate) fn failure(path: &Path, message: impl Into<String>) -> SourceReadError {

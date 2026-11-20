@@ -269,12 +269,14 @@ impl FootageInterpretation {
         self.set_leaf(tree, "IsFieldTypeOverridden", "true")
     }
 
+    pub(super) fn stored_pixel_aspect_ratio(&self, tree: &Tree) -> Option<String> {
+        self.overridden(tree, "IsPAROverridden", "OverriddenPAR")
+            .or_else(|| findtext(tree, self.stream, "OriginalPAR"))
+    }
+
     /// `pixel_aspect_ratio`: the override, else the native `OriginalPAR`, else 1.0.
     pub fn pixel_aspect_ratio(&self, tree: &Tree) -> Result<f64> {
-        let stored = match self.overridden(tree, "IsPAROverridden", "OverriddenPAR") {
-            Some(s) => Some(s),
-            None => findtext(tree, self.stream, "OriginalPAR"),
-        };
+        let stored = self.stored_pixel_aspect_ratio(tree);
         if let Some((n, d)) = stored.as_deref().and_then(|s| s.split_once(',')) {
             let (n, d) = (py_int(n)?, py_int(d)?);
             if d == 0 {

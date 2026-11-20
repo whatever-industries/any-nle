@@ -21,6 +21,12 @@ copyrights remain applicable to their respective code and assets.
   registry archive hashes; local first-party crates use the root MIT license.
   MPL 2.0 crates, including option-ext, include exact hash-verified registry source
   archives under `sources/rust/`; see `SOURCE_AVAILABILITY.md` for source access.
+- The GUI embeds the Inter 4.1 Regular and SemiBold TrueType fonts with
+  optional PostScript glyph names removed. The glyph outlines and layout
+  tables follow the upstream fonts. The Inter Project Authors provide the
+  fonts under SIL Open Font License 1.1.
+  See [the Inter 4.1 release](https://github.com/rsms/inter/releases/tag/v4.1)
+  and `crates/gui/resources/inter/OFL.txt`, included under `licenses/` in packages.
 - Windows installers use NSIS 3.11 with its zlib compressor. The installer stub,
   MUI and standard plugin notices are preserved in `licenses/nsis/COPYING`;
   LZMA/CPL and bzip2 compressor modules are not selected.

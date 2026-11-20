@@ -64,7 +64,7 @@ pub(super) struct Mp3Timing {
     pub extent: Rational,
 }
 
-pub(super) struct ItemRoutes {
+pub(super) struct ItemRoutes<'a> {
     pub audio: HashSet<i64>,
     pub dry_audio: HashSet<i64>,
     pub linked_audio_render: Option<(MobId, MobId)>,
@@ -80,6 +80,7 @@ pub(super) struct ItemRoutes {
     pub same_rate_aac: HashMap<i64, Rational>,
     pub mp3_timing: HashMap<i64, Mp3Timing>,
     pub timewarp_picture: Option<Rational>,
+    pub(super) missing_managed_siblings: Option<(&'a av::SourceMaster, MissingManagedSiblings<'a>)>,
 }
 
 fn adapter_picture_frame(source_in: i64, phase: i64, record: i128, span_ratio: (i64, i64)) -> i128 {
@@ -284,6 +285,7 @@ fn extend_effect_issue<'a>(
     issue: &av::SourceIssue, fields: &mut Vec<(&str, Value)>,
     resolve_item: impl Fn(MobId) -> Option<&'a str>,
     color_placement: Option<&str>,
+    reordered_placement: Option<&str>,
 ) {
     let (id, length) = match issue.issue_kind {
         av::SourceIssueKind::MatteKey { length } => ("EFF2_2DMATTE", length),
@@ -308,6 +310,26 @@ fn extend_effect_issue<'a>(
         }
         if let Some(range) = av::SourceColorRange::from_saved_xml(&adapter.transform) {
             facts.push(("linear_range", super::color_range_receipt(range)));
+        }
+        if let Some(stack) = av::SourceColorStack::from_saved_xml(&adapter.transform) {
+            let range = obj(vec![
+                ("kind", s("linear_range")),
+                ("range", super::color_range_receipt(stack.range)),
+            ]);
+            let cube = obj(vec![
+                ("kind", s("external_cube")),
+                ("name", s(stack.cube_name)),
+                ("filename", s(stack.cube_file)),
+                ("inhibit_scaling", Value::Bool(true)),
+            ]);
+            let steps = if stack.cube_first { vec![cube, range] } else { vec![range, cube] };
+            facts.push(("ordered_steps", Value::Arr(steps)));
+        }
+        if let Some(file) = adapter.reordered_picture_file {
+            facts.push(("reordered_picture_source", obj(vec![
+                ("picture_file", s(file.urn())),
+                ("placement", opt_s(reordered_placement)),
+            ])));
         }
         if let Some(color) = adapter.wrapper_clip_color {
             facts.push(("wrapper_clip_color_rgb16", Value::Arr(
@@ -348,15 +370,7 @@ fn extend_effect_issue<'a>(
                     ("segment_effect", opt_s(input.segment_effect.as_deref())),
                 ];
                 if let Some(source) = input.picture_source {
-                    let mut reference = vec![
-                        ("mob", s(source.mob.urn())),
-                        ("track", Value::Int(source.track)),
-                        ("source_start", Value::Int(source.source_start)),
-                        ("local_start", Value::Int(source.local_start)),
-                        ("length", Value::Int(source.length)),
-                        ("local_length", Value::Int(source.local_length)),
-                        ("rate", s(rational(source.rate))),
-                    ];
+                    let mut reference = picture_input_fields(source);
                     if issue.picture_profile == Some(av::SourcePictureProfile::PlainLayeredSubmaster) {
                         reference.push(("item", opt_s(resolve_item(source.mob))));
                     }
@@ -401,9 +415,88 @@ fn extend_effect_issue<'a>(
     }
 }
 
+fn picture_input_fields(source: av::SubmasterPictureInput) -> Vec<(&'static str, Value)> {
+    vec![
+        ("mob", s(source.mob.urn())),
+        ("track", Value::Int(source.track)),
+        ("source_start", Value::Int(source.source_start)),
+        ("local_start", Value::Int(source.local_start)),
+        ("length", Value::Int(source.length)),
+        ("local_length", Value::Int(source.local_length)),
+        ("rate", s(rational(source.rate))),
+    ]
+}
+
+fn warp_control_receipt(control: &av::SourceWarpControl) -> Value {
+    use av::SourceWarpControlCurve as Curve;
+    use av::SourceWarpControlValue as Scalar;
+
+    let value = match control.value {
+        Scalar::Int(value) => obj(vec![("int", Value::Int(value))]),
+        Scalar::Float(value) => obj(vec![
+            ("float", raw_float(value)),
+            ("float_bits", s(format!("{:016x}", value.to_bits()))),
+        ]),
+        Scalar::Unresolved => Value::Null,
+    };
+    let curve = match &control.curve {
+        Curve::Absent => "absent",
+        Curve::Empty => "empty",
+        Curve::Keyframed(_) => "keyframed",
+        Curve::Unresolved => "unresolved",
+    };
+    let mut fields = vec![
+        ("id", s(control.parameter_id)),
+        ("name", s(control.name)),
+        ("value_type", control.value_type.map_or(Value::Null, Value::Int)),
+        ("value", value),
+        ("enabled", control.enabled.map_or(Value::Null, Value::Bool)),
+        ("curve", s(curve)),
+    ];
+    if let Curve::Keyframed(curve) = &control.curve {
+        let integer = |v: Option<i64>| v.map_or(Value::Null, Value::Int);
+        fields.push(("curve_data", obj(vec![
+            ("value_type", integer(curve.value_type)),
+            ("interpolation", integer(curve.interpolation)),
+            ("extrapolation", integer(curve.extrapolation)),
+            ("fields", integer(curve.fields)),
+            ("point_count", Value::Int(curve.point_count as i64)),
+            ("keys", curve.keys.as_deref().map_or(Value::Null, param_key_receipts)),
+        ])));
+    }
+    obj(fields)
+}
+
+fn warp_input_receipt(warp: &av::SourceWarpInputs) -> Value {
+    let integer = |value: Option<i64>| value.map_or(Value::Null, Value::Int);
+    let slot = |input| match input {
+        av::SourceWarpInput::Filler => obj(vec![("kind", s("filler"))]),
+        av::SourceWarpInput::Unresolved => obj(vec![("kind", s("unresolved"))]),
+        av::SourceWarpInput::Picture(picture) => obj(vec![
+            ("kind", s("picture")),
+            ("source", obj(picture_input_fields(picture))),
+        ]),
+    };
+    let mut fields = vec![
+        ("owner", s(&warp.owner)),
+        ("track", Value::Int(warp.track)),
+        ("record_start", integer(warp.record_start)),
+        ("record_length", integer(warp.record_length)),
+        ("effect_rate", warp.effect_rate.map_or(Value::Null, |rate| s(rational(rate)))),
+        ("effect_length", Value::Int(warp.effect_length)),
+        ("swap_sources", warp.swap_sources.map_or(Value::Null, Value::Bool)),
+        ("slots", Value::Arr(warp.inputs.map(slot).into())),
+    ];
+    if !warp.controls.is_empty() {
+        fields.push(("controls", Value::Arr(warp.controls.iter().map(warp_control_receipt).collect())));
+    }
+    obj(fields)
+}
+
 fn source_issue_receipt<'a>(
     issue: &av::SourceIssue, resolve_item: impl Fn(MobId) -> Option<&'a str>,
     color_placement: Option<&str>,
+    reordered_placement: Option<&str>,
 ) -> Value {
     let mut fields = vec![
         ("owner", s(&issue.owner)),
@@ -445,8 +538,22 @@ fn source_issue_receipt<'a>(
     if let Some(motion) = issue.nested_picture_motion.as_deref() {
         fields.push(("nested_picture_motion", subclip_motion_receipt(motion)));
     }
-    extend_effect_issue(issue, &mut fields, resolve_item, color_placement);
+    extend_effect_issue(issue, &mut fields, resolve_item, color_placement, reordered_placement);
     obj(fields)
+}
+
+fn param_key_receipts(keys: &[av::SourceParamKey]) -> Value {
+    let float = |v: Option<f64>| v.map_or(Value::Null, Value::Float);
+    Value::Arr(keys.iter().map(|key| {
+        obj(vec![
+            ("time", Value::Arr(vec![Value::Int(key.time.0), Value::Int(key.time.1)])),
+            ("timescale", Value::Int(key.timescale)),
+            ("value", Value::Float(key.value)),
+            ("handles", Value::Arr(key.handles.into_iter().map(float).collect())),
+            ("anchor", float(key.anchor)),
+            ("flags", key.flags.map_or(Value::Null, Value::Int)),
+        ])
+    }).collect())
 }
 
 fn timewarp_controls(controls: &av::SourceTimewarpControls) -> Value {
@@ -467,16 +574,7 @@ fn timewarp_controls(controls: &av::SourceTimewarpControls) -> Value {
                 ("first_half_frame", Value::Int(*first)),
                 ("values", Value::Arr(values.iter().copied().map(Value::Float).collect())),
             ]),
-            Some(av::SourceTimewarpPoints::Keys(keys)) => Value::Arr(keys.iter().map(|key| {
-                obj(vec![
-                    ("time", pair(key.time)),
-                    ("timescale", Value::Int(key.timescale)),
-                    ("value", Value::Float(key.value)),
-                    ("handles", Value::Arr(key.handles.into_iter().map(float).collect())),
-                    ("anchor", float(key.anchor)),
-                    ("flags", integer(key.flags)),
-                ])
-            }).collect()),
+            Some(av::SourceTimewarpPoints::Keys(keys)) => param_key_receipts(keys),
             None => Value::Null,
         };
         obj(vec![
@@ -509,13 +607,17 @@ fn timewarp_controls(controls: &av::SourceTimewarpControls) -> Value {
 
 type ColorEventIndex<'a> = HashMap<(i64, i64), (usize, Option<&'a av::SourceEvent>)>;
 
+fn has_color_picture(adapter: &av::SourceColorAdapter) -> bool {
+    matches!(adapter.picture_file, Observed::Known(_)) || adapter.reordered_picture_file.is_some()
+}
+
 fn source_color_events<'a>(
     source: &'a av::SourceSequence, budget: &mut Budget,
 ) -> Result<ColorEventIndex<'a>, String> {
     let mut events = HashMap::new();
     for issue in &source.unresolved {
         if let (Some(adapter), Observed::Known(frame)) = (&issue.color_adapter, &issue.record_start) {
-            if !matches!(adapter.picture_file, Observed::Known(_)) {
+            if !has_color_picture(adapter) {
                 continue;
             }
             budget.charge(96)?;
@@ -543,7 +645,9 @@ fn color_adapter_event<'a>(
     issue: &av::SourceIssue, events: &ColorEventIndex<'a>,
 ) -> Option<&'a av::SourceEvent> {
     let adapter = issue.color_adapter.as_ref()?;
-    let Observed::Known(_) = adapter.picture_file else { return None };
+    if !has_color_picture(adapter) {
+        return None;
+    }
     let Observed::Known(start) = issue.record_start else { return None };
     let av::SourceIssueKind::ColorAdapter { length: Some(length) } = issue.issue_kind else {
         return None;
@@ -577,12 +681,44 @@ fn color_adapter_event<'a>(
     Some(event)
 }
 
+#[derive(Default)]
+struct GapTransitionCuts<'a> {
+    transitions: HashSet<&'a str>,
+    before: HashMap<&'a str, i64>,
+    after: HashMap<&'a str, i64>,
+}
+
+impl GapTransitionCuts<'_> {
+    fn bounds(&self, event: &av::SourceEvent, range: &av::QualifiedRange) -> Option<(i64, i64)> {
+        let start = self.after.get(event.id.as_str()).copied().unwrap_or(range.record_start);
+        let end = self.before.get(event.id.as_str()).copied()
+            .or_else(|| range.record_start.checked_add(range.length))?;
+        Some((start, end))
+    }
+}
+
+fn missing_mono_cut(t: &av::SourceTransition, outgoing: &av::SourceEvent, incoming: &av::SourceEvent) -> Option<i64> {
+    let (Observed::Known(start), Observed::Known(length), Observed::Known(offset)) =
+        (&t.position, &t.length, &t.cutpoint) else { return None };
+    let (left, right) = (outgoing.range.as_ref()?, incoming.range.as_ref()?);
+    let end = start.checked_add(*length)?;
+    let cut = start.checked_add(*offset)?;
+    (t.effect.as_deref() == Some("BLEND_AUDIO_DISSOLVE")
+        && outgoing.event.track == t.track && incoming.event.track == t.track
+        && t.rate == Some(left.record_rate) && t.rate == Some(right.record_rate)
+        && *start >= 0 && *start <= cut && cut <= end && *length > 0
+        && left.record_start < cut && left.record_start.checked_add(left.length) == Some(end)
+        && right.record_start == *start && right.record_start.checked_add(right.length)? > cut)
+        .then_some(cut)
+}
+
 fn append_media_gap(
     source: &av::SourceSequence,
     sequence: &mut SourceSequence,
     event: &av::SourceEvent,
     master: &av::SourceMaster,
     reason: &str,
+    cuts: &GapTransitionCuts<'_>,
     unresolved: &mut Vec<Value>,
     out: &mut ReadResult,
     budget: &mut Budget,
@@ -608,29 +744,31 @@ fn append_media_gap(
         ("track_kind", Value::Int(native.kind)), ("track", Value::Int(native.track)),
         ("saved_range", facts), ("reason", s(reason)),
     ]));
-    let Some((kind, range, end)) = kind(native.kind).zip(range)
-        .and_then(|(kind, r)| r.record_start.checked_add(r.length).map(|end| (kind, r, end)))
-        .filter(|(_, r, end)| native.track > 0 && native.combined.is_none()
-            && r.record_start >= 0 && r.length > 0 && *end <= source.info.length
+    let Some((kind, range, start_frame, end)) = kind(native.kind).zip(range)
+        .and_then(|(kind, r)| cuts.bounds(event, r).map(|(start, end)| (kind, r, start, end)))
+        .filter(|(_, r, start, end)| native.track > 0 && native.combined.is_none()
+            && *start >= 0 && *end > *start && *end <= source.info.length
             && Some(r.record_rate) == source.rate)
     else {
         loss(out, budget, &sequence.id, UNQUALIFIED_ROUTE_TIMING,
             format!("{description}: media gap requires one verified record span and lane. {reason}"))?;
         return Ok(None);
     };
-    let start = time(range.record_start, range.record_rate)?;
-    let duration = time(range.length, range.record_rate)?;
+    let start = time(start_frame, range.record_rate)?;
+    let duration = time(end - start_frame, range.record_rate)?;
     let end_time = time(end, range.record_rate)?;
     let other_edit = source.events.iter().any(|other| {
         other.id != event.id && other.event.kind == native.kind && other.event.track == native.track
             && other.range.as_ref().is_none_or(|r| r.record_rate != range.record_rate
-                || r.record_start.checked_add(r.length).is_none_or(|last| r.record_start < end && last > range.record_start))
+                || cuts.bounds(other, r).is_none_or(|(first, last)| first < end && last > start_frame))
     });
     let overlaps_transition = source.transitions.iter().any(|t| {
-        if t.kind != native.kind || t.track != native.track { return false; }
+        if t.kind != native.kind || t.track != native.track || cuts.transitions.contains(t.id.as_str()) {
+            return false;
+        }
         match (&t.position, &t.length) {
             (Observed::Known(at), Observed::Known(len)) if t.rate == Some(range.record_rate) =>
-                at.checked_add(*len).is_none_or(|last| *at < end && last > range.record_start),
+                at.checked_add(*len).is_none_or(|last| *at < end && last > start_frame),
             _ => true,
         }
     });
@@ -650,7 +788,7 @@ fn append_media_gap(
     }
     let name = format!("Media omitted · {lane}{}", native.track);
     let comment = format!("{description} at record frame {} for {} frames. {reason} This span is a gap.",
-        range.record_start, range.length);
+        start_frame, end - start_frame);
     budget.charge(size_of::<SourceMarker>() + name.len() + comment.len() + event.id.len() + 64)?;
     sequence.markers.push(SourceMarker {
         name, comment: comment.clone(), user: String::new(), color: None, start: Some(start), duration,
@@ -840,6 +978,7 @@ pub(super) fn append(
     let mut original: HashMap<usize, HashSet<usize>> = HashMap::new();
     let mut unresolved = vec![];
     let mut media_gaps = Vec::new();
+    let mut missing_managed_edits = HashMap::new();
     for event in &source.events {
         if let Some((g, ch)) = event.event.combined {
             original.entry(g).or_default().insert(ch);
@@ -849,7 +988,8 @@ pub(super) fn append(
     let color_events = source_color_events(source, budget)?;
     let mut centered_stills = HashSet::new();
     for issue in &source.unresolved {
-        if issue.color_adapter.as_ref().is_some_and(|a| a.centered_still_fit) {
+        if issue.color_adapter.as_ref().is_some_and(|a| a.centered_still_fit
+            && matches!(a.picture_file, Observed::Known(_))) {
             if let Some(event) = color_adapter_event(issue, &color_events) {
                 budget.charge(64)?;
                 centered_stills.insert(event.id.as_str());
@@ -994,6 +1134,24 @@ pub(super) fn append(
         }
         let stream = (e.kind == KIND_SOUND && item_routes[index].audio.contains(&master_track))
             .then_some(master_track);
+        if let Some((master, track)) = item_routes[index].missing_managed_siblings
+            .and_then(|(master, missing)| missing.tracks()
+                .find(|track| track.kind == e.kind && track.index == master_track).map(|track| (master, track)))
+        {
+            if e.speed.is_none() && e.combined.is_none() && event.constant_speed.is_none()
+                && timing_aspect == "source_route" {
+                budget.charge(64)?;
+                missing_managed_edits.insert(event.id.as_str(), (event, master, track));
+                continue;
+            }
+            if e.kind == KIND_PICTURE {
+                loss(out, budget, id, UNQUALIFIED_ROUTE_TIMING, format!(
+                    "{}: source V{} MXF package {} is missing; the picture edit requires separate timing qualification",
+                    event.id, track.index, track.file_mob.umid_hex()
+                ))?;
+                continue;
+            }
+        }
         if e.kind == KIND_SOUND && stream.is_none() {
             loss(
                 out,
@@ -1511,7 +1669,22 @@ pub(super) fn append(
             }
         }
     }
+    let mut missing_mono_cuts = GapTransitionCuts::default();
     for t in &source.transitions {
+        if t.kind == KIND_SOUND && t.outgoing.reason.is_none() && t.incoming.reason.is_none() {
+            if let ([outgoing], [incoming]) = (&t.outgoing.placements[..], &t.incoming.placements[..]) {
+                let cut = missing_managed_edits.get(outgoing.as_str()).zip(missing_managed_edits.get(incoming.as_str()))
+                    .and_then(|((left, _, _), (right, _, _))| missing_mono_cut(t, left, right));
+                if let Some(cut) = cut.filter(|_| outgoing != incoming
+                    && !missing_mono_cuts.before.contains_key(outgoing.as_str())
+                    && !missing_mono_cuts.after.contains_key(incoming.as_str())) {
+                    budget.charge(192)?;
+                    missing_mono_cuts.before.insert(outgoing.as_str(), cut);
+                    missing_mono_cuts.after.insert(incoming.as_str(), cut);
+                    missing_mono_cuts.transitions.insert(t.id.as_str());
+                }
+            }
+        }
         if t.outgoing.placements.iter().chain(&t.incoming.placements)
             .any(|p| shifted_mp3_edits.contains(p.as_str()))
         {
@@ -1666,9 +1839,22 @@ pub(super) fn append(
     }
     for (event, master, reason) in media_gaps {
         if let Some(lane) = append_media_gap(source, &mut seq, event, master, reason,
-            &mut unresolved, out, budget)?
+            &GapTransitionCuts::default(), &mut unresolved, out, budget)?
         {
             tracks.insert(lane);
+        }
+    }
+    if !missing_managed_edits.is_empty() {
+        for event in &source.events {
+            if let Some((_, master, track)) = missing_managed_edits.get(event.id.as_str()) {
+                let lane = if track.kind == KIND_PICTURE { 'V' } else { 'A' };
+                let reason = format!("Source {lane}{} needs missing MXF package {}.", track.index, track.file_mob.umid_hex());
+                if let Some(lane) = append_media_gap(source, &mut seq, event, master, &reason,
+                    &missing_mono_cuts, &mut unresolved, out, budget)?
+                {
+                    tracks.insert(lane);
+                }
+            }
         }
     }
     for t in &seq.transitions {
@@ -1700,15 +1886,22 @@ pub(super) fn append(
         .sort_by_key(|t| (if t.kind == StreamKind::Video { 0 } else { 1 }, t.index));
     let mut cut_fallbacks = HashSet::new();
     for issue in &source.unresolved {
-        let color_placement = color_adapter_event(issue, &color_events)
+        let matched_color_placement = color_adapter_event(issue, &color_events)
             .and_then(|event| map.get(&event.id))
-            .or_else(|| nested_motion_placements.get(issue.owner.as_str()).map(|(_, id)| id))
             .map(String::as_str);
+        let color_placement = matched_color_placement.filter(|_| {
+            issue.color_adapter.as_ref().is_some_and(|a| matches!(a.picture_file, Observed::Known(_)))
+        })
+            .or_else(|| nested_motion_placements.get(issue.owner.as_str()).map(|(_, id)| id.as_str()));
+        let reordered_placement = matched_color_placement.filter(|_| {
+            issue.color_adapter.as_ref().is_some_and(|a| a.reordered_picture_file.is_some())
+        });
         unresolved.push(source_issue_receipt(
             issue,
             |mob| source_master_copy(mob, source.info.bin, copies, &out.graph.items)
                 .map(|item| item.id.as_str()),
             color_placement,
+            reordered_placement,
         ));
         match issue.issue_kind {
             av::SourceIssueKind::Timewarp { .. } => {}
@@ -1762,7 +1955,7 @@ pub(super) fn append(
                     Some(_) => "Graph/2 retains the constant-speed picture timing. The Avid Color Adapter is unapplied.",
                     None => reason,
                 };
-                loss(out, budget, color_placement.unwrap_or(id), aspect,
+                loss(out, budget, color_placement.or(reordered_placement).unwrap_or(id), aspect,
                     format!("V{} {position}: {reason}", issue.track))?;
             }
             av::SourceIssueKind::DisabledClip { length, .. } => {
@@ -1946,7 +2139,14 @@ pub(super) fn append(
             ),
             ("native_transitions", Value::Arr(native_transitions)),
             ("marker_native", Value::Arr(marker_receipts)),
-        ].into_iter().chain((!source.group_uses.is_empty()).then(||("native_group_uses",Value::Arr(source.group_uses.iter().map(group_use_native).collect())))).collect()),
+        ].into_iter()
+            .chain((!source.group_uses.is_empty()).then(|| (
+                "native_group_uses", Value::Arr(source.group_uses.iter().map(group_use_native).collect()),
+            )))
+            .chain((!source.warp_inputs.is_empty()).then(|| (
+                "warp_inputs", Value::Arr(source.warp_inputs.iter().map(warp_input_receipt).collect()),
+            )))
+            .collect()),
     )?;
     let unresolved_names: Vec<_> = source.track_names.iter()
         .filter(|track| portable_track_name(track).is_none())
@@ -2380,7 +2580,7 @@ fn raw_sequence(seq: &av::SourceSequence) -> Value {
                             ("kind", Value::Int(issue.kind)),
                             ("track", Value::Int(issue.track)),
                         ];
-                        extend_effect_issue(issue, &mut fields, |_| None, None);
+                        extend_effect_issue(issue, &mut fields, |_| None, None, None);
                         obj(fields)
                     })
                     .collect(),

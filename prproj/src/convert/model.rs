@@ -554,9 +554,23 @@ pub struct AvidInfo {
     pub source_path: Option<String>,
 }
 
+pub(super) const AVID_COLUMN_NAME_LIMIT: usize = 256;
+pub(super) const AVID_COLUMN_VALUE_LIMIT: usize = 4096;
+
 impl AvidInfo {
     pub fn column(&self, name: &str) -> Option<&str> {
         self.columns.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+}
+
+/// Identify invalid optional column text before constructing a strict writer model.
+pub fn avid_column_text_issue(name: &str, value: &str) -> Option<&'static str> {
+    if check_text(name, "", AVID_COLUMN_NAME_LIMIT, false).is_err() {
+        Some("name")
+    } else if check_text(value, "", AVID_COLUMN_VALUE_LIMIT, true).is_err() {
+        Some("value")
+    } else {
+        None
     }
 }
 
@@ -1218,9 +1232,9 @@ fn avid(obj: &Json, where_: &str) -> R<AvidInfo> {
     };
     let mut cols = Vec::new();
     for (k, v) in pairs {
-        let key = text(&Json::Str(k.clone()), &format!("{where_}.columns key"), 256, false)?;
+        let key = text(&Json::Str(k.clone()), &format!("{where_}.columns key"), AVID_COLUMN_NAME_LIMIT, false)?;
         // Avid allows empty column values (Phase 21 "Shoot Date"); metadata skips them.
-        let val = text(v, &format!("{where_}.columns[{}]", py_str_repr(k)), 4096, true)?;
+        let val = text(v, &format!("{where_}.columns[{}]", py_str_repr(k)), AVID_COLUMN_VALUE_LIMIT, true)?;
         cols.push((key, val));
     }
     let mut color_rgb16 = None;
@@ -2118,8 +2132,8 @@ pub(crate) fn validate_clip(c: &Clip, w: &str) -> R<()> {
         })?;
         unique_keys(a.columns.iter().map(|(k, _)| k.as_str()))?;
         for (k, v) in &a.columns {
-            check_text(k, &format!("{w}.columns key"), 256, false)?;
-            check_text(v, &format!("{w}.columns[{}]", py_str_repr(k)), 4096, true)?;
+            check_text(k, &format!("{w}.columns key"), AVID_COLUMN_NAME_LIMIT, false)?;
+            check_text(v, &format!("{w}.columns[{}]", py_str_repr(k)), AVID_COLUMN_VALUE_LIMIT, true)?;
         }
         if let Some(rgb) = a.color_rgb16 {
             for v in rgb {

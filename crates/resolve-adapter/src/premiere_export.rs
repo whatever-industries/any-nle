@@ -740,6 +740,7 @@ fn validate_sequence(
                     || !edit.track_pans.is_empty())
             || graph.sidecar(crate::grade::ADAPTER, &edit.id).is_some()
             || graph.sidecar(crate::grade::CDL_ADAPTER, &edit.id).is_some()
+            || graph.sidecar(crate::grade::RANGE_ADAPTER, &edit.id).is_some()
             || graph
                 .sidecar(crate::audio::UNQUALIFIED_FADE_ADAPTER, &edit.id)
                 .is_some()

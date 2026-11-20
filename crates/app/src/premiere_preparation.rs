@@ -37,7 +37,7 @@ pub(crate) fn managed_rewrap_candidates(graph: &SourceGraph, op1a_requested: boo
     let profiles: HashMap<_, _> = graph.sidecars.iter().filter_map(|receipt| {
         if receipt.adapter != "avid.source" { return None; }
         let Value::Str(coding) = receipt.data.get("picture_coding")? else { return None };
-        Some((receipt.object.as_str(), (PictureProfile::from_hex_label(coding)?, receipt.data.get("mxf_picture_descriptor"))))
+        Some((receipt.object.as_str(), (PictureProfile::from_hex_label(coding)?, &receipt.data)))
     }).collect();
     let pictures: HashMap<_, _> = graph
         .media
@@ -48,15 +48,25 @@ pub(crate) fn managed_rewrap_candidates(graph: &SourceGraph, op1a_requested: boo
                 && media.online == Some(true)
         })
         .filter_map(|media| {
-            let (profile, descriptor) = profiles.get(media.id.as_str()).copied()
-                .map(|(profile, descriptor)| (Some(profile), descriptor)).unwrap_or_default();
-            let (destination, wide_only) = match (media.codec.as_deref(), profile) {
-                (_, Some(PictureProfile::ProRes(profile))) => (format!("ProRes {} to MOV", profile.probe_name()), false),
-                (Some("apcs"), None) => (format!("ProRes {} to MOV", ProResProfile::Lt.probe_name()), false),
+            let (profile, receipt) = profiles.get(media.id.as_str()).copied()
+                .map(|(profile, receipt)| (Some(profile), Some(receipt))).unwrap_or_default();
+            let descriptor = receipt.and_then(|r| r.get("mxf_picture_descriptor"));
+            // The Avid adapter saves these locators only after verifying the
+            // legacy sibling packages. Rewrap rechecks their physical clocks.
+            let legacy_bundle = media.clock.is_none()
+                && media.rate == graph::Rational::new(24_000, 1001)
+                && receipt.is_some_and(|r| r.get("saved_file_track") == Some(&Value::Int(1))
+                    && matches!(r.get("saved_locators"), Some(Value::Arr(paths)) if paths.len() == 1));
+            let (destination, streams) = match (media.codec.as_deref(), profile) {
+                (_, Some(PictureProfile::ProRes(profile))) => (format!("ProRes {} to MOV", profile.probe_name()), 1..=usize::MAX),
+                (Some("apcs"), None) => (format!("ProRes {} to MOV", ProResProfile::Lt.probe_name()), 1..=usize::MAX),
+                (Some("AVdn"), Some(profile @ PictureProfile::Dnx(1253)))
+                    if !op1a_requested && legacy_bundle =>
+                        (format!("{} to MXF OP1a · direct file clock is unqualified", profile.probe_name()), 9..=9),
                 (Some("AVdn"), Some(profile @ PictureProfile::Dnx(cid)))
                     if !op1a_requested && !matches!(cid, 1253 | 1274) =>
-                        (format!("{} to MXF OP1a", profile.probe_name()), false),
-                (Some("AVdn"), _) if !op1a_requested => ("DNx to MXF OP1a".into(), true),
+                        (format!("{} to MXF OP1a", profile.probe_name()), 1..=usize::MAX),
+                (Some("AVdn"), _) if !op1a_requested => ("DNx to MXF OP1a".into(), 34..=usize::MAX),
                 _ => return None,
             };
             let [path] = media.locations.as_slice() else { return None };
@@ -68,7 +78,7 @@ pub(crate) fn managed_rewrap_candidates(graph: &SourceGraph, op1a_requested: boo
             Path::new(path)
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("mxf"))
-                .then_some((media.id.as_str(), (path, destination, wide_only, pending)))
+                .then_some((media.id.as_str(), (path, destination, streams, pending)))
         })
         .collect();
     if pictures.is_empty() {
@@ -81,7 +91,7 @@ pub(crate) fn managed_rewrap_candidates(graph: &SourceGraph, op1a_requested: boo
             item.media
                 .iter()
                 .filter_map(|binding| pictures.get(binding.media.as_str()))
-                .filter(move |(_, _, wide_only, _)| !wide_only || item.media.len() > 33)
+                .filter(move |(_, _, streams, _)| streams.contains(&item.media.len()))
                 .map(|(path, destination, _, pending)| ManagedRewrapCandidate {
                     item: item.id.as_str(),
                     detail: format!("{} · {} · {path} · {destination}{}",
@@ -122,7 +132,9 @@ pub(crate) fn prepare_typed(
         } else {
             crate::source_luts::ColorMedia::Linked
         };
-        crate::source_luts::apply(&mut prepared, graph, bins, ffprobe, color_media, check)?
+        crate::source_luts::apply(
+            &mut prepared, graph, bins, ffprobe, color_media, managed.map(|(selected, _)| selected), check,
+        )?
     } else {
         Default::default()
     };
@@ -140,13 +152,16 @@ pub(crate) fn prepare_document(
     native: bool,
     layout: Option<&DestinationBinLayout>,
     offline: &HashSet<&str>,
+    dnxhr_444_rgb_sources: &HashSet<String>,
 ) -> writer::Result<PreparedProject> {
     let media = if offline.is_empty() {
         TypedMedia::Bound { bindings, native_av: native }
     } else {
         TypedMedia::Offline { paths: offline }
     };
-    writer::prepare_typed_project_for_premiere_27(input, output, ids, media, layout)
+    writer::prepare_typed_project_for_premiere_27_with_rewrap_colors(
+        input, output, ids, media, layout, dnxhr_444_rgb_sources,
+    )
 }
 
 pub(crate) fn timeline_subject(
@@ -155,34 +170,46 @@ pub(crate) fn timeline_subject(
     track: i64,
     record_start: Option<graph::Rational>,
 ) -> String {
+    let clock = sequence.clock.as_ref().and_then(|clock| {
+        let start = sequence.start?;
+        (clock.rate == sequence.rate && clock.exact_start() == Some(start))
+            .then_some((start, clock.display_base, clock.drop))
+    });
+    timeline_subject_at(&sequence.name, kind, track, Some(sequence.rate), record_start, clock)
+}
+
+pub(crate) fn timeline_subject_at(
+    name: &str,
+    kind: graph::StreamKind,
+    track: i64,
+    rate: Option<graph::Rational>,
+    record_start: Option<graph::Rational>,
+    clock: Option<(graph::Rational, u16, bool)>,
+) -> String {
     use prproj::build::time::{Time, TICKS_PER_SECOND};
 
     let lane = match kind {
         graph::StreamKind::Audio => "A",
         graph::StreamKind::Video => "V",
     };
-    let subject = format!("{} · {lane}{track}", sequence.name);
+    let subject = format!("{name} · {lane}{track}");
     let position = (|| {
         let offset = record_start?;
-        let frame = graph::Rational::new(sequence.rate.den().into(), sequence.rate.num().into())?;
+        let rate = rate?;
+        let frame = graph::Rational::new(rate.den().into(), rate.num().into())?;
         let timebase = frame.to_units(TICKS_PER_SECOND)?;
         let offset_ticks = offset.to_units(TICKS_PER_SECOND)?;
         if timebase <= 0 || offset_ticks < 0 || offset_ticks % timebase != 0 {
             return None;
         }
-        if let Some(clock) = &sequence.clock {
+        if let Some((start, display_base, drop)) = clock {
             let nominal = (TICKS_PER_SECOND as f64 / timebase as f64).round_ties_even();
-            let valid_drop = !clock.drop
-                || matches!((clock.rate.num(), clock.rate.den()), (30_000, 1001) | (60_000, 1001));
-            if clock.rate == sequence.rate
-                && f64::from(clock.display_base) == nominal
-                && valid_drop
-                && clock.exact_start() == sequence.start
-            {
-                if let Some(ticks) = sequence.start.and_then(|start| start.to_units(TICKS_PER_SECOND))
+            let valid_drop = !drop || matches!((rate.num(), rate.den()), (30_000, 1001) | (60_000, 1001));
+            if f64::from(display_base) == nominal && valid_drop {
+                if let Some(ticks) = start.to_units(TICKS_PER_SECOND)
                     .and_then(|start| start.checked_add(offset_ticks))
                 {
-                    return Time::new(ticks).to_timecode(timebase, clock.drop).ok();
+                    return Time::new(ticks).to_timecode(timebase, drop).ok();
                 }
             }
         }

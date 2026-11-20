@@ -44,10 +44,20 @@ pub(super) fn validate_source(s: &Stream, raw: &Value, v: &VideoFile) -> R<()> {
         || s.width != v.width
         || s.height != v.height
         || s.rate != format!("{}/{}", v.rate.num, v.rate.den)
-        || string(p, "sample_aspect_ratio") != Some("1:1")
         || string(p, "field_order") != Some("progressive")
     {
         return Err("ProRes MOV requires matching profile, raster and rate with progressive square-pixel picture".into());
+    }
+    match string(p, "sample_aspect_ratio") {
+        Some("1:1") => {}
+        Some(ratio) if ratio.split_once(':').is_some_and(|(n, d)| {
+            n.parse::<u32>().is_ok_and(|n| n > 0) && d.parse::<u32>().is_ok_and(|d| d > 0)
+        }) => {
+            return Err(format!(
+                "ProRes MOV source pixel aspect {ratio} needs a verified Premiere aspect mapping"
+            ).into());
+        }
+        _ => return Err("ProRes MOV source pixel aspect could not be verified".into()),
     }
     Ok(())
 }
@@ -78,8 +88,14 @@ fn atom(kind: &[u8; 4], b: &[u8]) -> R<Vec<u8>> {
     out.extend(b);
     Ok(out)
 }
-fn rewrite(b: &[u8], channels: u32, bits: u32, depth: usize, changed: &mut usize) -> R<Vec<u8>> {
-    if depth > 8 {
+#[derive(Clone, Copy)]
+enum Description {
+    PackedPcm { channels: u32, bits: u32 },
+    ProResAlpha([u8; 4]),
+}
+
+fn rewrite(b: &[u8], description: Description, nesting: usize, changed: &mut usize) -> R<Vec<u8>> {
+    if nesting > 8 {
         return Err("MOV metadata nesting exceeded".into());
     }
     let mut out = Vec::new();
@@ -94,7 +110,7 @@ fn rewrite(b: &[u8], channels: u32, bits: u32, depth: usize, changed: &mut usize
         ]
         .contains(&kind.as_slice())
         {
-            atom(&kind, &rewrite(body, channels, bits, depth + 1, changed)?)?
+            atom(&kind, &rewrite(body, description, nesting + 1, changed)?)?
         } else if &kind == b"stsd" {
             if body.len() < 8 || u32::from_be_bytes(body[4..8].try_into().unwrap()) != 1 {
                 return Err("MOV needs one sample description per track".into());
@@ -104,7 +120,23 @@ fn rewrite(b: &[u8], channels: u32, bits: u32, depth: usize, changed: &mut usize
                 return Err("invalid MOV sample description count".into());
             }
             let (_, _, codec) = entries[0];
-            if [&b"sowt"[..], &b"in24"[..], &b"lpcm"[..]].contains(&codec.as_slice()) {
+            if matches!(description, Description::ProResAlpha(expected) if codec == expected) {
+                // QuickTime ImageDescription depth includes the alpha component.
+                let mut entry = body[8..].to_vec();
+                if entry.len() < 86
+                    || !matches!(&entry[82..84], [0, 24 | 32])
+                    || entry[84..86] != [0xff, 0xff]
+                {
+                    return Err("unqualified generated ProRes alpha description".into());
+                }
+                entry[82..84].copy_from_slice(&32u16.to_be_bytes());
+                let mut payload = body[..8].to_vec();
+                payload.extend(entry);
+                *changed += 1;
+                atom(&kind, &payload)?
+            } else if let (Description::PackedPcm { channels, bits }, b"sowt" | b"in24" | b"lpcm") =
+                (description, &codec)
+            {
                 let e = &body[8..];
                 if e.len() < 36 {
                     return Err("short PCM sample description".into());
@@ -179,7 +211,7 @@ fn rewrite(b: &[u8], channels: u32, bits: u32, depth: usize, changed: &mut usize
     }
     Ok(out)
 }
-fn fix_description(path: &Path, channels: u32, bits: u32) -> R<()> {
+fn fix_descriptions(path: &Path, descriptions: &[Description]) -> R<()> {
     let mut f = OpenOptions::new()
         .read(true)
         .write(true)
@@ -224,15 +256,20 @@ fn fix_description(path: &Path, channels: u32, bits: u32) -> R<()> {
         }
         at += n;
     }
-    let (offset, b) = moov.ok_or("missing MOV moov")?;
-    let mut changed = 0;
-    let new = rewrite(&b, channels, bits, 0, &mut changed)?;
-    if changed != 1 {
-        return Err("MOV needs exactly one interleaved PCM description".into());
+    let (offset, mut rewritten) = moov.ok_or("missing MOV moov")?;
+    for &description in descriptions {
+        let mut changed = 0;
+        rewritten = rewrite(&rewritten, description, 0, &mut changed)?;
+        if changed != 1 {
+            return Err(match description {
+                Description::PackedPcm { .. } => "MOV needs exactly one interleaved PCM description",
+                Description::ProResAlpha(_) => "MOV needs exactly one ProRes alpha description",
+            }.into());
+        }
     }
     f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
-    f.write_all(&new).map_err(|e| e.to_string())?;
-    f.set_len(offset + new.len() as u64)
+    f.write_all(&rewritten).map_err(|e| e.to_string())?;
+    f.set_len(offset + rewritten.len() as u64)
         .map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())
 }
@@ -367,8 +404,24 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
     }
     c.args(["-f", "mov"]).arg(partial);
     run(&mut c)?;
+    let source = &picture.probe.streams[0];
+    let mut descriptions = Vec::new();
     if let Some((count, bits)) = packed {
-        fix_description(partial, count, bits)?;
+        descriptions.push(Description::PackedPcm { channels: count, bits });
+    }
+    if matches!(source.pix.as_str(), "yuva444p10le" | "yuva444p12le") {
+        use avid_reader::mxf::ProResProfile;
+        let codec = if source.profile == ProResProfile::FourFourFourFour.probe_name() {
+            *b"ap4h"
+        } else if source.profile == ProResProfile::FourFourFourFourXq.probe_name() {
+            *b"ap4x"
+        } else {
+            return Err("unqualified ProRes alpha profile".into());
+        };
+        descriptions.push(Description::ProResAlpha(codec));
+    }
+    if !descriptions.is_empty() {
+        fix_descriptions(partial, &descriptions)?;
     }
     let raw = json::parse(&run(Command::new(&plan.ffprobe)
         .args([
@@ -396,7 +449,6 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
         .iter()
         .filter(|s| string(s, "codec_type") == Some("data"))
         .collect::<Vec<_>>();
-    let source = &picture.probe.streams[0];
     let packets = picture.terminal.as_ref().map_or(source.packets, |tail| tail.frames);
     if video.len() != 1
         || audio.len() != if job.separate_mono { channels } else { usize::from(channels > 0) }
@@ -517,6 +569,29 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
 mod tests {
     use super::*;
     #[test]
+    fn prores_alpha_rewrite_changes_only_qualified_sample_depth() {
+        for codec in [*b"ap4h", *b"ap4x"] {
+            let stsd = |depth: u16| {
+                let mut entry = vec![0; 78];
+                entry[74..76].copy_from_slice(&depth.to_be_bytes());
+                entry[76..78].copy_from_slice(&[0xff, 0xff]);
+                let mut body = vec![0, 0, 0, 0, 0, 0, 0, 1];
+                body.extend(atom(&codec, &entry).unwrap());
+                atom(b"stsd", &body).unwrap()
+            };
+            let mut changed = 0;
+            let description = Description::ProResAlpha(codec);
+            assert_eq!(rewrite(&stsd(24), description, 0, &mut changed).unwrap(), stsd(32));
+            assert_eq!(changed, 1);
+            assert!(rewrite(&stsd(16), description, 0, &mut 0).is_err());
+            let other_entry = Description::ProResAlpha(*b"apch");
+            let mut changed = 0;
+            assert_eq!(rewrite(&stsd(24), other_entry, 0, &mut changed).unwrap(), stsd(24));
+            assert_eq!(changed, 0);
+        }
+    }
+
+    #[test]
     fn malformed_metadata_and_unbounded_nesting_refuse_without_panicking() {
         for bad in [
             vec![0; 7],
@@ -530,7 +605,7 @@ mod tests {
         for _ in 0..10 {
             nested = atom(b"moov", &nested).unwrap();
         }
-        assert!(rewrite(&nested, 8, 24, 0, &mut 0).is_err());
+        assert!(rewrite(&nested, Description::PackedPcm { channels: 8, bits: 24 }, 0, &mut 0).is_err());
     }
     #[test]
     fn metadata_before_media_is_not_relocated_or_modified() {
@@ -549,7 +624,7 @@ mod tests {
         ]
         .concat();
         std::fs::write(&path, &bytes).unwrap();
-        assert!(fix_description(&path, 8, 24).is_err());
+        assert!(fix_descriptions(&path, &[Description::PackedPcm { channels: 8, bits: 24 }]).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         std::fs::remove_file(path).unwrap();
     }

@@ -3,6 +3,88 @@ use crate::{Effect, Transform, Value};
 
 pub const KIND: &str = "avid.picture_chain";
 pub const REFLECTION_KIND: &str = "picture.reflection";
+pub const CORNER_PIN_KIND: &str = "picture.corner_pin";
+
+pub fn is_corner_pin_stage(stage: &Value) -> bool {
+    matches!(stage.get("kind"), Some(Value::Str(kind)) if kind == CORNER_PIN_KIND)
+}
+
+pub struct OrderedCornerPin<'a> {
+    pub pin_params: &'a Value,
+    pub reflection: Option<Reflection>,
+    pub reflection_before_pin: bool,
+}
+
+/// Read the isolated pin and its adjacent stage. A missing reflection marks
+/// a different kind of adjacent stage for the destination to handle.
+pub fn read_ordered_corner_pin<'a>(
+    stages: &'a [Value],
+    params: &Value,
+) -> Result<Option<OrderedCornerPin<'a>>, Error> {
+    if !matches!(params, Value::Obj(fields) if fields.len() == 1)
+        || !(2..=16).contains(&stages.len())
+    {
+        return Err(Error::Malformed);
+    }
+    let [first, second] = stages else { return Ok(None); };
+    let (pin, adjacent, reflection_before_pin) = if is_corner_pin_stage(first) {
+        (first, second, false)
+    } else if is_corner_pin_stage(second) {
+        (second, first, true)
+    } else {
+        return Ok(None);
+    };
+    if !matches!(pin, Value::Obj(fields) if fields.len() == 2) {
+        return Err(Error::Malformed);
+    }
+    let pin_params = pin.get("params").ok_or(Error::Malformed)?;
+    let Some(Value::Str(kind)) = adjacent.get("kind") else {
+        return Err(Error::Malformed);
+    };
+    let reflection = if Reflection::is_effect_kind(kind) {
+        if !matches!(adjacent, Value::Obj(fields) if fields.len() == 2) {
+            return Err(Error::Malformed);
+        }
+        Some(Reflection::from_params(adjacent.get("params").ok_or(Error::Malformed)?)
+            .ok_or(Error::Malformed)?)
+    } else {
+        None
+    };
+    Ok(Some(OrderedCornerPin { pin_params, reflection, reflection_before_pin }))
+}
+
+/// Full-image edge coordinates in TL, TR, BR, BL order, followed by source
+/// crop margins in LTRB order. Destinations validate their supported geometry.
+pub fn corner_pin_geometry(params: &Value) -> Option<([[f64; 2]; 4], [f64; 4])> {
+    let Value::Obj(fields) = params else { return None };
+    let Value::Arr(points) = params.get("target_corners_tl_tr_br_bl")? else { return None };
+    let [tl, tr, br, bl] = points.as_slice() else { return None };
+    let source_crop = params.get("source_crop_ltrb");
+    if fields.len() != 1 + usize::from(source_crop.is_some()) {
+        return None;
+    }
+    let crop = match source_crop {
+        Some(value) => numbers(value)?,
+        None => [0.0; 4],
+    };
+    Some(([numbers(tl)?, numbers(tr)?, numbers(br)?, numbers(bl)?], crop))
+}
+
+fn numbers<const N: usize>(value: &Value) -> Option<[f64; N]> {
+    let Value::Arr(values) = value else { return None };
+    if values.len() != N {
+        return None;
+    }
+    let mut result = [0.0; N];
+    for (output, input) in result.iter_mut().zip(values) {
+        *output = match input {
+            Value::Float(value) => *value,
+            Value::Int(value) => *value as f64,
+            _ => return None,
+        };
+    }
+    Some(result)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reflection {
@@ -141,7 +223,7 @@ impl<'a> Chain<'a> {
                 };
                 *slot = slot.then(flip);
             } else {
-                if kind == "picture.corner_pin" {
+                if kind == CORNER_PIN_KIND {
                     return Err(Error::Unsupported(
                         "ordered Corner Pin is retained in graph/2; destination effect order is unqualified",
                     ));

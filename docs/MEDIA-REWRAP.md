@@ -59,10 +59,10 @@ picture frames and isolated audio on A1, A16, A31, and A32 matched the
 controls, with the established stereo pan law applied to PCM.
 
 Premiere rejected both the 33- and 64-channel MXFs during import. Treat
-32 as the per-file planning ceiling for Premiere. Preserve wider source
-layouts by keeping audio in separate linked files once that route
-qualifies. Mixed PCM depths still require an independently qualified
-mapping.
+32 as the per-file planning ceiling for DNx rewrap into Premiere. The
+rewrap plan uses picture-only OP1a and separate mono WAVs for qualified
+33–64 lane DNx masters. [Wide-audio verification](#wide-audio-with-separate-mono-wavs).
+Mixed PCM depths still require an independently qualified mapping.
 
 [SMPTE VC-3 labels](https://registry.smpte-ra.org/view/published/labels_view.html)
 · [ProRes MXF mapping](https://pub.smpte.org/latest/rdd44/rdd44-2022.pdf)
@@ -129,16 +129,6 @@ Premiere trial. Other terminal layouts and source profiles remain unqualified; t
 native MXF preflight report preserves its earlier
 blocked state as history.
 
-The Avid graph reader recognizes DNxHR HQ by its registered VC-3 CID 1272
-label and the label variant written by FFmpeg 8.1. Any NLE routes these
-managed sources to explicit OP1a rewrap and checks that the coded picture
-profile agrees. The same rule checks the saved raster against the actual
-file. Derived AVBs with synthetic 1080p24 and UHD24 picture-only MXFs passed
-offline conversion and packet comparison. Avid-authored media and Premiere
-reopen and playback are pending.
-[SMPTE Labels Register](https://registry.smpte-ra.org/view/published/labels_view.html)
-· [FFmpeg 8.1 MXF codec labels](https://github.com/FFmpeg/FFmpeg/blob/n8.1/libavformat/mxfenc.c#L2196-L2200)
-
 Supported exact picture rates (decimal labels are shorthand):
 
 | Rates | Exact fractional rates | Project display |
@@ -198,6 +188,140 @@ templates and explicit physical-channel vectors. Legacy clip constructions use f
 SingleAudioChannel/SingleChannel views. StreamNumber is not used for OP1a.
 [Scoped native results and remaining qualification](NATIVE-OP1A-MASTERS.md) are explicit.
 
+## Wide audio with separate mono WAVs
+
+The explicit and selective Avid → Premiere rewrap paths write a
+picture-only OP1a plus one 48 kHz PCM16 or PCM24 WAV for each independent
+mono sibling on qualified 33–64 lane DNx masters. The plan checks a shared
+source clock, a common bit depth, and full physical sample extents.
+The WAVs retain the original PCM bytes. Review counts the new WAVs
+and the receipt records each saved lane, WAV path, and sample hash.
+Each WAV has its own complete Premiere media-state record. At 32 mono
+lanes the DNx rewrap continues to use a single OP1a.
+
+Premiere 27.0.0 build 88 reopened generated DNxHR HQ projects with 32,
+33, and 64 independent mono lanes. Both 24-frame trims on every lane
+and one reusable bin master per project survived Save As, close,
+and reopen. Fresh insertion retained all lane assignments and their
+full source spans. All 144 decoded picture frames matched the reference.
+Across the 97 trimmed lanes, each 96,000-sample isolated stereo export
+matched its source on both outputs within one PCM24 count after the
+center pan law. The same comparison passed on seven fresh-insertion
+lanes, including A33 in both wide projects and A64 in the wider
+project. Four trimmed and two fresh-insertion lanes at 32 passed the
+same PCM comparison. Every WAV's decoded PCM matched its source MXF.
+
+The control projects that linked the same synthetic mono MXFs in place
+showed the correct paths and selectors after reopen. Every isolated lane
+rendered silence. An independent Premiere import of the same A33 MXF
+also rendered silence.
+
+Separate 33- and 64-lane PCM24 controls used the same synthetic 1080p24
+picture and distinct native-depth mono samples. Premiere 27.0.0 build 88
+reopened both trimmed timelines and both fresh insertions. Each of the
+97 WAV payloads matched the corresponding source MXF byte for byte.
+Isolated PCM on all 97 trimmed lanes and all 97 fresh-insertion lanes
+matched the source on both outputs within one PCM24 count after the
+center pan law. The first fresh A32 export in the 64-lane project was
+silent. A repeat with a pause after changing track mutes matched from
+the same saved project. All 96 decoded picture frames matched the
+reference. The mixed-depth control was refused before creating a
+project or media.
+
+Nonzero starts use a Broadcast Wave `bext` time reference. The writer
+converts the shared source clock to an exact 48 kHz sample count and
+records it in each WAV receipt. A start between samples or a sibling
+clock that disagrees with picture is refused before writing.
+Zero-start WAVs retain their original header and file bytes.
+[EBU Tech 3285](https://tech.ebu.ch/publications/tech3285/)
+
+A synthetic 1080p24 control with 33 PCM24 siblings at `01:02:03:04`
+kept that source start on picture and every audio lane after Premiere
+27.0.0 build 88 Save As and reopen, including after fresh insertion.
+A plain-WAV control lost its saved audio origins on fresh insertion.
+The Broadcast Wave outputs from explicit and selective rewrap were
+byte-identical, with every payload matching the original MXF.
+All 48 picture frames and all trimmed and fresh-insertion lanes
+matched the controls. Premiere briefly reported the fresh edit offline
+on the immediate read-back. The saved project read online on a later
+reopen and all audio lanes rendered correctly. A sibling offset by one
+frame was refused.
+
+Two more 33-lane PCM24 controls passed Premiere 27 reopen and fresh
+insertion at `24000/1001` and `30000/1001` drop-frame. Picture and every
+WAV retained starts of `01:02:03:04` and `01:00:59;23`, respectively.
+The drop-frame trim crossed the minute boundary. All 98 trimmed
+picture frames matched the corresponding frames in the fresh
+insertions, and all 66 lanes matched the original PCM on both stereo
+outputs within one PCM24 count after center pan, in both the trimmed
+and fresh-insertion renders. Each WAV payload matched its source MXF
+byte for byte. Changing the drop-frame start to `01:00:59;24` put it
+between 48 kHz samples and was refused before creating a project or media.
+
+## Managed DNxHR HQ
+
+The Avid graph reader recognizes DNxHR HQ by its registered VC-3 CID 1272
+label and the label variant written by FFmpeg 8.1. Any NLE routes these
+managed sources to explicit OP1a rewrap and checks that the coded picture
+profile agrees. The same rule checks the saved raster against the actual
+file. Derived AVBs with synthetic 1080p24 and UHD24 picture-only MXFs passed
+conversion and byte comparison of all 36 coded picture packets per source.
+[SMPTE Labels Register](https://registry.smpte-ra.org/view/published/labels_view.html)
+· [FFmpeg 8.1 MXF codec labels](https://github.com/FFmpeg/FFmpeg/blob/n8.1/libavformat/mxfenc.c#L2196-L2200)
+
+Premiere 27.0.0 build 88 retained the linked OP1a MXFs, HD and UHD rasters
+at 24 fps, one-hour sequence start, zero source start, and both source
+trims after Save As, close, and reopen. Each timeline uses source frames
+`[6,30)` twice. All 96 decoded frames across the two ProRes 422 HQ
+exports matched those intervals in fresh Premiere imports of the same
+OP1a media. A second reopen and export repeated the result at both
+rasters. The retained AVB and OP-Atom input hashes matched.
+
+The linked best-effort jobs on the same fixtures published both edits as
+marked gaps. A rewrap job with an HQ descriptor over SQ essence refused
+before creating a project or media.
+
+Premiere 27.0.0 build 88 showed an import-failure dialog for each of the
+synthetic HQ OP-Atom originals at 1080p24 and UHD24. After each dismissal,
+the scripting call returned success and the scratch project had zero items
+matching the requested path. The same test imported, reopened,
+and rendered the rewrapped HQ OP1a and an Avid-authored DNxHR LB OP-Atom
+control. Keep explicit OP1a rewrap for this HQ profile. Direct import
+of an Avid-authored HQ source still requires a separate test.
+
+## DNxHR HQX, DNxHR 444, and ProRes alpha
+
+Premiere 27.0.0 build 88 reopened the converted 1080p24 DNxHR HQX OP1a
+project. Both 24-frame trims matched all 48 decoded frames of the
+corresponding intervals from a fresh Premiere import. The 1080p24 DNxHR
+444 OP1a control isolated a rendering difference to Premiere's saved source
+color profile. The rewrap plan now selects the native full-range RGB
+interpretation for verified progressive, square-pixel DNxHR 444 10-bit
+YUV 4:4:4 with a Rec.709 matrix and unspecified range, transfer, and
+primaries. The Premiere writer applies it to the bound picture; the
+compressed source and rewrapped essence remain identical.
+
+The explicit native-master CLI, the saved job, and selective rewrap
+each passed Save As, close, and reopen in Premiere 27. Both source
+trims, clocks, and the saved source color profile survived. All 48 frames
+per route matched fresh imports in 4:4:4 exports. The DNxHR 444 native
+comparison used a synthetic MXF and derived Avid bin.
+
+The 720p24 picture-only ProRes 4444 and 4444 XQ OP-Atom fixtures carried
+alpha in every compressed frame. FFmpeg 8.1 wrote a MOV video sample depth
+of 24 for these stream copies, and Premiere exported fully opaque picture.
+Any NLE now writes depth 32 in the generated MOV sample description when
+the verified ProRes pixel format carries alpha. This uses the same bounded
+metadata rewrite as the packed PCM path and preserves compressed packets
+and media offsets. [FFmpeg 8.1 video sample description](https://github.com/FFmpeg/FFmpeg/blob/n8.1/libavformat/movenc.c#L2625-L2636)
+
+In Premiere 27, both corrected projects passed Save As, close, reopen, and
+fresh insertion from the rewrapped file. All 48 exported frames per
+profile matched the corresponding fresh-import render. Every decoded
+alpha plane matched the source interval, and a second reopen and export
+reproduced both results. These tests use derived Avid bins and synthetic
+picture with partial transparency.
+
 ## Optional native AV-master construction
 
 `--rewrap-native-master` explicitly selects experimental ordinary file-backed AV masters
@@ -222,6 +346,12 @@ tree. [Wizard flow and qualification](GUI-WIZARD.md).
 
 The broader repair option for other formats remains in the
 [roadmap](ROADMAP.md#media-linking-user-2026-10-14).
+
+In the linked modes, Review also offers selective rewrap for verified
+legacy 23.976 DNxHD LB bundles with eight PCM24 mono siblings and an
+unqualified direct file clock. Choosing a folder prepares those packages
+for OP1a rewrap. In Separate files, proceeding without a rewrap folder can
+leave a marked picture gap with the independent mono links in place.
 
 ## Broader requirements and follow-up scope
 

@@ -424,6 +424,7 @@ fn prepare(
         false,
         None,
         &HashSet::new(),
+        &HashSet::new(),
     )
     .map_err(|err| err.to_string())
 }

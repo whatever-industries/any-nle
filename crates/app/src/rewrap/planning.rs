@@ -185,6 +185,29 @@ impl Plan {
     pub(super) fn mono_path(&self, index: usize) -> PathBuf {
         self.destination.join(format!("audio-{:04}.wav", index + 1))
     }
+
+    pub(super) fn wide_audio_path(&self, job: usize, lane: usize) -> PathBuf {
+        self.destination.join(format!("media-{:04}-audio-{:02}.wav", job + 1, lane + 1))
+    }
+
+    pub(super) fn job_bindings(
+        &self, index: usize, target: &str,
+    ) -> impl Iterator<Item = prproj::convert::rewrap::MediaRelink> + '_ {
+        let job = &self.jobs[index];
+        let target = target.to_owned();
+        job.inputs.iter().enumerate().flat_map(move |(ordinal, input)| {
+            let wide_audio = !job.wide_audio.is_empty() && ordinal > 0;
+            let target_path = if wide_audio {
+                self.wide_audio_path(index, ordinal - 1).to_string_lossy().into_owned()
+            } else { target.clone() };
+            self.inputs[*input].aliases.iter().map(move |path| prproj::convert::rewrap::MediaRelink {
+                source_path: path.clone(),
+                target_path: target_path.clone(),
+                audio_stream: ordinal.checked_sub(1).map(|lane| if wide_audio { 0 } else { lane as u32 }),
+                separate_mono: job.separate_mono,
+            })
+        })
+    }
     /// Future paths/channel selectors are fixed by the read-only plan, so project
     /// construction can be validated before any media is created.
     pub fn bindings(&self) -> Vec<prproj::convert::rewrap::MediaRelink> {
@@ -195,19 +218,26 @@ impl Plan {
                 .join(format!("media-{:04}.{}", j + 1, if job.mov {"mov"}else{"mxf"}))
                 .to_string_lossy()
                 .into_owned();
-            for (n, i) in job.inputs.iter().enumerate() {
-                for path in &self.inputs[*i].aliases {
-                    mappings.push(prproj::convert::rewrap::MediaRelink {
-                        source_path: path.clone(),
-                        target_path: target.clone(),
-                        audio_stream: if n == 0 { None } else { Some((n - 1) as u32) },
-                        separate_mono: job.separate_mono,
-                    });
-                }
-            }
+            mappings.extend(self.job_bindings(j, &target));
         }
         mappings
     }
+
+    pub(crate) fn dnxhr_444_rgb_sources(&self) -> std::collections::HashSet<String> {
+        self.jobs.iter().filter_map(|job| {
+            let input = &self.inputs[job.inputs[0]];
+            let picture = &input.probe.streams[0];
+            // Premiere's native OP1a import interprets this descriptor as full-range RGB.
+            (!job.mov
+                && picture.profile == "DNXHR 444"
+                && picture.pix == "yuv444p10le"
+                && picture.color.iter().map(Option::as_deref).eq([
+                    Some("1:1"), None, Some("bt709"), None, None, Some("progressive"),
+                ]))
+                .then_some(input.aliases.iter().cloned())
+        }).flatten().collect()
+    }
+
     pub fn prepare(
         model: &Model,
         directory: &Path,
@@ -335,6 +365,16 @@ impl Plan {
             })?;
             let mov = avid_reader::mxf::ProResProfile::from_fourcc(&video.codec).is_some();
             let separate_mono = clip.audio.len() > 32 || (mov && prefer_separate_mono);
+            let wide_dnx = !mov && clip.audio.len() > 32;
+            if wide_dnx && (clip.audio.len() > 64
+                || !clip.stereo_pairs.is_empty() || !clip.multichannel_groups.is_empty()
+                || clip.audio.iter().any(|audio| !matches!(audio.bits, 16 | 24)))
+            {
+                return Err(format!(
+                    "{}: wide DNx rewrap requires 33–64 independent PCM16 or PCM24 mono lanes",
+                    clip.name,
+                ).into());
+            }
             if (video.codec != "AVdn" && !(allow_mov && mov)) || !supported_rate(video.rate)
             {
                 return Err(format!("clip {}: rewrap requires a qualified DNx or ProRes profile and rate",clip.id).into());
@@ -576,6 +616,7 @@ impl Plan {
                     }
                 }
             }
+            let job_index = recipes.get(&recipe).copied().unwrap_or(plan.jobs.len());
             let clip_facts = obj(vec![
                 ("id", text(&clip.id)),
                 ("name", text(&clip.name)),
@@ -586,16 +627,20 @@ impl Plan {
                             .iter()
                             .enumerate()
                             .map(|(ordinal, a)| {
-                                obj(vec![
+                                let mut channel = vec![
                                     ("avid_track", Value::Int(a.avid_track.unwrap())),
                                     ("source_path", text(&a.path)),
-                                    ("output_audio_ordinal", Value::Int(ordinal as i64)),
-                                    ("output_stream_index", Value::Int(if mov && !separate_mono {1}else{ordinal as i64+1})),
+                                    ("output_audio_ordinal", Value::Int(if wide_dnx { 0 } else { ordinal as i64 })),
+                                    ("output_stream_index", Value::Int(if wide_dnx {0} else if mov && !separate_mono {1}else{ordinal as i64+1})),
                                     ("output_channel_index", Value::Int(if mov && !separate_mono {ordinal as i64}else{0})),
                                     ("bits", Value::Int(a.bits)),
                                     ("sample_rate", Value::Int(a.sample_rate)),
                                     ("master_gain_db", Value::Float(a.gain_db)),
-                                ])
+                                ];
+                                if wide_dnx {
+                                    channel.push(("output_path", text(plan.wide_audio_path(job_index, ordinal).to_string_lossy())));
+                                }
+                                obj(channel)
                             })
                             .collect(),
                     ),
@@ -679,6 +724,11 @@ impl Plan {
                 if mov {
                     for i in recipe.iter().skip(1) { plan.estimate=plan.estimate.checked_add(plan.inputs[*i].stamp.len).ok_or("size overflow")?; }
                 }
+                let wide_audio = if wide_dnx {
+                    recipe[1..].iter()
+                        .map(|&i| super::mono::MonoPcm::plan_wide_sibling(&plan.inputs[i], video.start))
+                        .collect::<R<Vec<_>>>()?
+                } else { Vec::new() };
                 plan.jobs.push(Job {
                     inputs: recipe,
                     clips: vec![clip_facts],
@@ -686,6 +736,7 @@ impl Plan {
                     rate: video.rate,
                     mov,
                     separate_mono,
+                    wide_audio,
                 });
             }
         }
@@ -708,13 +759,14 @@ impl Plan {
         Ok(plan)
     }
     pub fn review_text(&self) -> String {
+        let wide_audio_count: usize = self.jobs.iter().map(|job| job.wide_audio.len()).sum();
         let estimate = if self.mono.is_empty() {
             "Estimate includes input file sizes plus an 8 MiB allowance per output, and an additional audio scratch allowance for MOV. Actual size may differ; free space is checked again while writing."
         } else {
             "Estimate includes the playable PCM bytes and WAV headers, plus allowances for any picture preparation. Free space is checked again while writing."
         };
         let mut text = format!("Creates new media.\n\nNew media folder:\n{}\n\n{} new media file(s)\nEstimated additional space: {} ({} bytes)\nAvailable on selected volume: {} ({} bytes)\n\n{estimate}\n\nOriginal media stays in place; no encoding.\nPremiere audio-routing qualification remains pending.",
-            self.destination.display(), self.jobs.len() + self.mono.len(),
+            self.destination.display(), self.jobs.len() + self.mono.len() + wide_audio_count,
             crate::media_prompt::size_label(self.estimate), self.estimate,
             crate::media_prompt::size_label(self.free), self.free);
         let count = self.inputs.iter().filter(|i| i.terminal.is_some()).count();
@@ -723,6 +775,9 @@ impl Plan {
         }
         if !self.mono.is_empty() {
             text.push_str("\n\nMono PCM24 is copied into WAV. AudioSuite Gain uses the saved render within its playable span.");
+        }
+        if wide_audio_count > 0 {
+            text.push_str(&format!("\n\n{wide_audio_count} wide-master mono lanes will link to separate PCM WAVs. Their picture is rewrapped to picture-only OP1a."));
         }
         text
     }

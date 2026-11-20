@@ -153,7 +153,7 @@ def collect(output, source_root=ROOT):
                 item['corresponding_source'] = source_archive(package, base, item['sha256'], output)
                 sources.append(item['corresponding_source'])
         packages.append(item)
-    for name in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'avid-reader/NOTICE', 'avid-reader/LICENSE-pyavb', 'avid-reader/LICENSE-filmcraft', 'vendor/py_premiere/LICENSE', 'vendor/FORK.md'):
+    for name in ('LICENSE', 'THIRD_PARTY_NOTICES.md', 'avid-reader/NOTICE', 'avid-reader/LICENSE-pyavb', 'avid-reader/LICENSE-filmcraft', 'vendor/py_premiere/LICENSE', 'vendor/FORK.md', 'crates/gui/resources/inter/OFL.txt'):
         target = output / 'licenses' / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / name, target)

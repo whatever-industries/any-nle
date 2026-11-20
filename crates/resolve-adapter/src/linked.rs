@@ -335,6 +335,7 @@ pub(crate) struct Edit {
     pub(crate) markers: Vec<PreparedMarker>,
     pub(crate) timing: Timing,
     pub(crate) grade: Option<(crate::grade::Operation, String)>,
+    pub(crate) fusion: Option<crate::clip_fusion::Operation>,
 }
 
 pub(crate) struct Timeline {
@@ -377,6 +378,7 @@ pub struct PreparedProject {
     pub(crate) omitted_markers: Vec<String>,
     pub(crate) destination_losses: Vec<graph::Loss>,
     recovered_premiere_marks: HashSet<String>,
+    recovered_premiere_adjusts: HashSet<String>,
 }
 
 impl PreparedProject {
@@ -398,6 +400,12 @@ impl PreparedProject {
             && self.recovered_premiere_marks.contains(&loss.object)
     }
 
+    pub(crate) fn recovers_premiere_adjust(&self, loss: &graph::Loss) -> bool {
+        loss.aspect == "premiere.appearance"
+            && loss.reason == crate::premiere::color_mode::ADJUST_LOSS
+            && self.recovered_premiere_adjusts.contains(&loss.object)
+    }
+
     pub(crate) fn writes_caption(&self, id: &str) -> bool {
         self.timelines.iter().flat_map(|timeline| &timeline.captions).any(|cue| cue.id == id)
     }
@@ -416,6 +424,10 @@ impl PreparedProject {
 
     pub fn transition_approximation_losses(&self) -> impl Iterator<Item = &graph::Loss> {
         self.destination_losses.iter().filter(|loss| loss.aspect == "transition_approximation")
+    }
+
+    pub fn color_adjust_losses(&self) -> impl Iterator<Item = &graph::Loss> {
+        self.destination_losses.iter().filter(|loss| loss.aspect == crate::clip_fusion::APPROXIMATION)
     }
 
     pub fn empty_nest_audio_losses(&self) -> impl Iterator<Item = &graph::Loss> {
@@ -1463,6 +1475,7 @@ pub(crate) fn prepare_project(
     let mut timelines = Vec::new();
     let mut omitted_markers = Vec::new();
     let mut destination_losses = Vec::new();
+    let mut recovered_premiere_adjusts = HashSet::new();
     let mut recovered_premiere_marks = HashSet::new();
     let mut seen = HashSet::new();
     let mut project_rate = None;
@@ -1496,9 +1509,19 @@ pub(crate) fn prepare_project(
             return Err(format!("{}: disabled source edit has no qualified Resolve mapping", edit.id).into());
         }
         let mut build = || -> Result<(Timeline, Vec<String>)> {
+            let avid_ranges = crate::grade::AvidRanges::new(graph, sequence)?;
             let premiere_avc_rate = avc_rate(sequence.rate)
                 && graph.sidecar("premiere.source", &sequence.id).is_some()
                 && row.group.is_none();
+            let saved_range = sequence.placements.iter()
+                .any(|edit| graph.sidecar(crate::grade::RANGE_ADAPTER, &edit.id).is_some());
+            let range_avc_rate = avc_rate(sequence.rate) && row.group.is_none()
+                && (avid_ranges.has_ranges() || saved_range) && sequence.placements.iter().all(|edit|
+                    selected.get(edit.item.as_str()).is_some_and(|(index, _)| {
+                        matches!(media[*index].profile, Profile::Mov {
+                            rate, video: MovieVideo::Avc, raster: (1920, 1080), aac: false, pcm: None, ..
+                        } if rate == sequence.rate)
+                    }));
             let assisted_rate = row.group.is_none() && crate::native_import::supported_rate(sequence.rate)
                 && sequence.placements.iter().any(|edit| selected.get(edit.item.as_str())
                     .is_some_and(|(index, _)| media[*index].native.is_some()));
@@ -1509,7 +1532,7 @@ pub(crate) fn prepare_project(
                 || !(canvas == (1920, 1080) || uhd)
                 || sequence.frame_size.is_some_and(|size| size != saved_canvas)
                 || (uhd && sequence.frame_size.is_none())
-                || !(supported_rate(sequence.rate) || premiere_avc_rate || assisted_rate)
+                || !(supported_rate(sequence.rate) || premiere_avc_rate || range_avc_rate || assisted_rate)
                 || project_rate.is_some_and(|rate| rate != sequence.rate)
                 || project_canvas.is_some_and(|size| size != canvas)
                 || sequence.texts.iter().any(|text| text.kind != graph::source::TextKind::Caption)
@@ -1576,7 +1599,16 @@ pub(crate) fn prepare_project(
                     || crate::stereo::clock(sequence.rate, (i64::from(canvas.0), i64::from(canvas.1))))
                 && sequence.placements.iter().any(crate::stereo::placement);
             let mixed_stereo = stereo && track_count == 3;
-            let picture_only = nest_member && !stereo_nest || track_count == 1;
+            // A saved linked project can declare empty mono lanes even when
+            // only the picture lane has edits. The writer already emits
+            // these lanes for a picture-only timeline.
+            let empty_linked_mono = track_count == 3 && !second_picture
+                && graph.sidecar("resolve.source", &sequence.id).is_some()
+                && shape(StreamKind::Video, 1) && shape(StreamKind::Audio, 1)
+                && shape(StreamKind::Audio, 2) && faders == Default::default()
+                && sequence.placements.iter().all(|edit| edit.video_track == Some(1)
+                    && edit.audio_tracks.is_empty() && edit.grouped_audio.is_empty());
+            let picture_only = nest_member && !stereo_nest || track_count == 1 || empty_linked_mono;
             let third_mono = track_count == 4 && second_picture && sequence.rate == Rational::integer(24);
             if (!picture_only && track_count != 3 && !third_mono && !stereo)
                 || [
@@ -1751,6 +1783,8 @@ pub(crate) fn prepare_project(
                 .map(|p| p.id.as_str())
                 .collect();
             let mut recovered_labels = HashSet::new();
+            let mut recovered_avid_ranges = HashSet::new();
+            let mut verified_color_media = HashSet::new();
             let mut marker_preparation = markers::TimelineMarkerPreparation::new(graph, sequence);
             let has_a1_crossfade = source_dissolves.iter().chain(&native_dissolves)
                 .any(|fade| fade.prepared.audio());
@@ -1927,9 +1961,63 @@ pub(crate) fn prepare_project(
                 let envelope = clip_envelopes.prepare(
                     edit, lane, &media[media_index].profile, source_in, length, premiere_fades,
                 )?;
-                let video = crate::video::prepare(edit, sequence.rate, source_in, length, available)
-                    .map_err(|e| format!("{}: {e}", edit.id))?;
+                let prepared_pin = match (edit.transform.as_ref(), edit.effects.as_slice()) {
+                    (None, [effect]) => crate::clip_fusion::prepare_pin(effect)
+                        .map_err(|error| format!("{}: {error}", edit.id))?,
+                    _ => None,
+                };
+                let video = if prepared_pin.is_some() {
+                    None
+                } else {
+                    crate::video::prepare(edit, sequence.rate, source_in, length, available)
+                        .map_err(|e| format!("{}: {e}", edit.id))?
+                };
                 let mut grade = crate::grade::prepare(graph, &edit.id)?;
+                if lane == 0 && canvas == (1920, 1080) && matches!(timing, Timing::Straight)
+                    && media[media_index].native.is_none() && media[media_index].proxy.is_none()
+                {
+                    let source = &items[edit.item.as_str()].media;
+                    if let [binding] = source.as_slice() {
+                        let source_media = streams[binding.media.as_str()];
+                        if source_media.online == Some(true) && source_media.rate == Some(sequence.rate)
+                            && binding.source_offset == Some(Rational::ZERO)
+                            && source_media.original.as_ref().is_some_and(|original|
+                                original.container == "mov" && original.stream_index == 0)
+                        {
+                            if let Some(range) = avid_ranges.prepare(graph, edit, source_media)? {
+                                if grade.is_some() || video.is_some() {
+                                    return Err(format!("{}: conflicting picture and Avid range operations", edit.id).into());
+                                }
+                                grade = Some(range);
+                                recovered_avid_ranges.insert(edit.id.as_str());
+                            }
+                        }
+                    }
+                }
+                if matches!(grade.as_ref(), Some((crate::grade::Operation::RangeCdl(_), _))) {
+                    let physical = &media[media_index];
+                    let refuse = || format!("{}: range CDL needs a plain same-rate 1080p Rec.709 picture-only MOV", edit.id);
+                    let Profile::Mov {
+                        rate, frames, video: codec, raster: (1920, 1080), aac: false, pcm: None, ..
+                    } = physical.profile else {
+                        return Err(refuse().into());
+                    };
+                    if lane != 0 || canvas != (1920, 1080) || !matches!(timing, Timing::Straight)
+                        || rate != sequence.rate || video.is_some() || physical.native.is_some()
+                        || physical.proxy.is_some() || raster_mismatch
+                    {
+                        return Err(refuse().into());
+                    }
+                    if verified_color_media.insert(media_index) {
+                        match codec {
+                            MovieVideo::Avc => avid_adapter::original::verify_avc_range_scale_picture(
+                                &physical.path, ffprobe, rate, frames)?,
+                            MovieVideo::ProResHq if rate == Rational::integer(24) =>
+                                avid_adapter::original::verify_range_scale_picture(&physical.path, ffprobe, frames)?,
+                            _ => return Err(refuse().into()),
+                        }
+                    }
+                }
                 if matches!(timing, Timing::Linear(_)) && grade.is_some() {
                     return Err(format!("{}: Linear retime with a saved grade is unqualified", edit.id).into());
                 }
@@ -1967,6 +2055,29 @@ pub(crate) fn prepare_project(
                 let input_sizing = crate::input_scaling::prepare(
                     graph, &sequence.id, &edit.id, edit.video_track.is_some() && raster_mismatch,
                 ).map_err(|error| format!("{}: {error}", edit.id))?;
+                let adjust = graph.sidecar(crate::premiere::color_mode::ADAPTER, &edit.id)
+                    .and_then(crate::premiere::color_mode::qualified_adjust);
+                let fusion_profile = lane == 0 && picture_only && canvas == (1920, 1080)
+                    && sequence.rate == Rational::integer(24) && matches!(timing, Timing::Straight)
+                    && grade.is_none() && video.is_none() && input_sizing.is_none()
+                    && source_dissolves.is_empty() && native_dissolves.is_empty()
+                    && crate::clip_fusion::supports_media(&media[media_index]);
+                let fusion = if let Some(operation) = prepared_pin {
+                    if !fusion_profile || adjust.is_some() {
+                        return Err(format!("{}: Resolve Corner Pin requires plain 1080p24 Rec.709 ProRes HQ picture", edit.id).into());
+                    }
+                    Some(operation)
+                } else if let Some(adjust) = adjust.filter(|_| fusion_profile) {
+                    recovered_premiere_adjusts.insert(edit.id.clone());
+                    destination_losses.push(graph::Loss {
+                        object: edit.id.clone(),
+                        aspect: crate::clip_fusion::APPROXIMATION.into(),
+                        reason: "Premiere Color Mode Adjust maps to editable Resolve Fusion controls using a measured Rec.709 approximation.".into(),
+                    });
+                    Some(crate::clip_fusion::Operation::Adjust(adjust))
+                } else {
+                    None
+                };
                 if input_sizing == Some(crate::input_scaling::Sizing::CenterCrop)
                     && (lane != 0 || media[media_index].native.is_none()
                     || video.is_some() || grade.is_some() || matches!(timing, Timing::Constant(_) | Timing::Hold | Timing::MixedRate(_)))
@@ -2001,6 +2112,7 @@ pub(crate) fn prepare_project(
                     markers,
                     timing,
                     grade,
+                    fusion,
                 });
             }
             let mut duration = None;
@@ -2124,6 +2236,14 @@ pub(crate) fn prepare_project(
                     return false;
                 }
                 if recovered_labels.contains(l.object.as_str()) && ClipLabel::recover(l) {
+                    return false;
+                }
+                if l.aspect == crate::grade::AVID_RANGE_LOSS && recovered_avid_ranges.contains(l.object.as_str()) {
+                    return false;
+                }
+                if l.aspect == "premiere.appearance" && l.reason == crate::premiere::color_mode::ADJUST_LOSS
+                    && recovered_premiere_adjusts.contains(&l.object)
+                {
                     return false;
                 }
                 if mixer.is_some() && mixer::DirectMixer::recover(l, &sequence.id) {
@@ -2293,6 +2413,7 @@ pub(crate) fn prepare_project(
         omitted_markers,
         destination_losses,
         recovered_premiere_marks,
+        recovered_premiere_adjusts,
     })
 }
 

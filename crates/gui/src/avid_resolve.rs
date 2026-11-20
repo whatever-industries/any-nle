@@ -5,7 +5,7 @@ use anynle_app::{
     resolve_job::{self, SequenceRow},
 };
 use anynle_resolve_adapter::turnover::{JobSchema, Templates, TurnoverJob, TurnoverSource};
-use eframe::{App as _, egui};
+use eframe::egui;
 use std::{
     path::PathBuf,
     sync::mpsc::{self, Receiver},
@@ -24,13 +24,16 @@ pub(crate) struct Wizard {
     ffmpeg: Option<PathBuf>,
     ffprobe: Option<PathBuf>,
     rewrap: bool,
+    op1a_rewrap_dir: Option<PathBuf>,
     camera: bool,
+    require_camera_originals: bool,
     proxies: bool,
     proxy_rewrap_dir: Option<PathBuf>,
     catalog: Option<Catalog>,
     pending: Option<Receiver<Result<Catalog, String>>>,
     ordered: Vec<String>,
     review: Option<Review>,
+    open_mappings: bool,
     issue: Option<String>,
 }
 
@@ -41,7 +44,9 @@ impl Wizard {
             avid_project_root,
             media_roots,
             mappings,
+            sequences,
             prefer_source_media,
+            require_camera_originals,
             attach_avid_proxies,
             proxy_rewrap_dir,
             op1a_rewrap_dir,
@@ -69,7 +74,10 @@ impl Wizard {
             Some(job.ffprobe.clone()),
         );
         wizard.rewrap = op1a_rewrap_dir.is_some();
-        wizard.camera = *prefer_source_media;
+        wizard.op1a_rewrap_dir = op1a_rewrap_dir.clone();
+        wizard.ordered.clone_from(sequences);
+        wizard.camera = *prefer_source_media || *require_camera_originals || *attach_avid_proxies;
+        wizard.require_camera_originals = *require_camera_originals;
         wizard.proxies = *attach_avid_proxies;
         wizard.proxy_rewrap_dir = proxy_rewrap_dir.clone();
         let mut review = Review::with_rewrap(Ok(job), wizard.rewrap);
@@ -103,13 +111,16 @@ impl Wizard {
             ffmpeg,
             ffprobe,
             rewrap: false,
+            op1a_rewrap_dir: None,
             camera: false,
+            require_camera_originals: false,
             proxies: false,
             proxy_rewrap_dir: None,
             catalog: None,
             pending: None,
             ordered: vec![],
             review: None,
+            open_mappings: false,
             issue: None,
         }
     }
@@ -120,16 +131,42 @@ impl Wizard {
         self.issue = None;
     }
 
-    fn scan(&mut self, ui: &egui::Ui) {
-        self.invalidate_catalog();
+    fn scan(&mut self, ctx: &egui::Context) {
+        self.catalog = None;
+        self.issue = None;
         let (bins, root) = (self.bins.clone(), self.root.clone());
         let (send, receive) = mpsc::channel();
-        let ctx = ui.ctx().clone();
+        let ctx = ctx.clone();
         self.pending = Some(receive);
         std::thread::spawn(move || {
             let _ = send.send(resolve_job::discover(&bins, root.as_deref()));
             ctx.request_repaint();
         });
+    }
+
+    fn set_catalog(&mut self, catalog: Catalog) {
+        let mut unavailable = 0;
+        self.ordered.retain_mut(|selection| {
+            let rows = &catalog.1;
+            if rows.iter().any(|row| &row.id == selection) {
+                return true;
+            }
+            let mut matches = rows.iter().filter(|row| &row.name == selection);
+            if let (Some(row), None) = (matches.next(), matches.next()) {
+                selection.clone_from(&row.id);
+                true
+            } else {
+                unavailable += 1;
+                false
+            }
+        });
+        if unavailable > 0 {
+            self.ordered.clear();
+            self.issue = Some(format!(
+                "{unavailable} saved timeline selection(s) could not be resolved. Select the timelines again."
+            ));
+        }
+        self.catalog = Some(catalog);
     }
 
     fn settings(&self) -> Result<TurnoverJob, String> {
@@ -151,14 +188,14 @@ impl Wizard {
                 media_roots: self.media_roots.clone(),
                 mappings: self.mappings.clone(),
                 prefer_source_media: self.camera,
-                require_camera_originals: false,
+                require_camera_originals: self.camera && self.require_camera_originals,
                 attach_avid_proxies: self.camera && self.proxies,
                 proxy_rewrap_dir: if self.camera && self.proxies {
                     self.proxy_rewrap_dir.clone()
                 } else {
                     None
                 },
-                op1a_rewrap_dir: None,
+                op1a_rewrap_dir: self.op1a_rewrap_dir.clone().filter(|_| self.rewrap),
                 ffmpeg: Some(tools.ffmpeg),
             },
             templates: self.templates.clone(),
@@ -167,7 +204,8 @@ impl Wizard {
         })
     }
 
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) -> bool {
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui, embedded: bool) -> bool {
+        let mut open_mappings = false;
         if let Some(review) = &mut self.review {
             let mut back = false;
             egui::Panel::top("avid-resolve-back").show(ui, |ui| {
@@ -175,10 +213,21 @@ impl Wizard {
                     .add_enabled(!review.busy(), egui::Button::new("Back to Avid source"))
                     .clicked();
             });
-            if back {
-                self.review = None;
-            } else {
-                review.ui(ui, frame);
+            if !back {
+                open_mappings = review.show(ui);
+            }
+            if !back && !open_mappings {
+                return false;
+            }
+            self.op1a_rewrap_dir = review.op1a_rewrap_dir().map(ToOwned::to_owned);
+            self.review = None;
+            if self.catalog.is_none() {
+                self.scan(ui.ctx());
+            }
+            // The Review panel has already used this frame's central layout.
+            if open_mappings {
+                self.open_mappings = true;
+                ui.ctx().request_repaint();
                 return false;
             }
         }
@@ -187,7 +236,7 @@ impl Wizard {
                 Ok(result) => {
                     self.pending = None;
                     match result {
-                        Ok(catalog) => self.catalog = Some(catalog),
+                        Ok(catalog) => self.set_catalog(catalog),
                         Err(error) => self.issue = Some(error),
                     }
                 }
@@ -198,10 +247,11 @@ impl Wizard {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        let open_mappings = std::mem::take(&mut self.open_mappings);
         let mut exit = false;
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if ui.button("Back to conversion routes").clicked() {
+            egui::ScrollArea::vertical().id_salt("avid-resolve-setup").show(ui, |ui| {
+                if embedded && ui.button("Back to conversion routes").clicked() {
                     exit = true;
                     return;
                 }
@@ -243,7 +293,7 @@ impl Wizard {
                                 )
                                 .clicked()
                             {
-                                self.scan(ui);
+                                self.scan(ui.ctx());
                             }
                         });
                     });
@@ -260,47 +310,56 @@ impl Wizard {
                         if rows.is_empty() {
                             ui.label("No timelines found in the selected bins.");
                         }
-                        for row in rows {
-                            let mut selected = self.ordered.contains(&row.id);
-                            let bin = self
-                                .root
-                                .as_ref()
-                                .and_then(|root| row.bin.strip_prefix(root).ok())
-                                .unwrap_or(&row.bin);
-                            if ui
-                                .checkbox(
-                                    &mut selected,
-                                    format!("{} · {}", row.name, bin.display()),
-                                )
-                                .on_hover_text(&row.id)
-                                .changed()
-                            {
-                                if selected {
-                                    self.ordered.push(row.id.clone());
-                                } else {
-                                    self.ordered.retain(|id| id != &row.id);
+                        crate::wizard::source_list(ui, "resolve-source-timelines", None, |ui| {
+                            for row in rows {
+                                let mut selected = self.ordered.contains(&row.id);
+                                let bin = self
+                                    .root
+                                    .as_ref()
+                                    .and_then(|root| row.bin.strip_prefix(root).ok())
+                                    .unwrap_or(&row.bin);
+                                if ui
+                                    .checkbox(
+                                        &mut selected,
+                                        format!("{} · {}", row.name, bin.display()),
+                                    )
+                                    .on_hover_text(&row.id)
+                                    .changed()
+                                {
+                                    if selected {
+                                        self.ordered.push(row.id.clone());
+                                    } else {
+                                        self.ordered.retain(|id| id != &row.id);
+                                    }
                                 }
                             }
-                        }
+                        });
                         if self.ordered.len() > 1 {
-                            ui.separator();
+                            ui.add_space(6.);
                             ui.strong("Timeline order");
-                            for index in 0..self.ordered.len() {
-                                ui.horizontal(|ui| {
-                                    let up = crate::icons::arrow(ui, 14., "Move timeline up")
-                                        .rotate(-std::f32::consts::FRAC_PI_2, egui::vec2(0.5, 0.5));
-                                    if ui.add_enabled(index > 0, egui::Button::image(up)).clicked()
-                                    {
-                                        self.ordered.swap(index, index - 1);
-                                    }
-                                    if let Some(row) =
-                                        rows.iter().find(|row| row.id == self.ordered[index])
-                                    {
-                                        ui.label(&row.name)
-                                            .on_hover_text(row.bin.display().to_string());
-                                    }
-                                });
-                            }
+                            crate::wizard::source_list(ui, "resolve-timeline-order", None, |ui| {
+                                for index in 0..self.ordered.len() {
+                                    ui.horizontal(|ui| {
+                                        let up = crate::icons::arrow(ui, 14., "Move timeline up")
+                                            .rotate(
+                                                -std::f32::consts::FRAC_PI_2,
+                                                egui::vec2(0.5, 0.5),
+                                            );
+                                        if ui
+                                            .add_enabled(index > 0, egui::Button::image(up))
+                                            .clicked()
+                                        {
+                                            self.ordered.swap(index, index - 1);
+                                        }
+                                        if let Some(row) =
+                                            rows.iter().find(|row| row.id == self.ordered[index])
+                                        {
+                                            ui.label(&row.name)
+                                                .on_hover_text(row.bin.display().to_string());
+                                        }
+                                    });
+                                }
+                            });
                         }
                     }
                 });
@@ -330,10 +389,12 @@ impl Wizard {
                     if let Some(index) = remove {
                         self.media_roots.remove(index);
                     }
-                    ui.collapsing("Original locations and proxies", |ui| {
+                    let mappings = egui::CollapsingHeader::new("Original locations and proxies")
+                        .open(open_mappings.then_some(true));
+                    let response = mappings.show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.mapping_prefix)
-                                .on_hover_text("Saved path or folder prefix");
+                            ui.add(egui::TextEdit::singleline(&mut self.mapping_prefix)
+                                .hint_text("Saved folder prefix"));
                             if ui
                                 .add_enabled(
                                     !self.mapping_prefix.trim().is_empty(),
@@ -364,6 +425,8 @@ impl Wizard {
                         }
                         ui.checkbox(&mut self.camera, "Prefer camera originals for picture");
                         if self.camera {
+                            ui.checkbox(&mut self.require_camera_originals, "Require camera originals")
+                                .on_hover_text("Block conversion if any picture edit or editable Group camera lacks a verified original.");
                             ui.checkbox(&mut self.proxies, "Attach matching Avid media as proxies");
                             if self.proxies
                                 && ui.button("Choose folder for proxy rewrap…").clicked()
@@ -380,6 +443,9 @@ impl Wizard {
                             }
                         }
                     });
+                    if open_mappings {
+                        response.header_response.scroll_to_me(Some(egui::Align::Center));
+                    }
                 });
                 ui.group(|ui| {
                     ui.strong("Destination");
@@ -414,5 +480,68 @@ impl Wizard {
             });
         });
         exit
+    }
+}
+
+impl eframe::App for Wizard {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wizard::report_view_tests::{click, text_center};
+
+    #[test]
+    fn strict_review_opens_mappings_and_preserves_timeline_selection() {
+        let ctx = egui::Context::default();
+        ctx.style_mut_of(egui::Theme::Dark, |style| style.animation_time = 0.);
+        ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.);
+        let templates = Templates {
+            layout: "layout.drp".into(),
+            profile: "profile.drp".into(),
+            atom: None,
+            group: None,
+            fairlight: None,
+            nested: None,
+        };
+        let inputs = Inputs { output: "result.drp".into(), ..Default::default() };
+        let mut wizard = Wizard::new(templates, &inputs, Some("ffmpeg".into()), Some("ffprobe".into()));
+        let bin = PathBuf::from("control.avb");
+        wizard.ordered = vec!["Timeline B".into(), "timeline-a-id".into()];
+        wizard.set_catalog((vec![bin.clone()], vec![
+            SequenceRow { id: "timeline-a-id".into(), name: "Timeline A".into(), bin: bin.clone() },
+            SequenceRow { id: "timeline-b-id".into(), name: "Timeline B".into(), bin },
+        ]));
+        wizard.camera = true;
+        wizard.require_camera_originals = true;
+        wizard.rewrap = true;
+        wizard.op1a_rewrap_dir = Some("OP1a Media".into());
+        let review = Review::with_rewrap(wizard.settings(), true);
+        review.report_camera_blocker_for_test();
+        wizard.review = Some(review);
+
+        let mut draw = |input| {
+            let mut output = ctx.run_ui(input, |ui| { wizard.show(ui, false); });
+            output.textures_delta.clear();
+            output
+        };
+        let blocked = draw(egui::RawInput::default());
+        assert!(text_center(&blocked, "Camera originals couldn’t be verified").is_some());
+        assert!(text_center(&blocked, "Convert").is_none());
+        draw(click(text_center(&blocked, "Open saved-path mappings").unwrap()));
+        let edit = draw(egui::RawInput::default());
+        assert!(text_center(&edit, "Map to folder…").is_some());
+        assert!(text_center(&edit, "Require camera originals").is_some());
+
+        let job = serde_json::to_value(wizard.settings().unwrap()).unwrap();
+        assert!(wizard.review.is_none());
+        assert_eq!(job["source"]["sequences"], serde_json::json!(["timeline-b-id", "timeline-a-id"]));
+        assert_eq!(job["source"]["require_camera_originals"], true);
+        assert_eq!(job["source"]["op1a_rewrap_dir"], "OP1a Media");
+        wizard.camera = false;
+        assert_eq!(serde_json::to_value(wizard.settings().unwrap()).unwrap()["source"]["require_camera_originals"], false);
     }
 }

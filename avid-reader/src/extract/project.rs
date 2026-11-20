@@ -16,7 +16,7 @@ mod equalizer;
 mod audiosuite;
 pub(super) mod pcm_prefix;
 mod submaster;
-pub(crate) use source_capture::{extract_source_paths, extract_source_files, extract_source_paths_observed, extract_source_paths_inspected};
+pub(crate) use source_capture::{extract_source_paths, extract_source_files, extract_source_paths_observed, extract_source_paths_inspected, extract_source_paths_with_progress};
 
 #[derive(Debug)]
 pub struct ProjectReadError {
@@ -60,6 +60,18 @@ pub fn extract_project(files: &[&AvbFile]) -> BinContents {
         project.push(compile_bin(file, bin));
     }
     project.finish()
+}
+
+/// Native effect inputs indexed by their saved slot numbers, retaining dangling slots.
+fn numbered_two_inputs<'a>(ctx: &Ctx<'a>, effect: &Node) -> Option<[Option<&'a Node>; 2]> {
+    let Value::List(tracks) = effect.get("tracks")? else { return None; };
+    let [Value::Node(first), Value::Node(second)] = tracks.as_slice() else { return None; };
+    let ordered = match (int(first, "index"), int(second, "index")) {
+        (Some(1), Some(2)) => [first, second],
+        (Some(2), Some(1)) => [second, first],
+        _ => return None,
+    };
+    Some(ordered.map(|track| ctx.deref(track.get("component"))))
 }
 
 // A source route only needs the supported range-routing facts, not arbitrary attributes,
@@ -1039,15 +1051,33 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     }
                 }
                 if let (Some(kind), true) = (picture_kind, self.kind == KIND_PICTURE) {
-                    // 3D Warp: track 1 is the background (filler showing the track below), track 2
-                    // the picture it moves; only an empty background is handled.
-                    let empty = |n: &Node| ctx.is_empty(n);
-                    let (input, ok) = match (kind, inputs.as_slice()) {
-                        (PictureKind::Resize, [one]) => (Some(*one), true),
-                        (PictureKind::Warp, [background, picture]) => (Some(*picture), empty(background)),
-                        _ => (None, false),
+                    if kind == PictureKind::Warp {
+                        if let Some(source) = &mut self.source {
+                            if source.warp_inputs(ctx, c, position, self.track) {
+                                source.unresolved_effect(c, position, self.kind, self.track, "3D Warp",
+                                    "Avid 3D Warp uses two picture inputs. The composite could not be converted.");
+                                return;
+                            }
+                        }
+                    }
+                    let input = match kind {
+                        PictureKind::Resize => match inputs.as_slice() {
+                            [one] => Some(*one),
+                            _ => None,
+                        },
+                        PictureKind::Warp => {
+                            let Some([Some(background), Some(picture)]) = numbered_two_inputs(ctx, c) else {
+                                if let Some(source) = &mut self.source {
+                                    source.unresolved_warp_slots(position, self.track);
+                                    return;
+                                }
+                                return self.problem(position, "Avid 3D Warp input slots are missing or ambiguous".into());
+                            };
+                            // The single-picture route uses slot 2 over an empty slot 1.
+                            ctx.is_empty(background).then_some(picture)
+                        }
                     };
-                    if let (Some(input), true) = (input, ok) {
+                    if let Some(input) = input {
                         let fx = self
                             .cache
                             .pictures
@@ -2138,6 +2168,10 @@ mod tests {
         stacked.fields.iter_mut().find(|(key, _)| *key == "tracks").unwrap().1 = Value::List(tracks);
         let ctx = Ctx { file: &file, mobs: HashMap::new() };
         assert_eq!(picture_extension::static_projective_warp(&ctx, &stacked), Some(pin));
+        let (_, Value::List(tracks)) = stacked.fields.iter_mut().find(|(key, _)| *key == "tracks").unwrap()
+            else { unreachable!() };
+        tracks.reverse();
+        assert_eq!(picture_extension::static_projective_warp(&ctx, &stacked), Some(pin));
         let Some(Object::Decoded(flip)) = &mut file.objects[inner as usize] else { unreachable!() };
         flip.fields.iter_mut().find(|(key, _)| *key == "edit_rate").unwrap().1 = Value::Float(25.0);
         let ctx = Ctx { file: &file, mobs: HashMap::new() };
@@ -2735,23 +2769,40 @@ mod tests {
     }
     #[test]
     fn source_paths_release_decoder_before_next_bin_and_limit_before_open(){
+        use crate::source::BinReadProgress;
         use std::cell::Cell;use std::rc::Rc;
         struct Tracked{file:AvbFile,active:Rc<Cell<usize>>}
         impl Borrow<AvbFile> for Tracked{fn borrow(&self)->&AvbFile{&self.file}}
         impl Drop for Tracked{fn drop(&mut self){self.active.set(self.active.get()-1);}}
         let mut a=file();let reference=source(&mut a,id(1),KIND_PICTURE,1,0,10);
         mob(&mut a,id(3),"Forward",MOB_COMPOSITION,0,&[(1,reference)]);
+        let mut unsupported = node(*b"TKFX", "TrackEffect");
+        unsupported.put("effect_id", Value::Str("synthetic unsupported effect".into()));
+        unsupported.put("media_kind_id", Value::Int(KIND_PICTURE));
+        unsupported.put("edit_rate", Value::Float(24.0));
+        unsupported.put("length", Value::Int(10));
+        let unsupported = add(&mut a, unsupported);
+        mob(&mut a,id(4),"Unsupported",MOB_COMPOSITION,0,&[(1,unsupported)]);
         let mut b=file();mob(&mut b,id(1),"Master",MOB_MASTER,0,&[]);
         let mut files=vec![a,b].into_iter();let active=Rc::new(Cell::new(0));
+        let mut progress = Vec::new();
         let out=source_capture::read_source_with(&source_inputs(2),crate::source::SourceLimits::default(),|_|{
             assert_eq!(active.get(),0);active.set(1);Ok(Tracked{file:files.next().unwrap(),active:active.clone()})
+        }, |event| {
+            assert_eq!(active.get(), 0);
+            progress.push(match event {
+                BinReadProgress::Reading { index, findings, .. } => (index, findings),
+                BinReadProgress::Finished { total, findings } => (total, findings),
+            });
+            Ok(())
         }).unwrap();
+        assert_eq!(progress, [(0, 0), (1, 1), (2, 1)]);
         assert_eq!(active.get(),0);assert_eq!(out.sequences[0].events.len(),1);
         assert!(out.accounted_bytes>0&&out.accounted_bytes<=crate::source::MAX_SOURCE_FACT_BYTES);
         let opened=Cell::new(false);
         let refusal=source_capture::read_source_with(&source_inputs(1),crate::source::SourceLimits{max_fact_bytes:0},|_|{
             opened.set(true);Ok(file())
-        });
+        }, |_| panic!("progress before the budget check"));
         assert!(refusal.is_err());assert!(!opened.get());
     }
 

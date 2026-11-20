@@ -4,6 +4,10 @@ Use the [roadmap](docs/ROADMAP.md#where-work-is-tracked) to find the current
 scope, pending checks, and held work. Use the [release notes](RELEASE_NOTES.md)
 to see what is in the download.
 
+Record open converter work in its owning roadmap section. Link to the
+feature guide or test evidence there. When a plan is finished or superseded,
+update the roadmap and retain the plan as history.
+
 ## Build and test from a public clone
 
 Use Rust 1.95.0, the release toolchain, and Python 3.11 or later. Check

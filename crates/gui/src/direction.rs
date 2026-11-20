@@ -13,8 +13,8 @@ impl Editor {
     fn label(self) -> &'static str {
         match self {
             Self::AvidMediaComposer => "Avid Media Composer",
-            Self::Premiere => "Premiere",
-            Self::Resolve => "Resolve",
+            Self::Premiere => "Adobe Premiere Pro",
+            Self::Resolve => "DaVinci Resolve",
         }
     }
 }
@@ -34,31 +34,28 @@ pub(super) fn show(ui: &mut egui::Ui, avid_resolve: bool) -> bool {
             destination.label(),
         )
     };
-    let mut selected_resolve = false;
-    egui::Grid::new("translation-direction").show(ui, |ui| {
-        dropdown(ui, "Translate from", source, &available, |editor| {
-            AVAILABLE_ROUTES.contains(&(editor, destination))
-        });
-        ui.end_row();
-        selected_resolve = dropdown(ui, "Translate to", destination, &available, |editor| {
-            AVAILABLE_ROUTES.contains(&(source, editor)) || (avid_resolve && editor == Editor::Resolve)
-        }) == Some(Editor::Resolve);
-        ui.end_row();
-    });
-    if !avid_resolve { ui.small(available); }
-    selected_resolve
+    ui.horizontal_wrapped(|ui| {
+        ui.small(source.label()).on_hover_text(&available);
+        ui.add(crate::icons::arrow(ui, 12., "to"));
+        if !avid_resolve {
+            ui.small(destination.label()).on_hover_text(&available);
+            return false;
+        }
+        dropdown(ui, destination, &available, |editor| {
+            AVAILABLE_ROUTES.contains(&(source, editor)) || editor == Editor::Resolve
+        }) == Some(Editor::Resolve)
+    })
+    .inner
 }
 
 fn dropdown(
     ui: &mut egui::Ui,
-    name: &str,
     current: Editor,
     explanation: &str,
     is_available: impl Fn(Editor) -> bool,
 ) -> Option<Editor> {
-    let label = ui.label(name);
     let mut selected = None;
-    egui::ComboBox::from_id_salt(name)
+    egui::ComboBox::from_id_salt("translation-destination")
         .selected_text(current.label())
         .width(176.)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -78,7 +75,6 @@ fn dropdown(
             }
         })
         .response
-        .labelled_by(label.id)
         .on_hover_text(explanation);
     selected
 }

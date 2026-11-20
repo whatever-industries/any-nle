@@ -10,13 +10,15 @@ pub(super) fn capture_adapter(
     ctx: &Ctx<'_>,
     effect: &Node,
     length: i64,
+    rate: Rate,
     ambiguous: &HashSet<MobId>,
     budget: &SharedBudget,
     hd_24_still_canvas: bool,
 ) -> Option<SourceColorAdapter> {
+    let use_24fps_profiles = Some(rate) == Rate::new(24, 1);
     if effect.class != *b"TKFX"
         || int(effect, "length") != Some(length)
-        || float(effect, "edit_rate") != Some(24.0)
+        || !at_edit_rate(effect, rate)
     {
         return None;
     }
@@ -24,11 +26,14 @@ pub(super) fn capture_adapter(
     let Value::List(tracks) = effect.get("tracks")? else { return None };
     let [Value::Node(track)] = tracks.as_slice() else { return None };
     let program = matte_track(ctx, effect, 1)?;
+    if !use_24fps_profiles && !at_edit_rate(program, rate) {
+        return None;
+    }
     let neutral = neutral_wrapper(ctx, effect);
     let fitted_still = (hd_24_still_canvas && neutral && spatial_track(ctx, track))
         .then(|| centered_still_input(ctx, program, length)).flatten();
     let input = fitted_still.or_else(|| sole_picture_input(ctx, program))?;
-    if int(input, "length") != Some(length) || float(input, "edit_rate") != Some(24.0)
+    if int(input, "length") != Some(length) || !at_edit_rate(input, rate)
     {
         return None;
     }
@@ -43,11 +48,13 @@ pub(super) fn capture_adapter(
         [Some(r), Some(g), Some(b)] => Some([r, g, b]),
         _ => None,
     };
-    let subclip = subclip_picture_file(ctx, master_id, master_track, source_in, length, ambiguous);
-    let subclip_motion = if subclip.is_none() {
+    let subclip = use_24fps_profiles
+        .then(|| subclip_picture_file(ctx, master_id, master_track, source_in, length, ambiguous))
+        .flatten();
+    let subclip_motion = if use_24fps_profiles && subclip.is_none() {
         let allow_other_speeds = neutral && master_track == 1
             && SourceColorRange::from_saved_xml(transform) == Some(SourceColorRange::VideoToFull);
-        subclip_motion(ctx, master_id, master_track, source_in, length, ambiguous, Rate::new(24, 1)?, allow_other_speeds)
+        subclip_motion(ctx, master_id, master_track, source_in, length, ambiguous, rate, allow_other_speeds)
             .map(|(speed_effect, mut motion)| {
                 let other_speed = motion.sampled_input_frames.is_some_and(|samples| samples.ratio != (2, 1));
                 if !neutral_managed_input(ctx, input, Some(transform))
@@ -63,11 +70,12 @@ pub(super) fn capture_adapter(
     } else {
         None
     };
+    let direct_span = (!use_24fps_profiles).then_some((rate, source_in, length));
     let picture = subclip.as_ref().map(|source| (source.file_id, source.file))
-        .or_else(|| direct_picture_file(ctx, master_id, master_track, ambiguous));
+        .or_else(|| direct_picture_file(ctx, master_id, master_track, ambiguous, direct_span));
     let centered_still_fit = fitted_still.is_some() && subclip.is_none()
         && picture.is_some_and(|(_, file)| still_raster(ctx, file));
-    let managed_cache = master_track == 1
+    let managed_cache = use_24fps_profiles && master_track == 1
         && ctx.deref(effect.get("left_bob")).is_some_and(|cache| cache.class == *b"DIDP");
     let managed_range = managed_cache
         && SourceColorRange::from_saved_xml(transform) == Some(SourceColorRange::VideoToFull);
@@ -121,6 +129,18 @@ pub(super) fn capture_adapter(
         }
         managed_picture_span(ctx, effect, master, id, file, backing.source_in, sampled_span)
     });
+    let reordered_picture_file = picture.and_then(|(id, file)| {
+        if effect.get("left_bob") != Some(&Value::Null) || !neutral_controls(ctx, effect)
+            || !managed_wrapper_attributes(wrapper_attrs, false)
+            || fitted_still.is_some() || subclip.is_some() || subclip_motion.is_some()
+            || !neutral_managed_input(ctx, input, Some(transform))
+        {
+            return None;
+        }
+        let edit = SourceColorStack::from_saved_xml(transform)?;
+        let saved = SourceColorStack::from_saved_xml(input_transform_text(ctx, file)?.ok()?)?;
+        edit.is_reordered(saved).then_some(id)
+    });
     let picture_file = match picture {
         Some(_) if conflicting_input_transform => Observed::Unresolved(copy_text(
             budget, MANAGED_INPUT_TRANSFORM_CONFLICT,
@@ -155,6 +175,7 @@ pub(super) fn capture_adapter(
             .map(|source| Box::new(source.master)),
         subclip_motion,
         picture_file,
+        reordered_picture_file,
         transform: copy_text(budget, transform),
         neutral_wrapper: neutral,
         wrapper_clip_color,
@@ -386,19 +407,36 @@ fn sole_picture_input<'a>(ctx: &Ctx<'a>, component: &'a Node) -> Option<&'a Node
 
 fn direct_picture_file<'a>(
     ctx: &Ctx<'a>, master_id: MobId, master_track: i64, ambiguous: &HashSet<MobId>,
+    span: Option<(Rate, i64, i64)>,
 ) -> Option<(MobId, &'a Node)> {
     let master = ctx.mobs.get(&master_id)?;
     if ambiguous.contains(&master_id) || int(master, "mob_type_id") != Some(MOB_MASTER) {
         return None;
     }
-    let (_, component) = picture_track(ctx, master, master_track)?;
+    let (track, component) = picture_track(ctx, master, master_track)?;
     let backing = sole_picture_input(ctx, component)?;
     let file_id = mob_id(backing)?;
     let file = ctx.mobs.get(&file_id)?;
     if ambiguous.contains(&file_id) || int(file, "mob_type_id") != Some(MOB_SOURCE) {
         return None;
     }
+    if let Some((rate, start, length)) = span {
+        let end = start.checked_add(length)?;
+        let file_start = int(backing, "start_time").filter(|offset| *offset >= 0)?;
+        let file_end = file_start.checked_add(end)?;
+        if start < 0 || length <= 0 || !ordinary_picture_track(track)
+            || ![master, component, backing, file].into_iter().all(|node| at_edit_rate(node, rate))
+            || ![master, backing].into_iter().all(|node| int(node, "length").is_some_and(|len| end <= len))
+            || !int(file, "length").is_some_and(|len| file_end <= len)
+        {
+            return None;
+        }
+    }
     Some((file_id, file))
+}
+
+fn at_edit_rate(node: &Node, rate: Rate) -> bool {
+    float(node, "edit_rate").and_then(Rate::from_avid) == Some(rate)
 }
 
 fn picture_track<'a>(ctx: &Ctx<'a>, owner: &'a Node, label: i64) -> Option<(&'a Node, &'a Node)> {
@@ -492,7 +530,7 @@ fn subclip_motion<'a>(
             let owner = ctx.mobs.get(&master.mob)?;
             let (track, component) = picture_track(ctx, owner, master.track)?;
             let backing = sole_picture_input(ctx, component)?;
-            let (id, file) = direct_picture_file(ctx, master.mob, master.track, ambiguous)?;
+            let (id, file) = direct_picture_file(ctx, master.mob, master.track, ambiguous, None)?;
             let desc = ctx.deref(file.get("descriptor"))?;
             if !ordinary_picture_track(track) || !at_rate(component) || !covers(backing, end)
                 || int(backing, "start_time") != Some(0) || int(backing, "track_id") != Some(1)
@@ -724,6 +762,65 @@ mod tests {
     use crate::{document::AvbDocument, file::Object};
 
     #[test]
+    fn direct_adapter_route_checks_the_saved_clock_and_file_extent() {
+        let mob = |data1| MobId {
+            label: [0; 12],
+            length: 19,
+            instance: [0; 3],
+            material: crate::io::Uuid { data1, data2: 0, data3: 0, data4: [0; 8] },
+        };
+        let master_id = mob(1);
+        let file_id = mob(2);
+        let bytes = AvbDocument::new_empty_bin(19, "Color clock control", 1, false)
+            .to_bytes().unwrap();
+        for raw in [23.976, 25.0, 29.97, 50.0] {
+            let rate = Rate::from_avid(raw).unwrap();
+            let mut bin = AvbFile::parse(&bytes).unwrap();
+            let backing = Value::Ref(bin.objects.len() as u32);
+            bin.objects.push(Some(Object::Decoded(Node {
+                class: *b"SCLP",
+                type_name: "Source clip",
+                fields: vec![
+                    ("media_kind_id", Value::Int(KIND_PICTURE)),
+                    ("mob_id", Value::MobId(file_id)),
+                    ("edit_rate", Value::Float(raw)),
+                    ("length", Value::Int(60)),
+                    ("start_time", Value::Int(7)),
+                ],
+            })));
+            let track = Node {
+                class: [0; 4],
+                type_name: "Track",
+                fields: vec![("index", Value::Int(1)), ("component", backing)],
+            };
+            let master = Node {
+                class: *b"CMPO",
+                type_name: "Master",
+                fields: vec![
+                    ("mob_type_id", Value::Int(MOB_MASTER)),
+                    ("edit_rate", Value::Float(raw)),
+                    ("length", Value::Int(60)),
+                    ("tracks", Value::List(vec![Value::Node(Box::new(track))])),
+                ],
+            };
+            for (file_rate, file_length, expected) in [(raw, 31, true), (24.0, 31, false), (raw, 30, false)] {
+                let picture = Node {
+                    class: *b"CMPO",
+                    type_name: "Picture file",
+                    fields: vec![
+                        ("mob_type_id", Value::Int(MOB_SOURCE)),
+                        ("edit_rate", Value::Float(file_rate)),
+                        ("length", Value::Int(file_length)),
+                    ],
+                };
+                let ctx = Ctx { file: &bin, mobs: HashMap::from([(master_id, &master), (file_id, &picture)]) };
+                let found = direct_picture_file(&ctx, master_id, 1, &HashSet::new(), Some((rate, 4, 20)));
+                assert_eq!(found.map(|(id, _)| id), expected.then_some(file_id), "{raw} fps");
+            }
+        }
+    }
+
+    #[test]
     fn saved_standalone_range_requires_endpoints_and_the_matching_direction_flag() {
         let xml = |direction, inverted| format!(
             "<ColorTransformationList><ColorTransformation><LinearLut><Name>Levels scaling ({direction})</Name><BitDepth>10</BitDepth><Black>64</Black><White>940</White>{inverted}</LinearLut></ColorTransformation></ColorTransformationList>"
@@ -738,6 +835,31 @@ mod tests {
         let extra = forward.replace("</ColorTransformationList>",
             "<ColorTransformation><ExternalLut/></ColorTransformation></ColorTransformationList>");
         assert_eq!(SourceColorRange::from_saved_xml(&extra), None);
+    }
+
+    #[test]
+    fn saved_stack_distinguishes_reordering_from_changed_steps() {
+        let range = "<LinearLut><Name>Levels scaling (video levels to full range)</Name><BitDepth>10</BitDepth><Black>64</Black><White>940</White></LinearLut>";
+        let cube = "<ExternalLut><Name>Chart (3D)</Name><LutFileName>Chart.cube</LutFileName><LutDimension>3D</LutDimension><InhibitScaling/></ExternalLut>";
+        let xml = |first, second| format!(
+            "<ColorTransformationList><ColorTransformation>{first}</ColorTransformation><ColorTransformation>{second}</ColorTransformation></ColorTransformationList>"
+        );
+        let forward = xml(range, cube);
+        let reverse = xml(cube, range);
+        let stack = SourceColorStack::from_saved_xml(&forward).unwrap();
+        assert!(!stack.cube_first);
+        assert!(stack.is_reordered(SourceColorStack::from_saved_xml(&reverse).unwrap()));
+        assert!(!stack.is_reordered(stack));
+        let different_cube = reverse.replace("Chart.cube", "Other.cube");
+        assert!(!stack.is_reordered(SourceColorStack::from_saved_xml(&different_cube).unwrap()));
+        for changed in [
+            reverse.replace("<InhibitScaling/>", ""),
+            reverse.replace("<White>940", "<White>939"),
+            reverse.replace("<ColorTransformationList>", "<ColorTransformationList automaticConversion=\"true\">"),
+            reverse.replace("</ColorTransformationList>", "<ColorTransformation><Matrix3x3/></ColorTransformation></ColorTransformationList>"),
+        ] {
+            assert_eq!(SourceColorStack::from_saved_xml(&changed), None);
+        }
     }
 
     #[test]

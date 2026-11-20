@@ -1,6 +1,7 @@
 //! Track operations (port of `py_premiere/models/track.py`: `add_clip`, `add_transition` and
 //! the element builders they use).
 
+use super::footage::FootageInterpretation;
 use super::project::py_int;
 use super::track_item::py_div_trunc;
 use super::{ItemId, MediaType, Project, TrackId, TrackItemData, TrackItemId};
@@ -132,7 +133,21 @@ pub fn new_video_track_item_element(
     let mut aspect = "1,1".to_string();
     let mut frame_rect = None;
     if let Some(stream) = video_stream {
-        aspect = tree.findtext(stream, "PixelAspectRatio")?.filter(|t| !t.is_empty()).unwrap_or_else(|| "1,1".into());
+        let interpretation = FootageInterpretation { stream, source: None };
+        let native = interpretation.stored_pixel_aspect_ratio(tree)
+            .filter(|ratio| !ratio.is_empty());
+        aspect = if let Some(ratio) = native {
+            let (n, d) = ratio.split_once(',')
+                .ok_or_else(|| Error::Value("invalid saved pixel aspect ratio".into()))?;
+            if py_int(n)? <= 0 || py_int(d)? <= 0 {
+                return value("invalid saved pixel aspect ratio");
+            }
+            ratio
+        } else {
+            tree.findtext(stream, "PixelAspectRatio")?
+                .filter(|ratio| !ratio.is_empty())
+                .unwrap_or_else(|| "1,1".into())
+        };
         frame_rect = tree.findtext(stream, "FrameRect")?;
     }
     leaf(tree, e, "PixelAspectRatio", &aspect, "\n\t\t");

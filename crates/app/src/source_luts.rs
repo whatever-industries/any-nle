@@ -1,11 +1,11 @@
 //! Qualify saved Avid source color controls for one Premiere picture edit.
 use crate::source_input::{original_stamp, recheck_originals, OriginalStamp};
-use avid_reader::source::{is_canonical_external_cube, SourceColorRange, SourceInput};
+use avid_reader::source::{is_canonical_external_cube, SourceColorRange, SourceColorStack, SourceInput};
 use graph::{source::SourceGraph, Rational, StreamKind, Value};
 use prproj::{
     convert::{
         model::{ticks_per_unit, Fraction, TICKS_PER_SECOND},
-        prepared::{supported_extended_sdr_edit, PictureEffect, PreparedClip, PreparedPictureEffect, PreparedSourceLut},
+        prepared::{supports_picture_motion_clock, supported_extended_sdr_edit, PictureEffect, PreparedClip, PreparedPictureEffect, PreparedSourceLut},
     },
     xml::{NodeId, Tree},
 };
@@ -54,40 +54,63 @@ pub(crate) enum ColorMedia {
     Rewrap,
 }
 
-fn adapter(row: &Value, media: ColorMedia) -> Option<&Value> {
+struct Adapter<'a> {
+    facts: &'a Value,
+    owner: &'a str,
+    reordered: bool,
+    stack: Option<SourceColorStack<'a>>,
+}
+
+fn adapter(row: &Value, media: ColorMedia) -> Option<Adapter<'_>> {
+    if text(row, "effect_id") != Some("EFF2_LUTSFX") {
+        return None;
+    }
     let facts = row.get("color_adapter")?;
     let xml = text(facts, "text")?;
-    let managed = facts.get("managed_picture_span").is_some() && is_expansion(xml);
+    let neutral = facts.get("neutral_wrapper") == Some(&Value::Bool(true));
+    if let Some(stack) = SourceColorStack::from_saved_xml(xml) {
+        if facts.get("subclip_motion").is_some() {
+            return None;
+        }
+        let (owner, reordered) = if neutral && text(facts, "picture_file").is_some() {
+            (text(facts, "placement")?, false)
+        } else {
+            let proof = facts.get("reordered_picture_source")?;
+            text(proof, "picture_file")?;
+            (text(proof, "placement")?, true)
+        };
+        return Some(Adapter { facts, owner, reordered, stack: Some(stack) });
+    }
+    let range = SourceColorRange::from_saved_xml(xml);
+    let expand = range == Some(SourceColorRange::VideoToFull);
+    let managed = facts.get("managed_picture_span").is_some() && expand;
     let nested = nested_picture_file(facts).is_some()
-        && (facts.get("neutral_wrapper") == Some(&Value::Bool(true))
+        && (neutral
             || (media == ColorMedia::Rewrap && facts.get("managed_picture_span").is_some()));
     let qualified_shape = match media {
-        ColorMedia::Linked => facts.get("neutral_wrapper") == Some(&Value::Bool(true))
-            && (xml.contains("<ExternalLut>") || is_expansion(xml)),
-        ColorMedia::Rewrap => managed || (nested && (is_expansion(xml)
+        ColorMedia::Linked => neutral
+            && (xml.contains("<ExternalLut>") || expand
+                || (!nested && range == Some(SourceColorRange::FullToVideo))),
+        ColorMedia::Rewrap => managed || (nested && (expand
             || (facts.get("managed_picture_span").is_some() && is_canonical_external_cube(xml)))),
     };
-    (text(row, "effect_id") == Some("EFF2_LUTSFX")
-        && qualified_shape
-        && (nested || text(facts, "picture_file").is_some())
-        && text(facts, "placement").is_some())
-    .then_some(facts)
+    (qualified_shape && (nested || text(facts, "picture_file").is_some()))
+        .then_some(Adapter { facts, owner: text(facts, "placement")?, reordered: false, stack: None })
 }
 
 fn nested_picture_file(facts: &Value) -> Option<&str> {
     text(facts.get("subclip_motion")?, "sampled_picture_file")
 }
 
-fn is_expansion(xml: &str) -> bool {
-    SourceColorRange::from_saved_xml(xml) == Some(SourceColorRange::VideoToFull)
-}
-
-fn matches_range_source(source: Option<&Value>, package: &str, xml: &str) -> bool {
-    matches!(source.and_then(|source| source.get("input_color_transforms")), Some(Value::Arr(rows))
-        if matches!(rows.as_slice(), [row]
-            if text(row, "owner_mob") == Some(package)
-                && text(row, "text") == Some(xml)
-                && row.get("track") == Some(&Value::Int(1))))
+fn source_transform<'a>(source: Option<&'a Value>, package: &str) -> Option<&'a str> {
+    let Some(Value::Arr(rows)) = source.and_then(|source| source.get("input_color_transforms")) else {
+        return None;
+    };
+    let [row] = rows.as_slice() else { return None };
+    if text(row, "owner_mob") != Some(package) || row.get("track") != Some(&Value::Int(1)) {
+        return None;
+    }
+    text(row, "text")
 }
 
 pub(crate) fn has_candidates(graph: &SourceGraph, media: ColorMedia) -> bool {
@@ -177,6 +200,26 @@ fn xml_lut(xml: &str, list: bool) -> Option<(String, String)> {
 
 type Cube = [(f64, f64, f64); 8];
 type EmbeddedCube = (u32, Arc<[(f64, f64, f64)]>);
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum CubeUse {
+    Affine,
+    Retimed,
+    Ordered { cube_first: bool },
+}
+
+impl CubeUse {
+    fn filename(self, filename: &str) -> String {
+        match self {
+            Self::Ordered { cube_first } => {
+                let stem = filename.strip_suffix(".cube").unwrap_or(filename);
+                let order = if cube_first { " - cube then range.cube" } else { " - range then cube.cube" };
+                format!("{}{order}", &stem[..stem.len().min(128 - order.len())])
+            }
+            _ => filename.to_owned(),
+        }
+    }
+}
 
 fn rgb(mut fields: std::str::SplitWhitespace<'_>) -> Option<[f64; 3]> {
     let point = [
@@ -280,6 +323,46 @@ fn affine_corners(points: &[[f64; 3]], edge: usize) -> Option<Cube> {
     Some(corners.map(|[r, g, b]| (r, g, b)))
 }
 
+fn tetrahedral(points: &[[f64; 3]], edge: usize, rgb: [f64; 3]) -> [f64; 3] {
+    // The Avid cube lookup clamps its inputs and uses a red-fastest lattice.
+    let last = edge - 1;
+    let coordinate = rgb.map(|component| component.clamp(0.0, 1.0) * last as f64);
+    let base = coordinate.map(|value| (value as usize).min(last - 1));
+    let fraction = std::array::from_fn::<_, 3, _>(|axis| coordinate[axis] - base[axis] as f64);
+    let strides = [1, edge, edge * edge];
+    let mut order = [0, 1, 2];
+    order.sort_by(|&a, &b| fraction[b].total_cmp(&fraction[a]));
+    let mut index = base[0] + edge * base[1] + edge * edge * base[2];
+    let mut result = points[index];
+    for axis in order {
+        let before = points[index];
+        index += strides[axis];
+        for channel in 0..3 {
+            result[channel] += fraction[axis] * (points[index][channel] - before[channel]);
+        }
+    }
+    result
+}
+
+fn ordered_cube(points: &[[f64; 3]], edge: usize, cube_first: bool) -> Result<EmbeddedCube, String> {
+    let expand = |rgb: [f64; 3]| rgb.map(|v| {
+        let black = SourceColorRange::VIDEO_BLACK as f64;
+        let white = SourceColorRange::VIDEO_WHITE as f64;
+        (v * ((1 << SourceColorRange::BIT_DEPTH) - 1) as f64 - black) / (white - black)
+    });
+    let output_edge = PreparedSourceLut::ORDERED_EDGE;
+    let points = prproj::convert::avid_color::cube_lut(&|r, g, b| {
+        let rgb = [r, g, b];
+        let [r, g, b] = if cube_first {
+            expand(tetrahedral(points, edge, rgb))
+        } else {
+            tetrahedral(points, edge, expand(rgb))
+        };
+        (r, g, b)
+    }, i64::from(output_edge)).map_err(|error| error.to_string())?;
+    Ok((output_edge, points.into()))
+}
+
 fn read_asset(path: PathBuf, byte_limit: u64) -> Result<(String, SourceInput), String> {
     let metadata = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !metadata.is_file() || metadata.len() > byte_limit {
@@ -301,7 +384,7 @@ fn read_asset(path: PathBuf, byte_limit: u64) -> Result<(String, SourceInput), S
     Ok((contents, SourceInput { path, revision }))
 }
 
-fn load(folder: &Path, name: &str, filename: &str, full_grid: bool) -> Result<(EmbeddedCube, [SourceInput; 2]), String> {
+fn load(folder: &Path, name: &str, filename: &str, usage: CubeUse) -> Result<(EmbeddedCube, [SourceInput; 2]), String> {
     let (descriptor, descriptor_pin) = read_asset(
         folder.join(filename).with_extension("xml"),
         MAX_DESCRIPTOR_BYTES,
@@ -310,19 +393,21 @@ fn load(folder: &Path, name: &str, filename: &str, full_grid: bool) -> Result<(E
         return Err("the project LUT descriptor disagrees with the edit's saved transform".into());
     }
     let (contents, cube_pin) = read_asset(folder.join(filename), MAX_CUBE_BYTES)?;
-    let error = if full_grid {
-        "the retimed LUT needs a complete 33×33×33 cube with a unit RGB domain"
-    } else {
-        "use a complete affine cube with edge length 2–65 and an explicit unit RGB domain"
+    let error = match usage {
+        CubeUse::Affine => "use a complete affine cube with edge length 2–65 and an explicit unit RGB domain",
+        CubeUse::Retimed => "the retimed LUT needs a complete 33×33×33 cube with a unit RGB domain",
+        CubeUse::Ordered { .. } => "the ordered Color Adapter needs a complete 33×33×33 cube with an explicit unit RGB domain",
     };
-    let (edge, samples) = cube_samples(&contents, full_grid).ok_or(error)?;
-    let grid = if full_grid {
-        if edge as u32 != PreparedSourceLut::FULL_EDGE {
-            return Err(error.into());
+    let (edge, samples) = cube_samples(&contents, usage == CubeUse::Retimed).ok_or(error)?;
+    let grid = match usage {
+        CubeUse::Affine => (2, Arc::from(affine_corners(&samples, edge).ok_or(error)?)),
+        CubeUse::Retimed if edge as u32 == PreparedSourceLut::FULL_EDGE => {
+            (edge as u32, samples.into_iter().map(|[r, g, b]| (r, g, b)).collect())
         }
-        (edge as u32, samples.into_iter().map(|[r, g, b]| (r, g, b)).collect())
-    } else {
-        (2, Arc::from(affine_corners(&samples, edge).ok_or(error)?))
+        CubeUse::Ordered { cube_first } if edge as u32 == PreparedSourceLut::FULL_EDGE => {
+            ordered_cube(&samples, edge, cube_first)?
+        }
+        _ => return Err(error.into()),
     };
     Ok((grid, [descriptor_pin, cube_pin]))
 }
@@ -402,6 +487,7 @@ pub(crate) fn apply(
     bins: &[SourceInput],
     ffprobe: &Path,
     color_media: ColorMedia,
+    approved_managed: Option<&HashSet<&str>>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<Applied, String> {
     let mut result = Applied::default();
@@ -434,12 +520,13 @@ pub(crate) fn apply(
         .filter(|sidecar| sidecar.adapter == "avid.nested_motion")
         .map(|sidecar| sidecar.object.as_str())
         .collect();
-    let mut cubes = HashMap::new();
+    let mut cubes = HashMap::<(PathBuf, String, String, CubeUse), _>::new();
     let mut pictures = HashMap::new();
     let mut managed_pictures = HashMap::new();
     let mut managed_picture_budget = MANAGED_PICTURE_BUDGET;
     let mut full_grid_edits = 0;
-    let mut pinned = HashSet::new();
+    let mut ordered_edits = 0;
+    let mut pinned = HashMap::<PathBuf, String>::new();
     let mut verified_pictures = HashSet::new();
     for (sequence_index, source) in graph.sequences.iter().enumerate() {
         let Some(sidecar) = sidecars.get(source.id.as_str()) else {
@@ -453,9 +540,10 @@ pub(crate) fn apply(
         let Some(sequence) = prepared.input.sequences.get(sequence_index) else {
             continue;
         };
-        let rate = Rational::integer(24);
-        if source.rate != rate
-            || sequence.rate != Fraction::new(24, 1)
+        let rate = source.rate;
+        let legacy_clock = rate == Rational::integer(24);
+        if sequence.rate != Fraction::new(rate.num(), rate.den())
+            || !supports_picture_motion_clock(sequence.rate)
             || (sequence.width, sequence.height) != (1920, 1080)
             || source
                 .frame_size
@@ -468,10 +556,8 @@ pub(crate) fn apply(
                 || source.transitions.iter().any(|t| t.kind == StreamKind::Video));
         let candidates: Vec<_> = issues.iter().filter_map(|row| adapter(row, color_media)).collect();
         let mut counts = HashMap::new();
-        for facts in &candidates {
-            *counts
-                .entry(text(facts, "placement").unwrap())
-                .or_insert(0usize) += 1;
+        for candidate in &candidates {
+            *counts.entry(candidate.owner).or_insert(0usize) += 1;
         }
         let placements: HashMap<_, _> = source
             .placements
@@ -497,16 +583,21 @@ pub(crate) fn apply(
                     .flatten()
             })
             .collect();
-        for facts in candidates {
+        for Adapter { facts, owner, reordered, stack } in candidates {
             check()?;
-            let owner = text(facts, "placement").unwrap();
             if counts[owner] != 1 {
                 continue;
             }
             let nested = nested_owners.contains(owner);
-            // Plain range expansion belongs to one opaque picture edit.
+            let xml = text(facts, "text").unwrap();
+            let range = SourceColorRange::from_saved_xml(xml);
+            let expand = range == Some(SourceColorRange::VideoToFull);
+            // A plain range transform belongs to one opaque picture edit.
             // Other linked Color Adapter profiles keep their original layout checks.
-            let plain_range = !nested && text(facts, "text").is_some_and(is_expansion);
+            let plain_range = !nested && range.is_some();
+            if !legacy_clock && (!plain_range || color_media != ColorMedia::Linked) {
+                continue;
+            }
             if linked_stack_or_dissolve && !plain_range {
                 continue;
             }
@@ -514,8 +605,9 @@ pub(crate) fn apply(
                 if !nested && !plain_color_events.contains(owner) {
                     return Err("the Color Adapter is part of an unqualified picture stack".into());
                 }
-                let xml = text(facts, "text").ok_or("missing saved color descriptor")?;
-                let expand = is_expansion(xml);
+                if range == Some(SourceColorRange::FullToVideo) && nested {
+                    return Err("full-to-video scaling requires a plain linked picture edit".into());
+                }
                 let placement = placements
                     .get(owner)
                     .filter(|p| {
@@ -533,6 +625,11 @@ pub(crate) fn apply(
                     return Err("the Color Adapter is on a video transition endpoint".into());
                 }
                 let id = placement.item.as_str();
+                let rewrap_picture = color_media == ColorMedia::Rewrap || stack.is_some()
+                    && approved_managed.is_some_and(|items| items.contains(id));
+                if stack.is_some() && !rewrap_picture {
+                    return Err("ordered Color Adapter requires a verified managed ProRes LT rewrap".into());
+                }
                 let item = items.get(id).ok_or("unresolved source item")?;
                 let [binding] = &item
                     .media
@@ -547,16 +644,24 @@ pub(crate) fn apply(
                     return Err("source item needs one known picture file".into());
                 };
                 let picture = media[binding.media.as_str()];
-                let frames = picture
-                    .duration
-                    .to_units(24)
+                let frames = Rational::new(
+                    i128::from(picture.duration.num()) * i128::from(rate.num()),
+                    i128::from(picture.duration.den()) * i128::from(rate.den()),
+                )
+                    .filter(|count| count.den() == 1 && count.num() > 0)
+                    .map(Rational::num)
                     .ok_or("unknown source picture duration")?;
                 let [path] = picture.locations.as_slice() else {
                     return Err("ambiguous picture path".into());
                 };
                 let clip = id.strip_prefix("clip:").unwrap_or(id);
-                let package = if nested { nested_picture_file(facts) } else { text(facts, "picture_file") }
-                    .ok_or("missing saved picture package")?;
+                let package = if reordered {
+                    facts.get("reordered_picture_source").and_then(|row| text(row, "picture_file"))
+                } else if nested {
+                    nested_picture_file(facts)
+                } else {
+                    text(facts, "picture_file")
+                }.ok_or("missing saved picture package")?;
                 if picture.online != Some(true)
                     || picture.rate != Some(rate)
                     || picture.frame_size != Some((1920, 1080))
@@ -564,7 +669,7 @@ pub(crate) fn apply(
                 {
                     return Err("the edit does not use a qualified online picture".into());
                 }
-                if expand || color_media == ColorMedia::Rewrap {
+                if range.is_some() || rewrap_picture {
                     let saved_picture = sidecars.get(binding.media.as_str()).copied();
                     let saved_package = package.strip_prefix("urn:smpte:umid:")
                         .map(|package| package.replace('.', ""));
@@ -575,13 +680,16 @@ pub(crate) fn apply(
                                     id.eq_ignore_ascii_case(package))
                             })
                     });
-                    let qualified_media = match color_media {
+                    let picture_mode = if rewrap_picture { ColorMedia::Rewrap } else { ColorMedia::Linked };
+                    let qualified_media = match picture_mode {
                         ColorMedia::Linked if nested => matches!(clips.get(clip), Some(PreparedClip::Legacy(c))
                             if c.video.as_ref().is_some_and(|v| &v.path == path && v.codec == "AVdn"))
                             && picture.original.is_none() && picture.start == Some(Rational::ZERO),
                         ColorMedia::Linked => matches!(clips.get(clip), Some(PreparedClip::Original(c))
                             if &c.path == path && c.audio.is_none() && c.proxy_path.is_none()
-                                && c.video.as_ref().is_some_and(|v| v.codec == "apch"))
+                                && c.video.as_ref().is_some_and(|v|
+                                    (legacy_clock && v.codec == "apch")
+                                        || (plain_range && v.codec == "avc1")))
                             && picture.original.as_ref().is_some_and(|binding|
                                 binding.container == "mov" && binding.stream_index == 0),
                         ColorMedia::Rewrap => matches!(clips.get(clip), Some(PreparedClip::Legacy(c))
@@ -590,15 +698,24 @@ pub(crate) fn apply(
                             && picture.original.is_none() && picture.start == Some(Rational::integer(0)),
                     };
                     let source = sidecars.get(id).copied();
-                    let source_matches = matches_range_source(source, package, xml);
-                    let edit_owned = (nested || (color_media == ColorMedia::Rewrap
+                    let saved_transform = source_transform(source, package);
+                    let source_matches = if reordered {
+                        stack.zip(saved_transform.and_then(SourceColorStack::from_saved_xml))
+                            .is_some_and(|(edit, file)| edit.is_reordered(file))
+                    } else {
+                        saved_transform == Some(xml)
+                    };
+                    let edit_owned = stack.is_none() && (nested || (color_media == ColorMedia::Rewrap
                         && facts.get("managed_picture_span").is_some()))
                         && source.and_then(|s| s.get("input_color_transforms")).is_none();
                     if !qualified_media || !same_package || !(source_matches || edit_owned)
                     {
+                        if stack.is_some() {
+                            return Err("ordered Color Adapter requires matching saved transforms and the picture-only Avid ProRes LT package".into());
+                        }
                         return Err(match color_media {
                             ColorMedia::Linked if nested => "nested range expansion requires its verified managed DNxHD package and matching color controls",
-                            ColorMedia::Linked => "range expansion requires the saved source transform on its original picture-only ProRes HQ MOV",
+                            ColorMedia::Linked => "range scaling requires the saved source transform on its verified picture-only MOV",
                             ColorMedia::Rewrap if expand => "range expansion requires matching saved transforms and the picture-only Avid ProRes LT rewrap",
                             ColorMedia::Rewrap => "the retimed source LUT requires matching saved transforms and the picture-only Avid ProRes LT rewrap",
                         }.into());
@@ -647,28 +764,55 @@ pub(crate) fn apply(
                 {
                     return Err("the destination edit already carries a picture effect".into());
                 }
-                let external = if expand {
+                if stack.is_some() && (nested || placement.video_track != Some(1) || !legacy_clock
+                    || placement.source_in.to_units(24).map(Value::Int).as_ref() != facts.get("source_in"))
+                {
+                    return Err("ordered Color Adapter requires one exact, unretimed V1 picture trim".into());
+                }
+                let external = if range.is_some() {
                     None
                 } else {
-                    let full_grid = nested && color_media == ColorMedia::Rewrap;
-                    if full_grid && full_grid_edits == PreparedSourceLut::MAX_FULL_GRID_EDITS {
+                    let usage = match stack {
+                        Some(stack) => CubeUse::Ordered { cube_first: stack.cube_first },
+                        None if nested && color_media == ColorMedia::Rewrap => CubeUse::Retimed,
+                        None => CubeUse::Affine,
+                    };
+                    if usage == CubeUse::Retimed && full_grid_edits == PreparedSourceLut::MAX_FULL_GRID_EDITS {
                         return Err("the project exceeds the supported number of full-grid retimed LUT edits".into());
                     }
-                    let (name, filename) = xml_lut(xml, true).ok_or("unqualified external LUT descriptor")?;
-                    let folder = project_lut_folder(&source.id, bins, full_grid)?;
-                    let key = (folder, name, filename.clone(), full_grid);
+                    if stack.is_some() && ordered_edits == PreparedSourceLut::MAX_ORDERED_EDITS {
+                        return Err("the project exceeds the supported number of ordered Color Adapter edits".into());
+                    }
+                    let (name, filename) = match stack {
+                        Some(stack) => (stack.cube_name.to_owned(), stack.cube_file.to_owned()),
+                        None => xml_lut(xml, true).ok_or("unqualified external LUT descriptor")?,
+                    };
+                    let folder = project_lut_folder(&source.id, bins, usage != CubeUse::Affine)?;
+                    let output_name = usage.filename(&filename);
+                    let key = (folder, name, filename, usage);
                     if !cubes.contains_key(&key) && cubes.len() == MAX_DISTINCT_LUT_INPUTS {
                         return Err("project exceeds the supported number of distinct LUT assets".into());
                     }
+                    if stack.is_some() && !cubes.contains_key(&key)
+                        && cubes.keys().filter(|key| matches!(key.3, CubeUse::Ordered { .. })).count()
+                            == PreparedSourceLut::MAX_ORDERED_EDITS
+                    {
+                        return Err("project exceeds the supported number of ordered LUT tables".into());
+                    }
                     let (grid, inputs) = cubes
                         .entry(key)
-                        .or_insert_with_key(|(folder, name, filename, full_grid)| load(folder, name, filename, *full_grid))
+                        .or_insert_with_key(|(folder, name, filename, usage)| load(folder, name, filename, *usage))
                         .as_ref()
                         .map_err(Clone::clone)?;
-                    Some((filename, grid, inputs))
+                    if inputs.iter().any(|input| pinned.get(&input.path)
+                        .is_some_and(|revision| revision != &input.revision))
+                    {
+                        return Err("the project LUT assets changed during preparation".into());
+                    }
+                    Some((output_name, grid, inputs))
                 };
-                let picture_key = (path, package, frames, expand);
-                let stamp = if color_media == ColorMedia::Rewrap {
+                let picture_key = (path, package, frames, rate, range.is_some());
+                let stamp = if rewrap_picture {
                     let saved_bytes = if let Some(span) = facts.get("managed_picture_span") {
                         let (Some(Value::Int(offset)), Some(Value::Int(bytes))) =
                             (span.get("offset"), span.get("length"))
@@ -676,7 +820,7 @@ pub(crate) fn apply(
                             return Err("missing saved picture byte bounds".into());
                         };
                         Some((*offset, *bytes))
-                    } else if nested {
+                    } else if nested || stack.is_some() {
                         None
                     } else {
                         return Err("no saved managed picture range".into());
@@ -698,8 +842,12 @@ pub(crate) fn apply(
                         recheck_originals(std::slice::from_ref(&stamp))?;
                         Ok::<_, String>((stamp, indexed))
                     }).as_ref().map_err(Clone::clone)?;
-                    if nested && !indexed.contains_frames(start, length) {
-                        return Err("the nested Color Adapter source trim exceeds the indexed picture".into());
+                    if (nested || stack.is_some()) && !indexed.contains_frames(start, length) {
+                        return Err(if nested {
+                            "the nested Color Adapter source trim exceeds the indexed picture"
+                        } else {
+                            "the ordered Color Adapter source trim exceeds the indexed picture"
+                        }.into());
                     }
                     if let Some((offset, bytes)) = saved_bytes {
                         indexed.verify_span(start, if nested { length - 1 } else { length }, offset, bytes)?;
@@ -719,8 +867,10 @@ pub(crate) fn apply(
                         let path = linked.canonicalize().map_err(|e| e.to_string())?;
                         if nested {
                             crate::rewrap::verify_dnxhd_range_picture(&path, ffprobe, frames, package)?;
-                        } else if expand {
-                            avid_adapter::original::verify_range_expansion_picture(&path, ffprobe, frames)?;
+                        } else if plain_range && picture.codec.as_deref() == Some("avc1") {
+                            avid_adapter::original::verify_avc_range_scale_picture(&path, ffprobe, rate, frames)?;
+                        } else if range.is_some() {
+                            avid_adapter::original::verify_range_scale_picture(&path, ffprobe, frames)?;
                         } else {
                             avid_adapter::original::verify_source_lut_picture(&path, ffprobe, package, frames)?;
                         }
@@ -741,7 +891,7 @@ pub(crate) fn apply(
                 );
                 if let Some((filename, (edge, points), inputs)) = external {
                     for input in inputs {
-                        if pinned.insert(input.path.clone()) {
+                        if pinned.insert(input.path.clone(), input.revision.clone()).is_none() {
                             result.inputs.push(input.clone());
                         }
                     }
@@ -749,19 +899,24 @@ pub(crate) fn apply(
                         sequence: sequence_index, event, filename: filename.clone(), edge: *edge, points: points.clone(),
                     });
                     full_grid_edits += usize::from(*edge == PreparedSourceLut::FULL_EDGE);
-                    let operation = if *edge == 2 { "Color Mode LUT" } else { "Lumetri Look" };
+                    ordered_edits += usize::from(stack.is_some());
+                    let operation = if *edge == PreparedSourceLut::FULL_EDGE { "Lumetri Look" } else { "Color Mode LUT" };
                     prepared.diagnostics.push(format!(
                         "{subject}: embedded {filename:?} as an editable clip {operation}."
                     ));
                 } else {
+                    let (effect, direction) = match range.ok_or("missing saved range transform")? {
+                        SourceColorRange::VideoToFull => (PictureEffect::VideoToFullRange, "video-to-full-range"),
+                        SourceColorRange::FullToVideo => (PictureEffect::FullToVideoRange, "full-range-to-video"),
+                    };
                     prepared.input.picture_effects.push(PreparedPictureEffect {
                         sequence: sequence_index,
                         event,
-                        effect: PictureEffect::VideoToFullRange,
+                        effect,
                         reflection_before_motion: [false; 2],
                     });
                     prepared.diagnostics.push(format!(
-                        "{subject}: applied Avid video-to-full-range scaling as editable ASC CDL."
+                        "{subject}: applied Avid {direction} scaling as editable ASC CDL."
                     ));
                 }
                 result.recovered.insert(owner.into());
@@ -775,10 +930,10 @@ pub(crate) fn apply(
                     placement.and_then(|p| p.video_track).unwrap_or(1),
                     placement.map(|p| p.record_start),
                 );
-                let control = if text(facts, "text").is_some_and(is_expansion) {
-                    "range expansion"
-                } else {
-                    "source LUT"
+                let control = match range {
+                    Some(SourceColorRange::VideoToFull) => "range expansion",
+                    Some(SourceColorRange::FullToVideo) => "full-range-to-video scaling",
+                    None => "source LUT",
                 };
                 prepared.diagnostics.push(format!("{subject}: {control} unavailable: {reason}."));
             }
@@ -794,6 +949,51 @@ pub(crate) fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_cube_keeps_the_saved_order_and_only_clamps_cube_inputs() {
+        let mut corners = [[0.0; 3]; 8];
+        corners[7] = [1.0, 0.0, 0.0];
+        assert_eq!(tetrahedral(&corners, 2, [0.8, 0.4, 0.2]), [0.2, 0.0, 0.0]);
+        let (_, before) = ordered_cube(&corners, 2, false).unwrap();
+        let (_, after) = ordered_cube(&corners, 2, true).unwrap();
+        assert_eq!(before[0], (0.0, 0.0, 0.0));
+        assert_eq!(after[0], (-64.0 / 876.0, -64.0 / 876.0, -64.0 / 876.0));
+        assert_eq!(before.last().unwrap().0, 1.0);
+        assert_eq!(after.last().unwrap().0, 959.0 / 876.0);
+    }
+
+    #[test]
+    fn full_to_video_requires_the_saved_direction_and_a_plain_linked_adapter() {
+        let xml = concat!(
+            "<ColorTransformationList><ColorTransformation><LinearLut>",
+            "<Name>Levels scaling (full range to video levels)</Name><BitDepth>10</BitDepth>",
+            "<Black>64</Black><White>940</White><Inverted/></LinearLut></ColorTransformation>",
+            "</ColorTransformationList>",
+        );
+        let row = |text: &str, neutral, nested| {
+            let mut facts = vec![
+                ("text".into(), Value::Str(text.into())),
+                ("neutral_wrapper".into(), Value::Bool(neutral)),
+                ("picture_file".into(), Value::Str("file".into())),
+                ("placement".into(), Value::Str("edit".into())),
+            ];
+            if nested {
+                facts.push(("subclip_motion".into(), Value::Obj(vec![
+                    ("sampled_picture_file".into(), Value::Str("file".into())),
+                ])));
+            }
+            Value::Obj(vec![
+                ("effect_id".into(), Value::Str("EFF2_LUTSFX".into())),
+                ("color_adapter".into(), Value::Obj(facts)),
+            ])
+        };
+        assert!(adapter(&row(xml, true, false), ColorMedia::Linked).is_some());
+        assert!(adapter(&row(xml, true, false), ColorMedia::Rewrap).is_none());
+        assert!(adapter(&row(xml, true, true), ColorMedia::Linked).is_none());
+        assert!(adapter(&row(xml, false, false), ColorMedia::Linked).is_none());
+        assert!(adapter(&row(&xml.replace("<Inverted/>", ""), true, false), ColorMedia::Linked).is_none());
+    }
 
     #[test]
     fn cube_requires_the_exact_domain_and_an_affine_lattice() {

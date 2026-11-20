@@ -300,10 +300,17 @@ control changed the opaque clip state while the effect payload continued
 to identify the saved choice. The [linked writer](RESOLVE-TURNOVER-IMPLEMENTATION.md#automatic-native-media-import-fallback)
 preserves inherited Center Crop as an editable clip setting for qualified
 assisted picture edits. For paired picture
-edits, the report also compares the supported single-node primary gain
-and identifies an added or removed grade. It validates the value
-against the saved node body and treats other grade profiles as
-inconclusive. Paired audio edits compare saved Voice Isolation and
+edits, the report also compares supported single-node primary gain,
+equal RGB CDL slopes, and both recognized range shifts. It identifies
+an added or removed grade and treats unknown grade controls as
+inconclusive. A clip-owned Fusion composition retains its payload size,
+hashes and active index when saved on an ordinary video edit. Unmapped
+compositions contribute an occurrence-specific effect omission. The linked
+writer can generate an editable Corner Positioner from qualified graph/2
+targets. The reader retains the resulting composition receipt, and
+staged read-back verifies the saved bytes on the exact edit.
+[Static Corner Pin scope](SOURCE-GRAPH-MIGRATION.md#static-avid-corner-pin).
+Paired audio edits compare saved Voice Isolation and
 Dialogue Leveler records by effect ID, including raw flags and decoded
 parameters. Changed clip FX payloads also report a gap for any settings
 outside the decoded fields. Plain subtitle cues

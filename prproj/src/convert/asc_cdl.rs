@@ -2,10 +2,10 @@ use crate::build::{leaf, top};
 use crate::model::{Project, TrackItemId};
 use crate::{Error, Result};
 
-pub(super) fn apply_video_to_full(project: &mut Project, item: TrackItemId) -> Result<()> {
+pub(super) fn apply_range_scale(project: &mut Project, item: TrackItemId, video_to_full: bool) -> Result<()> {
     let item = project.track_item(item).element;
     let reference = project.doc.tree.find1(item, "ClipTrackItem/ComponentOwner/Components")
-        .ok_or_else(|| Error::Value("range expansion has no picture component chain".into()))?;
+        .ok_or_else(|| Error::Value("range scaling has no picture component chain".into()))?;
     let chain = project.doc.resolve(reference)?;
     let tree = &mut project.doc.tree;
     let effect = top(tree, "VideoFilterComponent", "d10da199-beea-4dd1-b941-ed3a78766d50", "9", None);
@@ -21,10 +21,13 @@ pub(super) fn apply_video_to_full(project: &mut Project, item: TrackItemId) -> R
     leaf(tree, effect, "MatchName", "AE.ADBE AEASCCDL", "\n\t");
     project.register(effect)?;
 
-    // Premiere supplies RGB normalized to video levels. Keep the expanded
-    // endpoints outside 0..1 so its Rec.709 output can retain the excursions.
-    let slope = 1023.0 / (940.0 - 64.0);
-    let offset = -64.0 / (940.0 - 64.0);
+    // Premiere supplies RGB normalized to video levels. The inverse maps
+    // full-range codes 0 and 1023 back to the nominal 10-bit video endpoints.
+    let (slope, offset) = if video_to_full {
+        (1023.0 / (940.0 - 64.0), -64.0 / (940.0 - 64.0))
+    } else {
+        ((940.0 - 64.0) / 1023.0, 64.0 / 1023.0)
+    };
     let controls = [
         ("Red Slope", slope, "0"), ("Red Offset", offset, "-10"), ("Red Power", 1.0, "0"),
         ("Green Slope", slope, "0"), ("Green Offset", offset, "-10"), ("Green Power", 1.0, "0"),

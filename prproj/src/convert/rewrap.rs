@@ -99,6 +99,13 @@ pub struct MediaRelink {
     pub separate_mono: bool,
 }
 
+impl MediaRelink {
+    pub(super) fn is_separate_mono_wav(&self) -> bool {
+        self.audio_stream == Some(0) && self.separate_mono
+            && std::path::Path::new(&self.target_path).extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+    }
+}
 fn invalid(message: String) -> WriteError {
     WriteError::Other(crate::Error::Value(message))
 }
@@ -133,16 +140,23 @@ pub fn validate_audio_formats(model: &super::model::Model, mappings: &[MediaReli
 }
 
 pub fn apply(project: &mut Project, mappings: &[MediaRelink]) -> Result<()> {
-    apply_views(project, mappings, true)
+    apply_views(project, mappings, true, &HashSet::new())
 }
 
 /// Native masters use full-source templates and channel vectors. Narrowing the
 /// Media would make Premiere collapse a stereo bin template to mono on read-back.
 pub fn apply_native(project: &mut Project, mappings: &[MediaRelink]) -> Result<()> {
-    apply_views(project, mappings, false)
+    apply_views(project, mappings, false, &HashSet::new())
 }
 
-fn apply_views(project: &mut Project, mappings: &[MediaRelink], narrow: bool) -> Result<()> {
+const DNXHR_444_RGB: &str = r#"{"baseColorProfile":{"colorProfileName":"1,1,1,Full,RGB,32f,Display-Referred"},"baseProfileType":1,"colorSpaceMetadata":{"dataRangeInfoValid":1}}"#;
+
+pub(super) fn apply_views(
+    project: &mut Project,
+    mappings: &[MediaRelink],
+    narrow: bool,
+    dnxhr_444_rgb_sources: &HashSet<String>,
+) -> Result<()> {
     let mut by_path = HashMap::new();
     let mut channels: HashMap<&str, HashSet<u32>> = HashMap::new();
     let mut layouts = HashMap::new();
@@ -180,6 +194,15 @@ fn apply_views(project: &mut Project, mappings: &[MediaRelink], narrow: bool) ->
             ));
         }
     }
+    if dnxhr_444_rgb_sources.iter().any(|path| {
+        !by_path.get(path.as_str()).is_some_and(|mapping| {
+            mapping.audio_stream.is_none()
+                && std::path::Path::new(&mapping.target_path).extension()
+                    .and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("mxf"))
+        })
+    }) {
+        return Err(invalid("DNxHR 444 source color requires a bound MXF picture".into()));
+    }
     let dir = project
         .path()
         .parent()
@@ -191,6 +214,24 @@ fn apply_views(project: &mut Project, mappings: &[MediaRelink], narrow: bool) ->
     let mut states = HashMap::new();
     let mut state_remap = HashMap::new();
     for node in nodes {
+        if !dnxhr_444_rgb_sources.is_empty() && project.doc.tree.tag(node) == "Media"
+            && project.doc.tree.child_by_tag(node, "FilePath")
+                .and_then(|path| project.doc.tree.text(path))
+                .is_some_and(|path| dnxhr_444_rgb_sources.contains(path))
+        {
+            let e = project.doc.tree.child_by_tag(node, "VideoStream")
+                .ok_or_else(|| invalid("DNxHR 444 binding lacks a video stream".into()))?;
+            let stream = project.doc.resolve(e)?;
+            let tree = &mut project.doc.tree;
+            if tree.findtext(stream, "CodecType")?.and_then(|value| value.parse().ok())
+                != Some(u32::from_be_bytes(*b"AVdn"))
+            {
+                return Err(invalid("DNxHR 444 source color requires a DNx picture stream".into()));
+            }
+            let color = tree.child_by_tag(stream, "OriginalColorSpace")
+                .ok_or_else(|| invalid("DNxHR 444 binding lacks a source color field".into()))?;
+            tree.set_text(color, Some(DNXHR_444_RGB));
+        }
         let audio_stream = project
             .doc
             .tree
@@ -313,6 +354,100 @@ fn apply_views(project: &mut Project, mappings: &[MediaRelink], narrow: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_mono_wav_bindings_keep_distinct_media_states() {
+        use super::super::opatom::{ensure_audio_media, ensure_video_media, MediaTable};
+        let mut model = super::super::model::parse_model_str(include_str!(
+            "../../../examples/opatom_clip.model.json"
+        )).unwrap();
+        let clip = model.clips.get_mut("clip-1").unwrap();
+        let mono = clip.audio[0].clone();
+        clip.audio = (1..=33).map(|lane| {
+            let mut audio = mono.clone();
+            audio.avid_track = Some(lane);
+            audio.path = format!("/Volumes/Media/A{lane}.mxf");
+            audio
+        }).collect();
+        let clip = &model.clips["clip-1"];
+        let picture = clip.video.as_ref().unwrap();
+        let mut bindings = vec![MediaRelink {
+            source_path: picture.path.clone(), target_path: "/Volumes/Output/Picture.mxf".into(),
+            audio_stream: None, separate_mono: true,
+        }];
+        bindings.extend(clip.audio.iter().enumerate().map(|(lane, audio)| MediaRelink {
+            source_path: audio.path.clone(), target_path: format!("/Volumes/Output/A{}.wav", lane + 1),
+            audio_stream: Some(0), separate_mono: true,
+        }));
+        super::super::native_av::validate_bindings(&model, &bindings).unwrap();
+        let mut duplicate = bindings.clone();
+        duplicate[33].target_path = duplicate[32].target_path.clone();
+        assert!(super::super::native_av::validate_bindings(&model, &duplicate).is_err());
+
+        let mut ids = crate::SeededUuids::new("wide-wav-binding");
+        let mut project = Project::new(&mut ids).unwrap();
+        let mut table = MediaTable::new();
+        ensure_video_media(&mut project, &mut table, picture, clip, &mut ids).unwrap();
+        for audio in &clip.audio {
+            ensure_audio_media(&mut project, &mut table, audio, clip, &mut ids).unwrap();
+        }
+        apply_native(&mut project, &bindings).unwrap();
+        let tree = &project.doc.tree;
+        let mut hashes = HashSet::new();
+        let mut paths = HashSet::new();
+        for media in tree.iter_tag(project.doc.root, "Media") {
+            if tree.child_by_tag(media, "AudioStream").is_none() { continue; }
+            let state = tree.child_by_tag(media, "ModificationState").unwrap();
+            assert!(tree.text(state).is_some_and(|body| !body.is_empty()));
+            assert!(hashes.insert(tree.get(state, "BinaryHash").unwrap()));
+            assert!(paths.insert(tree.findtext(media, "FilePath").unwrap().unwrap()));
+            assert!(tree.child_by_tag(media, "StreamNumber").is_none());
+        }
+        assert_eq!(paths.len(), 33);
+
+        let clip = model.clips.get_mut("clip-1").unwrap();
+        for audio in &mut clip.audio {
+            audio.bits = 24;
+        }
+        super::super::native_av::validate_bindings(&model, &bindings).unwrap();
+    }
+
+    #[test]
+    fn dnxhr_444_color_is_scoped_to_the_planned_picture() {
+        use super::super::opatom::{ensure_video_media, MediaTable};
+        let model = super::super::model::parse_model_str(include_str!(
+            "../../../examples/opatom_clip.model.json"
+        )).unwrap();
+        let clip = &model.clips["clip-1"];
+        let picture = clip.video.as_ref().unwrap();
+        let mut control = picture.clone();
+        control.path = "/Volumes/Media/Control.mxf".into();
+        let mut ids = crate::SeededUuids::new("dnxhr-444-color");
+        let mut project = Project::new(&mut ids).unwrap();
+        let mut table = MediaTable::new();
+        ensure_video_media(&mut project, &mut table, picture, clip, &mut ids).unwrap();
+        ensure_video_media(&mut project, &mut table, &control, clip, &mut ids).unwrap();
+        let target = "/Volumes/Media/Rewrapped.mxf";
+        let bindings = [MediaRelink {
+            source_path: picture.path.clone(), target_path: target.into(),
+            audio_stream: None, separate_mono: false,
+        }];
+        let unrelated = HashSet::from([control.path.clone()]);
+        assert!(apply_views(&mut project, &bindings, false, &unrelated).is_err());
+        apply_views(&mut project, &bindings, false, &HashSet::from([picture.path.clone()])).unwrap();
+        let doc = &project.doc;
+        let tree = &doc.tree;
+        let color = |path: &str| {
+            let media = tree.iter_tag(doc.root, "Media")
+                .find(|&node| tree.findtext(node, "FilePath").unwrap().as_deref() == Some(path))
+                .unwrap();
+            let stream = doc.resolve(tree.child_by_tag(media, "VideoStream").unwrap()).unwrap();
+            tree.findtext(stream, "OriginalColorSpace").unwrap().unwrap()
+        };
+        assert_eq!(color(target), DNXHR_444_RGB);
+        assert_eq!(color(&control.path), crate::build::media::opatom::DNX_COLOR_SPACE);
+    }
+
     #[test]
     fn incompatible_formats_and_invalid_channel_inventories_do_not_write() {
         let mut model = super::super::model::parse_model_str(include_str!(

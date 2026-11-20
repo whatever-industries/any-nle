@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::{Path, PathBuf}};
 
 pub use crate::archive::check_output;
-pub use crate::avid::AvidTurnoverPlan;
+pub use crate::avid::{AvidTurnoverPlan, CameraOriginalsRequired};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -227,7 +227,7 @@ impl Turnover {
         spec: linked::ProjectSpec,
         ffprobe: &Path,
         inputs: Vec<(PathBuf, [u8; 32])>,
-        notices: Vec<String>,
+        mut notices: Vec<String>,
         caption_omissions: Vec<graph::Loss>,
         media_preparation: linked::MediaPreparation<'_>,
     ) -> Result<Self> {
@@ -237,6 +237,14 @@ impl Turnover {
             .flat_map(|sequence| &sequence.texts)
             .map(|text| text.id.clone()).collect();
         let prepared = linked::prepare_project(&graph, spec, ffprobe, Some(&caption_omissions), media_preparation)?;
+        if prepared.timelines.iter().flat_map(|timeline| timeline.lanes.iter().flatten())
+            .any(|edit| matches!(
+                edit.grade.as_ref(),
+                Some((crate::grade::Operation::RangeCdl(avid_reader::source::SourceColorRange::VideoToFull), _)),
+            ))
+        {
+            notices.push("For legal-to-full grades, set Deliver data levels to Video and enable Retain sub-black and super-white data to preserve excursions in the render.".into());
+        }
         let caption_omissions = caption_omissions.into_iter()
             .filter(|loss| !prepared.writes_caption(&loss.object)).collect();
         Ok(Self {
@@ -264,6 +272,7 @@ impl Turnover {
             .iter()
             .filter(|loss| is_reviewable_loss(loss)
                 && !self.prepared.recovers_premiere_mark(loss)
+                && !self.prepared.recovers_premiere_adjust(loss)
                 && (loss.aspect != "text_appearance" || self.selected_texts.contains(&loss.object)))
             .chain(&self.caption_omissions)
             .chain(&self.prepared.destination_losses)

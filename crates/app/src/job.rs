@@ -100,6 +100,12 @@ impl Default for JobSpec {
     }
 }
 #[derive(Clone, Debug, PartialEq)]
+pub struct BinPath {
+    pub path: PathBuf,
+    pub relative: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct BinEntry {
     pub path: PathBuf,
     pub relative: PathBuf,
@@ -139,7 +145,17 @@ pub struct Review {
     pub notes: Vec<ReportNote>,
     /// Display names keyed by the diagnostic's stable source object ID.
     pub subjects: std::collections::HashMap<String, String>,
+    pub timeline_groups: Vec<ReviewGroup>,
+    pub source_groups: Vec<ReviewGroup>,
     pub cli_equivalent: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReviewGroup {
+    pub id: String,
+    pub name: String,
+    pub bin: Option<PathBuf>,
+    /// Sorted zero-based positions in the unfiltered report or blocker's affected details.
+    pub note_indices: Vec<usize>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct MediaLinking {
@@ -187,11 +203,19 @@ pub struct ReviewBlocker {
     pub message: String,
     pub affected: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub timeline_groups: Vec<ReviewGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rewrap_sources: Vec<Vec<PathBuf>>,
 }
 impl ReviewBlocker {
     pub fn new(kind: BlockerKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), affected: Vec::new(), rewrap_sources: Vec::new() }
+        Self {
+            kind,
+            message: message.into(),
+            affected: Vec::new(),
+            timeline_groups: Vec::new(),
+            rewrap_sources: Vec::new(),
+        }
     }
     pub(crate) fn cli_summary(self) -> String {
         if self.affected.is_empty() {
@@ -263,12 +287,13 @@ impl CancelToken {
 }
 
 mod inventory;
-pub use inventory::inventory;
+pub use inventory::{bin_catalog, inventory};
 #[cfg(target_os = "macos")]
 pub(crate) use inventory::selected_paths;
 
 mod engine;
-pub(crate) use engine::{blocked_preflight_report, sequence_timing_blocker};
+pub(crate) use engine::sequence_timing_blocker;
 pub use engine::{
-    execute, load, load_encoded, prepare, prepare_for_review, save_blocked_preflight_report, PreparedJob,
+    blocked_preflight_report, execute, load, load_encoded, prepare, prepare_for_review,
+    save_blocked_preflight_report, PreparedJob,
 };

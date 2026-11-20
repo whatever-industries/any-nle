@@ -732,6 +732,7 @@ fn write_timeline<'a>(
     bin: &str,
     media: &[Media],
     media_ids: &[String],
+    fusion_media_ids: &std::collections::HashMap<usize, String>,
     donors: &TimelineDonors<'_>,
     edit_metadata: &mut Vec<markers::EditMetadata<'a>>,
 ) -> Result<(String, String, String, String, String)> {
@@ -960,6 +961,13 @@ fn write_timeline<'a>(
             if let Some((_, body)) = &edit.grade {
                 write_grade(&mut clip, body)?;
             }
+            if let Some(operation) = edit.fusion {
+                let media_id = fusion_media_ids.get(&edit.media).ok_or("missing Fusion pool item ID")?;
+                let (fields, body) = crate::clip_fusion::encode_edit(
+                    operation, source, media_id, edit.source_in, edit.length,
+                )?;
+                write_clip_fusion(&mut clip, &fields, &hex::encode(body))?;
+            }
             if let Some(channel) = edit.channel {
                 let (selector, payload) = if let Some(native) = &source.native {
                     let saved = native.selectors.as_ref().and_then(|selectors| selectors.get(channel))
@@ -1144,6 +1152,20 @@ fn write_grade(clip: &mut String, body: &str) -> Result<()> {
     Ok(())
 }
 
+fn write_clip_fusion(clip: &mut String, fields: &str, body: &str) -> Result<()> {
+    if clip.contains("<CompositionTable>") {
+        return Err("Resolve skeleton already contains a clip composition".into());
+    }
+    let anchor = clip.find("<In>").ok_or("missing Resolve clip composition insertion anchor")?;
+    let composition = format!(concat!(
+        "<CompositionTable><Sm2TiCompositionTable DbId=\"{}\"><FieldsBlob>{}</FieldsBlob>",
+        "<DbSavedTime>0</DbSavedTime><CompositionBA>{}</CompositionBA>",
+        "<ActiveCompositionIdx>0</ActiveCompositionIdx></Sm2TiCompositionTable></CompositionTable>"
+    ), uid(), fields, body);
+    clip.insert_str(anchor, &composition);
+    Ok(())
+}
+
 fn write_captions(container: &mut String, timeline: &Timeline, sequence_id: &str) -> Result<()> {
     use std::fmt::Write as _;
     let mut track = format!(
@@ -1242,6 +1264,7 @@ fn folder_path(index: usize, project: &PreparedProject) -> Result<String> {
 struct Identities {
     bins: Vec<String>,
     media: Vec<String>,
+    fusion_media: std::collections::HashMap<usize, String>,
     sequences: Vec<String>,
     timeline_pools: Vec<Option<String>>,
     group: Option<String>,
@@ -1264,6 +1287,7 @@ fn build(
     bin_ids.extend((1..p.bins.len()).map(|_| uid()));
     let mut children = vec![String::new(); p.bins.len()];
     let mut media_ids = Vec::new();
+    let mut fusion_media_ids = std::collections::HashMap::new();
     let mut remaining_xml = MAX_XML as usize;
     let donor = member(layout, MEDIA_DONOR)?;
     let wide_pool = wider_layout.map(|members|
@@ -1299,6 +1323,8 @@ fn build(
     let stereo_sources: HashSet<_> = p.timelines.iter().filter(|row| row.stereo)
         .flat_map(|row| row.lanes[1].iter().map(|edit| edit.media))
         .collect();
+    let fusion_sources: HashSet<_> = p.timelines.iter().flat_map(|row| &row.lanes[0])
+        .filter(|edit| edit.fusion.is_some()).map(|edit| edit.media).collect();
     for (index, media) in p.media.iter().enumerate() {
         let (id, item) = pool_item(
             donor, media, &bin_ids[media.bin], p.rate, mxf_donors, stereo_sources.contains(&index),
@@ -1307,6 +1333,9 @@ fn build(
             .checked_sub(item.len() + 19)
             .ok_or("media XML exceeds its construction budget")?;
         media_ids.push(id);
+        if fusion_sources.contains(&index) {
+            fusion_media_ids.insert(index, tag(&item, "UniqueMediaPoolItemId")?.to_owned());
+        }
         children[media.bin].push_str(&format!("<Element>{item}</Element>"));
     }
     let mut members = Members::new();
@@ -1367,6 +1396,7 @@ fn build(
             &bin_ids[timeline.bin],
             &p.media,
             &media_ids,
+            &fusion_media_ids,
             donors,
             &mut edit_metadata,
         )?;
@@ -1452,6 +1482,7 @@ fn build(
         Identities {
             bins: bin_ids,
             media: media_ids,
+            fusion_media: fusion_media_ids,
             sequences: sequence_ids,
             timeline_pools,
             group: group_id,
@@ -1763,6 +1794,7 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
     }
     let mut recovered_audio = std::collections::HashMap::new();
     let mut recovered_labels = HashSet::new();
+    let mut recovered_fusion = HashSet::new();
     for (index, (timeline, &read)) in p.timelines.iter().zip(&readbacks).enumerate() {
         let count = if let Some(group) = &timeline.group {
             group.prepared.lanes.iter().map(Vec::len).sum::<usize>()
@@ -1909,6 +1941,26 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                 if wanted.label.is_some() {
                     recovered_labels.insert(edit.id.as_str());
                 }
+                let fusion = graph.sidecar(crate::clip_fusion::ADAPTER, &edit.id);
+                if let Some(operation) = wanted.fusion {
+                    use sha2::{Digest, Sha256};
+                    let media_id = ids.fusion_media.get(&wanted.media).ok_or("missing Fusion pool item ID")?;
+                    let (fields, body) = crate::clip_fusion::encode_edit(
+                        operation, &p.media[wanted.media], media_id, wanted.source_in, wanted.length,
+                    )?;
+                    let receipt = fusion.ok_or("generated Resolve clip composition is missing")?;
+                    let fields = hex::encode(Sha256::digest(hex::decode(fields)?));
+                    let body = hex::encode(Sha256::digest(&body));
+                    if receipt.get("fields_sha256") != Some(&Value::Str(fields))
+                        || receipt.get("composition_sha256") != Some(&Value::Str(body))
+                        || receipt.get("active_composition_index") != Some(&Value::Int(0))
+                    {
+                        return Err("generated Resolve clip composition differs from preparation".into());
+                    }
+                    recovered_fusion.insert(edit.id.as_str());
+                } else if fusion.is_some() {
+                    return Err("generated Resolve archive has an unexpected clip composition".into());
+                }
                 let frame = |time| crate::prepare::frames_on(time, p.rate);
                 let matches_timing =
                     wanted.timing.matches_readback(&graph, edit, wanted.source_in, wanted.length)?;
@@ -1943,6 +1995,11 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
     }
     if graph.losses.iter().any(|loss| {
         if recovered_labels.contains(loss.object.as_str()) && crate::clip_label::ClipLabel::recover(loss) {
+            return false;
+        }
+        if loss.aspect == "effect" && loss.reason == crate::clip_fusion::LOSS
+            && recovered_fusion.contains(loss.object.as_str())
+        {
             return false;
         }
         if recovered_audio

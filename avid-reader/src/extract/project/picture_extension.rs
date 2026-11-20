@@ -114,13 +114,8 @@ fn ordered_picture_input<'a>(ctx: &Ctx<'a>, effect: &Node, length: i64, rate: Ra
     match (effect.get("effect_id")?.as_str()?, tracks.as_slice()) {
         ("EFF2_BLEND_RESIZE", [picture]) => input(picture),
         (name, [picture]) if flip(name).is_some() => input(picture),
-        ("EFF2_SBLEND" | spectramatte::ID, [background, picture]) => {
-            let (Value::Node(back_track), Value::Node(picture_track)) = (background, picture) else { return None };
-            if (int(back_track, "index"), int(picture_track, "index")) != (Some(1), Some(2)) {
-                return None;
-            }
-            let background = input(background)?;
-            let picture = input(picture)?;
+        ("EFF2_SBLEND" | spectramatte::ID, _) => {
+            let [Some(background), Some(picture)] = numbered_two_inputs(ctx, effect)? else { return None; };
             let fill_length = |node: &Node| {
                 (node.class == *b"FILL" && int(node, "media_kind_id") == Some(KIND_PICTURE))
                     .then(|| int(node, "length").filter(|n| *n >= 0)).flatten()
@@ -1278,10 +1273,7 @@ pub(super) fn warp(ctx: &Ctx<'_>, effect: &Node) -> Option<PictureExtension> {
     let candidate = (|| {
         let length = int(effect, "length")?;
         let rate = float(effect, "edit_rate").and_then(Rate::from_avid)?;
-        let tracks = ctx.tracks(effect);
-        let [background, picture] = tracks.as_slice() else { return None; };
-        let background = ctx.deref(background.get("component"))?;
-        let picture = ctx.deref(picture.get("component"))?;
+        let [Some(background), Some(picture)] = numbered_two_inputs(ctx, effect)? else { return None; };
         let full_span_background = if background.class == *b"FILL" {
             int(background, "length") == Some(length)
         } else {
@@ -1293,7 +1285,6 @@ pub(super) fn warp(ctx: &Ctx<'_>, effect: &Node) -> Option<PictureExtension> {
             || int(background, "media_kind_id") != Some(KIND_PICTURE)
             || int(picture, "media_kind_id") != Some(KIND_PICTURE)
             || !full_span_background || !ctx.is_empty(background)
-            || tracks.iter().map(|track| int(track, "index")).ne([Some(1), Some(2)])
         {
             return None;
         }

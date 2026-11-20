@@ -1,6 +1,7 @@
 //! The saved half-frame position map of the retained 1080p24 ramp profile (AVB-0010).
 //! Read the visible samples directly. The Speed keys help identify the profile.
 use super::*;
+use super::param_keys::key_parts;
 
 const SPEED: &str = "8d56827c-847e-11d5-935a-50f857c10000";
 const POSITION: &str = "8d56827d-847e-11d5-935a-50f857c10000";
@@ -196,23 +197,10 @@ fn flag(value: &Value) -> Option<bool> {
     }
 }
 
-fn key_parts(raw: &Value) -> Option<(&Node, i64, i64, i64, f64)> {
-    let Value::Node(node) = raw else { return None; };
-    let Value::List(offset) = node.get("offset")? else { return None; };
-    let [Value::Int(num), Value::Int(den)] = offset.as_slice() else { return None; };
-    let value = match node.get("value")? {
-        Value::Float(value) => *value,
-        Value::Int(value) => *value as f64,
-        _ => return None,
-    };
-    (*den > 0 && value.is_finite()).then_some((node, *num, *den, int(node, "timescale")?, value))
-}
-
 fn observe_points(
     points: &[Value], interpolation: Option<i64>, budget: &SharedBudget,
 ) -> Option<SourceTimewarpPoints> {
     const MAX_SAMPLES: usize = 2 * MAX_SAVED_PICTURE_FRAMES as usize + 1;
-    const MAX_KEYS: usize = 64;
     if interpolation == Some(3) && (3..=MAX_SAMPLES).contains(&points.len()) {
         let (_, num, den, _, _) = key_parts(points.first()?)?;
         let first = num.checked_mul(2)?.checked_div(den)?;
@@ -229,35 +217,7 @@ fn observe_points(
             return Some(SourceTimewarpPoints::HalfFrameSamples { first, values });
         }
     }
-    if points.len() > MAX_KEYS { return None; }
-    let mut keys = Vec::new();
-    if !reserve(budget, &mut keys, points.len()) { return None; }
-    for raw in points {
-        let (node, num, den, timescale, value) = key_parts(raw)?;
-        let Value::List(properties) = node.get("pp")? else { return None; };
-        let mut key = SourceTimewarpKey {
-            time: (num, den), timescale, value, handles: [None; 4], anchor: None, flags: None,
-        };
-        for property in properties {
-            let Value::Node(property) = property else { return None; };
-            match int(property, "code")? {
-                code @ 5..=8 if int(property, "type") == Some(2) => {
-                    let v = float(property, "value").filter(|v| v.is_finite())?;
-                    if key.handles[(code - 5) as usize].replace(v).is_some() { return None; }
-                }
-                14 if int(property, "type") == Some(2) => {
-                    let v = float(property, "value").filter(|v| v.is_finite())?;
-                    if key.anchor.replace(v).is_some() { return None; }
-                }
-                9 if int(property, "type") == Some(1) => {
-                    if key.flags.replace(int(property, "value")?).is_some() { return None; }
-                }
-                _ => return None,
-            }
-        }
-        keys.push(key);
-    }
-    Some(SourceTimewarpPoints::Keys(keys))
+    param_keys::observe(points, budget).map(SourceTimewarpPoints::Keys)
 }
 
 fn saved_render_clip<'a>(ctx: &Ctx<'a>, effect: &Node) -> Option<&'a Node> {

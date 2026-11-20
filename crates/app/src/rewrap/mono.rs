@@ -1,4 +1,4 @@
-//! Byte-preserving PCM24 WAV preparation for saved Gain renders and dry audio.
+//! Byte-preserving mono WAV preparation for saved Gain renders and wide rewraps.
 use super::backend::probe;
 use super::receipts::{obj, text};
 use super::source::{essence_spans, stamp, Stamp};
@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 const GAIN_OP: &str = "060e2b34040101020d01020110000000";
 const RATE: i64 = 48_000;
 const ALIGN: u32 = 3;
+const BEXT_BYTES: u32 = 602;
+const BEXT_CHUNK_BYTES: u32 = 8 + BEXT_BYTES;
+const BEXT_TIME_REFERENCE_OFFSET: usize = 338;
 const PCM_KEY: [u8; 16] = [6, 14, 43, 52, 1, 2, 1, 1, 13, 1, 3, 1, 22, 1, 2, 1];
 
 pub(crate) type GainPaths<'a> = HashMap<&'a str, (&'a str, &'a str)>;
@@ -61,6 +64,8 @@ pub(super) struct MonoPcm {
     stamp: Stamp,
     offset: u64,
     bytes: u32,
+    bits: u16,
+    time_reference: i64,
     gain: bool,
     hash: [u8; 32],
     material: String,
@@ -160,7 +165,65 @@ impl MonoPcm {
             stamp: before,
             offset: span.offset,
             bytes,
+            bits: 24,
+            time_reference: 0,
             gain,
+            hash: [0; 32],
+            material: material.clone(),
+            file: file.clone(),
+        };
+        pcm.hash = pcm.source_hash()?;
+        Ok(pcm)
+    }
+
+    pub(super) fn plan_wide_sibling(input: &super::Input, start: i64) -> R<Self> {
+        let stream = &input.probe.streams[0];
+        let unit = TICKS_PER_SECOND / RATE;
+        let samples = stream.ticks / unit;
+        let (bits, bytes_per_sample) = match (stream.codec.as_str(), stream.bits) {
+            ("pcm_s16le", 16) => (16, 2),
+            ("pcm_s24le", 24) => (24, 3),
+            _ => {
+                return Err("wide rewrap requires independent mono 48 kHz PCM16 or PCM24 MXFs".into());
+            }
+        };
+        if stream.kind != "audio"
+            || stream.samples != RATE || stream.channels != 1 || !input.probe.references.is_empty()
+            || samples <= 0 || stream.ticks % unit != 0
+        {
+            return Err("wide rewrap requires independent mono 48 kHz PCM16 or PCM24 MXFs".into());
+        }
+        let time_reference = bwf_time_reference(start)?;
+        let overhead = u32::from(time_reference != 0) * BEXT_CHUNK_BYTES;
+        let bytes = samples.checked_mul(bytes_per_sample).ok_or("PCM length overflow")?;
+        let bytes = u32::try_from(bytes)
+            .ok()
+            .filter(|n| *n <= u32::MAX - 37 - overhead)
+            .ok_or("PCM length exceeds RIFF WAV limits")?;
+        let id = avid_reader::mxf::read_identity(&input.path).map_err(|e| e.to_string())?;
+        let ([material], [file]) = (id.material_packages.as_slice(), id.file_packages.as_slice())
+        else { return Err("wide audio needs one material and file package per sibling".into()); };
+        let spans = essence_spans(&input.path)?;
+        let [span] = spans.as_slice() else { return Err("wide audio needs one sound KLV".into()); };
+        if !id.file_tracks.contains(&(RATE, 1, samples))
+            || id.file_tracks.iter().any(|&(num, den, length)| {
+                num <= 0 || den <= 0 || length <= 0
+                    || (i128::from(length) * i128::from(den)).checked_mul(i128::from(RATE))
+                        != Some(i128::from(samples) * i128::from(num))
+            })
+            || span.kind != 0x16 || span.bytes != u64::from(bytes)
+        {
+            return Err("wide audio sample extent disagrees with its physical PCM payload".into());
+        }
+        let mut pcm = Self {
+            source: input.aliases[0].clone(),
+            path: input.path.clone(),
+            stamp: input.stamp.clone(),
+            offset: span.offset,
+            bytes,
+            bits,
+            time_reference,
+            gain: false,
             hash: [0; 32],
             material: material.clone(),
             file: file.clone(),
@@ -205,7 +268,7 @@ impl MonoPcm {
     }
 
     pub(super) fn size(&self) -> u64 {
-        u64::from(self.bytes) + 45
+        u64::from(self.bytes) + 45 + u64::from(self.time_reference != 0) * u64::from(BEXT_CHUNK_BYTES)
     }
 
     pub(super) fn write(&self, partial: &Path, output: &Path) -> R<Value> {
@@ -213,7 +276,7 @@ impl MonoPcm {
             return Err("mono PCM payload changed after preflight".into());
         }
         let mut input = self.input()?;
-        let header = wave_header(self.bytes);
+        let header = wave_header(self.bytes, self.bits, self.time_reference);
         let result = (|| -> io::Result<()> {
             let mut out = OpenOptions::new()
                 .write(true)
@@ -232,7 +295,7 @@ impl MonoPcm {
         result.map_err(|e| format!("{}: {e}", partial.display()))?;
         self.finish_input(&mut input)?;
         let mut verify = BufReader::new(File::open(partial).map_err(|e| e.to_string())?);
-        let mut actual = [0; 44];
+        let mut actual = vec![0; header.len()];
         verify.read_exact(&mut actual).map_err(|e| e.to_string())?;
         let mut payload = (&mut verify).take(u64::from(self.bytes));
         if actual != header || hash(&mut payload)? != self.hash || payload.limit() != 0 {
@@ -241,33 +304,85 @@ impl MonoPcm {
         fs::hard_link(partial, output)
             .map_err(|e| format!("refusing to replace {}: {e}", output.display()))?;
         fs::remove_file(partial).map_err(|e| e.to_string())?;
-        Ok(obj(vec![
-            ("status", text("verified mono PCM24 WAV")),
+        let mut receipt = vec![
+            ("status", text(format!("verified mono PCM{} WAV", self.bits))),
             ("source", text(&self.source)),
             ("output", text(output.to_string_lossy())),
             ("material_package", text(&self.material)),
             ("file_package", text(&self.file)),
             (
                 "playable_samples",
-                Value::Int(i64::from(self.bytes / ALIGN)),
+                Value::Int(i64::from(self.bytes / u32::from(self.bits / 8))),
             ),
             (
                 "excluded_zero_samples",
                 Value::Int(if self.gain { 2 } else { 0 }),
             ),
             ("essence_sha256", text(prproj::hash::hex(&self.hash))),
-        ]))
+        ];
+        if self.time_reference != 0 {
+            receipt.push(("bwf_time_reference_samples", Value::Int(self.time_reference)));
+        }
+        Ok(obj(receipt))
     }
 }
 
-fn wave_header(bytes: u32) -> [u8; 44] {
+fn bwf_time_reference(ticks: i64) -> R<i64> {
+    let unit = TICKS_PER_SECOND / RATE;
+    if ticks < 0 || ticks % unit != 0 {
+        return Err("wide rewrap source clock falls outside the exact 48 kHz WAV sample grid".into());
+    }
+    Ok(ticks / unit)
+}
+
+fn wave_header(bytes: u32, bits: u16, time_reference: i64) -> Vec<u8> {
     let mut header =
         *b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\0\0\0\0\0\0\0\0\x03\0\x18\0data\0\0\0\0";
-    header[4..8].copy_from_slice(&(bytes + 36 + bytes % 2).to_le_bytes());
+    let overhead = u32::from(time_reference != 0) * BEXT_CHUNK_BYTES;
+    header[4..8].copy_from_slice(&(bytes + 36 + bytes % 2 + overhead).to_le_bytes());
     header[24..28].copy_from_slice(&(RATE as u32).to_le_bytes());
-    header[28..32].copy_from_slice(&(RATE as u32 * ALIGN).to_le_bytes());
+    let align = bits / 8;
+    header[28..32].copy_from_slice(&(RATE as u32 * u32::from(align)).to_le_bytes());
+    header[32..34].copy_from_slice(&align.to_le_bytes());
+    header[34..36].copy_from_slice(&bits.to_le_bytes());
     header[40..44].copy_from_slice(&bytes.to_le_bytes());
-    header
+    if time_reference == 0 {
+        return header.to_vec();
+    }
+    // EBU Tech 3285 version 0 stores the clock as a sample count since midnight.
+    let mut bext = [0; BEXT_BYTES as usize];
+    bext[BEXT_TIME_REFERENCE_OFFSET..BEXT_TIME_REFERENCE_OFFSET + 8]
+        .copy_from_slice(&time_reference.to_le_bytes());
+    let mut out = Vec::with_capacity(header.len() + BEXT_CHUNK_BYTES as usize);
+    out.extend_from_slice(&header[..12]);
+    out.extend_from_slice(b"bext");
+    out.extend_from_slice(&BEXT_BYTES.to_le_bytes());
+    out.extend_from_slice(&bext);
+    out.extend_from_slice(&header[12..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_wav_stores_only_exact_source_sample_references() {
+        let ticks = 945_743_904_000_000;
+        let reference = bwf_time_reference(ticks).unwrap();
+        assert_eq!(reference, 178_712_000);
+        assert!(bwf_time_reference(ticks + 1).is_err());
+        assert!(bwf_time_reference(-TICKS_PER_SECOND).is_err());
+
+        let header = wave_header(3, 24, reference);
+        assert_eq!(&header[..12], b"RIFF\x8a\x02\0\0WAVE");
+        assert_eq!(&header[12..20], b"bext\x5a\x02\0\0");
+        assert_eq!(&header[358..366], &reference.to_le_bytes());
+        assert_eq!(&header[646..], b"data\x03\0\0\0");
+        let ordinary = wave_header(4, 16, bwf_time_reference(0).unwrap());
+        assert_eq!(ordinary.len(), 44);
+        assert_eq!(&ordinary[36..], b"data\x04\0\0\0");
+    }
 }
 
 pub(super) fn writer_clip(clip: &Clip, output: &Path) -> R<OriginalClip> {

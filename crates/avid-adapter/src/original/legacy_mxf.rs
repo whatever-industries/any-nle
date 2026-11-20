@@ -130,12 +130,18 @@ fn indexed_package<'a>(
     Ok(index.files.get(package).map(|path| path.as_path()))
 }
 
+#[derive(Debug)]
+pub(crate) struct PackageFinding {
+    pub track: usize,
+    pub message: String,
+}
+
 /// Summarize what is known from the header index after preparation has stopped.
 pub(super) fn package_index_findings(
     source: &SourceMaster,
     index: &MediaIndex,
     primary_track: Option<usize>,
-) -> Vec<String> {
+) -> Vec<PackageFinding> {
     let mut findings = Vec::new();
     for (ordinal, track) in source.master.tracks.iter().enumerate() {
         if Some(ordinal) == primary_track {
@@ -143,11 +149,12 @@ pub(super) fn package_index_findings(
         }
         let package = track.file_mob.umid_hex();
         let label = package_label(track, &package);
-        match indexed_package(index, &package, &label) {
-            Ok(Some(_)) => {}
-            Ok(None) => findings.push(format!("{label} absent from the selected MXF package index")),
-            Err(reason) => findings.push(reason),
-        }
+        let message = match indexed_package(index, &package, &label) {
+            Ok(Some(_)) => continue,
+            Ok(None) => format!("{label} absent from the selected MXF package index"),
+            Err(reason) => reason,
+        };
+        findings.push(PackageFinding { track: ordinal, message });
     }
     findings
 }
@@ -163,7 +170,7 @@ pub(crate) fn missing_siblings(
     index: &MediaIndex,
     check: &mut dyn FnMut() -> Result<(), String>,
     probe: &mut dyn FnMut(&Path) -> Result<Value, String>,
-) -> Result<Vec<String>, SiblingIssue> {
+) -> Result<Vec<PackageFinding>, SiblingIssue> {
     let mut missing = Vec::new();
     let mut paths = HashSet::new();
     for (ordinal, track) in source.master.tracks.iter().enumerate() {
@@ -173,7 +180,7 @@ pub(crate) fn missing_siblings(
         let video = track.kind == KIND_PICTURE;
         let label = package_label(track, &package);
         let Some(path) = indexed_package(index, &package, &label).map_err(at_track)? else {
-            missing.push(label);
+            missing.push(PackageFinding { track: ordinal, message: label });
             continue;
         };
         let identity = index.identity(path).map_err(at_track)?;

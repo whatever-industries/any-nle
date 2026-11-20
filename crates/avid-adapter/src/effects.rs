@@ -1,7 +1,7 @@
 use super::*;
 use avid_reader::color::ParamValue;
 use avid_reader::extract::SeqEvent;
-use avid_reader::source::{PictureExtension, PictureStage};
+use avid_reader::source::{PictureExtension, PictureStage, WARP_COMPOSITING_PARAMETERS};
 use sha2::{Digest, Sha256};
 
 const INLINE_EFFECT_BYTES: usize = 4096;
@@ -320,6 +320,23 @@ fn picture_receipt(p: &avid_reader::transform::PictureEffect, nested: bool) -> V
         ("params", params(&p.params)),
         ("nested", Value::Bool(nested)),
     ];
+    if p.kind == avid_reader::transform::Kind::Warp {
+        let saved: Vec<_> = WARP_COMPOSITING_PARAMETERS.iter().filter_map(|&(id, name)| {
+            let mut values = p.params.params.iter().filter(|(param, _)| param == id);
+            let (_, value) = values.next()?;
+            if values.next().is_some() {
+                return None;
+            }
+            match value {
+                ParamValue::Int(n) => Some((name, Value::Int(*n))),
+                ParamValue::Float(n) if n.is_finite() => Some((name, Value::Float(*n))),
+                _ => None,
+            }
+        }).collect();
+        if !saved.is_empty() {
+            fields.push(("saved_compositing", obj(saved)));
+        }
+    }
     if let Some(pin) = p.corner_pin {
         let name = if pin.from_transform { "projected_corners" } else { "corner_pin" };
         fields.push((name, obj(vec![
@@ -465,22 +482,35 @@ fn reserve_parameter_receipt(
     Ok(())
 }
 
+fn reserve_picture_receipt(
+    p: &avid_reader::transform::PictureEffect, budget: &mut Budget,
+) -> Result<(), String> {
+    reserve_parameter_receipt(&p.params, budget)?;
+    if p.kind == avid_reader::transform::Kind::Warp {
+        for (id, name) in WARP_COMPOSITING_PARAMETERS {
+            if p.params.params.iter().any(|(param, _)| param == id) {
+                budget.charge(size_of::<(String, Value)>() + name.len() + 64)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn reserve_receipt(event: &avid_reader::source::SourceEvent, budget: &mut Budget) -> Result<(), String> {
     for (_, picture) in projective_stages(&event.picture_chain) {
         budget.charge(2048 + size_of::<Value>())?;
-        reserve_parameter_receipt(&picture.params, budget)?;
+        reserve_picture_receipt(picture, budget)?;
     }
     let event = &event.event;
     budget.charge(2048)?;
     if event.picture.as_ref().is_some_and(|p| p.corner_pin.is_some()) {
         budget.charge(1024)?;
     }
-    for cc in event
-        .color
-        .iter()
-        .chain(event.picture.iter().map(|p| &p.params))
-    {
-        reserve_parameter_receipt(cc, budget)?;
+    if let Some(color) = &event.color {
+        reserve_parameter_receipt(color, budget)?;
+    }
+    if let Some(picture) = &event.picture {
+        reserve_picture_receipt(picture, budget)?;
     }
     if let Some(a) = &event.animatte {
         for st in &a.states {

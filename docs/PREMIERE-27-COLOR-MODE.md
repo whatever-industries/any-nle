@@ -74,7 +74,9 @@ independently authored Resolve controls exactly. Across the 24 neutral,
 saturated and clipping patches, the largest difference from Premiere was
 1.29 RGB codes on an 8-bit scale. The reader verifies the complete
 Save As node body apart from the three equal slope values. It also
-recognizes the earlier native +1 encoding.
+recognizes equal-slope native Resolve saves with the same neutral
+offset, power and saturation. Only the slope changes across the
+qualified range. See the [native Resolve round trip](#native-resolve-cdl-round-trip).
 
 The trial of a clip LUT saved a Resolve library reference. An export
 requested with LUT assets did not include the table in that control.
@@ -88,8 +90,9 @@ The reader retains non-neutral static values as `contrast` and `pivot`
 on the existing `premiere.color_mode_exposure` graph/2 receipt. Each
 known scalar survives independently when another control is unresolved.
 The isolated Exposure mapping still requires the complete neutral
-witness for the other Adjust controls. An edit with changed Contrast
-or Pivot stays in Review.
+witness for the other Adjust controls. For Contrast and Pivot, the
+reader resolves Premiere's shared binary payloads before comparing
+the full control tree with the static Adjust witness.
 
 Premiere 27 Save As and reopen covered Contrast values 0.5, 0.75,
 1.1, 1.25, 1.5 and 2, Pivot at −1, 0, +0.5 and +1, and combined
@@ -109,9 +112,48 @@ Two private archive prototypes embedded a Fusion Custom Tool with
 editable Exposure, Contrast and Pivot inputs. Each kept its
 values and original media link after import, save and reopen in
 Resolve Studio 21.2. Across 96 frames, the largest measured
-chart difference from Premiere was 1.20 codes. The ordinary writer
-reports the grade in Review until composition timing and media
-ownership are verified on trimmed and repeated edits.
+chart difference from Premiere was 1.20 codes.
+
+The internal writer now maps this static Adjust to one editable Fusion
+Custom Tool per qualified V1 edit. It uses the edit's Exposure, Contrast
+and Pivot from graph/2 and binds MediaIn to the linked Media Pool item.
+The profile is picture-only 1080p24 with explicitly tagged Rec.709
+ProRes HQ MOV and the verified Premiere Rec.709 pipeline. It admits
+Exposure from −1.5 to +1, Contrast from 0.5 to 2, and Pivot from −1 to
++1. Review reports an appearance approximation and requires approval
+for the run. Other controls retain the edit's existing omission notice.
+
+The numbered chart repeats the same original with trims at source
+frames [5,25) and [14,42), then checks the file boundaries in a second
+project. After save, close and reopen in Resolve, the generated projects
+preserved all 96 source-frame selections, with distinct editable
+settings on each occurrence. The maximum patch difference from
+Premiere was 1.06 codes on an 8-bit RGB scale. With the native author's
+saved Fusion start offset, a fresh DRP import selected both trims one
+frame early despite matching edit In points. The writer adjusts that
+field for the archive import. Prepublication read-back checks the
+composition and offset fields against the prepared edit. The reader
+retains other clip Fusion compositions as bounded observations.
+
+### Native Resolve CDL round trip
+
+Resolve Studio 21.2.0 build 00006 saves a one-node CDL differently
+after editing the grade through its native API. Graph/2 now gives
+both saved layouts the same edit-owned range or slope receipt. The
+reader validates the complete witnessed control payload, including
+neutral controls and the relationships among the changing integer
+fields. Changing one channel or breaking the integer relationship
+leaves a grade omission on that edit.
+
+Reopened linked DRPs preserved both range shifts at 24, 23.976, 25
+and 29.97 DF. The picture-only controls use a ProRes HQ MOV at 24
+fps and H.264 MOV at the other rates. Each keeps the nonzero picture
+trim, linked original, and native empty mono track declarations.
+All 288 decoded frames matched the respective native Resolve
+controls under the same Deliver settings. Isolated equal-RGB slope
+controls at −1.25 and +1.75 exposure stops also passed the 24 fps
+native reopen and frame comparison. These checks cover Resolve
+reconstruction in the qualified picture profile.
 
 ## Clip LUT
 
@@ -141,8 +183,33 @@ matched Lumetri exactly. In uncompressed full-range 10-bit DPX, the
 graded-frame difference was at most five codes per RGB channel. The
 Color Mode ProRes render measured 48.85 dB RGB PSNR against the Avid
 graded reference. The earlier Lumetri render measured 48.34 dB.
-These measurements support the bounded mapping and leave wider
-working spaces, nonlinear grids and other color controls open.
+These measurements support the bounded affine mapping. The nonlinear
+profile below covers one ordered Avid Color Adapter.
+
+### Ordered Avid Color Adapters
+
+For a plain V1 edit using a verified 1080p24 Rec.709 picture-only Avid
+ProRes LT rewrap, the converter can compose the saved 10-bit
+legal-to-full step and a project-local 33³ cube in either order. Graph/2
+retains both stages, the occurrence, and its media identity. Where the
+master saved the opposite order, the converter requires the saved
+reordered-source receipt and an exact match to the same cube and range.
+Missing assets and rejected bindings retain the edit's omission report.
+
+The writer embeds one 65³ Color Mode LUT per qualified stack. It
+evaluates the cube with tetrahedral interpolation over unit RGB and
+clamps the cube input. Expansion after the cube can retain excursions.
+Both orders use editable LUT controls in Premiere. Their individual
+stages remain available in graph/2. The rewrap copies the coded picture
+without applying the color transform to media.
+
+Premiere 27.0.0 build 88 saved and reopened both orders. All 72 decoded
+frames matched the retained Premiere prototype exactly. Against Avid,
+the 36 frames of range then cube measure 59.30 dB YUV PSNR. The 36
+frames of cube then range measure 58.29 dB. Swapping their Avid
+references lowers both comparisons to about 30.2 dB. This qualifies the
+observed chart and working space. Wider source profiles, other
+transform stacks, and writing the stack to Resolve remain open.
 
 ### Modeled Avid HSL and curves
 

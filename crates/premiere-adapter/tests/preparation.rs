@@ -163,6 +163,47 @@ fn fixture() -> SourceGraph {
 }
 
 #[test]
+fn invalid_avid_logging_text_is_omitted_only_from_premiere() {
+    let mut graph = fixture();
+    let item = graph.items[0].id.clone();
+    let columns = v(vec![
+        ("Scene", Value::Str("12A".into())),
+        ("Log", Value::Str("Keep this note".into())),
+        ("Log\u{7}", Value::Str("Invalid field name".into())),
+        ("Take", Value::Str("2\u{0}".into())),
+        ("Shoot Date", Value::Str(String::new())),
+    ]);
+    graph.sidecars.push(Sidecar {
+        adapter: "avid".into(),
+        object: item.clone(),
+        data: v(vec![
+            ("mob_id", Value::Str("synthetic-master".into())),
+            ("columns", columns.clone()),
+            ("start_timecode", Value::Null),
+            ("aux_timecodes", Value::Arr(Vec::new())),
+            ("source_file", Value::Null),
+            ("source_path", Value::Null),
+        ]),
+    });
+
+    let graph = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    let prepared = prepare(&graph, &options(), ClockProfile::LegacyImport).unwrap();
+    assert_eq!(graph.sidecar("avid", &item).unwrap().get("columns"), Some(&columns));
+    let avid = prepared.model.clips["clip-1"].avid.as_ref().unwrap();
+    assert_eq!(avid.columns, [
+        ("Scene".into(), "12A".into()),
+        ("Log".into(), "Keep this note".into()),
+        ("Shoot Date".into(), String::new()),
+    ]);
+    let losses: Vec<_> = prepared.losses.iter()
+        .filter(|loss| loss.aspect == "avid_logging_column").collect();
+    assert_eq!(losses.len(), 2);
+    assert!(losses.iter().all(|loss| loss.object == item));
+    assert!(losses[0].reason.contains(r#""Log\u{7}" has an invalid name"#));
+    assert!(losses[1].reason.contains(r#""Take" has an invalid value"#));
+}
+
+#[test]
 fn avid_source_color_transform_survives_graph_reload_and_reports_one_affected_clip() {
     let graph = fixture();
     let options = parse_model_str(include_str!("../../../examples/opatom_clip.model.json"))
@@ -346,12 +387,12 @@ fn direct_dnxhr_needs_the_native_codec_clock_and_discrete_siblings() {
         } else {
             assert!(matches!(lane, Some(1 | 2)));
             m.bits = Some(24);
-            v(vec![("channels", Value::Int(1))])
+            v(vec![("channels", Value::Int(1)), ("bits", Value::Int(24))])
         };
         let facts = g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == m.id).unwrap();
         facts.data = v(vec![
             ("legacy_clock", clock(1198, 24, false)),
-            ("file_package", Value::Str(format!("file package {i}"))),
+            ("file_package", Value::Str(format!("{:064X}", i + 1))),
             ("descriptor_length", Value::Int(if picture { 36 } else { 72072 })),
             ("descriptor", descriptor),
             ("picture_coding", if picture { Value::Str("060E2B340401010D0401020271280000".into()) } else { Value::Null }),
@@ -486,6 +527,80 @@ fn direct_dnxhr_needs_the_native_codec_clock_and_discrete_siblings() {
     }
     g.sequences.clear();
     g.sidecars.retain(|s| s.object != sequence_id);
+    let mut audio_only = g.clone();
+    let picture = audio_only.media.iter().find(|media| media.kind == StreamKind::Video).unwrap().id.clone();
+    let package = audio_only.sidecar("avid.source", &picture).unwrap().get("file_package").unwrap().clone();
+    audio_only.media.retain(|media| media.id != picture);
+    audio_only.items[0].media.retain(|binding| binding.media != picture);
+    audio_only.sidecars.retain(|sidecar| sidecar.object != picture);
+    audio_only.sidecars.push(Sidecar {
+        adapter: "avid.missing_managed_picture".into(), object: audio_only.items[0].id.clone(),
+        data: v(vec![("track", Value::Int(1)), ("file_package", package.clone())]),
+    });
+    let prepared = premiere_adapter::prepare_originals(&audio_only, &separate, ClockProfile::LegacyImport)
+        .unwrap().input;
+    assert_eq!(prepared.direct_dnxhr_origins.values().copied().collect::<Vec<_>>(), [origin]);
+    let mut ids = prproj::SeededUuids::new("managed-audio-without-picture");
+    let out = dir.join("managed-audio-without-picture.prproj");
+    assert!(prepare_typed_project(&prepared, &out, &mut ids, &[], false).is_ok());
+    for lane in [1, 2] {
+        let mut one_mono = audio_only.clone();
+        let missing = one_mono.media.iter().find(|media| media.stream == Some(lane)).unwrap().id.clone();
+        let missing_package = one_mono.sidecar("avid.source", &missing).unwrap().get("file_package").unwrap().clone();
+        one_mono.media.retain(|media| media.id != missing);
+        one_mono.items[0].media.retain(|binding| binding.media != missing);
+        one_mono.sidecars.retain(|sidecar| sidecar.object != missing);
+        for (track, receipt_package, allowed) in [
+            (lane, missing_package.clone(), true),
+            (3 - lane, missing_package, false),
+            (lane, package.clone(), false),
+        ] {
+            one_mono.sidecars.retain(|sidecar| sidecar.adapter != "avid.missing_managed_mono");
+            one_mono.sidecars.push(Sidecar {
+                adapter: "avid.missing_managed_mono".into(), object: one_mono.items[0].id.clone(),
+                data: v(vec![("track", Value::Int(track)), ("file_package", receipt_package)]),
+            });
+            let saved = SourceGraph::from_json_text(&one_mono.to_json_text().unwrap()).unwrap();
+            let result = premiere_adapter::prepare_originals(&saved, &separate, ClockProfile::LegacyImport);
+            if allowed {
+                let input = result.unwrap().input;
+                assert_eq!(input.direct_dnxhr_origins.values().copied().collect::<Vec<_>>(), [origin]);
+                let out = dir.join(format!("managed-a{}-without-picture.prproj", 3 - lane));
+                assert!(prepare_typed_project(&input, &out, &mut ids, &[], false).is_ok());
+            } else {
+                assert!(result.err().unwrap().to_string().contains("matching file clocks and extents"));
+            }
+        }
+    }
+    let mono = audio_only.media.iter_mut().find(|media| media.stream == Some(2)).unwrap();
+    let changed = mono.clock.as_mut().unwrap();
+    changed.effective_count += 1;
+    changed.provenance.origin_count += 1;
+    mono.start = changed.exact_start();
+    assert!(premiere_adapter::prepare_originals(&audio_only, &separate, ClockProfile::LegacyImport)
+        .err().unwrap().to_string().contains("matching file clocks and extents"));
+
+    for lane in [1, 2] {
+        let mut partial = g.clone();
+        let missing = partial.media.iter().find(|media| media.stream == Some(lane)).unwrap().id.clone();
+        let package = partial.sidecar("avid.source", &missing).unwrap().get("file_package").unwrap().clone();
+        partial.media.retain(|media| media.id != missing);
+        partial.items[0].media.retain(|binding| binding.media != missing);
+        partial.sidecars.retain(|sidecar| sidecar.object != missing);
+        for (track, allowed) in [(lane, true), (3 - lane, false)] {
+            partial.sidecars.retain(|sidecar| sidecar.adapter != "avid.missing_managed_mono");
+            partial.sidecars.push(Sidecar {
+                adapter: "avid.missing_managed_mono".into(), object: partial.items[0].id.clone(),
+                data: v(vec![("track", Value::Int(track)), ("file_package", package.clone())]),
+            });
+            let prepared = premiere_adapter::prepare_originals(&partial, &separate, ClockProfile::LegacyImport)
+                .unwrap().input;
+            assert_eq!(!prepared.direct_dnxhr_origins.is_empty(), allowed);
+            let mut ids = prproj::SeededUuids::new("partial-managed-mono");
+            let out = dir.join(format!("partial-{lane}-{allowed}.prproj"));
+            assert_eq!(prepare_typed_project(&prepared, &out, &mut ids, &[], false).is_ok(), allowed);
+        }
+    }
     let picture = g.media.iter().find(|m| m.kind == StreamKind::Video).unwrap();
     let facts = g.sidecars.iter_mut().find(|s| s.adapter == "avid.source" && s.object == picture.id).unwrap();
     if let Value::Obj(fields) = &mut facts.data {

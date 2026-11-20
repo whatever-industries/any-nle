@@ -7,9 +7,49 @@ use prproj::{
     xml::NodeId,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 pub(crate) const ADAPTER: &str = "premiere.color_mode_exposure";
+pub(crate) const ADJUST_LOSS: &str =
+    "Premiere Color Mode Adjust is retained in graph/2. The saved controls or color pipeline are outside the qualified Resolve mapping";
+
+#[derive(Default)]
+pub(super) struct SavedPayloads<'a> {
+    index: Option<HashMap<&'a str, Option<&'a str>>>,
+}
+
+impl<'a> SavedPayloads<'a> {
+    fn text(&mut self, project: &'a Project, node: NodeId) -> &'a str {
+        let tree = &project.doc.tree;
+        let text = tree.text(node).unwrap_or("").trim();
+        let Some(key) = tree.get(node, "BinaryHash") else {
+            return text;
+        };
+        let index = self.index.get_or_insert_with(|| {
+            let mut rows = HashMap::new();
+            for id in tree.iter(project.doc.root) {
+                let Some(hash) = tree.get(id, "BinaryHash") else { continue };
+                let payload = tree[id].text_or_empty().trim();
+                if payload.is_empty() {
+                    continue;
+                }
+                if !rows.contains_key(hash) && rows.len() == 65_536 {
+                    continue;
+                }
+                let saved = rows.entry(hash).or_insert(Some(payload));
+                if *saved != Some(payload) {
+                    *saved = None;
+                }
+            }
+            rows
+        });
+        index.get(key).copied().flatten().unwrap_or("")
+    }
+}
 const CONTROL_PROFILE: &str = "829284cfd5976cc94cce11fc126856f0d59998cb06065b8d28254e11b5199916";
+// Static Adjust with the three supported scalars normalized and all shared
+// binary values resolved. A repeated edit can refer to the first stored copy.
+const ADJUST_PROFILE: &str = "c819c1741a439cebd703ffecf243cfb6bdf713ed3086d257ac6106ecf7a5721b";
 const SOURCE_COLOR: &str =
     r#"{"baseColorProfile":{"colorProfileName":"BT.709 RGB Full"},"baseProfileType":1}"#;
 const OUTPUT_COLOR: &str = r#"{"baseColorProfile":{"colorProfileName":"BT.709,8-bit,Display-Referred"},"baseProfileType":1,"colorSpaceMetadata":{"peakLuminance":100}}"#;
@@ -28,20 +68,45 @@ pub(crate) fn qualified_exposure(row: &Value) -> Option<f64> {
     (in_range(value)
         && row.get("contrast").is_none()
         && row.get("pivot").is_none()
-        && matches!(row.get("operation"), Some(Value::Str(s)) if s == "clip Adjust")
         && matches!(row.get("controls_sha256"), Some(Value::Str(s)) if s == CONTROL_PROFILE)
-        && matches!(row.get("source_color"), Some(Value::Str(s)) if s == SOURCE_COLOR)
-        && matches!(row.get("output_color"), Some(Value::Str(s)) if s == OUTPUT_COLOR)
-        && row.get("qualified_pipeline") == Some(&Value::Bool(true)))
+        && qualified_pipeline(row))
     .then_some(value)
 }
 
-pub(super) fn capture(
-    project: &Project,
+fn qualified_pipeline(row: &Value) -> bool {
+    matches!(row.get("operation"), Some(Value::Str(s)) if s == "clip Adjust")
+        && matches!(row.get("source_color"), Some(Value::Str(s)) if s == SOURCE_COLOR)
+        && matches!(row.get("output_color"), Some(Value::Str(s)) if s == OUTPUT_COLOR)
+        && row.get("qualified_pipeline") == Some(&Value::Bool(true))
+}
+
+pub(crate) fn qualified_adjust(row: &Value) -> Option<crate::clip_fusion::Adjust> {
+    if !qualified_pipeline(row)
+        || !matches!(row.get("adjust_controls_sha256"), Some(Value::Str(s)) if s == ADJUST_PROFILE)
+    {
+        return None;
+    }
+    let scalar = |key, default| match row.get(key) {
+        Some(Value::Float(value)) => Some(*value),
+        Some(Value::Int(value)) => Some(*value as f64),
+        None => Some(default),
+        _ => None,
+    };
+    let exposure = scalar("exposure", 0.0)?;
+    let contrast = scalar("contrast", 1.0)?;
+    let pivot = scalar("pivot", 0.0)?;
+    ((-1.5..=1.0).contains(&exposure) && (0.5..=2.0).contains(&contrast)
+        && (-1.0..=1.0).contains(&pivot) && (contrast != 1.0 || pivot != 0.0))
+        .then_some(crate::clip_fusion::Adjust { exposure, contrast, pivot })
+}
+
+pub(super) fn capture<'a>(
+    project: &'a Project,
     sequence: NodeId,
     clip: TrackItemId,
     source: ItemId,
     occurrence: &str,
+    payloads: &mut SavedPayloads<'a>,
 ) -> Result<Option<Sidecar>> {
     let track_item = project.track_item(clip);
     let ([component], []) = (
@@ -91,24 +156,39 @@ pub(super) fn capture(
         }
     }
     let exposure = static_value(project, exposure_param)?.filter(|v| in_range(*v));
-    let contrast =
-        static_value(project, contrast_param)?.filter(|v| (0.0..=2.0).contains(v) && *v != 1.0);
-    let pivot =
-        static_value(project, pivot_param)?.filter(|v| (-3.0..=3.0).contains(v) && *v != 0.0);
+    let saved_contrast = static_value(project, contrast_param)?;
+    let saved_pivot = static_value(project, pivot_param)?;
+    let contrast = saved_contrast.filter(|v| (0.0..=2.0).contains(v) && *v != 1.0);
+    let pivot = saved_pivot.filter(|v| (-3.0..=3.0).contains(v) && *v != 0.0);
     if exposure.is_none() && contrast.is_none() && pivot.is_none() {
         return Ok(None);
     }
     let mut hash = Sha256::new();
     let mut budget = 64 * 1024;
-    let normalized_exposure = exposure.and(exposure_param);
+    let normalized_exposure = exposure.and(exposure_param).map(|id| (id, "0"));
     fingerprint(
         project,
         root,
-        normalized_exposure,
+        normalized_exposure.as_slice(),
+        None,
         &mut hash,
         0,
         &mut budget,
     )?;
+    let adjust_controls = if let (Some(exposure), Some(contrast_id), Some(pivot_id)) = (
+        normalized_exposure,
+        saved_contrast.filter(|v| (0.0..=2.0).contains(v)
+            && (contrast.is_some() || pivot.is_some())).and(contrast_param),
+        saved_pivot.filter(|v| (-3.0..=3.0).contains(v)).and(pivot_param),
+    ) {
+        let mut hash = Sha256::new();
+        let mut budget = 64 * 1024;
+        fingerprint(project, root, &[exposure, (contrast_id, "1."), (pivot_id, "0.")],
+            Some(payloads), &mut hash, 0, &mut budget)?;
+        Some(hex::encode(hash.finalize()))
+    } else {
+        None
+    };
     let mut output = None;
     let mut video_group_seen = false;
     let mut known_pipeline = false;
@@ -159,6 +239,9 @@ pub(super) fn capture(
         ),
         ("qualified_pipeline".into(), Value::Bool(known_pipeline)),
     ]);
+    if let Some(witness) = adjust_controls {
+        data.push(("adjust_controls_sha256".into(), Value::Str(witness)));
+    }
     for (name, value) in [("source_color", source_color), ("output_color", output)] {
         if let Some(value) = value.filter(|value| value.len() <= 1024) {
             data.push((name.into(), Value::Str(value.into())));
@@ -221,10 +304,11 @@ fn ordered_references(project: &Project, references: &[NodeId], tag: &str) -> Re
 
 // Compare the complete ordered Adjust controls to the neutral witness,
 // normalizing only the chosen Exposure value and saved component IDs.
-fn fingerprint(
-    project: &Project,
+fn fingerprint<'a>(
+    project: &'a Project,
     node: NodeId,
-    exposure: Option<NodeId>,
+    normalized: &[(NodeId, &str)],
+    mut payloads: Option<&mut SavedPayloads<'a>>,
     hash: &mut Sha256,
     depth: usize,
     budget: &mut usize,
@@ -253,10 +337,15 @@ fn fingerprint(
         add(value)?;
     }
     add("")?;
-    let text = tree.text(node).unwrap_or("").trim();
-    if tree.tag(node) == "StartKeyframe" && exposure.is_some() && tree.parent(node) == exposure {
+    let text = if let Some(cache) = payloads.as_deref_mut() {
+        cache.text(project, node)
+    } else {
+        tree.text(node).unwrap_or("").trim()
+    };
+    let adjustment = normalized.iter().find(|(id, _)| tree.parent(node) == Some(*id));
+    if let Some((_, neutral)) = adjustment.filter(|_| tree.tag(node) == "StartKeyframe") {
         let mut values: Vec<_> = text.split(',').take(9).collect();
-        values[1] = "0";
+        values[1] = neutral;
         add(&values.join(","))?;
     } else {
         add(text)?;
@@ -275,15 +364,15 @@ fn fingerprint(
             }
             "ComponentOwner" => {
                 for nested in chain(project, node)? {
-                    fingerprint(project, nested, exposure, hash, depth + 1, budget)?;
+                    fingerprint(project, nested, normalized, payloads.as_deref_mut(), hash, depth + 1, budget)?;
                 }
             }
             "Params" => {
                 for param in ordered_references(project, tree.children(child), "Param")? {
-                    fingerprint(project, param, exposure, hash, depth + 1, budget)?;
+                    fingerprint(project, param, normalized, payloads.as_deref_mut(), hash, depth + 1, budget)?;
                 }
             }
-            _ => fingerprint(project, child, exposure, hash, depth + 1, budget)?,
+            _ => fingerprint(project, child, normalized, payloads.as_deref_mut(), hash, depth + 1, budget)?,
         }
     }
     *budget = budget
