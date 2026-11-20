@@ -21,10 +21,12 @@ anynle-mapping = { path = "../mapping" }
 anynle-fcpxml = { path = "../fcpxml" }
 anynle-avid-adapter = { path = "../avid-adapter" }
 anynle-premiere-adapter = { path = "../premiere-adapter" }
+anynle-media-verification = { path = "../media-verification" }
 avid-reader = { path = "../../avid-reader" }
 prproj = { path = "../../prproj" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+anynle-resolve-adapter = { path = "../resolve-adapter" }
 rfd = { version = "=0.17.2", default-features = false }
 objc2 = "=0.6.5"
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSApplication", "NSAlert", "NSButton", "NSWindow", "NSResponder", "NSView"] }

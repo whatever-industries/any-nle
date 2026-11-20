@@ -51,6 +51,8 @@ pub struct OriginalChannel {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct OriginalClip {
+    /// The draft media record must be replaced with a verified Premiere import.
+    pub premiere_assisted: bool,
     pub proxy_path: Option<String>,
     pub metadata: ClipMetadata,
     pub path: String,
@@ -80,7 +82,7 @@ impl OriginalClip {
                     && suffix.is_some_and(|ext| match v.codec.as_str() {
                         "avc1" => ext.eq_ignore_ascii_case("mov") || ext.eq_ignore_ascii_case("mp4"),
                         "apch" => ext.eq_ignore_ascii_case("mov"),
-                        _ => false,
+                        _ => self.premiere_assisted && ["mov", "mp4"].iter().any(|suffix| ext.eq_ignore_ascii_case(suffix)),
                     }))
     }
 
@@ -95,7 +97,7 @@ impl OriginalClip {
                         "mov" => a.duration <= v.duration
                             && (matches!(v.codec.as_str(), "avc1" | "apch") && is_25_or_2997(v.rate)
                                 || self.supports_explicit_linked_raster() && !self.separate_mono_streams
-                                    && (v.codec == "avc1" || (v.width, v.height) != (1920, 1080))),
+                                    && (v.codec == "avc1" || self.premiere_assisted || (v.width, v.height) != (1920, 1080))),
                         "mxf" => is_25_or_2997(v.rate) && v.codec == "AVdn" && (v.width, v.height) == (1920, 1080)
                             && a.duration >= v.duration
                             && std::path::Path::new(&self.path).extension()
@@ -1985,6 +1987,13 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         c.video.is_some() || c.audio.is_some(),
         "original has no streams",
     )?;
+    if c.premiere_assisted {
+        require(std::path::Path::new(&c.path).is_absolute() && c.proxy_path.is_none()
+            && !c.separate_mono_streams
+            && (c.container == "mov" && c.video.is_some()
+                || matches!(c.container.as_str(), "wav" | "mp3") && c.video.is_none()),
+            "Premiere-assisted original needs an exact linked file and an unambiguous stream layout")?;
+    }
     if c.separate_mono_streams {
         require(c.is_same_rate_linked_pcm()
             && c.audio.as_ref().is_some_and(|a| a.representation == SampleRepresentation::Pcm24)
@@ -2022,7 +2031,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
                 _ => false,
             });
         require(
-            v.stream_index == 0 && (c.container == "mov" && qualified_codec
+            v.stream_index == 0 && (c.container == "mov" && (qualified_codec || c.premiere_assisted)
                 || c.container == "mxf" && c.is_same_rate_linked_pcm() || qualified_still),
             "unqualified original picture stream/profile",
         )?;
@@ -2033,7 +2042,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         require(
             v.source_start >= 0
                 && v.source_start % frame == 0
-                && (v.source_start == 0 || v.codec == "apch" || c.is_timecoded_avc_pcm()),
+                && (v.source_start == 0 || v.codec == "apch" || c.is_timecoded_avc_pcm() || c.premiere_assisted),
             "unqualified original picture source timecode",
         )?;
         super::model::check_ticks(

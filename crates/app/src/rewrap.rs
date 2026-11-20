@@ -133,6 +133,7 @@ struct Job {
     tc: Option<String>,
     rate: Fraction,
     mov: bool,
+    separate_mono: bool,
 }
 pub struct Plan {
     destination: PathBuf,

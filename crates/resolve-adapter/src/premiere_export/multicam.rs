@@ -316,6 +316,7 @@ fn camera_clip(
             source_path: source_path.clone(),
             target_path: binding.path.to_string_lossy().into_owned(),
             audio_stream,
+            separate_mono: false,
         });
         source_path
     };

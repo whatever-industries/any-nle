@@ -89,7 +89,7 @@ pub fn add_item(
             ticks_per_unit(v.rate),
             v.duration,
             &c.container,
-            &v.codec,
+            if c.premiere_assisted { "avc1" } else { &v.codec },
             0,
         )?;
         if c.container == "mxf" {

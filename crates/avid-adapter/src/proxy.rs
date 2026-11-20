@@ -218,6 +218,12 @@ impl Attachment {
 }
 
 impl Binding {
+    pub fn rewrap_sources(&self) -> Option<Vec<PathBuf>> {
+        self.audio.as_ref().map(|audio| {
+            std::iter::once(self.picture.clone()).chain(audio.iter().cloned()).collect()
+        })
+    }
+
     pub(crate) fn fact(&self) -> Value {
         super::obj(vec![
             ("path", super::s(self.path.to_str().unwrap())),

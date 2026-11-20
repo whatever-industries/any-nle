@@ -58,23 +58,7 @@ fn swatch(ui: &mut egui::Ui, c: Color32) {
     ui.painter().rect_filled(r, 3., c);
 }
 fn mapping_arrow(ui: &mut egui::Ui) {
-    let (r, _) = ui.allocate_exact_size(egui::vec2(22., 16.), egui::Sense::hover());
-    let c = r.center();
-    let color = ui.visuals().weak_text_color();
-    // A filled vector tip stays legible at small sizes without a font glyph.
-    ui.painter().line_segment(
-        [c - egui::vec2(8., 0.), c + egui::vec2(3., 0.)],
-        egui::Stroke::new(1.75, color),
-    );
-    ui.painter().add(egui::Shape::convex_polygon(
-        vec![
-            c + egui::vec2(8., 0.),
-            c + egui::vec2(1., -5.),
-            c + egui::vec2(1., 5.),
-        ],
-        color,
-        egui::Stroke::NONE,
-    ));
+    ui.add(crate::icons::arrow(ui, 16., "to").tint(ui.visuals().weak_text_color()));
 }
 fn selector(
     ui: &mut egui::Ui,

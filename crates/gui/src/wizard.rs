@@ -35,6 +35,7 @@ enum Pick {
     Media,
     MappedOriginalFolder,
     NewMedia,
+    RewrapNeeded,
     ProxyMedia,
     LoadPreset,
     SavePreset,
@@ -196,6 +197,7 @@ pub struct App {
     wizard: Wizard,
     inventory: Option<Inventory>,
     prepared: Option<PreparedJob>,
+    rewrap_size: crate::rewrap_size::SizeControl,
     review_blocker: Option<ReviewBlocker>,
     media_jump: Option<MediaJump>,
     completion: Option<Completion>,
@@ -223,6 +225,12 @@ pub struct App {
     close_confirmation: bool,
     #[cfg(target_os = "macos")]
     relink: crate::relink::Relink,
+    #[cfg(target_os = "macos")]
+    premiere_status: crate::premiere_review::WizardStatus,
+    #[cfg(target_os = "macos")]
+    resolve_wizard: Option<crate::avid_resolve::Wizard>,
+    #[cfg(target_os = "macos")]
+    resolve_templates: Option<anynle_resolve_adapter::turnover::Templates>,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, replay: Option<PathBuf>) -> Self {
@@ -239,6 +247,14 @@ impl App {
             wizard,
             inventory: None,
             prepared: None,
+            rewrap_size: Default::default(),
+            #[cfg(target_os = "macos")]
+            resolve_wizard: None,
+            #[cfg(target_os = "macos")]
+            resolve_templates: anynle_app::resolve_job::local_templates().unwrap_or_else(|error| {
+                eprintln!("Resolve templates: {error}");
+                None
+            }),
             review_blocker: None,
             media_jump: None,
             completion: None,
@@ -266,6 +282,8 @@ impl App {
             close_confirmation: false,
             #[cfg(target_os = "macos")]
             relink: Default::default(),
+            #[cfg(target_os = "macos")]
+            premiere_status: Default::default(),
         };
         if let Some(path) = replay {
             app.load_job(&path);
@@ -354,6 +372,7 @@ impl App {
             } else {
                 None
             },
+            rewrap_needed: if c.mode == ClipMode::Rewrap { None } else { i.rewrap_needed.clone() },
             policy_json: p.to_json_text(),
             effects: self
                 .wizard
@@ -379,6 +398,7 @@ impl App {
     }
     fn invalidate(&mut self) {
         self.prepared = None;
+        self.rewrap_size = Default::default();
         self.review_blocker = None;
         self.completion = None;
         self.completion_subjects = HashMap::new();
@@ -447,7 +467,20 @@ impl App {
             ctx.request_repaint();
         });
     }
+    fn media_linking_ready(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.prepared.as_ref().and_then(|job| job.review().media_linking.as_ref())
+            .is_some_and(|media| !media.premiere_files.is_empty())
+        {
+            return self.premiere_status.ready();
+        }
+        true
+    }
+
     fn convert(&mut self, ctx: &egui::Context) {
+        if !self.media_linking_ready() {
+            return;
+        }
         if self.busy || !self.wizard.can_convert() {
             return;
         }
@@ -525,7 +558,7 @@ impl App {
                 Pick::ProxyMedia => d
                     .set_title("Choose a folder for rewrapped proxies")
                     .pick_folder().map(|p| vec![p]),
-                Pick::NewMedia => d
+                Pick::NewMedia | Pick::RewrapNeeded => d
                     .set_title("Choose a parent for NEW media folder")
                     .pick_folder()
                     .map(|p| vec![p]),
@@ -589,6 +622,7 @@ impl App {
                         .map(|m| (m.saved_prefix, m.actual_root))
                         .collect(),
                     new_media: s.new_media,
+                    rewrap_needed: s.rewrap_needed,
                     proxy_rewrap_dir: s.proxy_rewrap_dir,
                 };
                 self.wizard.choices = Choices {
@@ -732,6 +766,9 @@ impl App {
                                 Pick::NewMedia => {
                                     self.wizard.inputs.new_media = Some(path.join(new_media_name()))
                                 }
+                                Pick::RewrapNeeded => {
+                                    self.wizard.inputs.rewrap_needed = Some(path.join(new_media_name()))
+                                }
                                 Pick::LoadPreset => match storage::read_settings(path)
                                     .and_then(|t| Preset::from_json(&t))
                                 {
@@ -786,7 +823,21 @@ impl App {
                                 Pick::SavePreflightReport => {
                                     self.save_preflight_report(path.clone(), ctx);
                                 }
-                                Pick::LoadJob => self.load_job(path),
+                                Pick::LoadJob => {
+                                    #[cfg(target_os = "macos")]
+                                    match anynle_app::resolve_job::load_if_avid_resolve(path) {
+                                        Ok(Some(job)) => {
+                                            self.resolve_wizard = Some(crate::avid_resolve::Wizard::from_job(job, ctx));
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            self.error = Some(error);
+                                            continue;
+                                        }
+                                        Ok(None) => {}
+                                    }
+                                    self.load_job(path);
+                                }
                                 Pick::Ffmpeg => {
                                     self.ffmpeg = Some(path.clone());
                                     self.wizard.invalidate();
@@ -859,7 +910,21 @@ impl App {
             "Project",
             "Choose the Avid source and where to save the Premiere project.",
         );
-        Self::card(ui, direction::show);
+        #[cfg(target_os = "macos")]
+        let resolve_available = self.resolve_templates.is_some() && !self.busy;
+        #[cfg(not(target_os = "macos"))]
+        let resolve_available = false;
+        Self::card(ui, |ui| {
+            let _resolve_selected = direction::show(ui, resolve_available);
+            #[cfg(target_os = "macos")]
+            if _resolve_selected {
+                if let Some(templates) = &self.resolve_templates {
+                    self.resolve_wizard = Some(crate::avid_resolve::Wizard::new(
+                        templates.clone(), &self.wizard.inputs, self.ffmpeg.clone(), self.ffprobe.clone(),
+                    ));
+                }
+            }
+        });
         #[cfg(target_os = "macos")]
         if ui.button("Relink media in an existing project…").clicked() {
             self.relink.open = true;
@@ -1519,10 +1584,12 @@ impl App {
         Self::title(ui, "Review & convert", "Avid Media Composer to Premiere Pro");
         let blocked = self.review_blocker.is_some();
         if let Some(issue) = &self.review_blocker {
+            self.rewrap_size.show(ui, &issue.rewrap_sources);
             if let Some(action) = Self::blocker_card(ui, issue, &mut self.report) {
                 self.take_review_action(action, ui.ctx());
             }
         }
+        let media_ready = self.media_linking_ready();
         let i = &self.wizard.inputs;
         let choices = &self.wizard.choices;
         let rewrap = choices.mode == ClipMode::Rewrap;
@@ -1563,8 +1630,10 @@ impl App {
             }
             if creates_media {
                 ui.colored_label(AMBER, RichText::new("Creates new media.").strong());
-                if let Some(path) = if rewrap { &i.new_media } else { &i.proxy_rewrap_dir } {
-                    review_path(ui, if rewrap { "Media folder" } else { "Proxy folder" }, path);
+                if let Some(path) = if rewrap { i.new_media.as_ref() } else {
+                    i.rewrap_needed.as_ref().or(i.proxy_rewrap_dir.as_ref())
+                } {
+                    review_path(ui, "Media folder", path);
                 }
             } else if rewrap && review.is_none() {
                 ui.label(RichText::new("A new media folder is needed for native OP-Atom rewraps.").color(MUTED));
@@ -1572,15 +1641,22 @@ impl App {
                     review_path(ui, "Media folder", path);
                 }
             }
+            if let Some(review) = review {
+                self.rewrap_size.show(ui, &review.rewrap_sources);
+            }
         });
 
         let mut save_report = false;
+        let mut choose_rewrap = false;
+        let mut clear_rewrap = false;
         if !blocked {
             Self::card(ui, |ui| {
                 if let Some(review) = review {
                     let inv = &review.inventory;
                     let changes = self.report.changes;
-                    let (status, color) = if changes == 0 {
+                    let (status, color) = if !media_ready {
+                        ("Waiting for Premiere", AMBER)
+                    } else if changes == 0 {
                         ("Ready to convert", GOOD)
                     } else {
                         ("Ready to convert with changes", AMBER)
@@ -1600,9 +1676,44 @@ impl App {
                     if inv.ume_originals > 0 && inv.native_media == 0 {
                         ui.label("Links to available originals in place.");
                     }
+                    if let Some(media) = &review.media_linking {
+                        ui.separator();
+                        ui.strong("Media linking");
+                        if !media.rewrap_available.is_empty() {
+                            ui.colored_label(AMBER, format!("Rewrap available for {} managed clips.", media.rewrap_available.len()));
+                            ui.collapsing("Affected clips", |ui| {
+                                for clip in &media.rewrap_available { ui.label(clip); }
+                            });
+                            choose_rewrap = ui.button("Choose folder to rewrap affected clips…").clicked();
+                        }
+                        if !media.rewrapped_clips.is_empty() {
+                            ui.label(format!("{} managed clips will be rewrapped.", media.rewrapped_clips.len()));
+                            clear_rewrap = ui.button("Continue without rewrapping").clicked();
+                        }
+                        if !media.conversion_pending.is_empty() {
+                            ui.colored_label(AMBER, format!("Conversion pending for {} recognized clips.", media.conversion_pending.len()));
+                            ui.collapsing("Show clips with pending conversion", |ui| {
+                                for clip in &media.conversion_pending { ui.label(clip); }
+                            });
+                        }
+                        if media.premiere_files.is_empty() {
+                            ui.label(format!("{} link directly in place.",
+                                counted(media.direct_files, "verified file", "verified files")));
+                        } else {
+                            #[cfg(target_os = "macos")]
+                            if let Err(error) = self.premiere_status.show(ui) {
+                                self.error = Some(error);
+                            }
+                            egui::CollapsingHeader::new("Files that need Premiere").show(ui, |ui| {
+                                for path in &media.premiere_files {
+                                    review_path(ui, "Original", Path::new(path));
+                                }
+                            });
+                        }
+                    }
                     if creates_media {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Estimated new media").color(MUTED));
+                            ui.label(RichText::new("Space reserved for preparation").color(MUTED));
                             ui.strong(bytes(review.estimated_bytes));
                             ui.separator();
                             ui.label(RichText::new("Available").color(MUTED));
@@ -1619,10 +1730,14 @@ impl App {
                                     ui.strong(&link.name);
                                     review_path(ui, "Picture", &link.picture);
                                     if !link.audio_channels.is_empty() {
-                                        let routes = link.audio_channels.iter()
-                                            .map(|(track, channel)| format!("A{track} → channel {channel}"))
-                                            .collect::<Vec<_>>().join(" · ");
-                                        ui.small(format!("Audio from camera file · {routes}"));
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.small("Audio from camera file");
+                                            for (track, channel) in &link.audio_channels {
+                                                ui.small(format!("· A{track}"));
+                                                ui.add(crate::icons::arrow(ui, 11., "to"));
+                                                ui.small(format!("channel {channel}"));
+                                            }
+                                        });
                                     }
                                     if let Some(proxy) = &link.proxy {
                                         review_path(ui, "Proxy", proxy);
@@ -1703,6 +1818,13 @@ impl App {
                     }
                 }
             });
+        }
+        if choose_rewrap {
+            self.pick(Pick::RewrapNeeded, ui.ctx());
+        }
+        if clear_rewrap {
+            self.wizard.inputs.rewrap_needed = None;
+            self.invalidate();
         }
         if save_report {
             self.pick(Pick::SavePreflightReport, ui.ctx());
@@ -1929,7 +2051,7 @@ impl App {
                 };
                 if self.wizard.page == Page::Review {
                     if self.wizard.can_convert() && self.prepared.is_some() {
-                        if ui.add(primary("Convert")).clicked() {
+                        if ui.add_enabled(self.media_linking_ready(), primary("Convert")).clicked() {
                             self.convert(ui.ctx());
                         }
                         if !self.busy && ui.button("Check again").clicked() {
@@ -2043,6 +2165,13 @@ impl eframe::App for App {
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        if let Some(resolve) = &mut self.resolve_wizard {
+            if resolve.show(ui, _frame) {
+                self.resolve_wizard = None;
+            }
+            return;
+        }
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.viewport().close_requested()) && self.busy {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2055,6 +2184,12 @@ impl eframe::App for App {
         self.poll(&ctx);
         if self.wizard.page == Page::Review {
             self.require_project_paths();
+            #[cfg(target_os = "macos")]
+            if let Some(media) = self.prepared.as_ref().and_then(|job| job.review().media_linking.as_ref()) {
+                if !media.premiere_files.is_empty() {
+                    self.premiere_status.refresh(&ctx, media);
+                }
+            }
         }
         if self.completion.is_none() || self.busy {
             egui::Panel::bottom("navigation")
@@ -2290,10 +2425,10 @@ fn media_status(inv: &Inventory) -> String {
 }
 
 #[cfg(test)]
-mod report_view_tests {
+pub(crate) mod report_view_tests {
     use super::*;
 
-    fn text_center(output: &egui::FullOutput, text: &str) -> Option<egui::Pos2> {
+    pub(crate) fn text_center(output: &egui::FullOutput, text: &str) -> Option<egui::Pos2> {
         output.shapes.iter().find_map(|shape| match &shape.shape {
             egui::Shape::Text(shape) if shape.galley.job.text == text => {
                 Some(shape.pos + shape.galley.rect.center().to_vec2())
@@ -2302,7 +2437,7 @@ mod report_view_tests {
         })
     }
 
-    fn click(pos: egui::Pos2) -> egui::RawInput {
+    pub(crate) fn click(pos: egui::Pos2) -> egui::RawInput {
         let pointer = |pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -2467,5 +2602,53 @@ mod report_view_tests {
             assert!(shown(visible));
             assert!(!shown(hidden));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos", feature = "live-premiere-tests"))]
+mod installed_helper_tests {
+    use super::*;
+    use super::report_view_tests::{click, text_center};
+
+    #[test]
+    fn qualify_installed_premiere_helper_from_wizard() {
+        let request = PathBuf::from(std::env::var_os("ANYNLE_WIZARD_ASSISTED_JOB")
+            .expect("set ANYNLE_WIZARD_ASSISTED_JOB to a disposable job"));
+        assert_eq!(anynle_app::premiere_import::worker_status(),
+            anynle_app::premiere_import::WorkerState::Ready);
+        let ctx = egui::Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), Some(request));
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut draw = |app: &mut App, mut input: egui::RawInput| {
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100., 850.)));
+            let mut output = ctx.run_ui(input, |ui| eframe::App::ui(app, ui, &mut frame));
+            output.textures_delta.clear();
+            output
+        };
+        app.wizard.page = Page::Review;
+        app.prepare(&ctx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while app.busy {
+            assert!(std::time::Instant::now() < deadline, "preflight timed out");
+            draw(&mut app, egui::RawInput::default());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let normal = draw(&mut app, egui::RawInput::default());
+        assert!(text_center(&normal, "Media linking").is_some());
+        assert!(text_center(&normal, "Ready · 1 original will use Premiere.").is_some());
+        let preflight = app.prepared.as_ref().expect("normal wizard preflight");
+        preflight.save_preflight_report(&app.wizard.inputs.output.with_extension("preflight.json")).unwrap();
+        assert!(!app.wizard.inputs.output.exists());
+        assert!(app.media_linking_ready());
+        draw(&mut app, click(text_center(&normal, "Convert").expect("Convert button")));
+        assert!(app.busy);
+        while app.busy {
+            assert!(std::time::Instant::now() < deadline, "conversion timed out");
+            draw(&mut app, egui::RawInput::default());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let completion = app.completion.expect("normal wizard conversion");
+        assert_eq!(completion.status, CompletionStatus::Complete, "{}", completion.message);
+        assert!(completion.report.iter().any(|note| note.message.starts_with("Used Premiere to link ")));
     }
 }

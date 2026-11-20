@@ -30,7 +30,7 @@ mod track_state;
 mod video;
 
 pub use archive::{
-    publish, publish_group, publish_linked, publish_linked_with_templates, publish_turnover,
+    check_output, publish, publish_group, publish_linked, publish_linked_with_templates, publish_turnover,
     Published,
 };
 pub use atom::{verify_atom_binding, AtomBindingSpec};

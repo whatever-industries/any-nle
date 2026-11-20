@@ -2081,8 +2081,8 @@ pub(crate) fn validate_clip(c: &Clip, w: &str) -> R<()> {
     require(c.audio.len() <= 64, || format!("{w}.audio: expected a list of at most 64 files"))?;
     if let Some(v) = &c.video {
         let w = format!("{w}.video");
-        require(["AVdn", "apcs", "apch"].contains(&v.codec.as_str()), || {
-            format!("{w}.codec: only DNx, ProRes LT and the prepared ProRes HQ freeze profile are supported")
+        require(["AVdn", "apco", "apcs", "apcn", "apch", "ap4h", "ap4x"].contains(&v.codec.as_str()), || {
+            format!("{w}.codec: unsupported DNx or ProRes profile")
         })?;
         check_dimensions(v.width, v.height, &w)?;
         check_rate(v.rate, &format!("{w}.rate"))?;

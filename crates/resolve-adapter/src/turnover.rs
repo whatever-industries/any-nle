@@ -6,12 +6,13 @@ use crate::{
     Result,
 };
 use graph::source::SourceGraph;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::{Path, PathBuf}};
 
 pub use crate::archive::check_output;
+pub use crate::avid::AvidTurnoverPlan;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Templates {
     pub layout: PathBuf,
@@ -24,7 +25,7 @@ pub struct Templates {
 
 /// Internal saved-job contract for the two experimental Resolve routes.
 /// The public application still reads and writes its existing job/1 format.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnoverJob {
     pub schema: JobSchema,
@@ -34,13 +35,13 @@ pub struct TurnoverJob {
     pub output: PathBuf,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub enum JobSchema {
     #[serde(rename = "anynle.job/2")]
     V2,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "route", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TurnoverSource {
     AvidToResolve {
@@ -58,6 +59,7 @@ pub enum TurnoverSource {
         #[serde(default)]
         attach_avid_proxies: bool,
         proxy_rewrap_dir: Option<PathBuf>,
+        op1a_rewrap_dir: Option<PathBuf>,
         ffmpeg: Option<PathBuf>,
     },
     PremiereToResolve {
@@ -67,6 +69,35 @@ pub enum TurnoverSource {
 }
 
 impl TurnoverJob {
+    pub fn plan_avid(&self) -> Result<crate::avid::AvidTurnoverPlan> {
+        use avid_adapter::original::{OriginalOptions, RootMapping};
+        let TurnoverSource::AvidToResolve {
+            bins, sequences, avid_project_root, media_roots, mappings,
+            prefer_source_media, require_camera_originals, attach_avid_proxies,
+            proxy_rewrap_dir, ffmpeg, ..
+        } = &self.source else {
+            return Err("Expected an Avid to Resolve job".into());
+        };
+        check_output(&self.output)?;
+        if proxy_rewrap_dir.is_some() && !attach_avid_proxies {
+            return Err("Proxy rewrap requires attaching Avid proxies".into());
+        }
+        let options = OriginalOptions {
+            ffprobe: self.ffprobe.clone(),
+            prefer_source_media: *prefer_source_media || *require_camera_originals || *attach_avid_proxies,
+            attach_avid_proxies: *attach_avid_proxies,
+            proxy_rewrap_dir: proxy_rewrap_dir.clone(),
+            ffmpeg: ffmpeg.clone().unwrap_or_else(|| "ffmpeg".into()),
+            root_mappings: mappings.iter().map(|[saved_root, current_root]| RootMapping {
+                saved_root: saved_root.clone(),
+                current_root: current_root.clone(),
+            }).collect(),
+            ..Default::default()
+        };
+        crate::avid::plan_avid_turnover(bins, media_roots, sequences, &options,
+            avid_project_root.as_deref(), *require_camera_originals)
+    }
+
     pub fn review_media_links(&self) -> Result<crate::premiere::MediaLinkReview> {
         let TurnoverSource::PremiereToResolve { premiere, sequence } = &self.source else {
             return Err("Media linking Review requires a Premiere to Resolve job".into());
@@ -86,52 +117,10 @@ impl TurnoverJob {
     }
 
     pub fn prepare(&self) -> Result<Turnover> {
-        use avid_adapter::original::{OriginalOptions, RootMapping};
         match &self.source {
-            TurnoverSource::AvidToResolve {
-                bins,
-                sequences,
-                avid_project_root,
-                media_roots,
-                mappings,
-                prefer_source_media,
-                require_camera_originals,
-                attach_avid_proxies,
-                proxy_rewrap_dir,
-                ffmpeg,
-            } => {
-                if proxy_rewrap_dir.is_some() && !attach_avid_proxies {
-                    return Err("proxy_rewrap_dir requires attach_avid_proxies; creates new media".into());
-                }
-                let options = OriginalOptions {
-                    link_managed_op1a: false,
-                    link_dry_gain: false,
-                    ffprobe: self.ffprobe.clone(),
-                    prefer_source_media: *prefer_source_media
-                        || *require_camera_originals
-                        || *attach_avid_proxies,
-                    attach_avid_proxies: *attach_avid_proxies,
-                    allow_media_gaps: false,
-                    collect_blocked_locators: false,
-                    proxy_rewrap_dir: proxy_rewrap_dir.clone(),
-                    ffmpeg: ffmpeg.clone().unwrap_or_else(|| "ffmpeg".into()),
-                    root_mappings: mappings
-                        .iter()
-                        .map(|[saved_root, current_root]| RootMapping {
-                            saved_root: saved_root.clone(),
-                            current_root: current_root.clone(),
-                        })
-                        .collect(),
-                };
-                crate::avid::prepare_avid_turnover_with_policy(
-                    bins,
-                    media_roots,
-                    sequences,
-                    &options,
-                    avid_project_root.as_deref(),
-                    *require_camera_originals,
-                )
-            }
+            TurnoverSource::AvidToResolve { op1a_rewrap_dir: Some(_), .. } =>
+                Err("Use the Any NLE job runner for managed OP1a rewrap".into()),
+            TurnoverSource::AvidToResolve { .. } => self.plan_avid()?.prepare(&self.ffprobe),
             TurnoverSource::PremiereToResolve { premiere, sequence } => {
                 crate::prepare_premiere_turnover(premiere, sequence, &self.ffprobe)
             }
@@ -154,7 +143,81 @@ pub struct TurnoverReview {
     pub estimated_proxy_bytes: u64,
 }
 
+pub struct ManagedRewrap {
+    pub item_id: String,
+    pub name: String,
+    pub sources: [PathBuf; 3],
+    pub frames: i64,
+    pub start_frame: i64,
+}
+
 impl Turnover {
+    pub fn review_op1a_template(templates: &Templates) -> Result<()> {
+        crate::archive::review_op1a_template(templates)
+    }
+
+    pub fn recheck_projects(&self) -> Result<()> {
+        for (path, revision) in &self.inputs {
+            if media_digest(path)? != *revision {
+                return Err(format!("source project changed: {}", path.display()).into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn managed_rewraps(&self) -> Vec<ManagedRewrap> {
+        let cameras: HashSet<_> = self.prepared.timelines.iter()
+            .filter_map(|timeline| timeline.group.as_ref())
+            .flat_map(|group| group.cameras).collect();
+        self.prepared.media.iter().enumerate()
+            .filter(|(index, _)| !cameras.contains(index))
+            .filter_map(|(_, media)| {
+                let linked::Profile::BoundMxf(binding) = &media.profile else { return None; };
+                let atom = binding.atom.as_ref()?;
+                Some(ManagedRewrap {
+                    item_id: binding.item_id.clone(),
+                    name: media.name.clone(),
+                    sources: atom.files.each_ref().map(|file| file.path.clone()),
+                    frames: binding.frames,
+                    start_frame: binding.timecode_frames,
+                })
+            }).collect()
+    }
+
+    pub fn use_verified_rewraps(
+        &mut self, replacements: &std::collections::HashMap<String, PathBuf>, ffprobe: &Path,
+    ) -> Result<()> {
+        let eligible: HashSet<_> = self.managed_rewraps().into_iter().map(|row| row.item_id).collect();
+        if replacements.keys().any(|key| !eligible.contains(key)) {
+            return Err("OP1a output does not identify an eligible managed source".into());
+        }
+        for media in &mut self.prepared.media {
+            let linked::Profile::BoundMxf(source) = &media.profile else { continue; };
+            let Some(path) = replacements.get(&source.item_id) else { continue; };
+            source.recheck()?;
+            let digest = media_digest(path)?;
+            let bound = crate::media::verify_group_binding(crate::media::BindingSpec {
+                item_id: source.item_id.clone(),
+                path: path.clone(),
+                sha256: hex::encode(digest),
+                streams: source.streams.each_ref().map(|stream| crate::StreamSelector {
+                    media_id: stream.media_id.clone(), index: stream.index, channel: stream.channel,
+                }),
+            }, ffprobe)?;
+            if bound.frames != source.frames || bound.timecode_frames != source.timecode_frames {
+                return Err(format!("{}: rewrapped OP1a changed the source clock or extent", source.item_id).into());
+            }
+            for file in &source.atom.as_ref().ok_or("missing original sibling binding")?.files {
+                self.inputs.push((file.path.clone(), file.digest));
+            }
+            media.path = bound.path.clone();
+            media.modified_micros = bound.modified_micros;
+            media.identity = linked::MediaIdentity::Digest(digest);
+            media.profile = linked::Profile::BoundMxf(std::sync::Arc::new(bound));
+        }
+        Ok(())
+    }
+
     pub fn media_counts(&self) -> (usize, usize) {
         self.prepared.media_counts()
     }
@@ -166,14 +229,14 @@ impl Turnover {
         inputs: Vec<(PathBuf, [u8; 32])>,
         notices: Vec<String>,
         caption_omissions: Vec<graph::Loss>,
-        premiere_files: Option<&linked::FileProbes>,
+        media_preparation: linked::MediaPreparation<'_>,
     ) -> Result<Self> {
         let selected: HashSet<_> = spec.timelines.iter().map(|timeline| timeline.id.as_str()).collect();
         let selected_texts = graph.sequences.iter()
             .filter(|sequence| selected.contains(sequence.id.as_str()))
             .flat_map(|sequence| &sequence.texts)
             .map(|text| text.id.clone()).collect();
-        let prepared = linked::prepare_project(&graph, spec, ffprobe, Some(&caption_omissions), premiere_files)?;
+        let prepared = linked::prepare_project(&graph, spec, ffprobe, Some(&caption_omissions), media_preparation)?;
         let caption_omissions = caption_omissions.into_iter()
             .filter(|loss| !prepared.writes_caption(&loss.object)).collect();
         Ok(Self {
@@ -238,14 +301,7 @@ impl Turnover {
             self.review(templates, output)?;
         }
         publish_turnover_checked(&self.prepared, templates, output, || {
-            let verify = || -> Result<()> {
-                for (path, revision) in &self.inputs {
-                    if media_digest(path)? != *revision {
-                        return Err(format!("source project changed: {}", path.display()).into());
-                    }
-                }
-                Ok(())
-            };
+            let verify = || self.recheck_projects();
             verify()?;
             avid_adapter::proxy::execute_all(&self.proxies)?;
             if self.proxies.iter().any(|p|p.audio.is_some()) {

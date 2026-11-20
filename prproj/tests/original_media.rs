@@ -40,6 +40,7 @@ fn original(shape: &str) -> OriginalClip {
         })
         .collect();
     OriginalClip {
+        premiere_assisted: false,
         separate_mono_streams: false,
         proxy_path: None,
         metadata: ClipMetadata {

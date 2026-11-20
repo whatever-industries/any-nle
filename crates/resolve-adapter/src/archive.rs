@@ -28,6 +28,11 @@ pub(crate) use linked::{publish_turnover_checked, review_turnover};
 const MAX_ARCHIVE: u64 = 1 << 20;
 const MAX_XML: u64 = 8 << 20;
 const SKELETON_SHA256: &str = "957171ef74e1b1b36cb8824983f0f73c9185785a8b424f0d8f5dfd135a1725de";
+
+pub(crate) fn review_op1a_template(templates: &crate::turnover::Templates) -> Result<()> {
+    let path = templates.group.as_deref().ok_or("OP1a rewrap requires the pinned Resolve Group template")?;
+    group::camera_donor(path).map(|_| ())
+}
 const PROJECT: &str = "project.xml";
 const POOL: &str = "MediaPool/Master/MpFolder.xml";
 const SOURCE: &str = "MediaPool/Master/000_Source/MpFolder.xml";

@@ -261,18 +261,24 @@ pub(crate) struct Media {
     pub(crate) profile: Profile,
     pub(crate) modified_micros: u64,
     pub(crate) calendar_seconds: Option<u64>,
-    identity: MediaIdentity,
+    pub(crate) identity: MediaIdentity,
     pub(crate) proxy: Option<avid_adapter::proxy::Attachment>,
     pub(crate) native: Option<Arc<crate::native_import::Movie>>,
 }
 
 #[derive(Clone)]
-enum MediaIdentity {
+pub(crate) enum MediaIdentity {
     Digest([u8; 32]),
     File(crate::media::FileStamp),
 }
 
 pub(crate) type FileProbes = HashMap<PathBuf, (Media, Rational, i64)>;
+
+pub(crate) enum MediaPreparation<'a> {
+    Automatic,
+    StandaloneOnly,
+    VerifiedPremiere(&'a FileProbes),
+}
 
 impl Media {
     fn for_item(&self, name: String, bin: usize) -> Self {
@@ -376,7 +382,12 @@ pub struct PreparedProject {
 impl PreparedProject {
     pub fn media_counts(&self) -> (usize, usize) {
         let direct: HashSet<_> = self.media.iter().filter(|media| media.native.is_none())
-            .map(|media| &media.path).collect();
+            .flat_map(|media| match &media.profile {
+                Profile::BoundMxf(binding) if binding.atom.is_some() => {
+                    binding.atom.iter().flat_map(|atom| atom.files.iter().map(|file| &file.path)).collect::<Vec<_>>()
+                }
+                _ => vec![&media.path],
+            }).collect();
         let assisted: HashSet<_> = self.media.iter().filter(|media| media.native.is_some())
             .map(|media| &media.path).collect();
         (direct.len(), assisted.len())
@@ -458,7 +469,7 @@ pub(crate) fn probe(
     bin: usize,
     canvas: (u16, u16),
 ) -> Result<(Media, Rational, i64)> {
-    probe_linked(spec, tool, name, bin, None, None, Some(canvas))
+    probe_linked(spec, tool, name, bin, None, None, Some(canvas), true)
 }
 
 pub(crate) fn review_original(
@@ -492,6 +503,7 @@ fn probe_linked(
     avid_start: Option<i64>,
     proxy: Option<avid_adapter::proxy::Attachment>,
     canvas: Option<(u16, u16)>,
+    allow_native_import: bool,
 ) -> Result<(Media, Rational, i64)> {
     let eligible = proxy.is_none() && canvas == Some((1920, 1080))
         && crate::native_import::eligible(&spec.path);
@@ -508,7 +520,7 @@ fn probe_linked(
         Ok(result)
     };
     let assisted = || probe_native(spec, tool, name.clone(), bin, avid_start);
-    if !eligible || !crate::native_import::available() {
+    if !allow_native_import || !eligible || !crate::native_import::available() {
         return standalone();
     }
     if std::env::var_os("ANYNLE_RESOLVE_IMPORT_ORDER").as_deref() == Some("api-first".as_ref()) {
@@ -1157,7 +1169,7 @@ pub(crate) fn check_origin(sequence: &SourceSequence) -> Result<i64> {
 }
 
 pub fn prepare(graph: &SourceGraph, spec: ProjectSpec, ffprobe: &Path) -> Result<PreparedProject> {
-    prepare_project(graph, spec, ffprobe, None, None)
+    prepare_project(graph, spec, ffprobe, None, MediaPreparation::Automatic)
 }
 
 pub(crate) fn prepare_project(
@@ -1165,8 +1177,13 @@ pub(crate) fn prepare_project(
     spec: ProjectSpec,
     ffprobe: &Path,
     review_caption_omissions: Option<&[graph::Loss]>,
-    premiere_files: Option<&FileProbes>,
+    media_preparation: MediaPreparation<'_>,
 ) -> Result<PreparedProject> {
+    let (premiere_files, allow_native_import) = match media_preparation {
+        MediaPreparation::VerifiedPremiere(files) => (Some(files), false),
+        MediaPreparation::Automatic => (None, true),
+        MediaPreparation::StandaloneOnly => (None, false),
+    };
     graph.validate()?;
     if !(1..=64).contains(&spec.timelines.len())
         || !(1..=256).contains(&spec.media.len().saturating_add(spec.atom_media.len()))
@@ -1309,13 +1326,13 @@ pub(crate) fn prepare_project(
             let (file, time_base, count) = match replay_files.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                    probe_linked(binding, ffprobe, name.clone(), bin_index, avid_source_timecode, None, canvas)
+                    probe_linked(binding, ffprobe, name.clone(), bin_index, avid_source_timecode, None, canvas, allow_native_import)
                         .map_err(|error| format!("{item_id}: {error}"))?,
                 ),
             };
             (file.for_item(name, bin_index), *time_base, *count)
         } else {
-            probe_linked(binding, ffprobe, name, bin_index, avid_source_timecode, proxy, canvas)
+            probe_linked(binding, ffprobe, name, bin_index, avid_source_timecode, proxy, canvas, allow_native_import)
                 .map_err(|error| format!("{item_id}: {error}"))?
         };
         let mut by_label = HashMap::new();

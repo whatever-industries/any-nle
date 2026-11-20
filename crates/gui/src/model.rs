@@ -172,6 +172,7 @@ pub struct Inputs {
     pub original_roots: Vec<PathBuf>,
     pub path_mappings: Vec<(PathBuf, PathBuf)>,
     pub new_media: Option<PathBuf>,
+    pub rewrap_needed: Option<PathBuf>,
     pub proxy_rewrap_dir: Option<PathBuf>,
 }
 #[derive(Clone, Copy)]

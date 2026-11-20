@@ -2002,8 +2002,9 @@ fn master(
                 ]);
                 None
             };
-            let original_clock = if let ("apch", Some(Observed::Known(count)), Some(rate), Some(saved)) =
-                (selected.codec.as_str(), &selected.embedded_mov_timecode, selected.rate, &m.start)
+            let original_clock = if let (Some(Observed::Known(count)), Some(rate), Some(saved), true) =
+                (&selected.embedded_mov_timecode, selected.rate, &m.start,
+                 selected.kind == StreamKind::Video && (selected.verified_for_native_import || matches!(selected.codec.as_str(), "apch" | "apcs")))
             {
                 let effective_count = u64::try_from(*count).map_err(|_| "negative linked MOV timecode")?;
                 Some(SourceClock {
@@ -2041,6 +2042,9 @@ fn master(
             } else {
                 None
             };
+            if selected.verified_for_native_import {
+                native_original.push(("verified_for_native_import", Value::Bool(true)));
+            }
             let source_clock = source_clock.or(original_clock);
             if let Some(timecode) = &selected.embedded_mov_timecode {
                 let mut witness = vec![("observation", observed(timecode))];
@@ -2188,28 +2192,21 @@ fn master(
                         return Err("more than one picture track".to_string().into());
                     }
                     video = true;
-                    let codec = match compression.as_str() {
-                        "RI00" if source.rendered_freeze
-                            && identity.picture_essence_coding == Some(avid_reader::mxf::PRORES_422_HQ_CODING)
-                            && identity.material_packages == [m.mob_id.umid_hex()]
-                            && identity.file_packages == [t.file_mob.umid_hex()]
-                            && identity.file_tracks == [(24, 1, t.length)]
-                            && identity.timecodes.is_empty() => "apch",
-                        "AVHD" => "AVdn",
-                        "RI00"
-                            if identity.picture_essence_coding
-                                == Some(avid_reader::mxf::PRORES_422_LT_CODING) =>
-                        {
-                            "apcs"
-                        }
-                        "RI00"
-                            if matches!(
-                                identity.picture_essence_coding,
-                                Some(avid_reader::mxf::DNXHR_LB_CODING | avid_reader::mxf::DNXHR_LB_CODING_0A)
-                            ) =>
-                        {
-                            "AVdn"
-                        }
+                    use avid_reader::mxf::PictureProfile;
+                    let profile = identity.picture_essence_coding.and_then(PictureProfile::from_label);
+                    if source.rendered_freeze && (identity.picture_essence_coding
+                        != Some(avid_reader::mxf::PRORES_422_HQ_CODING)
+                        || identity.material_packages != [m.mob_id.umid_hex()]
+                        || identity.file_packages != [t.file_mob.umid_hex()]
+                        || identity.file_tracks != [(24, 1, t.length)]
+                        || !identity.timecodes.is_empty())
+                    {
+                        return Err("generated Freeze Frame package or clock disagrees with the saved render".into());
+                    }
+                    let codec = match (compression.as_str(), profile) {
+                        ("AVHD", None | Some(PictureProfile::Dnx(_)))
+                        | ("RI00", Some(PictureProfile::Dnx(_))) => "AVdn",
+                        ("RI00", Some(PictureProfile::ProRes(profile))) => profile.fourcc(),
                         _ => {
                             return Err(
                                 format!("unsupported picture compression {compression:?}").into()
@@ -2363,6 +2360,24 @@ fn master(
                         .unwrap_or(Value::Null),
                 ),
         ];
+        if let Some(profile) = identity.picture_essence_coding.and_then(avid_reader::mxf::PictureProfile::from_label) {
+            native.push(("picture_profile", s(profile.probe_name())));
+            if let avid_reader::mxf::PictureProfile::Dnx(cid) = profile {
+                native.push(("picture_compression_id", Value::Int(i64::from(cid))));
+            }
+            if !identity.picture_descriptor.is_empty() {
+                native.push(("mxf_picture_descriptor", obj(identity.picture_descriptor.iter().map(|(name, bytes)| {
+                    let value = match bytes.as_slice() {
+                        [byte] => Value::Int(i64::from(*byte)),
+                        [a, b, c, d] => Value::Int(i64::from(u32::from_be_bytes([*a, *b, *c, *d]))),
+                        bytes if *name == "display_aspect" => Value::Arr(bytes.chunks_exact(4)
+                            .map(|n| Value::Int(i64::from(u32::from_be_bytes(n.try_into().unwrap())))).collect()),
+                        bytes => s(bytes.iter().map(|b| format!("{b:02X}")).collect::<String>()),
+                    };
+                    (*name, value)
+                }).collect())));
+            }
+        }
         if originals.legacy_mxf.contains_key(&source.id) {
             let raw = source.originals[tindex].as_ref().expect("verified legacy MXF track");
             for path in &raw.locators {

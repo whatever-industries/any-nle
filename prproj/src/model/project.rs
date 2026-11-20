@@ -83,6 +83,15 @@ pub(crate) struct PreparedSave {
     replace: bool,
 }
 impl PreparedSave {
+    pub(crate) fn inspect_document(&self) -> Result<PremiereDocument> {
+        PremiereDocument::from_bytes(&self.data)
+    }
+
+    pub(crate) fn replace_document(&mut self, document: &PremiereDocument) -> Result<()> {
+        self.data = document.to_bytes()?;
+        Ok(())
+    }
+
     pub(crate) fn publish(self) -> Result<Vec<String>> {
         self.publish_with(crate::publication::publish_new)
     }

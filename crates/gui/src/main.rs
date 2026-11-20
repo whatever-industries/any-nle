@@ -2,12 +2,18 @@
 #![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 use anynle_gui::model;
 mod direction;
+mod icons;
 mod palette;
 #[cfg(target_os = "macos")]
 mod relink;
 #[cfg(target_os = "macos")]
 mod resolve_review;
+#[cfg(target_os = "macos")]
+mod avid_resolve;
+#[cfg(target_os = "macos")]
+mod premiere_review;
 mod report;
+mod rewrap_size;
 mod storage;
 mod wizard;
 
@@ -15,6 +21,8 @@ fn main() -> eframe::Result {
     let mut job = None;
     #[cfg(target_os = "macos")]
     let mut resolve_job = None;
+    #[cfg(target_os = "macos")]
+    let mut premiere_import_job = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -31,10 +39,18 @@ fn main() -> eframe::Result {
             #[cfg(target_os = "macos")]
             "--resolve-job" => {
                 let Some(path) = args.next() else {
-                    eprintln!("--resolve-job needs a saved Premiere to Resolve job");
+                    eprintln!("--resolve-job needs a saved Resolve conversion job");
                     std::process::exit(2);
                 };
                 resolve_job = Some(std::path::PathBuf::from(path));
+            }
+            #[cfg(target_os = "macos")]
+            "--premiere-import-job" => {
+                let Some(path) = args.next() else {
+                    eprintln!("--premiere-import-job needs a Premiere media linking request");
+                    std::process::exit(2);
+                };
+                premiere_import_job = Some(std::path::PathBuf::from(path));
             }
             "--job" => {
                 let Some(path) = args.next() else {
@@ -68,12 +84,26 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     #[cfg(target_os = "macos")]
+    if let Some(path) = premiere_import_job {
+        if job.is_some() || resolve_job.is_some() {
+            eprintln!("Select one job per wizard window");
+            std::process::exit(2);
+        }
+        return premiere_review::run(path, options);
+    }
+    #[cfg(target_os = "macos")]
     if let Some(path) = resolve_job {
         if job.is_some() {
             eprintln!("Select one job per wizard window");
             std::process::exit(2);
         }
         return resolve_review::run(path, options);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(path) = &job {
+        if matches!(anynle_app::resolve_job::load_if_avid_resolve(path), Ok(Some(_))) {
+            return resolve_review::run(path.clone(), options);
+        }
     }
     eframe::run_native(
         "Any NLE",

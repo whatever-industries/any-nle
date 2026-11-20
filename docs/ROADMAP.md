@@ -229,6 +229,40 @@ profiles. Separate, Grouped, and Merged pass the tested 23.976 DNxHR LB/PCM24,
 use Separate files. [Direct-link read-back](SPLIT-EDIT-AUDIO-2026-11-06.md#grouped-and-merged-direct-linking)
 · [Adobe AAF migration baseline](https://helpx.adobe.com/il_en/premiere/desktop/render-and-export/export-files/export-from-avid-media-composer-to-premiere.html)
 
+- [x] **Premiere-assisted media linking prototype.** Live UXP import,
+  graph/2 replay, Save As, reopen, and isolated renders passed for 24 fps
+  ProRes HQ with mono PCM16/24 WAVs and 23.976 fps DNxHR LB with two mono
+  PCM24 OP-Atom siblings. The normal probe uses the donor for ProRes HQ
+  when the graph has only the codec family. Explicit donor replay exercises
+  all six originals. The prototype remains internal.
+  [Prototype and native checks](../tools/premiere-import-uxp/README.md)
+- [x] **Installed Premiere helper.** The internal graph/2 route uses an
+  installed UXP worker automatically for verified originals that need a
+  media record. On macOS, `--premiere-import-job` shows Media linking in
+  Review. Installed import, busy-project refusal, and reopened picture
+  and isolated PCM passed on Premiere 27.0.0 build 88 with Developer Tool
+  closed.
+  [Worker setup](../tools/premiere-import-uxp/README.md#automatic-linking-on-macos)
+- [x] **Avid → Premiere wizard fallback.** Separate files, Grouped, and
+  Merged on macOS use the installed helper for verified 1080p24
+  picture-only ProRes LT MOV with zero source timecode. Normal Review lists
+  the assisted original and enables Convert when the helper is ready. All
+  three modes preserved the original's path, clock, and trim after Save As
+  and reopen in Premiere 27.0.0 build 88. All 32 decoded frames matched the
+  native Premiere reference in each mode. The DNxHR OP-Atom control still
+  linked with the helper unavailable.
+  [Wizard profile](../tools/premiere-import-uxp/README.md#avid-to-premiere-wizard)
+- [x] **Generalize the installed fallback by stream facts.** The wizard lets
+  Premiere supply the media encoding for a verified original that needs
+  it. The linked MOV/MP4 source check verifies picture timing and optional
+  stereo PCM without a video codec allowlist. A ProRes LT/PCM24 fixture
+  retained its one-hour logging timecode, 36 trimmed frames, and both
+  independent 72,000-sample lanes after Premiere 27 Save As and reopen.
+  Premiere normalized the redundant media alternate-start field on save.
+  HEVC/PCM24 MP4
+  passed assisted import and saved read-back. Avid-managed OP-Atom keeps
+  its direct-link and rewrap paths.
+
 Qualify the saved Media Composer 25.12.0.58863 edit against the Any NLE
 project after Save As and reopen in Premiere 27.0.0 build 88. Check saved
 editability and use Avid picture and Direct Out where timing or rendering
@@ -2771,6 +2805,25 @@ Implemented fixes, tests and remaining native gates.
 - [ ] **Qualify wider direct OP-Atom profiles.** Direct ProRes OP-Atom playback
       remains unresolved.
       [Evidence and decision gate](SPLIT-EDIT-AUDIO-2026-11-06.md#users-fallback-decision-and-remaining-work).
+- [ ] **Qualify managed DNxHR HQ rewrap in Premiere 27.** The Avid reader
+      recognizes VC-3 CID 1272 and the explicit rewrap checks the source raster
+      and coded profile. Derived 1080p24 and UHD24 bins wrote picture-only OP1a
+      projects offline. Compare an Avid-authored HQ control after Premiere
+      Save As and reopen. Direct HQ OP-Atom linking has its own native check.
+      [Media rewrap coverage](MEDIA-REWRAP.md#current-cli).
+- [ ] **Qualify broad managed OP-Atom rewrap in Premiere 27.** The registered
+      DNx and ProRes profiles survive graph/2 capture. Selective rewrap can
+      keep direct links, write new OP1a and MOV media, and mark omitted edits.
+      Synthetic and derived fixtures preserve compressed picture, decoded
+      alpha where present, and 1–64 separately routed PCM16 siblings.
+      Premiere 27 imported 32-channel MXF and MOV controls through UXP
+      and rejected the 33- and 64-channel MXFs. Keep wider lanes in
+      separate linked files and qualify that layout. At 32, Save As and
+      reopen and fresh insertion preserved all mono lanes in both
+      containers. Picture and representative isolated PCM matched.
+      Wider native Avid packaging and field-order and pixel-aspect
+      interpretation remain separate acceptance checks.
+      [Media rewrap coverage](MEDIA-REWRAP.md#managed-picture-and-mono-streams).
 
 - [ ] **Resolve the retained anamorphic ProRes fixture and OP1a alternative**
       (2026-11-07). Its 446/447 duration/index conflict, 21952-byte terminal nonframe,
@@ -2784,7 +2837,10 @@ Implemented fixes, tests and remaining native gates.
       OP-Atom source. MOV stream copy played and exported in the retained trial.
       The converter now prepares admitted progressive square-pixel 1080p24 ProRes LT
       with PCM16/PCM24. Selected 5.1 and Adaptive8 macOS controls passed native render,
-      reopen and ten-minute loops. [Implementation](MULTICHANNEL-REWRAP-2026-11-07.md).
+      reopen and ten-minute loops. Review and the Avid CLI route managed ProRes LT
+      MXFs to this explicit rewrap before publishing a linked project.
+      [Routing by retained profile](VERIFIED-RELINK.md#what-triggers-rewrap-in-premiere).
+      [Implementation](MULTICHANNEL-REWRAP-2026-11-07.md).
       [Playback checks](PLAYBACK-ACCEPTANCE-2026-11-07.md).
 - [x] **Rewrap Avid-transcoded picture-only ProRes LT with a verified zero tail.**
       A native 1080p24 square-pixel control uses a separate OP-Atom label and
@@ -3803,10 +3859,13 @@ only for comparing results; route (3) (scripting API) is for test read-back.
 
 - [ ] **Qualify each route for the public CLI and wizard.** Complete its
       native acceptance and verify the media, project structure, and editor
-      versions in the intended release scope. Review the same-build template
-      for redistribution. Exercise Review, CLI conversion, and saved-job
-      replay from the packaged build before enabling the route. Publish the
-      tested profile and its limitations. Resolve conversion remains internal.
+      versions in the intended release scope. Both Avid media choices and
+      the rewrap estimate passed in the local macOS arm64 wizard. Replace
+      the private Resolve donors with a reviewed synthetic template set
+      and check generated archives for inherited previews and locators.
+      Repeat Review, CLI conversion, and saved-job replay with the
+      release templates before enabling the route. Publish the tested
+      profile and its limitations. Resolve conversion remains internal.
 
 Premiere → Resolve and Avid → Resolve target editable project conversion.
 Grading turnovers use **Link to originals** as the preferred media menu

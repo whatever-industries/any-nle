@@ -245,6 +245,105 @@ pub(crate) fn prepare_avid_turnover_with_policy(
     project_root: Option<&Path>,
     require_camera_originals: bool,
 ) -> Result<crate::turnover::Turnover> {
+    plan_avid_turnover(bins, media_roots, sequences, options, project_root, require_camera_originals)?
+        .prepare(&options.ffprobe)
+}
+
+pub struct AvidTurnoverPlan {
+    graph: SourceGraph,
+    spec: crate::linked::ProjectSpec,
+    inputs: Vec<(PathBuf, [u8; 32])>,
+    notices: Vec<String>,
+    problem: Option<String>,
+    proxies: Vec<avid_adapter::proxy::Binding>,
+}
+
+impl AvidTurnoverPlan {
+    pub fn review_links(&self, ffprobe: &Path, rewrap_managed: bool) -> crate::MediaLinkReview {
+        let mut review = crate::MediaLinkReview { direct: 0, assist: vec![], blockers: vec![] };
+        let mut seen = HashSet::new();
+        let cameras = self.group_camera_ids();
+        for row in &self.spec.atom_media {
+            if rewrap_managed && !cameras.contains(&row.binding.item_id.as_str()) {
+                continue;
+            }
+            for sibling in &row.binding.siblings {
+                if seen.insert(&sibling.path) { review.direct += 1; }
+            }
+        }
+        let canvas = self.spec.timelines.first().map(|row| {
+            (i64::from(row.canvas.0), i64::from(row.canvas.1))
+        });
+        for item in &self.spec.media {
+            if !seen.insert(&item.path) { continue; }
+            if self.proxies.iter().any(|proxy| self.graph.sidecar(avid_adapter::proxy::ADAPTER, &item.item_id)
+                .and_then(|v| v.get("path")).is_some_and(|v| matches!(v, graph::Value::Str(path) if Path::new(path) == proxy.path))) {
+                // Assisted import does not build the proxy attachment record.
+                review.direct += 1;
+                continue;
+            }
+            match crate::linked::review_original(&item.path, ffprobe, canvas) {
+                Ok(false) => review.direct += 1,
+                Ok(true) => review.assist.push(format!("{} · {}", item.item_id, item.path.display())),
+                Err(error) => review.blockers.push(format!("{} · {}: {error}", item.item_id, item.path.display())),
+            }
+        }
+        review
+    }
+
+    pub fn primary_rewrap_sources(&self) -> std::collections::BTreeSet<Vec<PathBuf>> {
+        let cameras = self.group_camera_ids();
+        self.spec.atom_media.iter().filter(|row| !cameras.contains(row.binding.item_id.as_str()))
+            .map(|row| row.binding.siblings.iter().map(|sibling| sibling.path.clone()).collect())
+            .collect()
+    }
+
+    fn group_camera_ids(&self) -> HashSet<&str> {
+        self.spec.timelines.iter().filter_map(|row| row.group.as_ref())
+            .flat_map(|group| group.cameras.iter().map(String::as_str)).collect()
+    }
+
+    pub fn rewrap_sources(&self, include_primary: bool) -> Vec<Vec<PathBuf>> {
+        let mut rows = if include_primary { self.primary_rewrap_sources().into_iter().collect() } else { Vec::new() };
+        let mut seen = HashSet::new();
+        rows.extend(self.proxies.iter().filter_map(|binding| {
+            let inputs = binding.rewrap_sources()?;
+            seen.insert(&binding.path).then_some(inputs)
+        }));
+        rows
+    }
+
+    pub fn prepare(self, ffprobe: &Path) -> Result<crate::turnover::Turnover> {
+        self.prepare_with_media(ffprobe, crate::linked::MediaPreparation::Automatic)
+    }
+
+    /// Validate the selected edits and bindings without invoking Resolve.
+    pub fn prepare_standalone(self, ffprobe: &Path) -> Result<crate::turnover::Turnover> {
+        self.prepare_with_media(ffprobe, crate::linked::MediaPreparation::StandaloneOnly)
+    }
+
+    fn prepare_with_media(
+        self,
+        ffprobe: &Path,
+        media: crate::linked::MediaPreparation<'_>,
+    ) -> Result<crate::turnover::Turnover> {
+        crate::turnover::Turnover::prepare(self.graph, self.spec, ffprobe, self.inputs, self.notices, vec![], media)
+            .map(|mut turnover| { turnover.proxies = self.proxies; turnover })
+            .map_err(|error| match self.problem {
+                Some(detail) => format!("{error}\n{detail}").into(),
+                None => error,
+            })
+    }
+}
+
+pub(crate) fn plan_avid_turnover(
+    bins: &[PathBuf],
+    media_roots: &[PathBuf],
+    sequences: &[String],
+    options: &avid_adapter::original::OriginalOptions,
+    project_root: Option<&Path>,
+    require_camera_originals: bool,
+) -> Result<AvidTurnoverPlan> {
     use crate::linked::{GroupSpec, ProjectSpec, TimelineSpec};
     if !(1..=256).contains(&bins.len()) || !(1..=64).contains(&sequences.len()) {
         return Err("select 1–256 Avid bins and 1–64 sequences".into());
@@ -424,12 +523,7 @@ pub(crate) fn prepare_avid_turnover_with_policy(
             guards.push((input.path,digest));
         }
     }
-    crate::turnover::Turnover::prepare(read.graph, spec, &options.ffprobe, guards, notices, vec![], None)
-        .map(|mut t| { t.proxies = proxies; t })
-        .map_err(|error| match problem {
-            Some(detail) => format!("{error}\n{detail}").into(),
-            None => error,
-        })
+    Ok(AvidTurnoverPlan { graph: read.graph, spec, inputs: guards, notices, problem, proxies })
 }
 
 fn check_camera_originals(

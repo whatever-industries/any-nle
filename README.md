@@ -52,8 +52,12 @@ Save settings from Review and replay them with the same job engine as the
 wizard.
 
 ```sh
+any-nle review --job SETTINGS.json
 any-nle run --job SETTINGS.json
 ```
+
+Review prints a machine-readable preflight report without creating the project
+or media. See the [report and exit codes](docs/GUI-WIZARD.md#automation).
 
 Or convert directly. Replace the example paths with your bin, media folder,
 and a new project filename.

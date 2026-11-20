@@ -461,7 +461,13 @@ verification of edit boundaries and audio phase.
 | 23.976 DNxHD LB + PCM16; 29.97 DF DNxHD LB + PCM24 | These native OP-Atom controls played and rendered after reopen. The tested 23.976 DNxHD picture also attached directly to a picture-only original. | Keep qualified direct links. Rewrap the verified 23.976 proxy only when the stereo layout requires combining its siblings. |
 | 23.976 DNxHR LB + PCM24 | The qualified direct construction plays in Premiere. Some earlier writer constructions had incorrect media descriptors or audio routing. | Do not infer a decoder failure from a bad project construction. Keep the existing qualified direct route. |
 | 29.97 synthetic DNx sample | Premiere displayed “codec missing.” The succeeding native DNxHD drop-frame fixture does not qualify this synthetic sample or 29.97 DNxHR. | Leave this unsupported shape unqualified. Drop-frame display is not evidence of a decoder failure. |
-| Native 24 fps ProRes LT OP-Atom, 10-bit, 16:15 pixel aspect | Retained direct playback trouble and a separately confirmed 446-picture/447-packet extent conflict. The conflict does not establish the sole cause of the Premiere failure. | Use the existing qualified ProRes MOV rewrap where its specific profile matches. Do not apply the DNx packet rule. |
+| Native 24 fps ProRes LT OP-Atom | Premiere's own import of the retained anamorphic sample hit frame-substitution recursion. A MOV stream copy played in that trial. Separate square-pixel rewrap controls passed Premiere 27 reopen and render. | Review and the Avid CLI direct managed ProRes LT to Any NLE's MOV rewrap. Rewrap still checks raster, pixel aspect, index, and PCM. The retained 16:15 sample remains outside automatic rewrap qualification. |
+
+Premiere-assisted UXP linking is for verified original files. A managed
+ProRes LT MXF stops linked preparation with the affected clip and a rewrap
+action. **Rewrap to native clips** or `--rewrap-media NEW_DIR
+--rewrap-native-master` uses the existing stream-copy path, with a new
+media folder selected explicitly.
 
 The 16 KiB all-zero item exposed by FFmpeg after the last DNxHD frame can be
 present even when Premiere plays the native MXF normally. The stereo proxy

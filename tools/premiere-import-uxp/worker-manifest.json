@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 5,
+  "id": "work.whatever-industries.anynle.media-link",
+  "name": "Any NLE Media Linking",
+  "version": "0.2.0",
+  "main": "worker.js",
+  "host": { "app": "premierepro", "minVersion": "27.0.0" },
+  "hostUIContext": { "hideFromMenu": true },
+  "entrypoints": []
+}

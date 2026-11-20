@@ -40,3 +40,5 @@ pub mod writer;
 pub mod prepared;
 pub mod multicam;
 pub mod original;
+#[doc(hidden)]
+pub mod media_donor;

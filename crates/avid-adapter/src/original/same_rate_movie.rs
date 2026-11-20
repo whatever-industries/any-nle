@@ -24,6 +24,43 @@ pub(super) fn frame_audio_extent(frames: i64, rate: av::Rate, round_up: bool) ->
 pub(super) fn select(
     path: &Path, probe: &Value, master: &av::SourceMaster, ordinal: usize,
 ) -> Result<Option<(Selected, bool)>, String> {
+    select_movie(path, probe, master, ordinal, false)
+}
+
+/// The portable movie layout is independent of the saved video codec.
+pub(super) fn may_need_import(path: &Path, probe: &Value) -> bool {
+    if !path.extension().is_some_and(|ext| ["mov", "mp4"].iter().any(|s| ext.eq_ignore_ascii_case(s))) {
+        return false;
+    }
+    matches!(probe.get("streams"), Some(Value::Arr(streams))
+        if streams.first().is_some_and(|stream| text(stream,"codec_type").as_deref() == Some("video")))
+}
+
+pub(super) fn select_verified_import(
+    path: &Path, probe: &Value, master: &av::SourceMaster, ordinal: usize,
+    ffprobe: &Path, check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(Selected, bool), String> {
+    let (selected, defaulted) = select_movie(path, probe, master, ordinal, true)?
+        .ok_or("linked file has no portable media layout")?;
+    // The first physical probe checks the entire file, independent of selector.
+    if ordinal == 0 {
+        let Some(Value::Arr(streams)) = probe.get("streams") else { unreachable!() };
+        let rate = master.rate.map(crate::rational).ok_or("linked picture rate is absent")?;
+        prove_picture_grid(path, ffprobe, &streams[0], rate, check)?;
+        if let Some(audio) = streams.get(1).filter(|stream| is_audio(stream)) {
+            let samples = number(audio, "duration_ts").ok_or("linked PCM extent is absent")?;
+            let stride = number(audio, "bits_per_sample").zip(number(audio,"channels"))
+                .and_then(|(bits, channels)| (matches!(bits,16 | 24) && channels == 2).then_some(bits / 8 * channels))
+                .ok_or("linked PCM payload shape is unknown")?;
+            prove_pcm_grid(path, ffprobe, samples, stride, check)?;
+        }
+    }
+    Ok((selected, defaulted))
+}
+
+fn select_movie(
+    path: &Path, probe: &Value, master: &av::SourceMaster, ordinal: usize, importer: bool,
+) -> Result<Option<(Selected, bool)>, String> {
     let picture_only_avc = avc_picture_only_rate(path, probe);
     let mov = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
     let custom_prores = mov && matches!(probe.get("streams"),
@@ -37,7 +74,7 @@ pub(super) fn select(
             Ok(None)
         };
     };
-    if !is_25_or_2997(Some(crate::rational(rate))) && picture_only_avc.is_none() && !custom_prores {
+    if !importer && !is_25_or_2997(Some(crate::rational(rate))) && picture_only_avc.is_none() && !custom_prores {
         return Ok(None);
     }
     let mp4 = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
@@ -63,7 +100,14 @@ pub(super) fn select(
         .ok_or("linked movie raster is missing")?;
     let brand = probe.get("format").and_then(|f| f.get("tags")).and_then(|f| text(f, "major_brand"));
     let avc_pcm = !mxf && is_avc_pcm_movie(streams);
+    let observed_codec;
     let codec = match (text(video, "codec_name").as_deref(), raster) {
+        _ if importer => {
+            observed_codec = text(video,"codec_tag_string").filter(|tag|
+                tag.len() == 4 && tag.is_ascii() && tag.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+                .or_else(|| text(video,"codec_name")).ok_or("linked picture codec is absent")?;
+            observed_codec.as_str()
+        }
         (Some("h264"), _) if avc_pcm => "avc1",
         (Some("h264"), _) if picture_only_avc.is_some() => "avc1",
         (Some("h264"), (1920, 1080) | (1280, 720) | (2048, 858)) if !mxf => {
@@ -116,15 +160,15 @@ pub(super) fn select(
         return Err("linked movie picture extent, master locator or lane origin disagrees".into());
     }
     let (audio, timecode) = match tail {
-        [] if codec == "apch" || picture_only_avc.is_some() => (&tail[..0], None),
+        [] if importer || codec == "apch" || picture_only_avc.is_some() => (&tail[..0], None),
         [a] if is_audio(a) => (tail, None),
-        [tc] if custom_prores => (&tail[..0], Some(tc)),
-        [a, tc] if codec == "apch" && is_audio(a) => (&tail[..1], Some(tc)),
-        [a, b] if (codec == "avc1" && mov || mxf) && is_audio(a) && is_audio(b) => (tail, None),
+        [tc] if custom_prores || importer => (&tail[..0], Some(tc)),
+        [a, tc] if (importer || codec == "apch") && is_audio(a) => (&tail[..1], Some(tc)),
+        [a, b] if !importer && (codec == "avc1" && mov || mxf) && is_audio(a) && is_audio(b) => (tail, None),
         _ => return Err("linked movie has unqualified additional streams".into()),
     };
-    let embedded = if codec == "apch" {
-        prores_origin(path, probe, video, timecode, 1 + audio.len() as i64, master, rate)?
+    let embedded = if importer || codec == "apch" {
+        movie_origin(path, probe, video, timecode, 1 + audio.len() as i64, master, rate, importer)?
     } else {
         if video.get("tags").is_some_and(|tags| tags.get("timecode").is_some())
             || master.master.start.as_ref().is_some_and(|tc| tc.frames != 0 || tc.drop)
@@ -175,7 +219,7 @@ pub(super) fn select(
             }
             let (representation, bits, priming) = if format == "aac" {
                 qualify_stereo_aac_lc(stream)?;
-                if codec == "apch" || !has_aac_priming_packet(probe, index)
+                if importer || codec == "apch" || !has_aac_priming_packet(probe, index)
                     || !same_rate_aac_master(master, samples, video, rate)
                 {
                     return Err("linked movie AAC extent or saved priming route disagrees".into());
@@ -190,11 +234,13 @@ pub(super) fn select(
                     ("pcm_s24le", _, false) if mxf => ("pcm24", 24),
                     _ => return Err("linked movie audio representation is unqualified".into()),
                 };
-                if codec == "hvc1" || number(stream, "bits_per_sample") != Some(bits)
+                if (!importer && codec == "hvc1") || number(stream, "bits_per_sample") != Some(bits)
                     || raw.descriptor_class != "PCMA" || raw.stored_quantization_bits != Some(bits)
                     || raw.descriptor_rate != 48_000.0 || raw.descriptor_length != samples
                     || if mxf { track.length != 0 || av::Rate::from_avid(track.edit_rate) != Some(rate) }
-                       else { track.edit_rate != 48_000.0 || track.length != samples }
+                       else if importer && av::Rate::from_avid(track.edit_rate) == Some(rate) {
+                           track.length != frames
+                       } else { track.edit_rate != 48_000.0 || track.length != samples }
                 {
                     return Err("linked movie saved PCM representation or extent disagrees".into());
                 }
@@ -207,6 +253,7 @@ pub(super) fn select(
     let (time_base, duration_ts, duration) = physical_span(stream)?;
     let is_picture = kind == StreamKind::Video;
     Ok(Some((Selected {
+        verified_for_native_import: importer,
         path: path.into(), online: true,
         stream: OriginalStream {
             saved_locators: raw.locators.clone(), container: if mxf { "mxf" } else { "mov" }.into(),
@@ -256,15 +303,22 @@ pub(super) fn prove_avc_picture_cadence(
         .ok_or("linked picture-only AVC requires H.264 High level 4.0 or 5.1")?;
     qualify_avc_high(video, level)?;
     qualify_movie_geometry_at_rate(video, raster, rate)?;
+    prove_picture_grid(path, tool, video, rate, check)
+}
+
+fn prove_picture_grid(
+    path: &Path, tool: &Path, video: &Value, rate: Rational,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
     let (base, extent, _) = physical_span(video)?;
     let count = number(video, "nb_frames").filter(|&n| (1..=(1 << 20)).contains(&n))
-        .ok_or("linked picture-only AVC needs a bounded declared frame count")?;
+        .ok_or("linked picture needs a bounded declared frame count")?;
     let frame = Rational::new(
         i128::from(rate.den()) * i128::from(base.den()),
         i128::from(rate.num()) * i128::from(base.num()),
     ).filter(|ticks| ticks.den() == 1 && ticks.num() > 0)
         .map(Rational::num)
-        .ok_or("linked picture-only AVC frame duration does not fit its file clock")?;
+        .ok_or("linked picture frame duration does not fit its file clock")?;
     if count.checked_mul(frame) != Some(extent) {
         return Err("linked picture-only AVC extent disagrees with its frame count".into());
     }
@@ -276,7 +330,39 @@ pub(super) fn prove_avc_picture_cadence(
         verify_avc_picture_packets(BufReader::new(stdout), count as usize, frame, || {
             progress.fetch_add(1, Ordering::Relaxed);
         })
-    }).map_err(|reason| format!("linked picture-only AVC packet proof failed: {reason}"))
+    }).map_err(|reason| format!("linked picture packet proof failed: {reason}"))
+}
+
+fn prove_pcm_grid(
+    path: &Path, tool: &Path, samples: i64, stride: i64,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let mut command = Command::new(tool);
+    command.args(["-v", "error", "-protocol_whitelist", "file,pipe", "-f", "mov",
+        "-select_streams", "a:0", "-show_packets", "-show_entries",
+        "packet=pts,duration,size:packet_side_data=", "-of", "csv=p=0"]).arg(path);
+    run_probe(command, PICTURE_PACKET_IDLE_LIMIT, check, move |stdout, progress| {
+        let mut packets = BufReader::new(stdout);
+        let mut bytes = Vec::new();
+        let mut cursor = 0;
+        while let Some(row) = read_picture_packet_row(&mut packets, &mut bytes)? {
+            let mut values = row.split(',').map(|value| value.parse::<i64>());
+            let (Some(Ok(pts)), Some(Ok(duration)), Some(Ok(bytes)), None) =
+                (values.next(), values.next(), values.next(), values.next()) else {
+                    return Err("linked PCM packet fields are unresolved".into());
+                };
+            if pts != cursor || !anynle_media_verification::pcm_payload_matches(duration, stride, bytes) {
+                return Err("linked PCM packet clock or payload differs".into());
+            }
+            cursor = anynle_media_verification::pcm_packet_end(cursor, duration, samples)
+                .ok_or("linked PCM exceeds the saved extent")?;
+            progress.fetch_add(1, Ordering::Relaxed);
+        }
+        if cursor != samples || cursor == 0 {
+            return Err("linked PCM packets do not cover the saved sample clock".into());
+        }
+        Ok(())
+    })
 }
 
 fn verify_avc_picture_packets(
@@ -344,9 +430,9 @@ fn physical_span(stream: &Value) -> Result<(Rational, i64, Rational), String> {
     Ok((base, len, duration))
 }
 
-fn prores_origin(
+fn movie_origin(
     path: &Path, probe: &Value, video: &Value, timecode: Option<&Value>, timecode_index: i64,
-    master: &av::SourceMaster, rate: av::Rate,
+    master: &av::SourceMaster, rate: av::Rate, importer: bool,
 ) -> Result<Option<i64>, String> {
     let saved = master.master.start.as_ref().ok_or("saved ProRes source timecode is absent")?;
     let base = match (rate.num, rate.den) {
@@ -365,7 +451,7 @@ fn prores_origin(
         if saved.frames == 0 && !saved.drop
             && video.get("tags").is_none_or(|tags| tags.get("timecode").is_none())
         {
-            return Ok(None);
+            return Ok(importer.then_some(0));
         }
         return Err("ProRes without an embedded timecode track requires saved zero origin".into());
     };
@@ -377,7 +463,11 @@ fn prores_origin(
     } else { frames };
     let mut label = avid_reader::extract::format_timecode(labelled, base);
     if saved.drop { label.replace_range(8..9, ";"); }
-    verify_prores_hq_timecode_track(path, probe, video, tc, timecode_index, crate::rational(rate), &label)?;
+    if importer {
+        verify_movie_timecode_track(video, tc, timecode_index, crate::rational(rate), &label)?;
+    } else {
+        verify_prores_hq_timecode_track(path, probe, video, tc, timecode_index, crate::rational(rate), &label)?;
+    }
     Ok(Some(frames))
 }
 

@@ -506,7 +506,7 @@ fn relative_name(path: &Path) -> String {
         .into_owned()
 }
 /// Engine selection uses the same cataloged dependency facts reviewed by the UI.
-pub(super) fn selected_paths(spec: &JobSpec, inv: &Inventory) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn selected_paths(spec: &JobSpec, inv: &Inventory) -> Result<Vec<PathBuf>, String> {
     let explicit = spec
         .bins
         .iter()

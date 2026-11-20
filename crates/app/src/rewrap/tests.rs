@@ -823,12 +823,12 @@ fn unsupported_output_timeline_refuses_before_source_access() {
         .contains("output timeline rate/raster"));
     assert!(!s.0.join("output").exists());
     m.sequences[0].rate = Fraction::new(24, 1);
-    m.sequences[0].events[0].audio_tracks.push(5);
+    m.sequences[0].events[0].audio_tracks.push(100);
     assert!(s
         .plan(&m)
         .err()
         .unwrap()
-        .contains("timeline layout exceeds"));
+        .contains("audio_tracks: expected distinct 1..99"));
     assert!(!s.0.join("output").exists());
 }
 #[test]

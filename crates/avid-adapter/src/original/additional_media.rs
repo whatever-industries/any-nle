@@ -478,6 +478,7 @@ pub(super) fn select(
         units
     };
     Ok(Some(Selected {
+        verified_for_native_import: false,
         path: path.into(),
         online: true,
         stream: OriginalStream {

@@ -51,7 +51,7 @@ pub(crate) struct AtomFile {
     pub(crate) package: [u8; 32],
     pub(crate) modified_micros: u64,
     clock: QualifiedClock,
-    digest: [u8; 32],
+    pub(crate) digest: [u8; 32],
 }
 
 impl AtomMedia {

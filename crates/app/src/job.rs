@@ -1,4 +1,6 @@
 //! Versioned shared job contract for the native wizard and command line.
+pub(crate) const PREFLIGHT_REPORT_SCHEMA: &str = "anynle.preflight-report/1";
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{
@@ -61,6 +63,8 @@ pub struct JobSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_rewrap_dir: Option<PathBuf>,
     pub new_media: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrap_needed: Option<PathBuf>,
     pub policy_json: String,
     pub effects: Vec<EffectChoice>,
     pub ffmpeg: Option<PathBuf>,
@@ -87,6 +91,7 @@ impl Default for JobSpec {
             attach_avid_proxies: false,
             proxy_rewrap_dir: None,
             new_media: None,
+            rewrap_needed: None,
             policy_json: String::new(),
             effects: vec![],
             ffmpeg: None,
@@ -126,13 +131,26 @@ pub struct EffectCapability {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Review {
     pub inventory: Inventory,
+    pub rewrap_sources: Vec<Vec<PathBuf>>,
     pub estimated_bytes: Option<u64>,
     pub available_bytes: Option<u64>,
     pub camera_originals: Vec<CameraOriginalLink>,
+    pub media_linking: Option<MediaLinking>,
     pub notes: Vec<ReportNote>,
     /// Display names keyed by the diagnostic's stable source object ID.
     pub subjects: std::collections::HashMap<String, String>,
     pub cli_equivalent: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct MediaLinking {
+    pub direct_files: usize,
+    pub premiere_files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rewrap_available: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rewrapped_clips: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conversion_pending: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CameraOriginalLink {
@@ -168,10 +186,12 @@ pub struct ReviewBlocker {
     pub kind: BlockerKind,
     pub message: String,
     pub affected: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rewrap_sources: Vec<Vec<PathBuf>>,
 }
 impl ReviewBlocker {
     pub fn new(kind: BlockerKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), affected: Vec::new() }
+        Self { kind, message: message.into(), affected: Vec::new(), rewrap_sources: Vec::new() }
     }
     pub(crate) fn cli_summary(self) -> String {
         if self.affected.is_empty() {
@@ -185,6 +205,7 @@ impl ReviewBlocker {
                 }
                 format!("{}: {summary}", self.message)
             }
+            BlockerKind::Rewrap => format!("{}\n{}", self.message, self.affected.join("\n")),
             BlockerKind::OriginalLocator | BlockerKind::LegacyMxfPackage => {
                 format!("{}: {}", self.message, self.affected.join("; "))
             }
@@ -243,9 +264,11 @@ impl CancelToken {
 
 mod inventory;
 pub use inventory::inventory;
+#[cfg(target_os = "macos")]
+pub(crate) use inventory::selected_paths;
 
 mod engine;
-pub(crate) use engine::sequence_timing_blocker;
+pub(crate) use engine::{blocked_preflight_report, sequence_timing_blocker};
 pub use engine::{
     execute, load, load_encoded, prepare, prepare_for_review, save_blocked_preflight_report, PreparedJob,
 };

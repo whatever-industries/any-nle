@@ -95,6 +95,8 @@ pub struct MediaRelink {
     /// Zero-based output audio ordinal, not the absolute container stream index.
     /// For the bounded uniform-depth mono OP1a route this is the flattened source channel.
     pub audio_stream: Option<u32>,
+    /// Each audio ordinal is a distinct mono stream in the output file.
+    pub separate_mono: bool,
 }
 
 fn invalid(message: String) -> WriteError {
@@ -143,10 +145,14 @@ pub fn apply_native(project: &mut Project, mappings: &[MediaRelink]) -> Result<(
 fn apply_views(project: &mut Project, mappings: &[MediaRelink], narrow: bool) -> Result<()> {
     let mut by_path = HashMap::new();
     let mut channels: HashMap<&str, HashSet<u32>> = HashMap::new();
+    let mut layouts = HashMap::new();
     for m in mappings {
+        if layouts.insert(m.target_path.as_str(), m.separate_mono).is_some_and(|old| old != m.separate_mono) {
+            return Err(invalid("rewrap bindings disagree about the target audio layout".into()));
+        }
         if let Some(index) = m.audio_stream {
-            if index >= 32 {
-                return Err(invalid("rewrap audio ordinal outside 0..31".into()));
+            if index >= 64 || (index >= 32 && !m.separate_mono) {
+                return Err(invalid("rewrap audio ordinal exceeds its binding layout".into()));
             }
             channels.entry(&m.target_path).or_default().insert(index);
         }
@@ -251,8 +257,9 @@ fn apply_views(project: &mut Project, mappings: &[MediaRelink], narrow: bool) ->
                 tree.remove(node, child);
             }
             let mono_mov = !narrow && m.target_path.to_ascii_lowercase().ends_with(".mov") && channels[m.target_path.as_str()].len()>2;
-            if mono_mov && index>0 {insert_leaf_before(tree,node,"ContentAndMetadataState","StreamNumber",&index.to_string())?;}
-            if narrow {
+            let mono_stream = m.separate_mono || mono_mov;
+            if mono_stream && index>0 {insert_leaf_before(tree,node,"ContentAndMetadataState","StreamNumber",&index.to_string())?;}
+            if narrow && !m.separate_mono {
                 insert_leaf_before(
                     tree,
                     node,
@@ -270,10 +277,10 @@ fn apply_views(project: &mut Project, mappings: &[MediaRelink], narrow: bool) ->
                 layout,
                 Some(format!(
                     "[{}]",
-                    vec!["{\"channellabel\":0}"; if mono_mov {1}else{channels[m.target_path.as_str()].len()}].join(",")
+                    vec!["{\"channellabel\":0}"; if mono_stream {1}else{channels[m.target_path.as_str()].len()}].join(",")
                 )),
             );
-            if narrow {
+            if narrow && !m.separate_mono {
                 insert_leaf_before(
                     tree,
                     stream,
@@ -321,12 +328,14 @@ mod tests {
             source_path: clip.video.as_ref().unwrap().path.clone(),
             target_path: target.clone(),
             audio_stream: None,
+            separate_mono: false,
         }];
         for (i, a) in clip.audio.iter().enumerate() {
             maps.push(MediaRelink {
                 source_path: a.path.clone(),
                 target_path: target.clone(),
                 audio_stream: Some(i as u32),
+                separate_mono: false,
             });
         }
         model.clips.get_mut("clip-1").unwrap().audio[1].bits = 24;
@@ -388,12 +397,14 @@ mod tests {
             source_path: c.video.as_ref().unwrap().path.clone(),
             target_path: target.clone(),
             audio_stream: None,
+            separate_mono: false,
         }];
         for (i, a) in c.audio.iter().enumerate() {
             maps.push(MediaRelink {
                 source_path: a.path.clone(),
                 target_path: target.clone(),
                 audio_stream: Some(i as u32),
+                separate_mono: false,
             });
         }
         let mut ids = crate::SeededUuids::new("op1a-parity");

@@ -8,7 +8,8 @@ publication engine; the GUI does not run the CLI as a subprocess.
 The five steps are Project, Clips & media, Markers & colors, Effects, and Review.
 The Project step starts with **Translate from** and **Translate to**. Both menus list
 Avid Media Composer, Premiere and Resolve.
-Avid Media Composer → Premiere is selected and is the only available direction.
+Avid Media Composer → Premiere is the default. Avid Media Composer → Resolve
+is available for [local macOS qualification](RESOLVE-TURNOVER-IMPLEMENTATION.md#avid-to-resolve-in-the-macos-wizard).
 To inspect the menus with a keyboard, Tab to each dropdown and press Enter or
 Space to open it. Press Escape to close it.
 The project step supports individual bins and project folders, the folder tree with
@@ -87,6 +88,34 @@ Last choices are remembered locally. The shared job file stores exact paths for 
 `any-nle-gui --job SETTINGS.json` loads it for a fresh check, and Review provides a CLI
 equivalent. Settings schemas and bounds are validated. A preset save refuses an existing
 file. No telemetry, updater or default AVB association is installed.
+
+## Automation
+
+Use the wizard's **Save job settings** action once and replay the same job
+headlessly. Review reads the job and prints a JSON report to stdout without
+creating the project or media, launching an editor, or importing media.
+
+```sh
+any-nle review --job SETTINGS.json
+any-nle run --job SETTINGS.json
+```
+
+The report uses `anynle.preflight-report/1`. Avid to Premiere uses the same
+report as **Save preflight report**. Its `media_linking.premiere_files` lists
+any originals that still need Premiere at conversion time. Local macOS Avid
+to Resolve jobs report direct links, Resolve-assisted originals and planned
+rewrap size where applicable. When Resolve is needed, the headless report
+stops at media linking with `requires_editor`.
+
+| Exit | Result |
+| --- | --- |
+| 0 | `ready`. Preflight completed. Check reported losses, media requirements and any required approval before running. |
+| 1 | `blocked` or `requires_editor`. Inspect the blocker or media requirements in the report. A report write failure is diagnosed on stderr. |
+| 2 | Invalid arguments or unreadable job settings, diagnosed on stderr. |
+
+For interface checks, load the job with `any-nle-gui --job SETTINGS.json`
+and inspect the accessible controls. Review and conversion recheck their
+inputs when run separately.
 
 On completion, the native wizard shows actual output/receipt paths, retained media and a
 searchable report. Open in Premiere is offered only when a local Premiere installation

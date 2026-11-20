@@ -62,7 +62,7 @@ impl NativeMediaPreparation<'_, '_> {
         ffprobe: &Path,
     ) -> Result<Plan, PrepareIssue> {
         let plan = Plan::prepare_media_review(
-            self.model, directory, media_roots, project, graph, ffmpeg, ffprobe, true, self.gain,
+            self.model, directory, media_roots, project, graph, ffmpeg, ffprobe, true, false, self.gain,
             self.managed_pictures,
         )?;
         if let Some(input) = self.writer_input {
@@ -134,6 +134,19 @@ fn validate_destination(
 }
 
 impl Plan {
+    pub(crate) fn estimate_sources(&self) -> Vec<Vec<PathBuf>> {
+        self.jobs.iter().map(|job| {
+            job.inputs.iter().map(|&index| self.inputs[index].path.clone()).collect()
+        }).collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn op1a_targets(&self) -> impl Iterator<Item = (Vec<PathBuf>, PathBuf)> + '_ {
+        self.estimate_sources().into_iter().enumerate().map(|(index, inputs)| {
+            (inputs, self.destination.join(format!("media-{:04}.mxf", index + 1)))
+        })
+    }
+
     pub fn estimated_bytes(&self)->u64 {self.estimate}
     pub fn available_bytes(&self)->u64 {self.free}
 
@@ -188,6 +201,7 @@ impl Plan {
                         source_path: path.clone(),
                         target_path: target.clone(),
                         audio_stream: if n == 0 { None } else { Some((n - 1) as u32) },
+                        separate_mono: job.separate_mono,
                     });
                 }
             }
@@ -216,8 +230,16 @@ impl Plan {
         ffprobe: &Path,
         allow_mov: bool,
     ) -> R<Self> {
-        Self::prepare_media_review(model, directory, media_roots, project, graph, ffmpeg, ffprobe, allow_mov, &HashMap::new(), HashMap::new())
+        Self::prepare_media_review(model, directory, media_roots, project, graph, ffmpeg, ffprobe, allow_mov, false, &HashMap::new(), HashMap::new())
             .map_err(PrepareIssue::into_message)
+    }
+
+    pub(crate) fn prepare_selected(
+        model: &Model, directory: &Path, media_roots: &[String], project: &Path,
+        ffmpeg: &Path, ffprobe: &Path,
+    ) -> Result<Self, PrepareIssue> {
+        Self::prepare_media_review(model, directory, media_roots, project, None, ffmpeg, ffprobe,
+            true, true, &HashMap::new(), HashMap::new())
     }
 
     fn prepare_media_review(
@@ -229,6 +251,7 @@ impl Plan {
         ffmpeg: &Path,
         ffprobe: &Path,
         allow_mov: bool,
+        prefer_separate_mono: bool,
         gain_paths: &GainPaths<'_>,
         mut managed_pictures: LtRangePictures,
     ) -> Result<Self, PrepareIssue> {
@@ -241,16 +264,7 @@ impl Plan {
         {
             return Err("rewrap preparation: output timeline rate/raster is not supported".into());
         }
-        // Rewrapping must not create media for a timeline the existing writer will refuse.
-        if model.sequences.iter().any(|s| {
-            s.events.iter().any(|e| {
-                e.audio_tracks.iter().any(|t| *t > 4)
-                    || e.stereo.iter().any(|p| p.audio_track > 4)
-                    || e.video_track.is_some_and(|t| t > 3)
-            })
-        }) {
-            return Err("rewrap preparation: timeline layout exceeds the existing writer's 4 audio / 3 video tracks; source bins may carry up to 32 discrete mono files".into());
-        }
+        // Destination track capacity is validated by the staged project writer before execution.
         prproj::convert::model::validate_model(model).map_err(|e| e.to_string())?;
         let used: HashSet<&str> = model
             .bins
@@ -263,7 +277,13 @@ impl Plan {
                     .flat_map(|s| s.events.iter().map(|e| e.clip.as_str())),
             )
             .collect();
-        if allow_mov && model.clips.values().any(|c|used.contains(c.id.as_str()) && c.video.as_ref().is_some_and(|v|v.codec=="apcs") && c.audio.len()>8) {
+        if allow_mov && !prefer_separate_mono && model.clips.values().any(|clip| {
+            used.contains(clip.id.as_str())
+                && clip.audio.len() > 8
+                && clip.video.as_ref().is_some_and(|video| {
+                    avid_reader::mxf::ProResProfile::from_fourcc(&video.codec).is_some()
+                })
+        }) {
             return Err("ProRes MOV currently supports at most eight qualified PCM lanes".into());
         }
         let versions = vec![
@@ -313,14 +333,16 @@ impl Plan {
                     clip.id
                 )
             })?;
-            let freeze = video.codec == "apch";
-            let mov = matches!(video.codec.as_str(), "apcs" | "apch");
-            if (video.codec != "AVdn" && !(allow_mov && mov)) || !supported_rate(video.rate) || clip.audio.len() > 32 {
-                return Err(format!("clip {}: rewrap supports qualified MXF rates, DNxHD/DNxHR 8-bit 4:2:2 picture and at most 32 mono PCM inputs",clip.id).into());
+            let mov = avid_reader::mxf::ProResProfile::from_fourcc(&video.codec).is_some();
+            let separate_mono = clip.audio.len() > 32 || (mov && prefer_separate_mono);
+            if (video.codec != "AVdn" && !(allow_mov && mov)) || !supported_rate(video.rate)
+            {
+                return Err(format!("clip {}: rewrap requires a qualified DNx or ProRes profile and rate",clip.id).into());
             }
             let source_id = avid_reader::mxf::read_identity(Path::new(&video.path))
                 .map_err(|e| e.to_string())?;
             let native_clock = source_id.file_start_timecode();
+            let freeze = video.codec == "apch" && native_clock.is_none();
             let tc = if freeze {
                 if !clip.audio.is_empty() || video.rate != Fraction::new(24, 1)
                     || video.start != 0 || video.duration != 5 * TPS
@@ -344,6 +366,11 @@ impl Plan {
                 Some(timecode(video.start, video.rate, drop)?)
             };
             let expected_op = if freeze { "060e2b34040101020d01020110000000" } else { OP_ATOM };
+            let avid_prores_picture = !freeze && mov
+                && source_id.picture_essence_coding.and_then(avid_reader::mxf::PictureProfile::from_label)
+                    .is_some_and(|profile| matches!(profile, avid_reader::mxf::PictureProfile::ProRes(p) if p.fourcc() == video.codec))
+                && source_id.file_tracks.contains(&(video.rate.num, video.rate.den, video.duration / ticks_per_unit(video.rate)))
+                && source_id.file_packages.len() == 1;
             let avid_lt_picture = video.codec == "apcs" && clip.audio.is_empty()
                 && source_id.picture_essence_coding == Some(avid_reader::mxf::PRORES_422_LT_CODING)
                 && source_id.file_tracks == [(24, 1, video.duration / ticks_per_unit(video.rate))]
@@ -364,7 +391,7 @@ impl Plan {
                 .enumerate()
             {
                 let accepts_op = |op: &str| op == expected_op
-                    || (at == 0 && avid_lt_picture && op == super::backend::AVID_PRORES_LT_ATOM);
+                    || (at == 0 && (avid_lt_picture || avid_prores_picture) && op == super::backend::AVID_PRORES_LT_ATOM);
                 let path = fs::canonicalize(original).map_err(|e| format!("{original}: {e}"))?;
                 if path.to_str().is_none()
                     || original
@@ -435,8 +462,9 @@ impl Plan {
                         super::mov::validate_source(stream, &input.probe.raw, video)?;
                     } else if stream.kind != "video"
                         || stream.codec != "dnxhd"
-                        || stream.pix != "yuv422p"
-                        || !["DNXHD", "DNXHR LB", "DNXHR SQ", "DNXHR HQ"]
+                        || !["yuv422p", "yuv422p10le", "yuv422p12le", "yuv444p10le", "yuv444p12le",
+                             "gbrp10le", "gbrp12le"].contains(&stream.pix.as_str())
+                        || !["DNXHD", "DNXHR LB", "DNXHR SQ", "DNXHR HQ", "DNXHR HQX", "DNXHR 444"]
                             .contains(&stream.profile.as_str())
                         || stream.rate != format!("{}/{}", video.rate.num, video.rate.den)
                         || stream.width != video.width
@@ -446,6 +474,14 @@ impl Plan {
                             "DNx stream descriptor/frame count disagrees with supported model"
                                 .into(),
                         );
+                    }
+                    if let Some(profile) = source_id.picture_essence_coding.and_then(avid_reader::mxf::PictureProfile::from_label) {
+                        if stream.profile != profile.probe_name() {
+                            return Err(format!("{} coding label disagrees with the coded picture profile", profile.probe_name()).into());
+                        }
+                        if let avid_reader::mxf::PictureProfile::Dnx(cid) = profile {
+                            verify_dnx_cid(&input.path, cid)?;
+                        }
                     }
                 } else {
                     let a = audio[at - 1];
@@ -554,8 +590,8 @@ impl Plan {
                                     ("avid_track", Value::Int(a.avid_track.unwrap())),
                                     ("source_path", text(&a.path)),
                                     ("output_audio_ordinal", Value::Int(ordinal as i64)),
-                                    ("output_stream_index", Value::Int(if video.codec=="apcs" {1}else{ordinal as i64+1})),
-                                    ("output_channel_index", Value::Int(if video.codec=="apcs" {ordinal as i64}else{0})),
+                                    ("output_stream_index", Value::Int(if mov && !separate_mono {1}else{ordinal as i64+1})),
+                                    ("output_channel_index", Value::Int(if mov && !separate_mono {ordinal as i64}else{0})),
                                     ("bits", Value::Int(a.bits)),
                                     ("sample_rate", Value::Int(a.sample_rate)),
                                     ("master_gain_db", Value::Float(a.gain_db)),
@@ -649,6 +685,7 @@ impl Plan {
                     tc,
                     rate: video.rate,
                     mov,
+                    separate_mono,
                 });
             }
         }
@@ -692,4 +729,19 @@ impl Plan {
     pub fn describe(&self) {
         println!("{}", self.review_text());
     }
+}
+
+fn verify_dnx_cid(path: &Path, expected: u16) -> R<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let spans = super::source::essence_spans(path)?;
+    let picture = spans.iter().find(|span| span.kind == 0x15)
+        .filter(|span| span.bytes >= 44).ok_or("missing coded VC-3 picture")?;
+    let mut source = fs::File::open(path).map_err(|e| e.to_string())?;
+    source.seek(SeekFrom::Start(picture.offset + 40)).map_err(|e| e.to_string())?;
+    let mut coded = [0; 4];
+    source.read_exact(&mut coded).map_err(|e| e.to_string())?;
+    if u32::from_be_bytes(coded) != u32::from(expected) {
+        return Err("VC-3 picture compression ID disagrees with the MXF descriptor".into());
+    }
+    Ok(())
 }

@@ -61,6 +61,68 @@ impl Drop for Scratch {
 }
 
 #[test]
+fn saved_job_review_returns_json_without_creating_conversion_outputs() {
+    use anynle_app::job::{self, CancelToken, ClipMode, JobSpec};
+    use std::fs;
+
+    let scratch = Scratch::new();
+    let source = scratch.0.join("source.avb");
+    let output = scratch.0.join("project.prproj");
+    let settings = scratch.0.join("settings.json");
+    let wizard_report = scratch.0.join("wizard-preflight.json");
+    let spec = JobSpec {
+        bins: vec![source.clone()],
+        media_roots: vec![scratch.0.join("media")],
+        mode: ClipMode::Separate,
+        output: output.clone(),
+        // Empty bin. No media tool invocation is needed.
+        ffmpeg: Some("unused-ffmpeg".into()),
+        ffprobe: Some("unused-ffprobe".into()),
+        ..Default::default()
+    };
+    let settings_bytes = serde_json::to_vec(&spec).unwrap();
+    fs::write(&settings, &settings_bytes).unwrap();
+    let source_bytes = fs::read(&source).unwrap();
+    job::prepare_for_review(spec, &CancelToken::default(), &mut |_| {})
+        .unwrap()
+        .save_preflight_report(&wizard_report)
+        .unwrap();
+    let review = || {
+        Command::new(env!("CARGO_BIN_EXE_any-nle"))
+            .args(["review", "--job"])
+            .arg(&settings)
+            .output()
+            .unwrap()
+    };
+    let ready = review();
+    assert!(ready.status.success(), "{:?}", ready);
+    let report: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
+    assert_eq!(report["status"], "ready");
+    let mut wizard_bytes = fs::read(wizard_report).unwrap();
+    wizard_bytes.push(b'\n');
+    assert_eq!(ready.stdout, wizard_bytes);
+    assert!(!output.exists());
+    assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 4);
+
+    fs::write(&output, b"occupied").unwrap();
+    let blocked = review();
+    assert_eq!(blocked.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(report["status"], "blocked");
+    assert_eq!(report["blocker"]["kind"], "project_output");
+    assert_eq!(fs::read(&output).unwrap(), b"occupied");
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(fs::read(&settings).unwrap(), settings_bytes);
+    assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 5);
+
+    fs::write(&settings, b"{").unwrap();
+    let invalid = review();
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    assert!(!invalid.stderr.is_empty());
+}
+
+#[test]
 fn existing_graph_file_is_not_overwritten() {
     let scratch = Scratch::new();
     let graph = scratch.0.join("protected.json");

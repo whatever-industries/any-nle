@@ -294,7 +294,7 @@ fn prepare_selection(
     }
     Turnover::prepare(
         capture.graph.graph, capture.spec, ffprobe, vec![(path, digest)],
-        capture.notices, capture.caption_omissions, Some(&capture.files),
+        capture.notices, capture.caption_omissions, linked::MediaPreparation::VerifiedPremiere(&capture.files),
     )
 }
 

@@ -6,6 +6,39 @@ destination preparation and archive writer. The probe uses original files in
 place. Resolve Studio 21.2.0 build 00006, project version 17, remains the native
 qualification target.
 
+## Avid to Resolve in the macOS wizard
+
+For local qualification, set `ANYNLE_RESOLVE_TEMPLATES` to a JSON file
+containing the pinned `templates` object from an Avid turnover job.
+Launch the wizard and choose **Resolve** as the destination. Read the
+selected Avid bins or project folder, select and order timelines, and
+choose a new `.drp` destination.
+
+**Link to originals** uses qualified OP-Atom siblings and UME originals.
+**Rewrap managed media to OP1a** copies qualified 23.976 DNxHR LB picture
+and its two independent PCM24 mono siblings into OP1a. UME and editable
+Group camera media retain their verified links. Review can calculate
+the OP1a size before a media folder is chosen. Optional proxy rewrap
+uses its own folder and contributes to the estimate.
+
+Review identifies UME originals that need the Resolve Studio importer.
+Prepare the dedicated scratch project as described below. **Save
+conversion settings** writes a job/2 file. Reopen it with
+`any-nle-gui --job SETTINGS.json` or run it with `any-nle run --job
+SETTINGS.json` on macOS. Approval of reported omissions applies to the
+current run. Both media choices passed Review and conversion in a local
+macOS arm64 package. **Calculate rewrap size** reported the combined
+source byte count before a media folder was chosen and cleared its
+result when the folder changed.
+
+The current donor archives stay private. Blackmagic documents sharing
+exported Resolve projects, and the installed license assigns user
+content to its applicable owner. The current archives contain private
+locators and saved previews, and generated projects inherit a donor
+preview. Public rollout requires a new, self-authored template set with
+reviewed contents, fresh pins, and a packaged native replay.
+[Blackmagic reference manual](https://documents.blackmagicdesign.com/UserManuals/DaVinciResolveReferenceManual.pdf)
+
 ## Automatic native media import fallback
 
 The internal linked and turnover writers try standalone preparation first.

@@ -206,8 +206,8 @@ fn interpret_probe(raw: Value) -> R<Probe> {
     let Some(Value::Arr(ss)) = raw.get("streams") else {
         return Err("probe has no streams".into());
     };
-    if ss.is_empty() || ss.len() > 33 {
-        return Err("only one picture and up to 32 mono sounds are supported".into());
+    if ss.is_empty() || ss.len() > 65 {
+        return Err("only one picture and up to 64 mono sounds are supported".into());
     }
     let mut streams = Vec::new();
     let mut stream_indices = Vec::new();

@@ -70,6 +70,7 @@ impl TryFrom<LegacyProbeJob> for TurnoverJob {
                 require_camera_originals: false,
                 attach_avid_proxies: false,
                 proxy_rewrap_dir: None,
+                op1a_rewrap_dir: None,
                 ffmpeg: None,
             },
         };

@@ -1,6 +1,7 @@
 //! Read-only preparation followed by one explicit execution of the prepared document.
 use super::*;
 use crate::premiere_preparation::timeline_subject;
+use crate::premiere_import::avid;
 use crate::source_input::{original_stamp, recheck_originals, OriginalStamp};
 use crate::{backend_bundle, output, premiere_preparation, rewrap, source_input};
 use avid_reader::source::SourceInput;
@@ -13,7 +14,6 @@ use std::{
 };
 
 const MAX_JOB_BYTES: usize = 1 << 20;
-const PREFLIGHT_REPORT_SCHEMA: &str = "anynle.preflight-report/1";
 const RECEIPT_SUFFIX: &str = ".anynle-report.json";
 const REPLAY_SUFFIX: &str = ".anynle-job.json";
 const DEBUG_SUFFIX: &str = ".anynle-debug.jsonl";
@@ -126,8 +126,15 @@ pub fn save_blocked_preflight_report(
         path,
         std::iter::once(spec.output.as_path())
             .chain(sidecars.iter().map(PathBuf::as_path))
-            .chain(spec.new_media.as_deref()),
+            .chain(spec.new_media.as_deref()).chain(spec.rewrap_needed.as_deref()),
     )?;
+    write_json(path, &blocked_preflight_report(spec, blocker), &mut Vec::new())
+}
+
+pub(crate) fn blocked_preflight_report<'a>(
+    spec: &'a JobSpec,
+    blocker: &'a ReviewBlocker,
+) -> impl serde::Serialize + 'a {
     #[derive(serde::Serialize)]
     struct BlockedReport<'a> {
         schema: &'static str,
@@ -135,13 +142,12 @@ pub fn save_blocked_preflight_report(
         project_output: &'a Path,
         blocker: &'a ReviewBlocker,
     }
-    let report = BlockedReport {
+    BlockedReport {
         schema: PREFLIGHT_REPORT_SCHEMA,
         status: "blocked",
         project_output: &spec.output,
         blocker,
-    };
-    write_json(path, &report, &mut Vec::new())
+    }
 }
 
 fn check_project_paths(spec: &JobSpec, receipt: &Path, replay: &Path) -> Result<(), String> {
@@ -153,7 +159,7 @@ fn check_project_paths(spec: &JobSpec, receipt: &Path, replay: &Path) -> Result<
     Ok(())
 }
 fn check_new_media_paths(spec: &JobSpec, receipt: &Path, replay: &Path) -> Result<(), String> {
-    if let Some(dir) = &spec.new_media {
+    if let Some(dir) = spec.new_media.as_ref().or(spec.rewrap_needed.as_ref()) {
         let dir = path_key(dir)?;
         for p in [&spec.output, receipt, replay] {
             let p = path_key(p)?;
@@ -212,6 +218,10 @@ impl PreparedJob {
             .check_reserved_output(path)
             .map_err(|error| error.to_string())?;
 
+        write_json(path, &self.preflight_report(), &mut Vec::new())
+    }
+
+    pub(crate) fn preflight_report(&self) -> impl serde::Serialize + '_ {
         #[derive(serde::Serialize)]
         struct PreflightReport<'a> {
             schema: &'static str,
@@ -221,11 +231,13 @@ impl PreparedJob {
             found_media: usize,
             total_media: usize,
             inventory_notes: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            media_linking: Option<&'a MediaLinking>,
             subjects: std::collections::BTreeMap<&'a str, &'a str>,
             report: &'a [ReportNote],
         }
         let review = &self.review;
-        let report = PreflightReport {
+        PreflightReport {
             schema: PREFLIGHT_REPORT_SCHEMA,
             status: "ready",
             project_output: &self.spec.output,
@@ -233,14 +245,14 @@ impl PreparedJob {
             found_media: review.inventory.found_media,
             total_media: review.inventory.total_media,
             inventory_notes: &review.inventory.notes,
+            media_linking: review.media_linking.as_ref(),
             subjects: review
                 .subjects
                 .iter()
                 .map(|(id, name)| (id.as_str(), name.as_str()))
                 .collect(),
             report: &review.notes,
-        };
-        write_json(path, &report, &mut Vec::new())
+        }
     }
 
     /// Move the display names to a client that will browse the completion report.
@@ -575,6 +587,13 @@ fn prepare_job(
         return Err(ReviewBlocker::new(Rewrap, "Allow offline media requires Separate files, Grouped or Merged"));
     }
     let linked = spec.mode != ClipMode::RewrapNative;
+    if !linked && spec.rewrap_needed.is_some() {
+        return Err(ReviewBlocker::new(Rewrap, "Rewrap only where needed requires a linked clip mode"));
+    }
+    if linked && spec.new_media.is_some() {
+        return Err(ReviewBlocker::new(Rewrap, "Use the selective rewrap folder in linked clip modes"));
+    }
+    let assisted = cfg!(target_os = "macos") && linked && !spec.attach_avid_proxies;
     if spec.proxy_rewrap_dir.is_some() && !spec.attach_avid_proxies {
         return Err(ReviewBlocker::new(Rewrap, "Proxy rewrap requires Attach Avid media as proxies. Creates new media."));
     }
@@ -701,6 +720,7 @@ fn prepare_job(
                 ffmpeg: tools.ffmpeg.clone(),
                 allow_media_gaps: linked,
                 collect_blocked_locators: for_review,
+                verify_linked_imports: assisted,
             },
             spec.allow_offline_media,
             linked,
@@ -880,6 +900,21 @@ fn prepare_job(
         notes.push(note("loss", l.object, l.reason, l.aspect));
     }
     let native = spec.mode == ClipMode::RewrapNative;
+    let candidates = if native { Vec::new() } else {
+        premiere_preparation::managed_rewrap_candidates(&read.graph, false)
+    };
+    let candidate_ids: HashSet<_> = candidates.iter().map(|clip| clip.item).collect();
+    let approved_items: HashSet<_> = candidates.iter()
+        .filter(|clip| !clip.pending && spec.rewrap_needed.is_some()).map(|clip| clip.item).collect();
+    let omitted_items: HashSet<_> = candidate_ids.difference(&approved_items).copied().collect();
+    let rewrap_approved = !approved_items.is_empty();
+    let selected_rewrap_ids: HashSet<_> = approved_items.iter()
+        .map(|id| id.strip_prefix("clip:").unwrap_or(id).to_string()).collect();
+    if rewrap_approved && spec.mode != ClipMode::Separate {
+        for clip in candidates.iter().filter(|clip| approved_items.contains(clip.item)) {
+            notes.push(note("loss", clip.item, &clip.detail, "Prepared as a native AV master. The requested Grouped or Merged bin construction applies to the remaining clips."));
+        }
+    }
     let gain = rewrap::gain_paths(&read.graph);
     if !native && !gain.is_empty() {
         return Err(ReviewBlocker::new(Rewrap, "AudioSuite Gain requires the native prepared-media mode to copy the saved render to WAV"));
@@ -893,6 +928,8 @@ fn prepare_job(
         &inputs,
         &tools.ffprobe,
         spool_stats.is_some(),
+        assisted,
+        (!candidates.is_empty()).then_some((&approved_items, &omitted_items)),
         &mut || cancel.check(),
     )
     .map_err(blocker(SourceContent))?;
@@ -976,29 +1013,42 @@ fn prepare_job(
         "Preparing the destination document and any new-media plan",
     );
     check_cancel()?;
-    let media = if native && native_count > 0 {
-        let dir = spec
-            .new_media
-            .as_deref()
-            .ok_or_else(|| ReviewBlocker::new(NewMedia, "Native OP-Atom clips need a NEW media output folder. Creates new media."))?;
-        let model = input
+    let media = if (native && native_count > 0) || rewrap_approved {
+        let mut model = input
             .build_native_media_model()
             .map_err(|e| ReviewBlocker::new(Rewrap, e.to_string()))?;
-        let native_media = rewrap::NativeMediaPreparation {
-            model: &model,
-            writer_input: Some(&mut input),
-            gain: &gain,
-            managed_pictures: luts.managed_pictures,
-        };
-        native_media.preflight().map_err(blocker(Rewrap))?;
+        if rewrap_approved {
+            model.clips = model.clips.values()
+                .filter(|clip| selected_rewrap_ids.contains(&clip.id)).cloned().collect();
+            for bin in &mut model.bins { bin.clips.retain(|id| selected_rewrap_ids.contains(id)); }
+        }
+        let dir = spec.new_media.as_deref().or(spec.rewrap_needed.as_deref())
+            .ok_or_else(|| {
+                let mut issue = ReviewBlocker::new(NewMedia, "Native OP-Atom clips need a NEW media output folder. Creates new media.");
+                issue.rewrap_sources = model.clips.values().filter_map(|clip| {
+                    let picture = clip.video.as_ref()?;
+                    Some(std::iter::once(PathBuf::from(&picture.path))
+                        .chain(clip.audio.iter().map(|audio| PathBuf::from(&audio.path)))
+                        .collect())
+                }).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                issue
+            })?;
         let roots = spec
             .media_roots
             .iter()
             .chain(&spec.original_roots)
             .map(|p| p.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let plan = native_media
-            .prepare(dir, &roots, &spec.output, None, &tools.ffmpeg, &tools.ffprobe)
+        let plan = if rewrap_approved {
+            rewrap::Plan::prepare_selected(&model, dir, &roots, &spec.output, &tools.ffmpeg, &tools.ffprobe)
+        } else {
+            let native_media = rewrap::NativeMediaPreparation {
+                model: &model, writer_input: Some(&mut input), gain: &gain,
+                managed_pictures: luts.managed_pictures,
+            };
+            native_media.preflight().map_err(blocker(Rewrap))?;
+            native_media.prepare(dir, &roots, &spec.output, None, &tools.ffmpeg, &tools.ffprobe)
+        }
             .map_err(|issue| match issue {
                 rewrap::PrepareIssue::Destination(m) => ReviewBlocker::new(NewMedia, m),
                 rewrap::PrepareIssue::Tools(m) => ReviewBlocker::new(MediaTools, m),
@@ -1014,9 +1064,6 @@ fn prepare_job(
     } else {
         None
     };
-    if !native && spec.new_media.is_some() {
-        return Err(ReviewBlocker::new(Rewrap, "A new-media folder applies only to the rewrap mode"));
-    }
     if native_count == 0 {
         notes.push(note(
             "info",
@@ -1069,7 +1116,16 @@ fn prepare_job(
     } else {
         None
     };
-    let document = if crate::managed_op1a::has_verified_streams(&read.graph) {
+    let mut document = if !candidates.is_empty() {
+        if crate::managed_op1a::has_verified_streams(&read.graph) {
+            return Err(ReviewBlocker::new(Rewrap, "This selection combines verified managed OP1a masters with selective rewrap candidates. Convert these bins separately."));
+        }
+        prproj::convert::writer::prepare_typed_project_for_premiere_27(
+            &input, &spec.output, &mut ids, prproj::convert::writer::TypedMedia::SelectedRewrap {
+                bindings: &bindings, clips: &selected_rewrap_ids, offline: &offline,
+            }, layout.as_ref(),
+        )
+    } else if crate::managed_op1a::has_verified_streams(&read.graph) {
         crate::managed_op1a::prepare(
             &read.graph, &mut input, &spec.output, &mut ids, layout.as_ref(), &offline,
         )
@@ -1092,6 +1148,13 @@ fn prepare_job(
         }
         issue
     })?;
+    if document.assisted_originals().len() > 64 {
+        return Err(ReviewBlocker::new(OriginalMedia, "Premiere-assisted media linking supports at most 64 originals per job"));
+    }
+    if document.assisted_originals().len() != 0 {
+        document.verify_assisted_media(None)
+            .map_err(|error| blocker(OriginalMedia)(error.to_string()))?;
+    }
     document
         .check_reserved_output(&receipt)
         .map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
@@ -1101,6 +1164,48 @@ fn prepare_job(
     if let Some((path, _)) = &offline_relink {
         document.check_reserved_output(path).map_err(|e| ReviewBlocker::new(ProjectOutput, e.to_string()))?;
     }
+    let direct_files = if candidates.is_empty() {
+        inv.found_media.saturating_sub(document.assisted_originals().len())
+    } else {
+        input.clips.iter().flat_map(|clip| match clip {
+            PreparedClip::Original(clip) if !clip.premiere_assisted => vec![clip.path.as_str()],
+            PreparedClip::Legacy(clip) if !selected_rewrap_ids.contains(&clip.id) => {
+                clip.video.iter().map(|v| v.path.as_str())
+                    .chain(clip.audio.iter().map(|a| a.path.as_str())).collect()
+            }
+            _ => Vec::new(),
+        }).filter(|path| !offline.contains(path)).collect::<HashSet<_>>().len() + png_count
+    };
+    let media_linking = linked.then(|| MediaLinking {
+        direct_files,
+        premiere_files: document.assisted_originals().cloned().collect(),
+        rewrap_available: candidates.iter().filter(|clip| !clip.pending && !rewrap_approved)
+            .map(|clip| clip.detail.clone()).collect(),
+        rewrapped_clips: candidates.iter().filter(|clip| approved_items.contains(clip.item))
+            .map(|clip| clip.detail.clone()).collect(),
+        conversion_pending: candidates.iter().filter(|clip| clip.pending)
+            .map(|clip| clip.detail.clone()).collect(),
+    });
+    let rewrap_sources = {
+        let mut sources = media.as_ref().map(|plan| plan.estimate_sources()).unwrap_or_default();
+        if !rewrap_approved && !candidates.is_empty() {
+            let locations: HashMap<_, _> = read.graph.media.iter().map(|media| (media.id.as_str(), media)).collect();
+            let eligible: HashSet<_> = candidates.iter().filter(|row| !row.pending).map(|row| row.item).collect();
+            let recipes = read.graph.items.iter().filter(|item| eligible.contains(item.id.as_str()))
+                .filter_map(|item| item.media.iter().map(|binding| {
+                    let media = locations.get(binding.media.as_str())?;
+                    let [path] = media.locations.as_slice() else { return None; };
+                    (media.online == Some(true) && media.original.is_none()).then(|| PathBuf::from(path))
+                }).collect::<Option<Vec<_>>>()).collect::<std::collections::BTreeSet<_>>();
+            sources.extend(recipes);
+        }
+        let mut seen = HashSet::new();
+        sources.extend(read.proxy_bindings.iter().filter_map(|binding| {
+            let sources = binding.rewrap_sources()?;
+            seen.insert(&binding.path).then_some(sources)
+        }));
+        sources
+    };
     let graph_debug = if spool_stats.is_some_and(|(records, _, _)| records > 0) {
         let path = sidecar(&spec.output, DEBUG_SUFFIX).map_err(blocker(ProjectOutput))?;
         output::preflight(&spec.output, Some(&path)).map_err(blocker(ProjectOutput))?;
@@ -1134,6 +1239,7 @@ fn prepare_job(
     }
     let review = Review {
         inventory: inv,
+        rewrap_sources,
         estimated_bytes: media.as_ref().map(|p| p.estimated_bytes()).or((proxy_bytes > 0).then_some(proxy_bytes)),
         available_bytes: media.as_ref().map(|p| p.available_bytes()).or_else(||
             (proxy_bytes > 0).then(|| spec.proxy_rewrap_dir.as_deref().and_then(|p| fs2::available_space(p).ok())).flatten()),
@@ -1142,6 +1248,7 @@ fn prepare_job(
         } else {
             Vec::new()
         },
+        media_linking,
         subjects: review_subjects(&read.graph, &notes),
         notes,
         cli_equivalent: cli_command(&spec).map_err(blocker(Retry))?,
@@ -1275,6 +1382,20 @@ pub fn execute(
         source_input::recheck_checked(&job.inputs, &mut || cancel.check())?;
         recheck_media(&job.media_inputs, cancel, cb)?;
         recheck_originals(&job.originals)?;
+        if job.document.assisted_originals().len() != 0 {
+            phase = "Premiere media linking";
+            progress(cb, "media", "Premiere is importing verified originals in a scratch project");
+            avid::bind(&mut job.document)?;
+            cancel.check()?;
+            source_input::recheck_checked(&job.inputs, &mut || cancel.check())?;
+            recheck_media(&job.media_inputs, cancel, cb)?;
+            recheck_originals(&job.originals)?;
+            for path in job.document.assisted_originals() {
+                job.review.notes.push(note("info", "media",
+                    format!("Used Premiere to link {path}"),
+                    "Verified against the Avid graph and the installed helper's saved media record."));
+            }
+        }
         if let Some(plan) = &job.media {
             phase = "media preparation";
             progress(cb,"media","Creating and verifying new media; cancellation takes effect at the next safe stage");
@@ -1721,9 +1842,11 @@ mod tests {
             spec,
             review: Review {
                 inventory: Inventory::default(),
+                rewrap_sources: vec![],
                 estimated_bytes: None,
                 available_bytes: None,
                 camera_originals: vec![],
+                media_linking: None,
                 notes: vec![],
                 subjects: HashMap::new(),
                 cli_equivalent: String::new(),

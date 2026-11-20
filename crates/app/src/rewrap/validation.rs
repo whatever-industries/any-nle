@@ -92,9 +92,6 @@ pub fn normalize_source_clocks(model: &mut Model) -> R<Vec<String>> {
         .collect::<Vec<_>>()
     {
         let clip = model.clips.get_mut(&id).unwrap();
-        if clip.audio.len() > 32 {
-            return Err("rewrap supports at most 32 discrete mono PCM sources".into());
-        }
         let Some(video) = &mut clip.video else {
             continue;
         };

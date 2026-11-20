@@ -16,7 +16,58 @@ MOV automatically by source codec. Declared `51:`/`71:` groups now reach native
 current scope and tests. The older DNx-only mode
 and folder prompt below retain their meaning. Surround is never inferred from count.
 
+## Calculate rewrap size
+
+Use **Calculate rewrap size** in Review to see the total size of the
+source files for the planned rewrap outputs. A shared output counts once
+across edits. A source used in multiple distinct outputs contributes to
+each. The button reads file metadata without starting an editor or
+running FFmpeg. The converter checks actual available space before writing.
+
 ## Current CLI
+
+Use `--rewrap-needed NEW_DIR` in a linked Avid → Premiere conversion to keep
+qualified originals in place and rewrap the managed clips that require it.
+Wizard Review lists the affected clips and asks for the new media location.
+Without a folder, supported clips still convert. The writer marks saved edit
+spans it can safely leave vacant and retains independently routed mono audio
+in the qualified Separate files case. The saved job carries the selected
+folder in optional `rewrap_needed`. Existing full-rewrap jobs keep their
+media choice.
+
+### Managed picture and mono streams
+
+Graph/2 recognizes the registered DNxHD/DNxHR codec labels and the six
+ProRes 422 and 4444 labels. It retains the raw MXF display, field, pixel
+layout, and color descriptor observations alongside the saved Avid clock
+and package references. Rewrap checks the coded profile, exact raster,
+rate, and extent. Progressive square-pixel media has offline controls
+across the new codec paths. The selective route reports non-square or
+non-progressive candidates as pending when the saved descriptor establishes
+those properties. Native interpretation remains separate from wrapping.
+
+The MXF route carries one mono PCM stream per sibling. The selective MOV
+route also uses a distinct mono stream per sibling. Existing full MOV
+rewrap keeps its qualified packed audio layouts through eight channels.
+Offline container checks cover up to 64 audio siblings. Premiere 27.0.0
+build 88 imported and saved the 32-channel MXF and MOV through UXP. It
+saved one 32-channel audio view for the MXF and 32 one-channel stream
+views for the MOV. Both generated timelines preserved all 32 mono lanes,
+two source trims per lane, and their selectors after Save As and reopen.
+Fresh insertion matched the native importer on all 32 lanes. All 48
+picture frames and isolated audio on A1, A16, A31, and A32 matched the
+controls, with the established stereo pan law applied to PCM.
+
+Premiere rejected both the 33- and 64-channel MXFs during import. Treat
+32 as the per-file planning ceiling for Premiere. Preserve wider source
+layouts by keeping audio in separate linked files once that route
+qualifies. Mixed PCM depths still require an independently qualified
+mapping.
+
+[SMPTE VC-3 labels](https://registry.smpte-ra.org/view/published/labels_view.html)
+· [ProRes MXF mapping](https://pub.smpte.org/latest/rdd44/rdd44-2022.pdf)
+· [Premiere channel support](https://helpx.adobe.com/ro/premiere-pro/how-to/mix-multichannel-audio.html)
+· [EBU MXF channel guidance](https://tech.ebu.ch/docs/r/r134.pdf)
 
 ```sh
 any-nle convert --from avid BIN.avb --media SOURCE_FOLDER --to premiere OUTPUT.prproj \
@@ -62,8 +113,8 @@ distribution/license review is required before bundling any build. Free-space pr
 uses `df -Pk` on macOS/Linux; Windows preparation is currently refused. Estimates are
 conservative input sizes plus header allowance and are rechecked while writing.
 
-The synthetic backend cohort covers DNxHD/DNxHR LB/SQ/HQ, 8-bit 4:2:2 picture,
-with video-only or 1–32 separate mono PCM 48 kHz, 16/24-bit inputs. Each output uses uniform 16-bit or uniform 24-bit audio; mixed-depth
+The synthetic backend cohort covers DNxHD and DNxHR LB/SQ/HQ/HQX/444,
+with video-only or 1–64 separate mono PCM 48 kHz, 16/24-bit inputs. Each output uses uniform 16-bit or uniform 24-bit audio; mixed-depth
 assembly is refused. They remain discrete streams; no surround layout is inferred.
 Explicit unique Avid source-track numbers determine order, never filenames.
 Full spans, zero packet origins, native timecode bases/drop flags and exact source
@@ -77,6 +128,16 @@ guarded terminal-zero handling and bounded native
 Premiere trial. Other terminal layouts and source profiles remain unqualified; the
 native MXF preflight report preserves its earlier
 blocked state as history.
+
+The Avid graph reader recognizes DNxHR HQ by its registered VC-3 CID 1272
+label and the label variant written by FFmpeg 8.1. Any NLE routes these
+managed sources to explicit OP1a rewrap and checks that the coded picture
+profile agrees. The same rule checks the saved raster against the actual
+file. Derived AVBs with synthetic 1080p24 and UHD24 picture-only MXFs passed
+offline conversion and packet comparison. Avid-authored media and Premiere
+reopen and playback are pending.
+[SMPTE Labels Register](https://registry.smpte-ra.org/view/published/labels_view.html)
+· [FFmpeg 8.1 MXF codec labels](https://github.com/FFmpeg/FFmpeg/blob/n8.1/libavformat/mxfenc.c#L2196-L2200)
 
 Supported exact picture rates (decimal labels are shorthand):
 
@@ -100,13 +161,13 @@ interlaced interpretation, or native Premiere handling. Those remain qualificati
 
 | Audio type/layout | Current behavior |
 |---|---|
-| 48 kHz signed little-endian PCM, 16/24-bit, one channel per OP-Atom file | Copy 1–32 streams at one depth per output; refuse mixed depths; preserve sample bytes/order |
+| 48 kHz signed little-endian PCM, 16/24-bit, one channel per OP-Atom file | Copy 1–64 streams at one depth per output; refuse mixed depths; preserve sample bytes/order |
 | 44.1/96 kHz, float/32-bit PCM, compressed audio or AES3 needing conversion | Refuse; no implicit resampling, decoding/re-encoding or repacking |
 | Interleaved multi-channel input, audio-only OP1a output | Refuse in this backend route; no splitting, mixdown, dummy picture or guessed layout |
 
 Timeline preparation allocates audio tracks up to lane 99 where the selected bus
-allows expansion. Expanded layouts still need native read-back. A source bin may
-contain up to 32 discrete sound files. Audio-only masters remain outside this
+allows expansion. Expanded layouts still need native read-back. A source clip may
+contain up to 64 discrete sound files. Audio-only masters remain outside this
 picture-led rewrap route. Track capacity and limits.
 The initial CLI conservatively refuses reader/media-scan problems (including omitted
 sound or skipped clips, even if another source is usable); repeated input-bin aliases

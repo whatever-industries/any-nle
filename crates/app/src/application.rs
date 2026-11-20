@@ -22,7 +22,9 @@ use prproj::convert::{
 use prproj::{RandomUuids, SeededUuids, UuidSource};
 
 pub(crate) const USAGE: &str = "usage:
-  any-nle run --job SETTINGS.json [--output NEW.prproj] [--new-media NEW_DIR]
+  any-nle review --job SETTINGS.json
+      Print the saved job's read-only preflight report (JSON).
+  any-nle run --job SETTINGS.json [--output NEW_PROJECT] [--new-media NEW_DIR]
       Run a saved native-wizard job with the same read-only preparation and explicit execution.
   any-nle verify-offline-relink REPORT.json MOVES.json [--checksums TRUSTED.json] [--ffprobe PATH]
       Verify proposed files before using Premiere's Link Media. Writes no files.
@@ -32,7 +34,7 @@ pub(crate) const USAGE: &str = "usage:
                   [--link-originals [--map-original-root SAVED_ROOT CURRENT_ROOT]...]
                   [--prefer-source-media [--attach-avid-proxies [--rewrap-avid-proxies EXISTING_DIR]]]
                   [--allow-offline-media]
-                  [--rewrap-op1a NEW_DIR | --rewrap-op1a-prompt | --rewrap-media NEW_DIR] [--rewrap-dry-run] [--rewrap-native-master] [--ffmpeg PATH] [--ffprobe PATH]
+                  [--rewrap-op1a NEW_DIR | --rewrap-op1a-prompt | --rewrap-media NEW_DIR | --rewrap-needed NEW_DIR] [--rewrap-dry-run] [--rewrap-native-master] [--ffmpeg PATH] [--ffprobe PATH]
       Convert Avid bins to a Premiere project. Prints what was converted, the reader's problems
       and every loss. --graph saves the qualified source anynle.graph/2 (Premiere route).
       --link-originals: Resolve qualified saved file links alongside direct Avid media; --media is optional for original-only bins.
@@ -42,11 +44,12 @@ pub(crate) const USAGE: &str = "usage:
       --rewrap-avid-proxies EXISTING_DIR: Creates new media when stereo requires it.
       --map-original-root: Map a saved path prefix to an absolute current folder. Repeat as needed.
       --rewrap-media NEW_DIR: Creates new media. DNx to MXF OP1a; qualified ProRes to MOV. Requires --rewrap-native-master.
+      --rewrap-needed NEW_DIR: Keep qualified direct links and rewrap only the managed clips that need it.
       --rewrap-op1a: Creates new media. Copies supported OP-Atom streams into NEW_DIR.
       --rewrap-op1a-prompt: macOS folder picker and space review before creating media.
       --rewrap-dry-run: preview only; creates no media/project/graph. Requires a rewrap destination option.
       --rewrap-native-master: experimental file-backed AV masters preserving bin audio groups; replaces bin mode.
-      Qualified MXF rates (including 23.976), DNxHD/DNxHR 8-bit 4:2:2 + up to 32 mono PCM48k inputs.
+      Selective rewrap accepts verified DNx and ProRes picture and up to 64 mono PCM48k inputs.
       Rewrap requires FFmpeg/ffprobe 8.1; bounded native read-backs pass.
   any-nle convert --from avid BIN.avb... --media DIR [--media DIR...] [--project NAME]
                   --to fcpxml OUTPUT.fcpxml [--graph GRAPH.json]
@@ -85,6 +88,7 @@ pub(crate) struct Args {
     pub(crate) graph_out: Option<PathBuf>,
     pub(crate) seed: Option<String>,
     pub(crate) rewrap: Option<PathBuf>,
+    pub(crate) rewrap_needed: Option<PathBuf>,
     pub(crate) rewrap_media: bool,
     pub(crate) rewrap_dry_run: bool,
     pub(crate) rewrap_prompt: bool,
@@ -159,7 +163,7 @@ pub(crate) fn parse(rest: &[String]) -> Result<Args, String> {
             .next()
             .cloned()
             .ok_or_else(|| format!("{arg} needs a value"))?;
-        if matches!(arg.as_str(), "--rewrap-op1a" | "--rewrap-media" | "--ffmpeg" | "--ffprobe" | "--map-original-root")
+        if matches!(arg.as_str(), "--rewrap-op1a" | "--rewrap-media" | "--rewrap-needed" | "--ffmpeg" | "--ffprobe" | "--map-original-root")
             && value.starts_with("--")
         {
             return Err(format!("{arg} needs a path, not another option"));
@@ -210,6 +214,11 @@ pub(crate) fn parse(rest: &[String]) -> Result<Args, String> {
                 a.rewrap_media = arg=="--rewrap-media";
                 a.rewrap = Some(PathBuf::from(value));
             }
+            "--rewrap-needed" => {
+                if a.rewrap_needed.replace(PathBuf::from(value)).is_some() {
+                    return Err("--rewrap-needed given twice".into());
+                }
+            }
             "--ffmpeg" => {
                 if a.ffmpeg.is_some() {
                     return Err("--ffmpeg given twice".into());
@@ -238,7 +247,12 @@ pub(crate) fn parse(rest: &[String]) -> Result<Args, String> {
     if a.rewrap_prompt && a.rewrap.is_some() {
         return Err("choose an explicit rewrap directory or --rewrap-op1a-prompt, not both".into());
     }
-    if !a.wants_rewrap()
+    if a.rewrap_needed.is_some() && (a.wants_rewrap() || a.rewrap_native_master
+        || a.to.as_deref() != Some("premiere") || a.seed.is_some() || a.graph_out.is_some())
+    {
+        return Err("--rewrap-needed requires Avid to Premiere linked conversion and cannot combine with full rewrap, --seed or --graph".into());
+    }
+    if !a.wants_rewrap() && a.rewrap_needed.is_none()
         && (a.rewrap_dry_run || a.rewrap_native_master || (a.ffmpeg.is_some() && a.proxy_rewrap_dir.is_none()))
     {
         return Err("rewrap settings require --rewrap-op1a NEW_DIR, --rewrap-media NEW_DIR or --rewrap-op1a-prompt".into());
@@ -383,6 +397,7 @@ fn read_avid_source(a: &Args, link_managed_op1a: bool) -> Result<AvidRead, Strin
                 ffmpeg: tools.ffmpeg,
                 allow_media_gaps: link_dry_gain,
                 collect_blocked_locators: false,
+                verify_linked_imports: false,
             }, a.allow_offline_media, link_dry_gain, &mut |_, _| Ok(()), &mut || Ok(()),
         ).map_err(avid_adapter::SourceReadIssue::into_message)?
     } else {
@@ -556,6 +571,45 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         .ok_or("--to premiere needs OUTPUT.prproj")?;
     output::preflight(&output, a.graph_out.as_deref())?;
     let policy = policy(a)?;
+    if let Some(folder) = &a.rewrap_needed {
+        use crate::job::{self, ClipMode, JobSpec};
+        if a.from.as_deref() != Some("avid") {
+            return Err("--rewrap-needed requires --from avid".into());
+        }
+        let spec = JobSpec {
+            bins: a.bins.iter().map(PathBuf::from).collect(),
+            output,
+            media_roots: a.media.iter().map(PathBuf::from).collect(),
+            project_name: a.project.clone(),
+            mode: match policy.bin_mode {
+                BinMode::Separate => ClipMode::Separate,
+                BinMode::Grouped => ClipMode::Grouped,
+                BinMode::Merged => ClipMode::Merged,
+            },
+            policy_json: policy.to_json_text(),
+            rewrap_needed: Some(folder.clone()),
+            allow_offline_media: a.allow_offline_media,
+            prefer_source_media: a.prefer_source_media,
+            attach_avid_proxies: a.attach_avid_proxies,
+            proxy_rewrap_dir: a.proxy_rewrap_dir.clone(),
+            ffmpeg: a.ffmpeg.clone(),
+            ffprobe: a.ffprobe.clone(),
+            path_mappings: a.original_mappings.iter().map(|mapping| job::PathMapping {
+                saved_prefix: mapping.saved_root.clone(), actual_root: mapping.current_root.clone(),
+            }).collect(),
+            ..JobSpec::default()
+        };
+        let cancel = job::CancelToken::default();
+        let mut progress = |stage: job::Progress| eprintln!("{}", stage.message);
+        let prepared = job::prepare(spec, &cancel, &mut progress)?;
+        if a.rewrap_dry_run {
+            for note in &prepared.review().notes { println!("{}", note.message); }
+            return Ok(());
+        }
+        let done = job::execute(prepared, &cancel, &mut progress);
+        println!("{}", serde_json::to_string_pretty(&done).map_err(|e| e.to_string())?);
+        return if done.status == job::CompletionStatus::Complete { Ok(()) } else { Err(done.message) };
+    }
     let route = if a.rewrap_media {PremiereRoute::NativeMedia}else{PremiereRoute::resolve(a.rewrap_native_master, policy.bin_mode)};
     let mut read = read_avid_source(a, !a.wants_rewrap() && policy.bin_mode == BinMode::Separate)?;
     if a.link_originals && policy.bin_mode == BinMode::Separate && !a.wants_rewrap() {
@@ -574,6 +628,15 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     let AvidRead { result, inputs, .. } = read;
     let avid_adapter::ReadResult { graph, mut original_inputs, proxy_bindings, .. } = result;
     original_inputs.append(&mut matte.inputs);
+    if !a.rewrap_media {
+        let affected = premiere_preparation::managed_rewrap_items(&graph, a.wants_rewrap());
+        if !affected.is_empty() {
+            return Err(format!(
+                "Selected Avid-managed OP-Atom clips need rewrap for Premiere. Use --rewrap-media NEW_DIR --rewrap-native-master.\n{}",
+                affected.join("\n"),
+            ));
+        }
+    }
     if a.wants_rewrap() {
         if let Some(issue) = crate::job::sequence_timing_blocker(&graph) {
             return Err(issue.cli_summary());
@@ -636,7 +699,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             PathBuf::new()
         };
         let (p, mut luts) = premiere_preparation::prepare_typed(
-            &graph, &policy.to_options(), clock, a.rewrap_media, &mut matte, &inputs, &ffprobe, false, &mut || Ok(()),
+            &graph, &policy.to_options(), clock, a.rewrap_media, &mut matte, &inputs, &ffprobe, false, false, None, &mut || Ok(()),
         )?;
         source_losses.retain(|loss| luts.keeps_loss(loss));
         original_inputs.append(&mut luts.inputs);
@@ -1004,8 +1067,28 @@ pub(crate) fn main() -> ExitCode {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
+        "review" => {
+            let [flag, job] = rest else {
+                return usage("review --job SETTINGS.json");
+            };
+            if flag != "--job" {
+                return usage("review --job SETTINGS.json");
+            }
+            return crate::job_review::run(Path::new(job));
+        }
         "run" => {
             if rest.len()<2 || !matches!(rest[0].as_str(),"--job"|"--job-json"|"--job-base64") {return usage("run --job SETTINGS.json [--output NEW.prproj] [--new-media NEW_DIR]");}
+            #[cfg(target_os = "macos")]
+            if rest[0] == "--job" {
+                match crate::resolve_job::load_if_avid_resolve(Path::new(&rest[1])) {
+                    Ok(Some(job)) => return match crate::resolve_job::run_cli(job, &rest[2..]) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => { eprintln!("{error}"); ExitCode::FAILURE }
+                    },
+                    Ok(None) => {}
+                    Err(error) => { eprintln!("{error}"); return ExitCode::FAILURE; }
+                }
+            }
             let loaded=if rest[0]=="--job"{crate::job::load(Path::new(&rest[1]))}else if rest[0]=="--job-base64"{crate::job::load_encoded(&rest[1])}else if rest[1].len()>1<<20{Err("Job settings exceed 1 MiB".into())}else{serde_json::from_str(&rest[1]).map_err(|e|format!("Invalid job settings: {e}"))};
             loaded.and_then(|mut spec:crate::job::JobSpec|{
                 let mut flags=rest[2..].chunks_exact(2);

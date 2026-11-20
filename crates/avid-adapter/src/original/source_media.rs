@@ -158,6 +158,7 @@ fn qualify(
         }
         let audio = (0..2)
             .map(|channel| Selected {
+                verified_for_native_import: false,
                 path: path.clone(),
                 online: true,
                 stream: OriginalStream {
@@ -237,6 +238,7 @@ fn qualify(
     prove_prores_cadence(&path, tool, video, rate, check)?;
     Ok((
         Selected {
+            verified_for_native_import: false,
             path,
             online: true,
             stream: OriginalStream {

@@ -35,6 +35,8 @@ pub struct OriginalOptions {
     pub proxy_rewrap_dir: Option<PathBuf>,
     pub ffmpeg: PathBuf,
     pub allow_media_gaps: bool,
+    /// Verify ordinary linked streams for a destination with a native importer.
+    pub verify_linked_imports: bool,
     /// Collect saved-path and MXF package details for Review blockers.
     pub collect_blocked_locators: bool,
 }
@@ -50,6 +52,7 @@ impl Default for OriginalOptions {
             proxy_rewrap_dir: None,
             ffmpeg: "ffmpeg".into(),
             allow_media_gaps: false,
+            verify_linked_imports: false,
             collect_blocked_locators: false,
         }
     }
@@ -57,6 +60,7 @@ impl Default for OriginalOptions {
 
 #[derive(Clone, Debug)]
 pub struct Selected {
+    pub verified_for_native_import: bool,
     pub path: PathBuf,
     pub online: bool,
     pub stream: OriginalStream,
@@ -281,6 +285,7 @@ fn offline_original(master: &av::SourceMaster, index: usize) -> Result<Option<Se
         return Err("offline original requires a known zero item offset and a positive extent".into());
     }
     Ok(Some(Selected {
+        verified_for_native_import: false,
         path,
         online: false,
         stream: OriginalStream {
@@ -625,6 +630,13 @@ fn embedded_avc_mov_timecode(
 fn verify_prores_hq_timecode_track(
     path: &Path, probe: &Value, video: &Value, timecode: &Value, index: i64, rate: Rational, expected: &str,
 ) -> Result<(), String> {
+    verify_prores_timecode_track(path, probe, video, timecode, index, rate, expected, ("apch", "HQ"))
+}
+
+fn verify_prores_timecode_track(
+    path: &Path, probe: &Value, video: &Value, timecode: &Value, index: i64,
+    rate: Rational, expected: &str, (tag, profile): (&str, &str),
+) -> Result<(), String> {
     let brand = probe.get("format").and_then(|f| f.get("tags"))
         .and_then(|tags| text(tags, "major_brand"));
     if !path.extension().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("mov"))
@@ -632,12 +644,19 @@ fn verify_prores_hq_timecode_track(
         || number(video, "index") != Some(0)
         || text(video, "codec_type").as_deref() != Some("video")
         || text(video, "codec_name").as_deref() != Some("prores")
-        || text(video, "codec_tag_string").as_deref() != Some("apch")
-        || text(video, "profile").as_deref() != Some("HQ")
+        || text(video, "codec_tag_string").as_deref() != Some(tag)
+        || text(video, "profile").as_deref() != Some(profile)
         || text(video, "pix_fmt").as_deref() != Some("yuv422p10le")
     {
-        return Err("linked ProRes picture requires QuickTime ProRes 422 HQ/apch, 10-bit 4:2:2".into());
+        return Err(format!("linked ProRes picture requires QuickTime ProRes 422 {profile}/{tag}, 10-bit 4:2:2"));
     }
+    verify_movie_timecode_track(video, timecode, index, rate, expected)
+        .map_err(|_| format!("linked ProRes HQ requires one matching {rate} fps non-drop timecode track at {expected}"))
+}
+
+fn verify_movie_timecode_track(
+    video: &Value, timecode: &Value, index: i64, rate: Rational, expected: &str,
+) -> Result<(), String> {
     let matching_timecode = |stream: &Value| {
         stream.get("tags").and_then(|tags| text(tags, "timecode")).as_deref() == Some(expected)
     };
@@ -657,7 +676,7 @@ fn verify_prores_hq_timecode_track(
         || !matching_timecode(video)
         || !matching_timecode(timecode)
     {
-        return Err(format!("linked ProRes HQ requires one matching {rate} fps non-drop timecode track at {expected}"));
+        return Err(format!("linked movie requires one matching {rate} fps timecode track at {expected}"));
     }
     Ok(())
 }
@@ -1152,8 +1171,8 @@ struct OriginalProbe {
     still_decoded: Option<(i64, i64)>,
 }
 
-fn probe(
-    path: &Path, tool: &Path, check: &mut dyn FnMut() -> Result<(), String>,
+fn probe_with_linked_imports(
+    path: &Path, tool: &Path, verify_linked_imports: bool, check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<OriginalProbe, String> {
     let metadata = probe_metadata(path, tool)?;
     if let Some(rate) = same_rate_movie::avc_picture_only_rate(path, &metadata) {
@@ -1172,9 +1191,23 @@ fn probe(
             if streams.iter().any(|stream| text(stream, "codec_name").as_deref() == Some("prores")) =>
         {
             qualify_container(path, &metadata)?;
-            let defaulted = qualify_prores_hq(path, &metadata, streams)?;
-            prove_prores_cadence(path, tool, &streams[0], Rational::integer(24), check)?;
-            Some(defaulted)
+            let source_profile = match streams.as_slice() {
+                [video, timecode] if text(video, "codec_tag_string").as_deref() == Some("apcs") => {
+                    let rate = Rational::integer(24);
+                    verify_prores_timecode_track(
+                        path, &metadata, video, timecode, 1, rate, "00:00:00:00", ("apcs", "LT"),
+                    ).and_then(|()| qualify_movie_geometry_at_rate(video, (1920, 1080), rate))
+                }
+                _ => qualify_prores_hq(path, &metadata, streams),
+            };
+            match source_profile {
+                Ok(defaulted) => {
+                    prove_prores_cadence(path, tool, &streams[0], Rational::integer(24), check)?;
+                    Some(defaulted)
+                }
+                Err(_) if verify_linked_imports => None,
+                Err(error) => return Err(error),
+            }
         }
         _ => None,
     };
@@ -1185,6 +1218,12 @@ fn probe(
     };
     let still_decoded = additional_media::probe_still(path, tool)?;
     Ok(OriginalProbe { metadata, prores_color_defaulted, mp3, still_decoded })
+}
+
+fn probe(
+    path: &Path, tool: &Path, check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<OriginalProbe, String> {
+    probe_with_linked_imports(path, tool, false, check)
 }
 
 fn probe_metadata(path: &Path, tool: &Path) -> Result<Value, String> {
@@ -1217,6 +1256,25 @@ fn probe_metadata(path: &Path, tool: &Path) -> Result<Value, String> {
         std::str::from_utf8(&bytes).map_err(|_| context("stdout is not UTF-8".into()))?,
     )
     .map_err(context)
+}
+
+/// Independently inspect an original before reconciling a Premiere media record.
+/// Uses the same bounded probe and ProRes cadence verification as direct linking.
+#[doc(hidden)]
+pub fn inspect_premiere_donor_original(
+    path: &Path, tool: &Path, timecode: Option<&str>,
+) -> Result<Value, String> {
+    let metadata = probe_metadata(path, tool)?;
+    match (qualify_container(path, &metadata)?, metadata.get("streams"), timecode) {
+        ("mov", Some(Value::Arr(streams)), Some(label)) => {
+            let rate = Rational::integer(24);
+            qualify_prores_hq_timecode(path, &metadata, streams, rate, label)?;
+            prove_prores_cadence(path, tool, &streams[0], rate, &mut || Ok(()))?;
+        }
+        ("wav", Some(Value::Arr(streams)), None) if streams.len() == 1 => {}
+        _ => return Err("expected one ProRes picture with timecode or one mono WAV".into()),
+    }
+    Ok(metadata)
 }
 
 /// Compare a relink candidate with the same bounded source profiles used by
@@ -1284,18 +1342,36 @@ pub fn probe_offline_atom(path: &Path, tool: &Path) -> Result<Value, String> {
 
 /// Prove that the declared 48 kHz mono PCM span is present in the file.
 pub(super) fn complete_mono_pcm_packets(path: &Path, tool: &Path, samples: i64, bytes_per_sample: i64) -> bool {
-    mono_pcm_packets(path, tool, samples, bytes_per_sample, false)
+    mono_pcm_packets(path, tool, "mxf", samples, bytes_per_sample, false)
 }
 
 pub(super) fn complete_pcm24_with_zero_tail(path: &Path, tool: &Path, samples: i64) -> bool {
-    mono_pcm_packets(path, tool, samples, 3, true)
+    mono_pcm_packets(path, tool, "mxf", samples, 3, true)
 }
 
-fn mono_pcm_packets(path: &Path, tool: &Path, samples: i64, bytes_per_sample: i64, check_tail: bool) -> bool {
+/// Check the complete payload of a one-stream donor file using the existing packet checks.
+#[doc(hidden)]
+pub fn verify_premiere_donor_payload(
+    path: &Path, tool: &Path, samples_or_frames: i64, pcm_bits: Option<i64>,
+) -> Result<(), String> {
+    let suffix = path.extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+    let verified = match pcm_bits {
+        Some(bits @ (16 | 24)) if suffix.eq_ignore_ascii_case("wav") =>
+            mono_pcm_packets(path, tool, "wav", samples_or_frames, bits / 8, false),
+        Some(24) if suffix.eq_ignore_ascii_case("mxf") =>
+            complete_mono_pcm_packets(path, tool, samples_or_frames, 3),
+        None if suffix.eq_ignore_ascii_case("mxf") =>
+            complete_picture_packets(path, tool, samples_or_frames),
+        _ => false,
+    };
+    verified.then_some(()).ok_or_else(|| "original packet coverage differs from the saved playable extent".into())
+}
+
+fn mono_pcm_packets(path: &Path, tool: &Path, demuxer: &str, samples: i64, bytes_per_sample: i64, check_tail: bool) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let mut command = Command::new(tool);
     let entries = if check_tail { "packet=pts,duration,size,pos" } else { "packet=pts,duration,size" };
-    command.args(["-v", "error", "-protocol_whitelist", "file,pipe", "-f", "mxf",
+    command.args(["-v", "error", "-protocol_whitelist", "file,pipe", "-f", demuxer,
         "-select_streams", "a:0", "-show_packets", "-show_entries", entries, "-of", "csv=p=0"]).arg(path);
     let Ok(bytes) = bounded_probe(command, std::time::Duration::from_secs(30)) else { return false };
     let Ok(rows) = std::str::from_utf8(&bytes) else { return false };
@@ -1671,7 +1747,7 @@ impl OriginalIndex {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, SourceReadIssue> {
         Self::scan_with_control(facts, allow_offline, references, options,
-            |path, check| probe(path, &options.ffprobe, check), check)
+            |path, check| probe_with_linked_imports(path, &options.ffprobe, options.verify_linked_imports, check), check)
     }
     fn scan_with_control(
         facts: &av::SourceProject,
@@ -1874,7 +1950,23 @@ impl OriginalIndex {
                 let physical = &probes.front().unwrap().1;
                 let v = &physical.metadata;
                 if !adapter_masters.contains(&m.master.mob_id) {
-                    let selected = match same_rate_movie::select(&path, v, m, i) {
+                    let direct = same_rate_movie::select(&path, v, m, i);
+                    let direct = if options.verify_linked_imports && direct.is_err()
+                        && same_rate_movie::may_need_import(&path, v)
+                    {
+                        match same_rate_movie::select_verified_import(
+                            &path, v, m, i, &options.ffprobe, check,
+                        ) {
+                            Ok(value) => Ok(Some(value)),
+                            Err(reason) => match direct {
+                                Err(previous) => Err(previous),
+                                _ => Err(reason),
+                            },
+                        }
+                    } else {
+                        direct
+                    };
+                    let selected = match direct {
                         Err(reason) if i == 0 && (gap_path.is_some()
                             || unused_path.is_some() && gap_saved_locator(m).is_some())
                             && matches!(v.get("streams"), Some(Value::Arr(streams)) if unsupported_pcm_movie(m, streams)) =>
@@ -1970,7 +2062,11 @@ impl OriginalIndex {
                         .first()
                         .ok_or("original movie picture stream absent")?;
                     let picture_profile = if text(video, "codec_name").as_deref() == Some("prores") {
-                        picture_codec = "apch";
+                        picture_codec = if text(video, "codec_tag_string").as_deref() == Some("apcs") {
+                            "apcs"
+                        } else {
+                            "apch"
+                        };
                         if m.master.tracks.len() != 1
                             || raw.descriptor_class != "CDCI"
                             || raw.descriptor_length != t.length
@@ -1981,10 +2077,11 @@ impl OriginalIndex {
                             }))
                             || m.master.start.as_ref().is_some_and(|tc| tc.frames != 0 || tc.fps != 24 || tc.drop)
                         {
-                            return Err(describe("linked ProRes HQ requires a matching saved 1080p24 picture-only descriptor and zero timecode origin".into()).into());
+                            Err("linked ProRes requires a matching saved 1080p24 picture-only descriptor and zero timecode origin".into())
+                        } else {
+                            physical.prores_color_defaulted
+                                .ok_or_else(|| "linked ProRes has no complete verified picture packet clock".into())
                         }
-                        physical.prores_color_defaulted
-                            .ok_or_else(|| "linked ProRes HQ has no complete verified picture packet clock".into())
                     } else if avc_pcm {
                         qualify_avc_pcm(streams, &path, m)
                     } else if uhd_avc_aac {
@@ -1992,6 +2089,30 @@ impl OriginalIndex {
                     } else {
                         qualify_movie(video, audios.first().copied(), adapter_masters.contains(&m.master.mob_id))
                     };
+                    if picture_profile.is_err() && options.verify_linked_imports
+                        && !adapter_masters.contains(&m.master.mob_id)
+                        && same_rate_movie::may_need_import(&path, v)
+                    {
+                        let imported = same_rate_movie::select_verified_import(
+                            &path, v, m, i, &options.ffprobe, check,
+                        );
+                        if let Ok((selected, defaulted)) = imported {
+                            used = used.checked_add(selection_cost(m, raw, &path))
+                                .and_then(|size| size.checked_add(if i == 0 && defaulted {
+                                    std::mem::size_of::<String>() + UNTAGGED_COLOR_NOTE.len()
+                                } else { 0 }))
+                                .filter(|n| *n <= MAX_ORIGINAL_INDEX_BYTES)
+                                .ok_or("original index exceeds 64 MiB")?;
+                            if i == 0 && defaulted { out.notes.push(UNTAGGED_COLOR_NOTE.into()); }
+                            out.tracks.insert((m.id.clone(), i), selected);
+                            continue;
+                        }
+                        if let Err(reason) = imported {
+                            if !(i == 0 && (gap_path.is_some() || unused_path.is_some()) && unsupported_pcm_movie(m, streams)) {
+                                return Err(describe(reason).into());
+                            }
+                        }
+                    }
                     let defaulted = match picture_profile {
                         Ok(defaulted) => defaulted,
                         Err(reason) if i == 0 && (gap_path.is_some()
@@ -2073,6 +2194,7 @@ impl OriginalIndex {
                     return Err("original index exceeds 64 MiB".into());
                 }
                 let mut selected = Selected {
+                    verified_for_native_import: false,
                     path: path.clone(),
                     online: true,
                     stream: OriginalStream {
@@ -2129,6 +2251,9 @@ impl OriginalIndex {
                         );
                     }
                     selected.rate = Some(rate);
+                    if picture_codec == "apcs" {
+                        selected.embedded_mov_timecode = Some(av::Observed::Known(0));
+                    }
                     if container == "mov" && picture_codec == "avc1"
                         && rate == Rational::integer(24) && audios.len() == 1
                     {

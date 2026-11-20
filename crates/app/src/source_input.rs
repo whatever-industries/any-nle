@@ -38,7 +38,7 @@ fn revision(path: &Path) -> Result<String, String> {
     checked_revision(path, &mut || Ok(()))
 }
 /// Streaming revision reads remain cancellable without buffering a whole media file.
-fn checked_revision(
+pub(crate) fn checked_revision(
     path: &Path,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<String, String> {

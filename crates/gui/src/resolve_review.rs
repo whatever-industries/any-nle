@@ -1,8 +1,9 @@
-//! Internal Review screen for a saved Premiere to Resolve job.
+//! Review and publication for the Resolve destination.
+use anynle_app::resolve_job;
 use anynle_resolve_adapter::{
     MediaLinkReview,
     native_import::{self, WorkerStatus},
-    turnover::{Turnover, TurnoverJob, TurnoverSource},
+    turnover::{AvidTurnoverPlan, Turnover, TurnoverJob, TurnoverSource},
 };
 use eframe::egui::{self, Color32};
 use std::{
@@ -16,10 +17,24 @@ use std::{
 
 enum Event {
     Media(Result<MediaLinkReview, String>),
+    AvidMedia(Result<(MediaLinkReview, AvidTurnoverPlan, Vec<Vec<PathBuf>>), String>),
     Worker(bool, WorkerStatus),
     Progress(String),
-    Prepared(Result<Box<Turnover>, String>),
+    Prepared(Result<Prepared, String>),
     Published(Result<Option<String>, String>),
+}
+
+enum Prepared {
+    Premiere(Box<Turnover>),
+    Avid(Box<resolve_job::Prepared>),
+}
+impl Prepared {
+    fn turnover(&self) -> &Turnover {
+        match self {
+            Self::Premiere(turnover) => turnover,
+            Self::Avid(prepared) => prepared.turnover(),
+        }
+    }
 }
 
 fn is_resolve_bundle(path: &Path) -> bool {
@@ -68,9 +83,6 @@ fn read_job(path: &Path) -> Result<TurnoverJob, String> {
         return Err("Resolve job exceeds its size limit".into());
     }
     let job: TurnoverJob = serde_json::from_slice(&json).map_err(|error| error.to_string())?;
-    if !matches!(job.source, TurnoverSource::PremiereToResolve { .. }) {
-        return Err("This Review screen requires a Premiere to Resolve job.".into());
-    }
     Ok(job)
 }
 
@@ -86,14 +98,18 @@ pub(crate) fn run(path: PathBuf, options: eframe::NativeOptions) -> eframe::Resu
     )
 }
 
-struct Review {
+pub(crate) struct Review {
     job: Option<Arc<TurnoverJob>>,
     installed: Option<PathBuf>,
     worker: WorkerStatus,
     running: bool,
     checking_worker: bool,
     media: Option<MediaLinkReview>,
-    prepared: Option<Box<Turnover>>,
+    prepared: Option<Prepared>,
+    avid_source: Option<AvidTurnoverPlan>,
+    primary_rewrap: bool,
+    rewrap_sources: Vec<Vec<PathBuf>>,
+    rewrap_size: crate::rewrap_size::SizeControl,
     accepting_losses: bool,
     busy: bool,
     progress: String,
@@ -106,6 +122,13 @@ struct Review {
 
 impl Review {
     fn new(job: Result<TurnoverJob, String>) -> Self {
+        let primary = job.as_ref().is_ok_and(|job| matches!(
+            job.source, TurnoverSource::AvidToResolve { op1a_rewrap_dir: Some(_), .. }
+        ));
+        Self::with_rewrap(job, primary)
+    }
+
+    pub(crate) fn with_rewrap(job: Result<TurnoverJob, String>, primary_rewrap: bool) -> Self {
         let (send, receive) = mpsc::channel();
         let (job, issue) = match job {
             Ok(job) => (Some(Arc::new(job)), None),
@@ -122,6 +145,10 @@ impl Review {
             checking_worker: false,
             media: None,
             prepared: None,
+            avid_source: None,
+            primary_rewrap,
+            rewrap_sources: vec![],
+            rewrap_size: Default::default(),
             accepting_losses: false,
             busy: false,
             progress: String::new(),
@@ -130,18 +157,33 @@ impl Review {
         }
     }
 
-    fn check_media(&mut self, ctx: &egui::Context) {
+    pub(crate) fn busy(&self) -> bool { self.busy }
+
+    pub(crate) fn check_media(&mut self, ctx: &egui::Context) {
         let Some(job) = self.job.clone() else { return };
         self.issue = None;
         self.prepared = None;
         self.media = None;
+        self.avid_source = None;
+        self.rewrap_sources.clear();
+        self.rewrap_size = Default::default();
         self.accepting_losses = false;
         self.busy = true;
         self.progress = "Checking saved media links…".into();
         let (send, ctx) = (self.send.clone(), ctx.clone());
+        let primary = self.primary_rewrap;
         std::thread::spawn(move || {
-            let result = job.review_media_links().map_err(|error| error.to_string());
-            let _ = send.send(Event::Media(result));
+            let event = match job.source {
+                TurnoverSource::AvidToResolve { .. } => Event::AvidMedia(
+                    job.plan_avid().map(|source| {
+                        let report = source.review_links(&job.ffprobe, primary);
+                        let sources = source.rewrap_sources(primary);
+                        (report, source, sources)
+                    }).map_err(|error| error.to_string())),
+                TurnoverSource::PremiereToResolve { .. } => Event::Media(
+                    job.review_media_links().map_err(|error| error.to_string())),
+            };
+            let _ = send.send(event);
             ctx.request_repaint();
         });
     }
@@ -202,7 +244,15 @@ impl Review {
         self.progress = "Preparing linked edit…".into();
         self.accepting_losses = false;
         let (send, ctx) = (self.send.clone(), ctx.clone());
+        let avid_source = self.avid_source.take();
         std::thread::spawn(move || {
+            if let Some(source) = avid_source {
+                let result = resolve_job::Prepared::prepare((*job).clone(), source)
+                    .map(|prepared| Prepared::Avid(Box::new(prepared)));
+                let _ = send.send(Event::Prepared(result));
+                ctx.request_repaint();
+                return;
+            }
             let progress = &mut |count, path: &Path| {
                 let name = path
                     .file_name()
@@ -216,7 +266,7 @@ impl Review {
             let result = (|| {
                 let conversion = job.prepare_with_media_progress(progress)?;
                 conversion.review(&job.templates, &job.output)?;
-                Ok::<_, Box<dyn std::error::Error>>(Box::new(conversion))
+                Ok::<_, Box<dyn std::error::Error>>(Prepared::Premiere(Box::new(conversion)))
             })()
             .map_err(|error| error.to_string());
             let _ = send.send(Event::Prepared(result));
@@ -233,10 +283,11 @@ impl Review {
         let accept = self.accepting_losses;
         let (send, ctx) = (self.send.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let result = prepared
-                .publish(&job.templates, &job.output, accept)
-                .map(|project| project.cleanup_warning)
-                .map_err(|error| error.to_string());
+            let result = match prepared {
+                Prepared::Avid(prepared) => prepared.publish(accept),
+                Prepared::Premiere(turnover) => turnover.publish(&job.templates, &job.output, accept)
+                    .map(|project| project.cleanup_warning).map_err(|error| error.to_string()),
+            };
             let _ = send.send(Event::Published(result));
             ctx.request_repaint();
         });
@@ -333,7 +384,7 @@ fn status_message(
         ),
         WorkerStatus::Disconnected if running => (
             format!(
-                "Can’t connect to Resolve Studio. {linking} Check Preferences → System → General → External scripting using → Local."
+                "Can’t connect to Resolve Studio. {linking} In Preferences, open System, then General. Set External scripting using to Local."
             ),
             Action::Check,
         ),
@@ -362,6 +413,20 @@ impl eframe::App for Review {
                                 self.check_worker(&ctx);
                             }
                             self.media = Some(review);
+                        }
+                        Err(error) => self.issue = Some(error),
+                    }
+                }
+                Event::AvidMedia(result) => {
+                    self.busy = false;
+                    match result {
+                        Ok((review, source, recipes)) => {
+                            if review.blockers.is_empty() && !review.assist.is_empty() {
+                                self.check_worker(&ctx);
+                            }
+                            self.media = Some(review);
+                            self.avid_source = Some(source);
+                            self.rewrap_sources = recipes;
                         }
                         Err(error) => self.issue = Some(error),
                     }
@@ -398,7 +463,9 @@ impl eframe::App for Review {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Review & convert");
-                ui.label("Adobe Premiere Pro → DaVinci Resolve");
+                let avid = self.job.as_ref().is_some_and(|job| matches!(job.source, TurnoverSource::AvidToResolve { .. }));
+                let source = if avid { "Avid Media Composer" } else { "Adobe Premiere Pro" };
+                crate::icons::route(ui, source, "DaVinci Resolve", egui::TextStyle::Body);
                 ui.separator();
                 if let Some(job) = &self.job {
                     ui.label(job.output.display().to_string());
@@ -429,10 +496,10 @@ impl eframe::App for Review {
                     let (message, next_action) = if self.checking_worker && needs_worker {
                         ("Checking Resolve Studio…".into(), Action::None)
                     } else {
-                        let (direct, assisted) = self
-                            .prepared
-                            .as_ref()
-                            .map_or((media.direct, media.assist.len()), |p| p.media_counts());
+                        let (direct, assisted) = match &self.prepared {
+                            Some(Prepared::Premiere(project)) => project.media_counts(),
+                            _ => (media.direct, media.assist.len()),
+                        };
                         status_message(
                             direct,
                             assisted,
@@ -443,7 +510,8 @@ impl eframe::App for Review {
                         )
                     };
                     let waiting = needs_worker && !worker_ready;
-                    can_prepare = !blocked && !waiting && !self.checking_worker;
+                    can_prepare = !blocked && !waiting && !self.checking_worker
+                        && (!avid || self.avid_source.is_some());
                     if waiting || blocked {
                         let fill = if blocked {
                             Color32::from_rgb(114, 35, 36)
@@ -470,6 +538,46 @@ impl eframe::App for Review {
                                 ui.colored_label(Color32::LIGHT_RED, issue);
                             }
                         });
+                    }
+                }
+
+                if !self.rewrap_sources.is_empty() {
+                    ui.label("Creates new media.");
+                    self.rewrap_size.show(ui, &self.rewrap_sources);
+                }
+                let primary_count = self.avid_source.as_ref().map(|source| source.primary_rewrap_sources().len());
+                if self.primary_rewrap && primary_count == Some(0) {
+                    ui.label("No selected managed clips qualify for OP1a rewrap. Verified links stay in place.");
+                }
+                if self.primary_rewrap && primary_count.is_some_and(|count| count > 0) {
+                    if let Some(job) = &mut self.job {
+                        let job = Arc::make_mut(job);
+                        if let TurnoverSource::AvidToResolve { op1a_rewrap_dir, .. } = &mut job.source {
+                            ui.label(format!("{} OP1a media files planned. UME originals and Group cameras stay linked.", primary_count.unwrap_or_default()));
+                            if let Some(path) = op1a_rewrap_dir.as_ref() {
+                                ui.label(path.display().to_string());
+                            }
+                            if !self.busy && ui.button("Choose folder for rewrapped media…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                    *op1a_rewrap_dir = Some(path.join("OP1a Media"));
+                                    self.rewrap_size = Default::default();
+                                    self.accepting_losses = false;
+                                }
+                            }
+                            can_prepare &= op1a_rewrap_dir.is_some();
+                        }
+                    }
+                }
+                if avid && !self.busy && self.media.is_some() && (!self.primary_rewrap || can_prepare || self.prepared.is_some()) {
+                    if ui.button("Save conversion settings…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().add_filter("Conversion settings", &["json"]).save_file() {
+                            if let Some(job) = &self.job {
+                                let result = fs::OpenOptions::new().write(true).create_new(true).open(&path)
+                                    .map_err(|error|error.to_string())
+                                    .and_then(|file| serde_json::to_writer_pretty(file, job.as_ref()).map_err(|error|error.to_string()));
+                                if let Err(error) = result { self.issue = Some(error); }
+                            }
+                        }
                     }
                 }
 
@@ -519,6 +627,7 @@ impl eframe::App for Review {
                 }
 
                 if let Some(prepared) = &self.prepared {
+                    let prepared = prepared.turnover();
                     let needs_approval = prepared.reviewable_losses().next().is_some()
                         || !prepared.omitted_markers().is_empty();
                     if needs_approval {
@@ -540,6 +649,11 @@ impl eframe::App for Review {
                             &mut self.accepting_losses,
                             "Accept these omissions for this conversion",
                         );
+                    }
+                    if avid && !prepared.notices.is_empty() {
+                        ui.collapsing("Source notices", |ui| {
+                            for notice in &prepared.notices { ui.label(notice); }
+                        });
                     }
                     if ui
                         .add_enabled(

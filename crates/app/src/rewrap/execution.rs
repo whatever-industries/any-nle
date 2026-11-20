@@ -328,6 +328,7 @@ impl Plan {
                         source_path: path.clone(),
                         target_path: target.to_string_lossy().into_owned(),
                         audio_stream: if n == 0 { None } else { Some((n - 1) as u32) },
+                        separate_mono: job.separate_mono,
                     })
                 }
             }

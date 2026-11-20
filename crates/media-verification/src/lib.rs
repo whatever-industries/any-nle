@@ -2,6 +2,8 @@
 
 use graph::Rational;
 
+pub mod rewrap_size;
+
 pub fn stream_duration(count: i64, time_base: Rational) -> Option<Rational> {
     Rational::new(
         i128::from(count) * i128::from(time_base.num()),

@@ -16,7 +16,7 @@ pub(super) fn append(
     losses: &mut Vec<Loss>,
     markers: &mut Vec<Marker>,
 ) -> R<()> {
-    let omitted = |p: &Placement| facts.omitted_offline_items.contains(p.item.as_str());
+    let omitted = |p: &Placement| facts.omits_placement(p);
     if !sequence.placements.iter().any(omitted) {
         return Ok(());
     }
@@ -71,7 +71,12 @@ pub(super) fn append(
                     "{description}: offline source omitted; a frame-aligned vacant span was not established."));
                 continue;
             };
-            let comment = format!("{description}: unqualified offline managed media omitted.");
+            let reason = if facts.omitted_managed_items.contains(p.item.as_str()) {
+                "managed media has no selected Premiere media route"
+            } else {
+                "unqualified offline managed media omitted"
+            };
+            let comment = format!("{description}: {reason}.");
             loss(losses, &p.id, "media_gap", comment.clone());
             markers.push(Marker {
                 name: format!("Media omitted · {label}"),

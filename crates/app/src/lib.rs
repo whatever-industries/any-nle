@@ -1,5 +1,6 @@
 //! Shared Any NLE application engine. The CLI and native wizard share preparation and publication.
 mod application;
+mod job_review;
 mod managed_op1a;
 mod png_mattes;
 mod wav_original;
@@ -7,12 +8,17 @@ mod media_prompt;
 mod offline;
 mod output;
 mod premiere_preparation;
+#[doc(hidden)]
+pub mod premiere_import;
 mod source_luts;
 mod premiere_route;
 mod rewrap;
 mod source_input;
 pub mod job;
 pub mod backend_bundle;
+pub use anynle_media_verification::rewrap_size;
+#[cfg(target_os = "macos")]
+pub mod resolve_job;
 
 pub fn cli_main()->std::process::ExitCode { application::main() }
 

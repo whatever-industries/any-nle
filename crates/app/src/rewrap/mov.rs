@@ -29,21 +29,25 @@ pub(super) fn validate_source(s: &Stream, raw: &Value, v: &VideoFile) -> R<()> {
         .iter()
         .find(|s| string(s, "codec_type") == Some("video"))
         .ok_or("missing ProRes picture")?;
+    let profile = avid_reader::mxf::ProResProfile::from_fourcc(&v.codec)
+        .ok_or("unrecognized ProRes picture profile")?;
+    use avid_reader::mxf::ProResProfile;
+    let pixel_format_matches = match profile {
+        ProResProfile::FourFourFourFour | ProResProfile::FourFourFourFourXq =>
+            matches!(s.pix.as_str(), "yuv444p10le" | "yuv444p12le" | "yuva444p10le" | "yuva444p12le"),
+        _ => s.pix == "yuv422p10le",
+    };
     if s.kind != "video"
         || s.codec != "prores"
-        || s.profile != if v.codec == "apch" { "HQ" } else { "LT" }
-        || s.pix != "yuv422p10le"
-        || s.width != 1920
-        || s.height != 1080
-        || v.width != 1920
-        || v.height != 1080
-        || v.rate.num != 24
-        || v.rate.den != 1
-        || s.rate != "24/1"
+        || s.profile != profile.probe_name()
+        || !pixel_format_matches
+        || s.width != v.width
+        || s.height != v.height
+        || s.rate != format!("{}/{}", v.rate.num, v.rate.den)
         || string(p, "sample_aspect_ratio") != Some("1:1")
         || string(p, "field_order") != Some("progressive")
     {
-        return Err("ProRes MOV requires progressive square-pixel 1920x1080 at 24/1 with the qualified picture profile".into());
+        return Err("ProRes MOV requires matching profile, raster and rate with progressive square-pixel picture".into());
     }
     Ok(())
 }
@@ -303,7 +307,7 @@ fn exact_ticks(s: &Value) -> R<i64> {
 pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String]) -> R<Value> {
     let channels = job.inputs.len() - 1;
     let scratch = partial.with_extension("pcm");
-    let packed = if channels > 0 {
+    let packed = if channels > 0 && !job.separate_mono {
         Some(pack(plan, job, &scratch)?)
     } else {
         None
@@ -333,6 +337,12 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
         ])
         .arg(&scratch);
     }
+    if job.separate_mono {
+        for index in job.inputs.iter().skip(1) {
+            c.args(["-protocol_whitelist", "file,pipe", "-f", "mxf", "-i"])
+                .arg(&plan.inputs[*index].path);
+        }
+    }
     c.args([
         "-map",
         &format!("0:{}", plan.inputs[job.inputs[0]].probe.stream_indices[0]),
@@ -340,11 +350,16 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
     if packed.is_some() {
         c.args(["-map", "1:a:0"]);
     }
+    if job.separate_mono {
+        for (file, index) in job.inputs.iter().enumerate().skip(1) {
+            c.args(["-map", &format!("{file}:{}", plan.inputs[*index].probe.stream_indices[0])]);
+        }
+    }
     let picture = &plan.inputs[job.inputs[0]];
     if let Some(tail) = &picture.terminal {
         c.args(["-bsf:v:0", &tail.filter()]);
     }
-    c.args(["-c", "copy", "-r:v", "24", "-map_metadata", "0"]);
+    c.args(["-c", "copy", "-r:v", &format!("{}/{}", job.rate.num, job.rate.den), "-map_metadata", "0"]);
     if let Some(tc) = &job.tc {
         c.args(["-timecode", tc, "-write_tmcd", "1"]);
     } else {
@@ -384,7 +399,7 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
     let source = &picture.probe.streams[0];
     let packets = picture.terminal.as_ref().map_or(source.packets, |tail| tail.frames);
     if video.len() != 1
-        || audio.len() != usize::from(channels > 0)
+        || audio.len() != if job.separate_mono { channels } else { usize::from(channels > 0) }
         || data.len() != usize::from(job.tc.is_some())
         || streams.len() != video.len() + audio.len() + data.len()
     {
@@ -395,11 +410,10 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
         || integer(v, "nb_read_packets")? != packets
         || string(v, "codec_name") != Some("prores")
         || string(v, "profile") != Some(source.profile.as_str())
-        || string(v, "pix_fmt") != Some("yuv422p10le")
-        || integer(v, "width")? != 1920
-        || integer(v, "height")? != 1080
-        || string(v, "sample_aspect_ratio") != Some("1:1")
-        || string(v, "r_frame_rate") != Some("24/1")
+        || string(v, "pix_fmt") != Some(source.pix.as_str())
+        || integer(v, "width")? != source.width
+        || integer(v, "height")? != source.height
+        || string(v, "r_frame_rate") != Some(source.rate.as_str())
         || v.get("tags").and_then(|t| string(t, "timecode")) != job.tc.as_deref()
         || integer(v, "start_pts")? != 0
     {
@@ -438,6 +452,23 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
         ]))?;
     if fingerprint.trim() != format!("SHA256={}", hashes[0]) {
         return Err("MOV compressed picture payload changed".into());
+    }
+    if job.separate_mono {
+        for (ordinal, a) in audio.iter().enumerate() {
+            let input = &plan.inputs[job.inputs[ordinal + 1]].probe.streams[0];
+            let encoding = format!("pcm_s{}le", input.bits);
+            if integer(a, "channels")? != 1 || integer(a, "sample_rate")? != input.samples
+                || string(a, "codec_name") != Some(encoding.as_str())
+                || exact_ticks(a)? != input.ticks || integer(a, "start_pts")? != 0
+            {
+                return Err(format!("MOV mono stream {ordinal} descriptor or clock changed"));
+            }
+            let hash = run(Command::new(&plan.ffmpeg).args(["-v", "error", "-nostdin", "-i"])
+                .arg(partial).args(["-map", &format!("0:a:{ordinal}"), "-c", "copy", "-f", "hash", "-hash", "sha256", "-"]))?;
+            if hash.trim() != format!("SHA256={}", hashes[ordinal + 1]) {
+                return Err(format!("MOV mono stream {ordinal} samples changed"));
+            }
+        }
     }
     if let Some((count, bits)) = packed {
         let a = audio[0];

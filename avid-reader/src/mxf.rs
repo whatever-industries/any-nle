@@ -65,6 +65,112 @@ pub const DNXHR_LB_CODING_0A: [u8; 16] = [
     0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A,
     0x04, 0x01, 0x02, 0x02, 0x71, 0x28, 0x00, 0x00,
 ];
+/// Registered SMPTE VC-3 compression ID 1272 (DNxHR HQ).
+pub const DNXHR_HQ_CODING: [u8; 16] = [
+    0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0D,
+    0x04, 0x01, 0x02, 0x02, 0x71, 0x26, 0x00, 0x00,
+];
+/// FFmpeg n8.1 writes CID 1272 with this register-version byte.
+pub const DNXHR_HQ_CODING_0A: [u8; 16] = [
+    0x06, 0x0E, 0x2B, 0x34, 0x04, 0x01, 0x01, 0x0A,
+    0x04, 0x01, 0x02, 0x02, 0x71, 0x26, 0x00, 0x00,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PictureProfile {
+    Dnx(u16),
+    ProRes(ProResProfile),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProResProfile {
+    Proxy,
+    Lt,
+    Standard,
+    Hq,
+    FourFourFourFour,
+    FourFourFourFourXq,
+}
+
+impl ProResProfile {
+    pub fn fourcc(self) -> &'static str {
+        match self {
+            Self::Proxy => "apco",
+            Self::Lt => "apcs",
+            Self::Standard => "apcn",
+            Self::Hq => "apch",
+            Self::FourFourFourFour => "ap4h",
+            Self::FourFourFourFourXq => "ap4x",
+        }
+    }
+
+    pub fn probe_name(self) -> &'static str {
+        match self {
+            Self::Proxy => "Proxy",
+            Self::Lt => "LT",
+            Self::Standard => "Standard",
+            Self::Hq => "HQ",
+            Self::FourFourFourFour => "4444",
+            Self::FourFourFourFourXq => "XQ",
+        }
+    }
+
+    pub fn from_fourcc(code: &str) -> Option<Self> {
+        [Self::Proxy, Self::Lt, Self::Standard, Self::Hq, Self::FourFourFourFour, Self::FourFourFourFourXq]
+            .into_iter().find(|profile| profile.fourcc() == code)
+    }
+}
+
+impl PictureProfile {
+    /// SMPTE ST 2019-4 registered VC-3 IDs and RDD 44 Table 5.
+    /// FFmpeg n8.1 also emits register version 0A for the later VC-3 IDs.
+    pub fn from_label(label: [u8; 16]) -> Option<Self> {
+        match label {
+            [6, 14, 43, 52, 4, 1, 1, 0x0a | 0x0d, 4, 1, 2, 2, 0x71, id, 0, 0] => {
+                matches!(id, 0x01 | 0x03..=0x04 | 0x07..=0x0a | 0x10..=0x13
+                    | 0x16 | 0x18..=0x1a | 0x24..=0x28)
+                    .then_some(Self::Dnx(1234 + u16::from(id)))
+            }
+            [6, 14, 43, 52, 4, 1, 1, 0x0d, 4, 1, 2, 2, 3, 6, id, 0] => {
+                let profile = match id {
+                    1 => ProResProfile::Proxy,
+                    2 => ProResProfile::Lt,
+                    3 => ProResProfile::Standard,
+                    4 => ProResProfile::Hq,
+                    5 => ProResProfile::FourFourFourFour,
+                    6 => ProResProfile::FourFourFourFourXq,
+                    _ => return None,
+                };
+                Some(Self::ProRes(profile))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn from_hex_label(value: &str) -> Option<Self> {
+        let value = value.as_bytes();
+        if value.len() != 32 || !value.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let mut label = [0; 16];
+        for (i, byte) in label.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(std::str::from_utf8(&value[i * 2..i * 2 + 2]).ok()?, 16).ok()?;
+        }
+        Self::from_label(label)
+    }
+
+    pub fn probe_name(self) -> &'static str {
+        match self {
+            Self::Dnx(1270) => "DNXHR 444",
+            Self::Dnx(1271) => "DNXHR HQX",
+            Self::Dnx(1272) => "DNXHR HQ",
+            Self::Dnx(1273) => "DNXHR SQ",
+            Self::Dnx(1274) => "DNXHR LB",
+            Self::Dnx(_) => "DNXHD",
+            Self::ProRes(profile) => profile.probe_name(),
+        }
+    }
+}
 
 /// A qualified file clock with the exact physical timecode-track rate retained.
 /// The rounded display base is never a substitute for this rate.
@@ -120,6 +226,8 @@ pub struct MxfIdentity {
     pub file_tracks: Vec<(i64, i64, i64)>,
     /// Present only when all picture descriptors in this bounded header agree.
     pub picture_essence_coding: Option<[u8; 16]>,
+    /// Bounded observations from a single consistent picture descriptor.
+    pub picture_descriptor: Vec<(&'static str, Vec<u8>)>,
     /// Effective file-track timecodes resolved through SourceClip -> physical package.
     pub file_timecodes: Vec<(u64, u16, bool)>,
     /// Exact-rate witnesses, one per resolved file essence track. Separate from the
@@ -243,6 +351,8 @@ fn parse_header(
     let mut source_packages: Vec<(String, usize, usize)> = Vec::new();
     let mut ambiguous_instance_ids = false;
     let mut picture_codings = Vec::<[u8; 16]>::new();
+    let mut picture_descriptor = None;
+    let mut ambiguous_picture_descriptor = false;
     while pos < data.len() {
         if let Some(limit) = header_end {
             if pos >= limit {
@@ -285,6 +395,28 @@ fn parse_header(
                 let coding: [u8; 16] = coding.try_into().unwrap();
                 if !picture_codings.contains(&coding) {
                     picture_codings.push(coding);
+                }
+                if PictureProfile::from_label(coding).is_some() {
+                    let mut fields = Vec::new();
+                    for (name, tag, size) in [
+                        ("stored_width", 0x3203, 4), ("stored_height", 0x3202, 4),
+                        ("display_width", 0x3209, 4), ("display_height", 0x3208, 4),
+                        ("frame_layout", 0x320c, 1), ("display_aspect", 0x320e, 8),
+                        ("field_dominance", 0x3212, 1), ("component_depth", 0x3301, 4),
+                        ("horizontal_subsampling", 0x3302, 4), ("vertical_subsampling", 0x3308, 4),
+                        ("black_reference", 0x3304, 4), ("white_reference", 0x3305, 4),
+                        ("color_range", 0x3306, 4), ("transfer_ul", 0x3210, 16),
+                        ("primaries_ul", 0x3219, 16), ("matrix_ul", 0x321a, 16),
+                        ("pixel_layout", 0x3401, 16),
+                    ] {
+                        if let Some(value) = local_item(&data[vstart..vend], tag, vstart)?.filter(|v| v.len() == size) {
+                            fields.push((name, value.to_vec()));
+                        }
+                    }
+                    if picture_descriptor.as_ref().is_some_and(|old| old != &fields) {
+                        ambiguous_picture_descriptor = true;
+                    }
+                    picture_descriptor = Some(fields);
                 }
             }
         }
@@ -331,6 +463,9 @@ fn parse_header(
     }
     if picture_codings.len() == 1 {
         id.picture_essence_coding = Some(picture_codings[0]);
+        if !ambiguous_picture_descriptor {
+            id.picture_descriptor = picture_descriptor.unwrap_or_default();
+        }
     }
     // File package -> its tracks -> each track's sequence duration and edit rate.
     let mut origins = Vec::new();
@@ -628,6 +763,26 @@ mod tests {
         let mut out = PARTITION.to_vec();
         out.extend_from_slice(&[0x05, 0x01, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 18]);
         out
+    }
+
+    #[test]
+    fn managed_picture_profiles_follow_registered_labels() {
+        for cid in [1235, 1237, 1238, 1241, 1242, 1243, 1244, 1250, 1251, 1252, 1253,
+                    1256, 1258, 1259, 1260, 1270, 1271, 1272, 1273, 1274] {
+            let mut label = DNXHR_LB_CODING;
+            label[13] = (cid - 1234) as u8;
+            assert_eq!(PictureProfile::from_label(label), Some(PictureProfile::Dnx(cid)));
+        }
+        for (index, fourcc) in ["apco", "apcs", "apcn", "apch", "ap4h", "ap4x"].iter().enumerate() {
+            let mut label = PRORES_422_LT_CODING;
+            label[14] = index as u8 + 1;
+            assert_eq!(PictureProfile::from_label(label),
+                ProResProfile::from_fourcc(fourcc).map(PictureProfile::ProRes));
+        }
+        let mut unknown = DNXHR_LB_CODING;
+        unknown[13] = 0xff;
+        assert_eq!(PictureProfile::from_label(unknown), None);
+        assert_eq!(PictureProfile::from_hex_label("060e2b34"), None);
     }
 
     #[test]
