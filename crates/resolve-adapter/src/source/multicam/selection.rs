@@ -6,7 +6,7 @@ use graph::{
 };
 use std::ops::Range;
 
-pub(in crate::source) const OBSERVED_GAP: &str = "selected Resolve angle includes an observed gap";
+pub(crate) const OBSERVED_GAP: &str = "selected Resolve angle includes an observed gap";
 
 pub(in crate::source) struct Selection<'a> {
     pub angle: &'a str,

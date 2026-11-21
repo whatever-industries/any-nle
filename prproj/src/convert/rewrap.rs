@@ -97,9 +97,23 @@ pub struct MediaRelink {
     pub audio_stream: Option<u32>,
     /// Each audio ordinal is a distinct mono stream in the output file.
     pub separate_mono: bool,
+    /// Verified effective pixel aspect of a rewrapped MOV picture.
+    pub pixel_aspect: Option<(u32, u32)>,
 }
 
 impl MediaRelink {
+    pub(super) fn validate_pixel_aspect(&self) -> Result<()> {
+        if let Some((n, d)) = self.pixel_aspect {
+            if n == 0 || d == 0 || n == d || self.audio_stream.is_some()
+                || !std::path::Path::new(&self.target_path).extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+            {
+                return Err(invalid("rewrap pixel aspect requires a non-square MOV picture binding".into()));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn is_separate_mono_wav(&self) -> bool {
         self.audio_stream == Some(0) && self.separate_mono
             && std::path::Path::new(&self.target_path).extension()
@@ -161,6 +175,7 @@ pub(super) fn apply_views(
     let mut channels: HashMap<&str, HashSet<u32>> = HashMap::new();
     let mut layouts = HashMap::new();
     for m in mappings {
+        m.validate_pixel_aspect()?;
         if layouts.insert(m.target_path.as_str(), m.separate_mono).is_some_and(|old| old != m.separate_mono) {
             return Err(invalid("rewrap bindings disagree about the target audio layout".into()));
         }
@@ -238,6 +253,22 @@ pub(super) fn apply_views(
             .child_by_tag(node, "AudioStream")
             .map(|reference| project.doc.resolve(reference))
             .transpose()?;
+        if let Some(&(n, d)) = project.doc.tree.child_by_tag(node, "FilePath")
+            .filter(|_| project.doc.tree.tag(node) == "Media")
+            .and_then(|path| project.doc.tree.text(path))
+            .and_then(|path| by_path.get(path))
+            .and_then(|mapping| mapping.pixel_aspect.as_ref())
+        {
+            let reference = project.doc.tree.child_by_tag(node, "VideoStream")
+                .ok_or_else(|| invalid("rewrap pixel aspect binding lacks a video stream".into()))?;
+            let stream = project.doc.resolve(reference)?;
+            let interpretation = crate::model::footage::FootageInterpretation { stream, source: None };
+            if interpretation.stored_pixel_aspect_ratio(&project.doc.tree).as_deref()
+                != Some(&format!("{n},{d}"))
+            {
+                return Err(invalid("rewrap picture interpretation disagrees with the binding".into()));
+            }
+        }
         let tree = &mut project.doc.tree;
         if tree.tag(node) != "Media" {
             continue;
@@ -374,10 +405,12 @@ mod tests {
         let mut bindings = vec![MediaRelink {
             source_path: picture.path.clone(), target_path: "/Volumes/Output/Picture.mxf".into(),
             audio_stream: None, separate_mono: true,
+            pixel_aspect: None,
         }];
         bindings.extend(clip.audio.iter().enumerate().map(|(lane, audio)| MediaRelink {
             source_path: audio.path.clone(), target_path: format!("/Volumes/Output/A{}.wav", lane + 1),
             audio_stream: Some(0), separate_mono: true,
+            pixel_aspect: None,
         }));
         super::super::native_av::validate_bindings(&model, &bindings).unwrap();
         let mut duplicate = bindings.clone();
@@ -431,6 +464,7 @@ mod tests {
         let bindings = [MediaRelink {
             source_path: picture.path.clone(), target_path: target.into(),
             audio_stream: None, separate_mono: false,
+            pixel_aspect: None,
         }];
         let unrelated = HashSet::from([control.path.clone()]);
         assert!(apply_views(&mut project, &bindings, false, &unrelated).is_err());
@@ -464,6 +498,7 @@ mod tests {
             target_path: target.clone(),
             audio_stream: None,
             separate_mono: false,
+            pixel_aspect: None,
         }];
         for (i, a) in clip.audio.iter().enumerate() {
             maps.push(MediaRelink {
@@ -471,6 +506,7 @@ mod tests {
                 target_path: target.clone(),
                 audio_stream: Some(i as u32),
                 separate_mono: false,
+                pixel_aspect: None,
             });
         }
         model.clips.get_mut("clip-1").unwrap().audio[1].bits = 24;
@@ -533,6 +569,7 @@ mod tests {
             target_path: target.clone(),
             audio_stream: None,
             separate_mono: false,
+            pixel_aspect: None,
         }];
         for (i, a) in c.audio.iter().enumerate() {
             maps.push(MediaRelink {
@@ -540,6 +577,7 @@ mod tests {
                 target_path: target.clone(),
                 audio_stream: Some(i as u32),
                 separate_mono: false,
+                pixel_aspect: None,
             });
         }
         let mut ids = crate::SeededUuids::new("op1a-parity");

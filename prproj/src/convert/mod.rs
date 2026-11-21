@@ -39,6 +39,7 @@ pub mod time_remap;
 pub mod writer;
 pub mod prepared;
 pub mod multicam;
+pub mod multicam_tracks;
 pub mod original;
 #[doc(hidden)]
 pub mod media_donor;

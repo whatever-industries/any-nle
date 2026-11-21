@@ -60,6 +60,207 @@ fn build(path: &Path, handle: &str, child_parent: &str) {
     build_with_child_registration(path, handle, child_parent, CHILD);
 }
 
+#[test]
+fn embedded_aac_keeps_44100_sample_clock_and_saved_channel_route() {
+    const CACHE: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+    const EDIT: &str = "bbbbbbbb-0000-0000-0000-000000000001";
+    const TRACK: &str = "cccccccc-0000-0000-0000-000000000001";
+    const SAMPLES: i64 = 441037;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aac-source.drp");
+    build(&path, HANDLE, ROOT);
+    let origin = 128.0 / 44100.0;
+    let track = encode_qt(&[
+        ("NumChannels", Qt::Int(2)), ("IdxTrack", Qt::Int(0)),
+        ("SampleRate", Qt::Int(44100)), ("BitDepth", Qt::Int(3)),
+        ("Duration", Qt::Long(SAMPLES)), ("StartTime", Qt::Double(origin)),
+        ("ChannelLayout", Qt::Int(2)), ("CodecName", Qt::Text("AAC")),
+    ]);
+    let tracks = hex::encode(encode_qt(&[("0", Qt::Bytes(&track))]));
+    let cache = xml::parse(&format!(r#"<BtAudioInfo DbId="{CACHE}"><TracksBA>{tracks}</TracksBA></BtAudioInfo>"#), &mut 0).unwrap();
+    let clip = |saved_origin: f64, right: i32| {
+        let channel = |index| encode_qt(&[("MediaRef", Qt::Text(CACHE)), ("ChannelIdx", Qt::Int(index))]);
+        let left = channel(0);
+        let right = channel(right);
+        let mapping = encode_qt(&[("0", Qt::Bytes(&left)), ("1", Qt::Bytes(&right))]);
+        let mut extent = saved_origin.to_le_bytes().to_vec();
+        extent.extend_from_slice(&(SAMPLES as f64 / 44100.0).to_le_bytes());
+        let route = encode_qt(&[
+            ("Type", Qt::Int(0)), ("CodecName", Qt::Text("AAC")),
+            ("MediaExtents", Qt::Bytes(&extent)), ("ChannelVecBA", Qt::Bytes(&mapping)),
+        ]);
+        let routes = encode_qt(&[("0", Qt::Bytes(&route))]);
+        let mut bytes = Vec::new();
+        crate::binary::pb_bytes(5, &routes, &mut bytes);
+        for _ in 0..2 {
+            let inner = std::mem::take(&mut bytes);
+            crate::binary::pb_bytes(1, &inner, &mut bytes);
+        }
+        let fields = crate::binary::pack(&bytes).unwrap();
+        xml::parse(&format!(r#"<Sm2MpVideoClip DbId="{CLIP}"><FieldsBlob>{fields}</FieldsBlob></Sm2MpVideoClip>"#), &mut 0).unwrap()
+    };
+    let capture = |clip: &Node| {
+        let mut graph = read(&path).unwrap();
+        let mut item = SourceItem {
+            id: CLIP.into(), name: "Stereo clip".into(), media: vec![],
+            umid: None, tape: None, rate: None, color_rgb16: None, stream_groups: vec![], markers: vec![],
+        };
+        assert!(graph.media.is_empty());
+        let saved = read_embedded_stereo(clip, &cache, "/fixture/stereo.mp4", 234, Rational::integer(24),
+            86400, "AAC", None, &mut Blobs::default(), &mut graph, &mut item)?;
+        assert!(saved);
+        graph.items.push(item);
+        Ok::<_, Box<dyn std::error::Error>>(graph)
+    };
+    assert!(capture(&clip(129.0 / 44100.0, 1)).is_err());
+    assert!(capture(&clip(origin, 0)).is_err());
+    let mut graph = capture(&clip(origin, 1)).unwrap();
+    assert_eq!(graph.items[0].stream_groups, vec![vec![1, 2]]);
+    assert!(graph.items[0].media.iter().all(|stream| stream.source_offset.is_none()));
+    for (index, media) in graph.media.iter().enumerate() {
+        assert_eq!(media.sample_rate, Some(44100));
+        assert_eq!(media.duration, Rational::from_units(SAMPLES, 44100).unwrap());
+        assert_eq!(media.start, Rational::from_units(128, 44100));
+        assert_eq!(media.stream, Some(index as i64 + 1));
+        assert_eq!(graph.sidecar(ADAPTER, &media.id).unwrap().get("saved_channel"), Some(&Value::Int(index as i64)));
+        assert!(media.original.is_none());
+    }
+    let selector = crate::stereo::SELECTOR;
+    let edit = xml::parse(&format!(r#"<Sm2TiAudioClip DbId="{EDIT}"><MediaRef>{CLIP}</MediaRef>
+        <MediaTrackIdx>0</MediaTrackIdx><VirtualAudioTrackBA>{selector}</VirtualAudioTrackBA>
+        <Start>86417</Start><Duration>24</Duration><In>9|000000000000e03f</In>
+        <MediaTimemapBA>023ff00000000000000000000000000000000000000000000000000000000000000000000000000000</MediaTimemapBA>
+        <MediaStartTime>0</MediaStartTime><Flags>0</Flags></Sm2TiAudioClip>"#), &mut 0).unwrap();
+    let track = xml::parse(&format!(r#"<Sm2TiTrack DbId="{TRACK}"><SubType>1</SubType><Flags>0</Flags></Sm2TiTrack>"#), &mut 0).unwrap();
+    let sequence = graph.sequences[0].clone();
+    embedded_audio::observe_edit(Rational::integer(24), &edit, &track, 2, &sequence, &mut graph, &mut Blobs::default()).unwrap();
+    let Some(Value::Arr(routes)) = graph.sidecar(embedded_audio::ROUTE_ADAPTER, SEQUENCE) else { panic!("saved AAC route") };
+    assert_eq!(routes[0].get("physical_channels"), Some(&Value::Arr(vec![Value::Int(1), Value::Int(2)])));
+    assert_eq!(routes[0].get("saved_track_subtype"), Some(&text("1")));
+    let Some(Value::Arr(timing)) = graph.sidecar("resolve.timing", SEQUENCE) else { panic!("saved AAC timing") };
+    assert_eq!(timing[0].get("saved_in"), Some(&text("9|000000000000e03f")));
+    assert!(graph.sequences[0].placements.is_empty());
+    assert!(graph.losses.iter().any(|row| row.reason.starts_with(EDIT)));
+    assert_eq!(SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap(), graph);
+}
+
+#[test]
+fn saved_still_and_stereo_mp3_round_trip_without_physical_media_claims() {
+    const STILL: &str = "88888888-0000-0000-0000-000000000000";
+    const AUDIO: &str = "99999999-0000-0000-0000-000000000000";
+    const CACHE: &str = "aaaaaaaa-0000-0000-0000-000000000000";
+    const STILL_EDIT: &str = "bbbbbbbb-0000-0000-0000-000000000000";
+    const AUDIO_EDIT: &str = "cccccccc-0000-0000-0000-000000000000";
+    const RATE: &str = "00000000000038400000000000000000";
+    const RASTER: &str = "00000000000007800000000000000438";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("media-sources.drp");
+    build(&path, HANDLE, ROOT);
+    let mut graph = read(&path).unwrap();
+    let mut blobs = Blobs::default();
+    let cache = |name: &str, codec: Option<&str>| {
+        let mut fields = Vec::new();
+        crate::binary::pb_bytes(1, b"/media", &mut fields);
+        crate::binary::pb_bytes(2, name.as_bytes(), &mut fields);
+        if let Some(codec) = codec {
+            crate::binary::pb_bytes(5, codec.as_bytes(), &mut fields);
+        }
+        crate::binary::pb_bytes(6, name.as_bytes(), &mut fields);
+        crate::binary::pack(&fields).unwrap()
+    };
+    let timing = hex::encode(encode_qt(&[
+        ("FrameRate", Qt::Bytes(&hex::decode(RATE).unwrap())),
+        ("NumFrames", Qt::Int(1)), ("StartFrame", Qt::Int(301)),
+    ]));
+    let mut geometry = encode_qt(&[
+        ("Resolution", Qt::Bytes(&hex::decode(RASTER).unwrap())),
+        ("PixelAspectRatio", Qt::Double(1.125)),
+    ]);
+    let type_start = geometry.len() - 13;
+    geometry[type_start..type_start + 4].copy_from_slice(&135u32.to_be_bytes());
+    let geometry = hex::encode(geometry);
+    let still_node = |name| xml::parse(&format!(
+        r#"<Sm2MpVideoClip DbId="{STILL}"><Name>Image</Name><Video><BtVideoInfo><Type>STANDARD_CLIP</Type><Clip>{}</Clip><Time>{timing}</Time><Geometry>{geometry}</Geometry></BtVideoInfo></Video></Sm2MpVideoClip>"#,
+        cache(name, None),
+    ), &mut 0).unwrap();
+    let caches = HashMap::new();
+    assert!(media(&still_node("still[301-305].png"), &caches, &mut blobs, &mut graph).unwrap().is_none());
+    let image = media(&still_node("still0301.png"), &caches, &mut blobs, &mut graph).unwrap().unwrap();
+    assert_eq!(graph.sidecar(ADAPTER, STILL).unwrap().get("saved_cache_start_frame"), Some(&Value::Int(301)));
+    let image_stream = &graph.media[0].id;
+    let pixel_aspect = graph.sidecar("resolve.media_geometry", image_stream).unwrap();
+    assert_eq!(pixel_aspect.get("pixel_aspect_ratio"), Some(&text("9/8")));
+    assert_eq!(pixel_aspect.get("saved_pixel_aspect_bits"), Some(&text("3ff2000000000000")));
+    assert!(graph.losses.iter().any(|loss| loss.object == *image_stream && loss.aspect == "geometry"));
+
+    let channel = |index| encode_qt(&[("MediaRef", Qt::Text(CACHE)), ("ChannelIdx", Qt::Int(index))]);
+    let left = channel(0);
+    let right = channel(1);
+    let mapping = encode_qt(&[("0", Qt::Bytes(&left)), ("1", Qt::Bytes(&right))]);
+    let mut media_extent = vec![0; 8];
+    media_extent.extend_from_slice(&10.0f64.to_le_bytes());
+    let route = encode_qt(&[
+        ("Type", Qt::Int(0)), ("CodecName", Qt::Text("MP3")),
+        ("MediaExtents", Qt::Bytes(&media_extent)), ("ChannelVecBA", Qt::Bytes(&mapping)),
+    ]);
+    let routes = encode_qt(&[("0", Qt::Bytes(&route))]);
+    let mut route_fields = Vec::new();
+    crate::binary::pb_bytes(5, &routes, &mut route_fields);
+    let mut fields = Vec::new();
+    crate::binary::pb_bytes(1, &route_fields, &mut fields);
+    let mut import_clock = vec![9];
+    import_clock.extend_from_slice(&24.0f64.to_le_bytes());
+    crate::binary::pb_bytes(2, &import_clock, &mut fields);
+    let fields = crate::binary::pack(&fields).unwrap();
+    let track = encode_qt(&[
+        ("SampleRate", Qt::Int(44100)), ("NumChannels", Qt::Int(2)), ("BitDepth", Qt::Int(3)),
+        ("Duration", Qt::Int(441000)), ("StartTime", Qt::Double(0.0)),
+        ("CodecName", Qt::Text("MP3")), ("IdxTrack", Qt::Int(0)),
+    ]);
+    let tracks = hex::encode(encode_qt(&[("0", Qt::Bytes(&track))]));
+    let mp3 = xml::parse(&format!(
+        r#"<Sm2MpAudioClip DbId="{AUDIO}"><Name>Music</Name><FieldsBlob>{fields}</FieldsBlob><EmbeddedAudioVec><Element><BtAudioInfo DbId="{CACHE}"><Clip>{}</Clip><TracksBA>{tracks}</TracksBA></BtAudioInfo></Element></EmbeddedAudioVec></Sm2MpAudioClip>"#,
+        cache("music.mp3", Some("MP3")),
+    ), &mut 0).unwrap();
+    let audio = wav::read(&mp3, &mut blobs, &mut graph).unwrap().unwrap();
+    assert_eq!(graph.media[1].sample_rate, Some(44100));
+    assert_eq!(graph.media[2].duration, Rational::integer(10));
+    assert!(graph.media.iter().all(|media| media.original.is_none() && media.online.is_none()));
+
+    let grid = Grid { origin: 0, rate: Rational::integer(24), drop: false, length: 120, size: (1920,1080) };
+    let mut hold_keys = vec![0x80, 0x0a, 0, 0x0a, 9, 9];
+    hold_keys.extend_from_slice(&60000.0f64.to_le_bytes());
+    let hold = hex::encode(encode_qt(&[
+        ("YMin", Qt::Double(-1.0)), ("YMax", Qt::Double(-1.0)), ("XMax", Qt::Double(60000.0)),
+        ("UniqueId", Qt::Text(STILL_EDIT)), ("DbType", Qt::Text("Sm2TimeMap")),
+        ("KeyframesBA", Qt::Bytes(&hold_keys)),
+    ]));
+    let node = xml::parse(&format!(
+        r#"<Sm2TiVideoClip DbId="{STILL_EDIT}"><MediaRef>{STILL}</MediaRef><Start>17</Start><Duration>24</Duration><In>86437</In><MediaStartTime>0</MediaStartTime><MediaFrameRate>{RATE}</MediaFrameRate><MediaTimemapBA>{hold}</MediaTimemapBA></Sm2TiVideoClip>"#,
+    ), &mut 0).unwrap();
+    let still_placement = still::edit(&image, &node, grid, 1, SEQUENCE, &mut graph, &mut blobs).unwrap().unwrap();
+    assert_eq!(still_placement.frame_map, Some(vec![0; 24]));
+    let map = hex::encode((10.0f64 - 1.0 / 24.0).to_be_bytes());
+    let audio_edit = |track| xml::parse(&format!(
+        r#"<Sm2TiAudioClip DbId="{AUDIO_EDIT}"><MediaRef>{AUDIO}</MediaRef><Start>17</Start><Duration>24</Duration><In>9</In><MediaStartTime>0</MediaStartTime><MediaFrameRate>{RATE}</MediaFrameRate><MediaTimemapBA>02{map}</MediaTimemapBA><MediaTrackIdx>{track}</MediaTrackIdx><VirtualAudioTrackBA>{}</VirtualAudioTrackBA></Sm2TiAudioClip>"#,
+        crate::stereo::SELECTOR,
+    ), &mut 0).unwrap();
+    let audio_placement = wav::edit(&audio, &audio_edit(0), grid, 2, true, SEQUENCE, &mut graph, &mut blobs).unwrap().unwrap();
+    assert_eq!(audio_placement.source_in, Rational::new(3, 8).unwrap());
+    assert_eq!(audio_placement.grouped_audio[0].track, 2);
+    assert_eq!(audio_placement.grouped_audio[0].streams, vec![1, 2]);
+    assert!(wav::edit(&audio, &audio_edit(1), grid, 2, true, SEQUENCE, &mut graph, &mut blobs).unwrap().is_none());
+
+    let seq = &mut graph.sequences[0];
+    seq.rate = grid.rate;
+    seq.start = Some(Rational::ZERO);
+    seq.clock = Some(grid.clock(SEQUENCE).unwrap());
+    seq.tracks = vec![SourceTrack::new(StreamKind::Video, 1, None), SourceTrack::new(StreamKind::Audio, 2, None)];
+    seq.placements = vec![still_placement, audio_placement];
+    graph.validate().unwrap();
+    assert_eq!(SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap(), graph);
+}
+
 fn build_with_child_registration(path: &Path, handle: &str, child_parent: &str, registered: &str) {
     let fields = hex::encode(encode_qt(&[("RootFolderRef", Qt::Text(ROOT))]));
     let mut child_list = Vec::new();

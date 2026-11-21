@@ -32,6 +32,23 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+type SidecarIndex<'a> = HashMap<(&'a str, &'a str), &'a Value>;
+
+#[derive(Clone, Copy)]
+pub(crate) enum SidecarLookup<'a> {
+    Indexed(&'a SidecarIndex<'a>),
+    Linear(&'a SourceGraph),
+}
+
+impl<'a> SidecarLookup<'a> {
+    pub(crate) fn get(self, adapter: &str, object: &str) -> Option<&'a Value> {
+        match self {
+            Self::Indexed(index) => index.get(&(adapter, object)).copied(),
+            Self::Linear(graph) => graph.sidecar(adapter, object),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectSpec {
@@ -603,6 +620,10 @@ fn probe_native(
 pub(crate) fn probe_resolve_original(spec: &MediaSpec, tool: &Path, camera: bool) -> Result<(Media, Rational, i64)> {
     let mode = if camera { ProbeMode::Camera } else { ProbeMode::Resolve };
     probe_original(spec, tool, String::new(), 0, None, None, mode)
+}
+
+pub(crate) fn probe_resolve_original_by_path(spec: &MediaSpec, tool: &Path) -> Result<(Media, Rational, i64)> {
+    probe_original(spec, tool, String::new(), 0, None, None, ProbeMode::Review)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1203,6 +1224,10 @@ pub(crate) fn prepare_project(
     {
         return Err("linked project exceeds timeline, media or bin limits".into());
     }
+    let sidecar_index = graph.sidecars.iter()
+        .map(|sidecar| ((sidecar.adapter.as_str(), sidecar.object.as_str()), &sidecar.data))
+        .collect();
+    let sidecars = SidecarLookup::Indexed(&sidecar_index);
     let nests = crate::nests::plan(graph, &spec.timelines)?;
     let nested_children: HashSet<_> = nests.iter().flatten().map(|usage| usage.child).collect();
     let stereo_children: HashSet<_> = nests.iter().flatten()
@@ -1295,7 +1320,7 @@ pub(crate) fn prepare_project(
         let name = checked_name(&item.name)?;
         let bin_index = bin_ids[bin.id.as_str()];
         if group_cameras.contains(item_id)
-            && graph.sidecar(crate::premiere::MULTICAM_CAMERA, item_id).is_some()
+            && sidecars.get(crate::premiere::MULTICAM_CAMERA, item_id).is_some()
         {
             let selectors = binding.streams.iter().map(|stream| StreamSelector {
                 media_id: stream.media_id.clone(),
@@ -1408,7 +1433,7 @@ pub(crate) fn prepare_project(
             for (channel, sibling) in siblings.iter().enumerate() {
                 let source = binding.streams.iter().find(|selector| selector.channel == Some(channel))
                     .ok_or("missing original channel for verified Avid sibling")?;
-                let package = graph.sidecar("avid.source", &source.media_id)
+                let package = sidecars.get("avid.source", &source.media_id)
                     .and_then(|data| match data.get("file_package") {
                         Some(Value::Str(id)) => Some(id.as_str()),
                         _ => None,
@@ -1509,12 +1534,12 @@ pub(crate) fn prepare_project(
             return Err(format!("{}: disabled source edit has no qualified Resolve mapping", edit.id).into());
         }
         let mut build = || -> Result<(Timeline, Vec<String>)> {
-            let avid_ranges = crate::grade::AvidRanges::new(graph, sequence)?;
+            let avid_ranges = crate::grade::AvidRanges::new(sidecars, sequence)?;
             let premiere_avc_rate = avc_rate(sequence.rate)
-                && graph.sidecar("premiere.source", &sequence.id).is_some()
+                && sidecars.get("premiere.source", &sequence.id).is_some()
                 && row.group.is_none();
             let saved_range = sequence.placements.iter()
-                .any(|edit| graph.sidecar(crate::grade::RANGE_ADAPTER, &edit.id).is_some());
+                .any(|edit| sidecars.get(crate::grade::RANGE_ADAPTER, &edit.id).is_some());
             let range_avc_rate = avc_rate(sequence.rate) && row.group.is_none()
                 && (avid_ranges.has_ranges() || saved_range) && sequence.placements.iter().all(|edit|
                     selected.get(edit.item.as_str()).is_some_and(|(index, _)| {
@@ -1549,7 +1574,7 @@ pub(crate) fn prepare_project(
                     reason: "The matched child has no audio edits. Resolve keeps the picture nest and omits its empty audio companion.".into(),
                 })
             }));
-            if graph.sidecar(crate::nests::PREMIERE_ADAPTER, &sequence.id).is_some() {
+            if sidecars.get(crate::nests::PREMIERE_ADAPTER, &sequence.id).is_some() {
                 destination_losses.extend(uses.iter().filter_map(|usage| {
                     Some(graph::Loss {
                         object: usage.stereo_audio.clone()?,
@@ -1581,8 +1606,8 @@ pub(crate) fn prepare_project(
                     !(picture || stereo_child && crate::stereo::placement(p))
                 })
                 || !sequence.texts.is_empty() || !sequence.transitions.is_empty()
-                || graph.sidecar(crate::dissolve::ADAPTER, &sequence.id).is_some()
-                || graph.sidecar(crate::generator::ADAPTER, &sequence.id).is_some()
+                || sidecars.get(crate::dissolve::ADAPTER, &sequence.id).is_some()
+                || sidecars.get(crate::generator::ADAPTER, &sequence.id).is_some()
                 || (compound && !sequence.markers.is_empty()))
             {
                 return Err("Resolve nesting requires a picture-only V1 parent and children".into());
@@ -1603,7 +1628,7 @@ pub(crate) fn prepare_project(
             // only the picture lane has edits. The writer already emits
             // these lanes for a picture-only timeline.
             let empty_linked_mono = track_count == 3 && !second_picture
-                && graph.sidecar("resolve.source", &sequence.id).is_some()
+                && sidecars.get("resolve.source", &sequence.id).is_some()
                 && shape(StreamKind::Video, 1) && shape(StreamKind::Audio, 1)
                 && shape(StreamKind::Audio, 2) && faders == Default::default()
                 && sequence.placements.iter().all(|edit| edit.video_track == Some(1)
@@ -1632,8 +1657,8 @@ pub(crate) fn prepare_project(
             let bin = *bin_ids
                 .get(row.bin_id.as_str())
                 .ok_or("timeline bin assignment absent")?;
-            if let Some(Value::Str(saved)) = graph
-                .sidecar("resolve.source", &sequence.id)
+            if let Some(Value::Str(saved)) = sidecars
+                .get("resolve.source", &sequence.id)
                 .and_then(|data| data.get("bin_id"))
             {
                 if saved != &row.bin_id {
@@ -1649,7 +1674,7 @@ pub(crate) fn prepare_project(
                     return Err("Group timelines require neutral track and bus faders".into());
                 }
                 if second_picture || !sequence.texts.is_empty() || !sequence.transitions.is_empty()
-                    || graph.sidecar(crate::generator::ADAPTER, &sequence.id).is_some()
+                    || sidecars.get(crate::generator::ADAPTER, &sequence.id).is_some()
                 {
                     return Err("subtitle tracks and transitions on Group timelines are unqualified".into());
                 }
@@ -1785,11 +1810,11 @@ pub(crate) fn prepare_project(
             let mut recovered_labels = HashSet::new();
             let mut recovered_avid_ranges = HashSet::new();
             let mut verified_color_media = HashSet::new();
-            let mut marker_preparation = markers::TimelineMarkerPreparation::new(graph, sequence);
+            let mut marker_preparation = markers::TimelineMarkerPreparation::new(graph, sequence, sidecars);
             let has_a1_crossfade = source_dissolves.iter().chain(&native_dissolves)
                 .any(|fade| fade.prepared.audio());
             let mut clip_envelopes =
-                clip_envelope::ClipEnvelopePreparation::new(graph, sequence, has_a1_crossfade);
+                clip_envelope::ClipEnvelopePreparation::new(graph, sequence, has_a1_crossfade, sidecars);
             let mut lanes: [Vec<Edit>; 5] = Default::default();
             for edit in &sequence.placements {
                 let stereo_edit = stereo && crate::stereo::placement(edit);
@@ -1929,19 +1954,19 @@ pub(crate) fn prepare_project(
                         || transition_tails.contains_key(edit.id.as_str()),
                     mixed_rate,
                     can_review_losses: review_caption_omissions.is_some(),
-                }.prepare(graph, edit, source_in, length)?;
+                }.prepare(sidecars, edit, source_in, length)?;
                 destination_losses.extend(loss);
                 if is_2997(sequence.rate) && matches!(lane, 1 | 2) {
                     let aligned_record = whole_sample_count(start, sequence.rate).is_ok();
                     let exact = aligned_record && [source_in, length]
                         .into_iter().all(|frame| whole_sample_count(frame, sequence.rate).is_ok());
-                    let resolve_source = graph.sidecar(crate::source::ADAPTER, &sequence.id)
+                    let resolve_source = sidecars.get(crate::source::ADAPTER, &sequence.id)
                         .and_then(|record| record.get("kind"))
                         .is_some_and(|kind| matches!(kind, Value::Str(kind) if kind == "registered_timeline"));
                     let verified_movie = media[media_index].native.as_ref()
                         .is_some_and(|movie| movie.verified_fractional_frame_audio());
                     if !exact && !(resolve_source && verified_movie) {
-                        if !verified_movie || graph.sidecar("premiere.source", &sequence.id).is_none() {
+                        if !verified_movie || sidecars.get("premiere.source", &sequence.id).is_none() {
                             return Err(format!("{}: 29.97 audio edit must align to whole 48 kHz samples", edit.id).into());
                         }
                         check_premiere_audio_record_grid(origin, start, sequence.rate)
@@ -1972,7 +1997,7 @@ pub(crate) fn prepare_project(
                     crate::video::prepare(edit, sequence.rate, source_in, length, available)
                         .map_err(|e| format!("{}: {e}", edit.id))?
                 };
-                let mut grade = crate::grade::prepare(graph, &edit.id)?;
+                let mut grade = crate::grade::prepare_with_sidecars(sidecars, &edit.id)?;
                 if lane == 0 && canvas == (1920, 1080) && matches!(timing, Timing::Straight)
                     && media[media_index].native.is_none() && media[media_index].proxy.is_none()
                 {
@@ -1984,7 +2009,7 @@ pub(crate) fn prepare_project(
                             && source_media.original.as_ref().is_some_and(|original|
                                 original.container == "mov" && original.stream_index == 0)
                         {
-                            if let Some(range) = avid_ranges.prepare(graph, edit, source_media)? {
+                            if let Some(range) = avid_ranges.prepare(sidecars, edit, source_media)? {
                                 if grade.is_some() || video.is_some() {
                                     return Err(format!("{}: conflicting picture and Avid range operations", edit.id).into());
                                 }
@@ -2028,7 +2053,7 @@ pub(crate) fn prepare_project(
                             video: MovieVideo::ProResHq, raster: (1920,1080), aac: false, pcm: None, ..
                         }))
                 {
-                    if graph.sidecar(crate::premiere::color_mode::ADAPTER, &edit.id)
+                    if sidecars.get(crate::premiere::color_mode::ADAPTER, &edit.id)
                         .and_then(crate::premiere::color_mode::qualified_exposure).is_some()
                     {
                         destination_losses.push(graph::Loss {
@@ -2053,9 +2078,9 @@ pub(crate) fn prepare_project(
                     return Err(format!("{}: editable UHD picture effects require a separate profile", edit.id).into());
                 }
                 let input_sizing = crate::input_scaling::prepare(
-                    graph, &sequence.id, &edit.id, edit.video_track.is_some() && raster_mismatch,
+                    sidecars, &sequence.id, &edit.id, edit.video_track.is_some() && raster_mismatch,
                 ).map_err(|error| format!("{}: {error}", edit.id))?;
-                let adjust = graph.sidecar(crate::premiere::color_mode::ADAPTER, &edit.id)
+                let adjust = sidecars.get(crate::premiere::color_mode::ADAPTER, &edit.id)
                     .and_then(crate::premiere::color_mode::qualified_adjust);
                 let fusion_profile = lane == 0 && picture_only && canvas == (1920, 1080)
                     && sequence.rate == Rational::integer(24) && matches!(timing, Timing::Straight)
@@ -2376,7 +2401,7 @@ pub(crate) fn prepare_project(
         .bins
         .iter()
         .filter(|bin| bin.parent.is_none())
-        .filter_map(|bin| graph.sidecar(crate::source::ACTIVE_TIMELINE_ADAPTER, &bin.id));
+        .filter_map(|bin| sidecars.get(crate::source::ACTIVE_TIMELINE_ADAPTER, &bin.id));
     let active = match (selections.next(), selections.next()) {
         (Some(receipt), None) => match receipt.get("sequence_id") {
             Some(Value::Str(id))
@@ -2420,7 +2445,7 @@ pub(crate) fn prepare_project(
 pub(crate) fn display_base(rate: Rational) -> u16 {
     match (rate.num(), rate.den()) {
         (25, 1) => 25,
-        (30000, 1001) => 30,
+        (30, 1) | (30000, 1001) => 30,
         _ => 24,
     }
 }

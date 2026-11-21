@@ -119,14 +119,24 @@ pub(crate) fn prepare_linked_track_pans(fairlight: Option<&Value>, sequence_id: 
     let Some(saved_pans) = data.get(LINKED_TRACK_PANS) else {
         return Ok(None);
     };
+    let Value::Arr(pans) = saved_pans else {
+        return Err(format!("{sequence_id}: unsupported Resolve track pan or routing").into());
+    };
+    let [Value::Int(left), Value::Int(right)] = pans.as_slice() else {
+        return Err(format!("{sequence_id}: unsupported Resolve track pan or routing").into());
+    };
+    check_linked_track_pans(data, sequence_id, [*left, *right])
+        .map(|()| Some([*left as i32, *right as i32]))
+}
+
+pub(crate) fn check_linked_track_pans(data: &Value, sequence_id: &str, [left, right]: [i64; 2]) -> Result<()> {
     let unsupported = || format!("{sequence_id}: unsupported Resolve track pan or routing");
-    let (Value::Arr(pans), Some(Value::Arr(tracks)), Some(Value::Arr(buses))) =
-        (saved_pans, data.get("tracks"), data.get("buses"))
+    let (Some(Value::Arr(tracks)), Some(Value::Arr(buses))) =
+        (data.get("tracks"), data.get("buses"))
     else {
         return Err(unsupported().into());
     };
-    let ([Value::Int(left), Value::Int(right)], [first, second], [bus]) =
-        (pans.as_slice(), tracks.as_slice(), buses.as_slice())
+    let ([first, second], [bus]) = (tracks.as_slice(), buses.as_slice())
     else {
         return Err(unsupported().into());
     };
@@ -144,7 +154,7 @@ pub(crate) fn prepare_linked_track_pans(fairlight: Option<&Value>, sequence_id: 
         || data.get("main_bus") != Some(bus)
         || data.get(PROCESSING_RECEIPT).is_some()
         || data.get(DIRECT_PROFILE).is_some_and(|profile| profile != &Value::Int(1))
-        || [(*left, first), (*right, second)].into_iter().enumerate().any(|(index, (pan, row))| {
+        || [(left, first), (right, second)].into_iter().enumerate().any(|(index, (pan, row))| {
             !(-1000..=1000).contains(&pan)
                 || !row_value(row, "track", index as i64 + 1)
                 || !row_value(row, "strip_id", index as i64)
@@ -163,7 +173,7 @@ pub(crate) fn prepare_linked_track_pans(fairlight: Option<&Value>, sequence_id: 
     {
         return Err(unsupported().into());
     }
-    Ok(Some([*left as i32, *right as i32]))
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

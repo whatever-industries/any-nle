@@ -86,8 +86,16 @@ pub enum SourceReadIssue {
     Bin(String),
     OriginalLocator(OriginalLocatorIssue),
     OriginalMedia(String),
+    OriginalMediaTracks(OriginalMediaTrackIssue),
     MediaScan(String),
     SourceFacts(String),
+}
+
+/// A media verification refusal tied to saved source tracks.
+pub struct OriginalMediaTrackIssue {
+    pub message: String,
+    pub bin: usize,
+    pub edits: MediaEditDetails,
 }
 
 /// A primary locator refusal and any subsequent read-only Review findings.
@@ -155,6 +163,7 @@ impl SourceReadIssue {
             | Self::MediaScan(message)
             | Self::SourceFacts(message) => message,
             Self::OriginalLocator(issue) => issue.message,
+            Self::OriginalMediaTracks(issue) => issue.message,
         }
     }
 }
@@ -1416,6 +1425,21 @@ fn color_range_receipt(range: av::SourceColorRange) -> Value {
     ])
 }
 
+fn clamped_cdl_receipt(cdl: av::SourceClampedCdl) -> (&'static str, Value) {
+    let triplet = |values: [f64; 3]| Value::Arr(values.into_iter().map(Value::Float).collect());
+    let key = if cdl.is_affine() { "affine_cdl" } else { "clamped_cdl" };
+    (key, obj(vec![
+        ("slope", triplet(cdl.slope)),
+        ("offset", triplet(cdl.offset)),
+        ("power", triplet(cdl.power)),
+        ("saturation", Value::Float(1.0)),
+        ("bit_depth", Value::Int(av::SourceColorRange::BIT_DEPTH)),
+        ("video_black", Value::Int(av::SourceColorRange::VIDEO_BLACK)),
+        ("video_white", Value::Int(av::SourceColorRange::VIDEO_WHITE)),
+        ("clamp", Value::Bool(true)),
+    ]))
+}
+
 fn source_input_transforms(
     source: &av::SourceMaster,
     budget: &Budget,
@@ -1434,7 +1458,13 @@ fn source_input_transforms(
         } else {
             0
         };
-        reservation.charge(text.len() + 512 + range_cost)?;
+        let cdl_cost = if matches!(&transform.value, Observed::Known(text)
+            if av::SourceClampedCdl::from_saved_xml(text).is_some()) {
+            1024
+        } else {
+            0
+        };
+        reservation.charge(text.len() + 512 + range_cost + cdl_cost)?;
     }
     Ok(Some(Value::Arr(source.input_transforms.iter().map(|transform| {
         let (key, text) = match &transform.value {
@@ -1449,6 +1479,8 @@ fn source_input_transforms(
         if let Observed::Known(text) = &transform.value {
             if let Some(range) = av::SourceColorRange::from_saved_xml(text) {
                 facts.push(("linear_range", color_range_receipt(range)));
+            } else if let Some(cdl) = av::SourceClampedCdl::from_saved_xml(text) {
+                facts.push(clamped_cdl_receipt(cdl));
             }
         }
         obj(facts)

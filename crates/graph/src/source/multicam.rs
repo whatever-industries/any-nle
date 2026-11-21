@@ -1,6 +1,6 @@
 //! Source multicamera topology. A lane's alternatives have independent identities;
 //! audio indices never imply a video camera identity. Gaps are explicit pieces.
-use super::*;
+use super::{decode::parse_binding, *};
 use crate::validation::{list, rate, require, text as check_text};
 
 #[derive(Clone, Debug, PartialEq)]

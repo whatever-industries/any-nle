@@ -6,8 +6,10 @@ use super::{
     Job, Plan, R,
 };
 use graph::json::{self, Value};
+use graph::{source::SourceGraph, StreamKind};
 use prproj::convert::model::{VideoFile, TICKS_PER_SECOND as TPS};
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -21,7 +23,9 @@ fn string<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
         None
     }
 }
-pub(super) fn validate_source(s: &Stream, raw: &Value, v: &VideoFile) -> R<()> {
+pub(super) type PixelAspect = (u32, u32);
+
+pub(super) fn validate_source(s: &Stream, raw: &Value, v: &VideoFile) -> R<Option<PixelAspect>> {
     let Some(Value::Arr(streams)) = raw.get("streams") else {
         return Err("missing ProRes streams".into());
     };
@@ -46,18 +50,75 @@ pub(super) fn validate_source(s: &Stream, raw: &Value, v: &VideoFile) -> R<()> {
         || s.rate != format!("{}/{}", v.rate.num, v.rate.den)
         || string(p, "field_order") != Some("progressive")
     {
-        return Err("ProRes MOV requires matching profile, raster and rate with progressive square-pixel picture".into());
+        return Err("ProRes MOV requires matching profile, raster and rate with progressive picture".into());
     }
-    match string(p, "sample_aspect_ratio") {
-        Some("1:1") => {}
-        Some(ratio) if ratio.split_once(':').is_some_and(|(n, d)| {
-            n.parse::<u32>().is_ok_and(|n| n > 0) && d.parse::<u32>().is_ok_and(|d| d > 0)
-        }) => {
-            return Err(format!(
-                "ProRes MOV source pixel aspect {ratio} needs a verified Premiere aspect mapping"
-            ).into());
+    fn parse_pair(ratio: &str) -> Option<PixelAspect> {
+        let (n, d) = ratio.split_once(':')?;
+        let (n, d) = (n.parse::<u32>().ok()?, d.parse::<u32>().ok()?);
+        (n > 0 && d > 0).then_some((n, d))
+    }
+    let (n, d) = string(p, "sample_aspect_ratio").and_then(parse_pair)
+        .ok_or("ProRes MOV source pixel aspect could not be verified")?;
+    Ok((n != d).then_some((n, d)))
+}
+
+/// Index saved descriptors by exact graph media locator. Shared locators must
+/// agree even when the same file appears under different bin item identities.
+pub(super) fn saved_picture_descriptors(graph: Option<&SourceGraph>) -> HashMap<&str, Vec<&Value>> {
+    let Some(graph) = graph else { return HashMap::new() };
+    let paths: HashMap<_, _> = graph.media.iter()
+        .filter(|m| m.kind == StreamKind::Video && m.original.is_none())
+        .filter_map(|m| match m.locations.as_slice() {
+            [path] => Some((m.id.as_str(), path.as_str())),
+            _ => None,
+        })
+        .collect();
+    let mut saved = HashMap::<_, Vec<_>>::new();
+    for side in graph.sidecars.iter().filter(|s| s.adapter == "avid.source") {
+        if let Some(&path) = paths.get(side.object.as_str()) {
+            saved.entry(path).or_default().push(&side.data);
         }
-        _ => return Err("ProRes MOV source pixel aspect could not be verified".into()),
+    }
+    saved
+}
+
+pub(super) fn verify_pixel_aspect(
+    video: &VideoFile,
+    pixel: PixelAspect,
+    identity: &avid_reader::mxf::MxfIdentity,
+    saved: &[&Value],
+) -> R<()> {
+    let fail = || format!("{}: ProRes pixel aspect {}:{} requires matching saved Avid and physical MXF picture geometry",
+        video.path, pixel.0, pixel.1);
+    let [package] = identity.file_packages.as_slice() else { return Err(fail()) };
+    let field = |name| identity.picture_descriptor.iter()
+        .find(|(key, _)| *key == name).map(|(_, value)| value.as_slice());
+    let dimension = |name| field(name)
+        .and_then(|b| b.try_into().ok()).map(u32::from_be_bytes).map(i64::from);
+    let Some(bytes) = field("display_aspect").filter(|b| b.len() == 8) else {
+        return Err(fail());
+    };
+    let physical = (
+        i64::from(u32::from_be_bytes(bytes[..4].try_into().unwrap())),
+        i64::from(u32::from_be_bytes(bytes[4..].try_into().unwrap())),
+    );
+    let matches_pixel = |(n, d): (i64, i64)| n > 0 && d > 0
+        && i128::from(n) * i128::from(video.height) * i128::from(pixel.1)
+            == i128::from(d) * i128::from(video.width) * i128::from(pixel.0);
+    if dimension("display_width") != Some(video.width)
+        || dimension("display_height") != Some(video.height)
+        || !matches_pixel(physical) || saved.is_empty()
+        || saved.iter().any(|side| {
+            let Some(desc) = side.get("descriptor") else { return true };
+            let Some(Value::Arr(ratio)) = desc.get("display_aspect") else { return true };
+            let [Value::Int(n), Value::Int(d)] = ratio.as_slice() else { return true };
+            !string(side, "file_package").is_some_and(|id| id.eq_ignore_ascii_case(package))
+                || desc.get("width") != Some(&Value::Int(video.width))
+                || desc.get("height") != Some(&Value::Int(video.height))
+                || !matches_pixel((*n, *d))
+        })
+    {
+        return Err(fail());
     }
     Ok(())
 }
@@ -568,6 +629,49 @@ pub(super) fn execute(plan: &Plan, job: &Job, partial: &Path, hashes: &[String])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anamorphic_picture_requires_matching_saved_and_physical_geometry() {
+        use super::super::receipts::obj;
+        let video = VideoFile {
+            path: "/media/picture.mxf".into(),
+            codec: "apcn".into(),
+            width: 1440,
+            height: 1080,
+            rate: prproj::convert::model::Fraction::new(24, 1),
+            duration: TPS,
+            start: 0,
+        };
+        let identity = avid_reader::mxf::MxfIdentity {
+            file_packages: vec!["A1".repeat(32)],
+            picture_descriptor: vec![
+                ("display_width", 1440u32.to_be_bytes().to_vec()),
+                ("display_height", 1080u32.to_be_bytes().to_vec()),
+                ("display_aspect", [16u32.to_be_bytes(), 9u32.to_be_bytes()].concat()),
+            ],
+            ..Default::default()
+        };
+        let descriptor = |package, width, n, d| obj(vec![
+            ("file_package", Value::Str(package)),
+            ("descriptor", obj(vec![
+                ("width", Value::Int(width)),
+                ("height", Value::Int(1080)),
+                ("display_aspect", Value::Arr(vec![Value::Int(n), Value::Int(d)])),
+            ])),
+        ]);
+        let saved = descriptor(identity.file_packages[0].clone(), 1440, 32, 18);
+        assert!(verify_pixel_aspect(&video, (4, 3), &identity, &[&saved]).is_ok());
+        assert!(verify_pixel_aspect(&video, (16, 15), &identity, &[&saved]).is_err());
+        assert!(verify_pixel_aspect(&video, (4, 3), &identity, &[]).is_err());
+        for bad in [
+            descriptor("B2".repeat(32), 1440, 16, 9),
+            descriptor(identity.file_packages[0].clone(), 1920, 16, 9),
+            descriptor(identity.file_packages[0].clone(), 1440, 4, 3),
+        ] {
+            assert!(verify_pixel_aspect(&video, (4, 3), &identity, &[&saved, &bad]).is_err());
+        }
+    }
+
     #[test]
     fn prores_alpha_rewrite_changes_only_qualified_sample_depth() {
         for codec in [*b"ap4h", *b"ap4x"] {

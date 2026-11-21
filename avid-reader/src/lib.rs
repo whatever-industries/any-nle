@@ -1,4 +1,4 @@
-//! Avid bin (.avb) reader for the avid2prproj converter. std-only.
+//! Standalone Avid bin (.avb) reader for the avid2prproj converter.
 //!
 //! The container and class decoders are a partial port of pyavb
 //! (https://github.com/markreidvfx/pyavb, MIT, Copyright (c) 2022 Mark Reid) at

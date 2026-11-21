@@ -4,7 +4,7 @@ mod physical;
 mod saved;
 
 use super::{
-    components, markers, metadata, premiere_path, read_project, select_sequence,
+    components, markers, metadata, mixer, premiere_path, read_project, select_sequence,
     source_capture::{owning_bin, source_clock, source_receipt, source_sequence, GraphCapture},
     ticks, MAX_EDITS,
 };
@@ -36,6 +36,16 @@ pub fn read_premiere_media_graph(
     selector: &str,
     ffprobe: &Path,
 ) -> Result<SourceGraph> {
+    read_media_graph(path, selector, ffprobe, false)
+}
+
+pub fn read_premiere_avid_graph(path: &Path, id: &str, ffprobe: &Path) -> Result<SourceGraph> {
+    read_media_graph(path, id, ffprobe, true)
+}
+
+fn read_media_graph(
+    path: &Path, selector: &str, ffprobe: &Path, neutral_avid: bool,
+) -> Result<SourceGraph> {
     let path = premiere_path(path)?;
     let before = physical::file_state(&path)?;
     let (project, _) = read_project(&path)?;
@@ -53,6 +63,19 @@ pub fn read_premiere_media_graph(
         .root_item()
         .ok_or("Premiere project root is absent")?;
     let data = project.sequence(sequence);
+    if neutral_avid {
+        if id != selector {
+            return Err("select the Premiere source sequence by exact ObjectUID".into());
+        }
+        let tree = &project.doc.tree;
+        let solo = tree.findall(data.element, "Node/Properties/AMM.CurrentSolo")?;
+        if !matches!(solo.as_slice(), [] | [_])
+            || solo.first().is_some_and(|&field| !tree.is_childless(field) || tree.text(field) != Some("[]"))
+        {
+            return Err("Avid link capture requires an empty Premiere solo set".into());
+        }
+        mixer::read_mix_bus(&project, data.element, mixer::MixBus::Stereo, false)?;
+    }
     let frame_ticks = data
         .timebase
         .filter(|&n| n > 0)
@@ -129,6 +152,17 @@ pub fn read_premiere_media_graph(
         let mut seen = HashSet::new();
         for &track_id in tracks {
             let track = project.track(track_id);
+            if neutral_avid {
+                if !track.clips.is_empty() && project.is_muted(track_id)? {
+                    return Err("Avid link capture requires unmuted Premiere tracks".into());
+                }
+                if kind == StreamKind::Audio {
+                    let state = mixer::read_track(&project, track.element, false)?;
+                    if state.pan != 0 || state.muted || state.tenths_db != 0 {
+                        return Err("Avid link capture requires neutral Premiere audio tracks".into());
+                    }
+                }
+            }
             if !track.transitions.is_empty() {
                 return Err(format!(
                     "{id}: transition timing is outside Premiere linked media capture"

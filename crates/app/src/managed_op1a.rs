@@ -145,6 +145,7 @@ pub(crate) fn prepare(
                 target_path: path.clone(),
                 audio_stream: ordinal,
                 separate_mono: false,
+                pixel_aspect: None,
             });
         }
     }

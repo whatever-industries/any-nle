@@ -1,6 +1,6 @@
 //! Witnessed Resolve 21.2 clip-local Color nodes.
-use crate::Result;
-use avid_reader::source::SourceColorRange;
+use crate::{linked::SidecarLookup, Result};
+use avid_reader::source::{saved_color_transforms_match, SourceColorRange};
 use graph::{source::{SourceGraph, SourceMedia, SourceSequence}, Placement, StreamKind, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -139,9 +139,9 @@ pub(crate) struct AvidRanges<'a> {
 }
 
 impl<'a> AvidRanges<'a> {
-    pub(crate) fn new(graph: &'a SourceGraph, sequence: &'a SourceSequence) -> Result<Self> {
+    pub(crate) fn new(sidecars: SidecarLookup<'a>, sequence: &'a SourceSequence) -> Result<Self> {
         let mut rows = HashMap::new();
-        if let Some(Value::Arr(issues)) = graph.sidecar("avid.source", &sequence.id)
+        if let Some(Value::Arr(issues)) = sidecars.get("avid.source", &sequence.id)
             .and_then(|s| s.get("unresolved"))
         {
             for issue in issues {
@@ -168,7 +168,7 @@ impl<'a> AvidRanges<'a> {
     }
 
     pub(crate) fn prepare(
-        &self, graph: &SourceGraph, edit: &Placement, media: &SourceMedia,
+        &self, sidecars: SidecarLookup<'_>, edit: &Placement, media: &SourceMedia,
     ) -> Result<Option<(Operation, String)>> {
         let Some(row) = self.rows.get(edit.id.as_str()) else { return Ok(None) };
         let Some(xml) = text(row, "text") else { return Ok(None) };
@@ -177,16 +177,17 @@ impl<'a> AvidRanges<'a> {
         let Some(package_hex) = package.strip_prefix("urn:smpte:umid:").map(|id| id.replace('.', "")) else {
             return Ok(None);
         };
-        let native = graph.sidecar("avid.source", &edit.id);
+        let native = sidecars.get("avid.source", &edit.id);
         let plain = matches!(native.and_then(|r| r.get("via")), Some(Value::Arr(via))
             if matches!(via.as_slice(), [Value::Str(stage)] if stage == "effect EFF2_LUTSFX not converted"));
-        let same_package = graph.sidecar("avid.source", &media.id)
+        let same_package = sidecars.get("avid.source", &media.id)
             .and_then(|record| text(record, "file_package"))
             .is_some_and(|id| id.eq_ignore_ascii_case(&package_hex));
-        let source_matches = matches!(graph.sidecar("avid.source", &edit.item)
+        let source_matches = matches!(sidecars.get("avid.source", &edit.item)
             .and_then(|record| record.get("input_color_transforms")), Some(Value::Arr(rows))
             if matches!(rows.as_slice(), [saved] if text(saved, "owner_mob") == Some(package)
-                && text(saved, "text") == Some(xml) && saved.get("track") == Some(&Value::Int(1))));
+                && text(saved, "text").is_some_and(|text| saved_color_transforms_match(xml, text))
+                && saved.get("track") == Some(&Value::Int(1))));
         if row.get("neutral_wrapper") != Some(&Value::Bool(true))
             || row.get("subclip_motion").is_some() || edit.video_track != Some(1)
             || edit.speed.is_some() || edit.frame_map.is_some()
@@ -302,13 +303,20 @@ pub(crate) fn prepare(
     graph: &SourceGraph,
     occurrence: &str,
 ) -> Result<Option<(Operation, String)>> {
-    let premiere = graph
-        .sidecar(crate::premiere::color_mode::ADAPTER, occurrence)
+    prepare_with_sidecars(SidecarLookup::Linear(graph), occurrence)
+}
+
+pub(crate) fn prepare_with_sidecars(
+    sidecars: SidecarLookup<'_>,
+    occurrence: &str,
+) -> Result<Option<(Operation, String)>> {
+    let premiere = sidecars
+        .get(crate::premiere::color_mode::ADAPTER, occurrence)
         .and_then(crate::premiere::color_mode::qualified_exposure)
         .filter(|exposure| *exposure != 0.0);
-    let cdl = graph.sidecar(CDL_ADAPTER, occurrence);
-    if let Some(row) = graph.sidecar(RANGE_ADAPTER, occurrence) {
-        if premiere.is_some() || cdl.is_some() || graph.sidecar(ADAPTER, occurrence).is_some()
+    let cdl = sidecars.get(CDL_ADAPTER, occurrence);
+    if let Some(row) = sidecars.get(RANGE_ADAPTER, occurrence) {
+        if premiere.is_some() || cdl.is_some() || sidecars.get(ADAPTER, occurrence).is_some()
             || row.get("node_id") != Some(&Value::Int(1))
         {
             return Err("conflicting or invalid Resolve range CDL".into());
@@ -320,7 +328,7 @@ pub(crate) fn prepare(
         };
     }
     if (premiere.is_some() && cdl.is_some())
-        || ((premiere.is_some() || cdl.is_some()) && graph.sidecar(ADAPTER, occurrence).is_some())
+        || ((premiere.is_some() || cdl.is_some()) && sidecars.get(ADAPTER, occurrence).is_some())
     {
         return Err("conflicting Resolve grade owners".into());
     }
@@ -346,7 +354,7 @@ pub(crate) fn prepare(
             encode_exposure_cdl(slope)?,
         )));
     }
-    let Some(row) = graph.sidecar(ADAPTER, occurrence) else {
+    let Some(row) = sidecars.get(ADAPTER, occurrence) else {
         return Ok(None);
     };
     let (gain, _, mut payload) = read_receipt(row)?;

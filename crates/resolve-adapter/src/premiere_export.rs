@@ -1,5 +1,6 @@
 //! Internal Resolve-to-Premiere paths for linked media.
 mod multicam;
+mod multicam_tracks;
 use crate::{
     audio::{self, Volume},
     dissolve,
@@ -74,7 +75,10 @@ pub fn write_with_options(
         return Err(format!("{}: disabled source edit has no qualified Resolve export mapping", edit.id).into());
     }
     if graph.multicam_uses.iter().any(|usage| usage.sequence == sequence_id) {
-        return multicam::write(&graph, sequence, ffprobe, output, accept_losses);
+        if multicam_tracks::legacy_profile(&graph, sequence) {
+            return multicam::write(&graph, sequence, ffprobe, output, accept_losses);
+        }
+        return multicam_tracks::write(graph, index, ffprobe, output, accept_losses);
     }
     let track_state = crate::track_state::TrackState::prepare(&graph, sequence)?;
     let (mut mixer, mapped_direct_mixer) = validate_sequence(&graph, sequence, track_state.is_some())?;
@@ -929,7 +933,38 @@ fn prepare_clip_controls(graph: &mut SourceGraph) -> Result<(Vec<ClipFade>, Vec<
 
 type VerifiedFiles = HashMap<String, (linked::Media, Rational, i64)>;
 
+/// Read and bind the neutral one-timeline pilot for the Avid destination.
+pub(crate) fn read_resolve_avid_graph(path: &Path, id: &str, ffprobe: &Path) -> Result<SourceGraph> {
+    let mut graph = crate::source::read(path)?;
+    let [sequence] = graph.sequences.as_slice() else {
+        return Err("Avid link capture requires one saved Resolve timeline".into());
+    };
+    if sequence.id != id {
+        return Err("select the Resolve source timeline by exact ID".into());
+    }
+    let fairlight = graph.sidecar(FAIRLIGHT_ADAPTER, id)
+        .ok_or("missing saved Resolve mixer for Avid link capture")?;
+    crate::linked::mixer::check_linked_track_pans(fairlight, id, [0; 2])?;
+    let neutral = |rows: &Value| match rows {
+        Value::Arr(rows) => rows.iter().all(|row| ["mute_code", "fader_tenths_db"]
+            .into_iter().all(|key| row.get(key) == Some(&Value::Int(0)))),
+        _ => false,
+    };
+    if ["tracks", "buses"].into_iter().any(|key| !fairlight.get(key).is_some_and(neutral)) {
+        return Err("Avid link capture requires unity Resolve faders and no mutes".into());
+    }
+    for (file, ..) in bind_originals(&mut graph, ffprobe, false)?.into_values() {
+        file.recheck()?;
+    }
+    graph.validate()?;
+    Ok(graph)
+}
+
 fn verify_originals(graph: &mut SourceGraph, ffprobe: &Path) -> Result<VerifiedFiles> {
+    bind_originals(graph, ffprobe, true)
+}
+
+fn bind_originals(graph: &mut SourceGraph, ffprobe: &Path, checksum: bool) -> Result<VerifiedFiles> {
     let receipts: HashMap<_, _> = graph
         .sidecars
         .iter()
@@ -954,10 +989,14 @@ fn verify_originals(graph: &mut SourceGraph, ffprobe: &Path) -> Result<VerifiedF
                 item_id: String::new(),
                 bin_id: String::new(),
                 path: path.to_owned(),
-                sha256: if camera { String::new() } else { hex::encode(media_digest(path).map_err(file_error)?) },
+                sha256: if camera || !checksum { String::new() } else { hex::encode(media_digest(path).map_err(file_error)?) },
                 streams: vec![],
             };
-            let binding = linked::probe_resolve_original(&spec, ffprobe, camera).map_err(file_error)?;
+            let binding = if checksum || camera {
+                linked::probe_resolve_original(&spec, ffprobe, camera)
+            } else {
+                linked::probe_resolve_original_by_path(&spec, ffprobe)
+            }.map_err(file_error)?;
             if let Profile::Wav {
                 bits,
                 channels,

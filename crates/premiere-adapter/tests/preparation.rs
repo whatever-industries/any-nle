@@ -5041,9 +5041,9 @@ fn editable_multicam_writes_reusable_source_with_two_output_lanes() {
     let mut bindings = Vec::new();
     for leaf in media.clips.values() {
         let dst = dir.join(format!("{}.mxf", leaf.id)).to_string_lossy().into_owned();
-        bindings.push(MediaRelink { source_path:leaf.video.as_ref().unwrap().path.clone(), target_path:dst.clone(), audio_stream:None, separate_mono: false });
+        bindings.push(MediaRelink { source_path:leaf.video.as_ref().unwrap().path.clone(), target_path:dst.clone(), audio_stream:None, separate_mono: false, pixel_aspect: None });
         for a in &leaf.audio {
-            bindings.push(MediaRelink { source_path:a.path.clone(), target_path:dst.clone(), audio_stream:Some((a.avid_track.unwrap()-1) as u32), separate_mono: false });
+            bindings.push(MediaRelink { source_path:a.path.clone(), target_path:dst.clone(), audio_stream:Some((a.avid_track.unwrap()-1) as u32), separate_mono: false, pixel_aspect: None });
         }
     }
     let ready = prepare_typed_project(&p.input, &out, &mut ids, &bindings, true).unwrap();

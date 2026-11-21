@@ -5,6 +5,7 @@
 //! source rate, offset, owner, or timing transform.
 use crate::extract::{AvidMarker, MasterClip, SeqEvent, SequenceInfo, Skipped};
 use crate::io::MobId;
+use roxmltree::{Document, Node as XmlNode, ParsingOptions};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,7 @@ pub const MAX_SOURCE_FACT_BYTES: usize = if usize::BITS >= 64 {
 } else {
     256 << 20
 };
+pub(crate) const MAX_INPUT_TRANSFORM_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rate {
@@ -708,6 +710,8 @@ pub struct SourceColorAdapter {
     pub reordered_picture_file: Option<MobId>,
     pub transform: String,
     pub neutral_wrapper: bool,
+    /// Neutral linked wrapper with a direct picture span on the same saved clock.
+    pub plain_same_rate_linked_input: bool,
     /// Saved edit-side clip color on the effect wrapper, separate from the transform.
     pub wrapper_clip_color: Option<[u16; 3]>,
     pub managed_picture_span: Option<(i64, i64)>,
@@ -723,14 +727,50 @@ pub enum SourceColorRange {
 
 impl SourceColorRange {
     pub fn from_saved_xml(text: &str) -> Option<Self> {
-        // Match the entire native list, including the direction flag.
-        match color_list_body(text)? {
-            VIDEO_TO_FULL_STEP => Some(Self::VideoToFull),
-            concat!(
-                "<LinearLut>",
-                "<Name>Levels scaling (full range to video levels)</Name><BitDepth>10</BitDepth>",
-                "<Black>64</Black><White>940</White><Inverted/></LinearLut>",
-            ) => Some(Self::FullToVideo),
+        if !text.contains("<LinearLut") {
+            return None;
+        }
+        let doc = color_transform_document(text)?;
+        let lut = standalone_color_step(&doc, "LinearLut")?;
+        let mut fields = [None; 4];
+        let mut inverted = false;
+        for field in color_content(lut) {
+            if !bare_element(field) {
+                return None;
+            }
+            let index = match field.tag_name().name() {
+                "Name" => 0,
+                "BitDepth" => 1,
+                "Black" => 2,
+                "White" => 3,
+                "Inverted" if !inverted && field.first_child().is_none() => {
+                    inverted = true;
+                    continue;
+                }
+                _ => return None,
+            };
+            if fields[index].replace(color_scalar(text, field)?).is_some() {
+                return None;
+            }
+        }
+        let [Some(name), Some(depth), Some(black), Some(white)] = fields else {
+            return None;
+        };
+        // Avid treats whitespace inside a number differently from whitespace between tags.
+        if [
+            (depth, Self::BIT_DEPTH),
+            (black, Self::VIDEO_BLACK),
+            (white, Self::VIDEO_WHITE),
+        ]
+        .into_iter()
+        .any(|(value, expected)| {
+            !value.bytes().all(|byte| byte.is_ascii_digit()) || value.parse::<i64>() != Ok(expected)
+        }) {
+            return None;
+        }
+        match (name, inverted) {
+            ("Levels scaling (video levels to full range)", false) => Some(Self::VideoToFull),
+            ("Levels scaling (full range to video levels)", true) => Some(Self::FullToVideo),
             _ => None,
         }
     }
@@ -738,6 +778,134 @@ impl SourceColorRange {
     pub const BIT_DEPTH: i64 = 10;
     pub const VIDEO_BLACK: i64 = 64;
     pub const VIDEO_WHITE: i64 = 940;
+}
+
+/// A saved single-step 10-bit ASC CDL with clamped slope, offset, and power
+/// and unit saturation. The original XML stays on the source owner.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SourceClampedCdl {
+    pub slope: [f64; 3],
+    pub offset: [f64; 3],
+    pub power: [f64; 3],
+}
+
+impl SourceClampedCdl {
+    pub fn from_saved_xml(text: &str) -> Option<Self> {
+        if !text.contains("<ColorDecision") {
+            return None;
+        }
+        let doc = color_transform_document(text)?;
+        let decision = standalone_color_step(&doc, "ColorDecision")?;
+        let [depth, sop, black, white, clamp] =
+            exactly_named_color_fields(decision, ["BitDepth", "SOPNode", "Black", "White", "Clamp"])?;
+        if color_scalar(text, depth)? != "10"
+            || color_scalar(text, black)? != "64"
+            || color_scalar(text, white)? != "940"
+            || color_scalar(text, clamp)? != "true"
+        {
+            return None;
+        }
+        let [slope, offset, power] = exactly_named_color_fields(sop, ["Slope", "Offset", "Power"])?;
+        let power = color_scalar(text, power)?;
+        let power = cdl_triplet(power).or_else(|| Some([cdl_decimal(power)?; 3]))?;
+        if power.iter().any(|&value| value <= 0.0) {
+            return None;
+        }
+        Some(Self {
+            slope: cdl_triplet(color_scalar(text, slope)?)?,
+            offset: cdl_triplet(color_scalar(text, offset)?)?,
+            power,
+        })
+    }
+
+    pub fn is_affine(self) -> bool {
+        self.power == [1.0; 3]
+    }
+}
+
+fn cdl_triplet(text: &str) -> Option<[f64; 3]> {
+    // The saved triplets use ASCII decimal text and a trailing space.
+    let mut values = text.trim_end_matches(' ').split(' ');
+    let mut triplet = [0.0; 3];
+    for value in &mut triplet {
+        *value = cdl_decimal(values.next()?)?;
+    }
+    values.next().is_none().then_some(triplet)
+}
+
+fn cdl_decimal(text: &str) -> Option<f64> {
+    if !text.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'-' | b'.')) {
+        return None;
+    }
+    text.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn color_transform_document(text: &str) -> Option<Document<'_>> {
+    if text.len() > MAX_INPUT_TRANSFORM_BYTES {
+        return None;
+    }
+    let options = ParsingOptions {
+        nodes_limit: 64,
+        ..Default::default()
+    };
+    Document::parse_with_options(text, options).ok()
+}
+
+fn standalone_color_step<'a, 'input>(
+    doc: &'a Document<'input>,
+    name: &str,
+) -> Option<XmlNode<'a, 'input>> {
+    let list = only_element(doc.root(), "ColorTransformationList")?;
+    only_element(only_element(list, "ColorTransformation")?, name)
+}
+
+fn exactly_named_color_fields<'a, 'input, const N: usize>(
+    parent: XmlNode<'a, 'input>,
+    names: [&str; N],
+) -> Option<[XmlNode<'a, 'input>; N]> {
+    let mut content = color_content(parent);
+    let mut fields = [parent; N];
+    for (field, name) in fields.iter_mut().zip(names) {
+        let node = content.next()?;
+        if !bare_element(node) || node.tag_name().name() != name {
+            return None;
+        }
+        *field = node;
+    }
+    content.next().is_none().then_some(fields)
+}
+
+fn color_scalar<'input>(text: &'input str, node: XmlNode<'_, 'input>) -> Option<&'input str> {
+    let mut content = node.children();
+    let scalar = content.next().filter(XmlNode::is_text)?;
+    let raw = text.get(scalar.range())?;
+    (scalar.text() == Some(raw) && content.next().is_none()).then_some(raw)
+}
+
+fn color_content<'a, 'input: 'a>(
+    node: XmlNode<'a, 'input>,
+) -> impl Iterator<Item = XmlNode<'a, 'input>> {
+    node.children().filter(|child| {
+        !child.is_comment()
+            && !(child.is_text() && child.text().is_some_and(|s| s.trim_ascii().is_empty()))
+    })
+}
+
+fn bare_element(node: XmlNode<'_, '_>) -> bool {
+    node.is_element() && node.tag_name().namespace().is_none() && node.attributes().len() == 0
+}
+
+fn only_element<'a, 'input: 'a>(parent: XmlNode<'a, 'input>, name: &str) -> Option<XmlNode<'a, 'input>> {
+    let mut content = color_content(parent);
+    let node = content.next()?;
+    (bare_element(node) && node.tag_name().name() == name && content.next().is_none()).then_some(node)
+}
+
+/// Match exact saved payloads or two representations of the same qualified range transform.
+pub fn saved_color_transforms_match(left: &str, right: &str) -> bool {
+    left == right || SourceColorRange::from_saved_xml(left).is_some_and(|range| {
+        SourceColorRange::from_saved_xml(right) == Some(range)
+    })
 }
 
 /// The single 3D .cube descriptor saved on the qualified Avid effect wrapper.

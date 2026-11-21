@@ -101,6 +101,7 @@ with seeded_ids('rewrap-rate-parity'): write_project(parse_model(v),Path(sys.arg
                 target_path: target.clone(),
                 audio_stream: None,
                 separate_mono: false,
+                pixel_aspect: None,
             }];
             let mut labels: Vec<_> = c.audio.iter().map(|a| a.avid_track.unwrap()).collect();
             labels.sort();
@@ -115,6 +116,7 @@ with seeded_ids('rewrap-rate-parity'): write_project(parse_model(v),Path(sys.arg
                             .unwrap() as u32,
                     ),
                     separate_mono: false,
+                    pixel_aspect: None,
                 });
             }
             if (n, d) != (24, 1) {

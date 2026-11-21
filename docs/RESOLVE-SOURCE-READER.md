@@ -37,6 +37,22 @@ fail. Mixed-rate or nonidentity timing outside the admitted
 profile retains occurrence data on a `resolve.timing` owner receipt and
 reports the omitted placement.
 
+A picture clip with saved effects and an absent `MediaRef` can remain in
+graph/2 as a sequence-owned `resolve.unbound_picture` receipt. It retains
+the saved track, record range, locator hint, and effect and time-map
+evidence. Small blobs retain their saved bytes. Larger bounded blobs
+retain their size and digest. The locator hint creates no Media Pool item
+or placement, and an occurrence loss records the unresolved binding.
+
+For the saved stereo camera and external mono PCM layout, the
+`resolve.virtual_audio` receipt records both routes by cache and pool-item
+identity. It retains the ordered physical channels, each cache's 48 kHz
+clock and sample extent, the signed sample offset, and the saved virtual
+selector. The external reference must resolve to one standalone audio
+cache. `resolve.virtual_audio_edits` keeps the timeline track and each
+occurrence's selector beside its `resolve.timing` receipt. The reader
+reports unresolved playback timing and leaves audio placement pending.
+
 The direct DNxHR LB MXF profile reads one saved picture cache and two
 independent PCM24 mono caches at exact 24000/1001. Saved route references
 identify the two cache objects regardless of serialization order. Both routes
@@ -50,6 +66,13 @@ The fixed-reference two-angle Group profile preserves inner spans and gaps,
 outer angle cuts, and independent mono audio selectors. A leaf placement
 is emitted only where its selected source covers the use. The full Group
 use retains the original range and any gap or unresolved binding.
+
+An embedded-audio Group can also save one audio slot backed by a native
+two-channel transport. The Group receipt preserves that slot and its
+default virtual channel. Occurrence receipts keep the saved track index
+and selected virtual channel separately when the edit uses the slot.
+Slot zero can select either channel of that transport. Physical audio
+binding remains unresolved until the saved Group mix is qualified.
 
 Sequence markers preserve relative position, duration, title, note, all
 16 Resolve marker colors, and saved custom data. The writer verifies
@@ -66,6 +89,15 @@ to their saved edit UUID. Other source profiles remain open.
 [Premiere marker palette](#resolve-to-premiere-sequence-marker-colors) ·
 [Source marker qualification](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-source-clip-markers) ·
 [Edit marker qualification](#resolve-to-premiere-timeline-edit-markers)
+
+Source and sequence lockable metadata accepts up to 256 KiB of stored Qt
+bytes and 512 KiB per decoded body within the archive-wide decoded blob budget.
+The reader checks at most 32,768 top-level fields and keeps the existing
+marker table and row limits. An explicitly empty saved field yields an
+owner-bound `resolve.lockable_metadata` receipt. A shared envelope with field 6
+byte records leaves a receipt with non-marker field counts and SHA-256 digests
+of the stored envelope and decoded body. The saved marker table supplies the
+typed markers. Malformed nonempty encodings still fail validation.
 
 The linked writer preserves matching audio and video timeline In/Out
 marks, including In-only and Out-only selections. These are timeline-relative
@@ -506,14 +538,75 @@ duplicate UUIDs and field tags, malformed archives, and output collisions.
 
 ## Bounds and validation
 
-The reader admits single-disk ZIP32 archives with up to 1,024 members and
-32 MiB on disk. It checks the raw directory count against the library's
-name index to catch exact duplicate members. No member is extracted. The
-expanded archive, XML node/depth counts, per-field decoded bytes and
-aggregate decoded blobs are bounded. The graph writer enforces the
-256 MiB graph/2 encoded ceiling. Unsupported native objects receive scoped losses
-when their owning sequence or bin is known. Broken required references,
-malformed encodings and unsupported project versions fail before output.
+The file-based DRP graph reader checks single-disk ZIP32 archives up to
+512 MiB on disk, 2 GiB expanded, and 4,096 members. It checks the raw
+directory against the library's name index and reads in place. It indexes
+sequence containers by saved identity, then loads one at a time. Project
+and Media Pool XML stay available during interpretation, with a separate
+256 MiB and 1.6 million node budget. Each parsed member can contain up to
+128 MiB of XML and 1.6 million nodes. The full archive has a 25 million
+node ceiling and XML depth remains limited to 96.
+
+Per-field decoded data stays bounded at its existing limit. The DRP graph
+reader caps aggregate decoded data charges at 384 MiB. Graph/2 output is
+still bounded at 256 MiB encoded. The retained in-memory DRT and saved-blob
+comparison paths have their smaller archive budgets. Unsupported native
+objects receive scoped losses when the owning sequence or bin is known.
+Broken required references, malformed encodings and unsupported project
+versions fail before output.
+
+Saved picture retains exact whole frame rates that fit the two-digit
+timecode label, along with the witnessed fractional rates 24000/1001,
+30000/1001, 48000/1001, and 60000/1001. The reader checks the actual
+saved binary encoding and preserves those ratios in graph/2. The
+30000/1001 form retains its saved drop-frame flag. Other drop-frame
+variants and approximate decimal rates remain unqualified. Source rate
+capture leaves destination retiming and media verification separate.
+
+When `BtVideoInfo.Geometry` saves a type-135 `PixelAspectRatio`, the
+video stream owns a `resolve.media_geometry` receipt with the exact
+reduced fraction and the original binary64 bits. Stored raster dimensions
+remain independent of this ratio. Non-square values carry a geometry
+loss until a destination can verify the resulting framing.
+
+The reader checks decimal media starts against the exact cached clock.
+A rounded spelling must agree at its saved precision and distinguish
+adjacent ticks of the owning clock. Edits with a saved fractional
+`Start`, `Duration`, or `In` retain the original field, integer frames,
+and an exact signed binary significand and exponent in
+`resolve.fractional_timing`. Each receipt identifies the occurrence and
+its record clock. Existing conform and PCM profiles keep their qualified
+interpretation. Other subframe placements remain source evidence with
+an omission report until their playback is qualified. A Group with a
+fractional duration retains that exact duration and its saved extent
+bytes. Its playback mapping remains unresolved.
+
+### Standalone audio and stills
+
+Standalone audio caches retain their saved paths, sample rates, exact sample
+extents, and physical channel order for the mono and stereo WAV, AIFF, MP3,
+and M4A profiles. The reader checks the stream and the virtual route against
+each other. It keeps an unresolved PCM depth code as a saved fact. Same-rate
+whole-frame occurrences with an identity time map carry their independent
+source trims and saved channel selections. Unsupported edit maps and
+selectors receive occurrence-level losses.
+
+Embedded 44.1 kHz stereo AAC retains the saved sample origin and sample
+count independently of the picture clock. The stereo pool route must
+agree with that audio extent and bind each channel to the same saved
+audio cache track. The sequence-owned `resolve.embedded_audio_routes`
+sidecar retains the selected physical channels, track identity and saved
+selector alongside the original `resolve.timing` observation. Current
+coverage establishes the source association. These edits still carry a
+loss for unresolved playback maps or track mixing. The item-to-file
+offset remains unresolved until the original AAC stream is verified.
+
+A literal one-frame JPEG, PNG, TIFF, or HEIC cache can be recognized from its
+matching saved filenames and format. The saved cache start remains a native
+observation. An edit with the verified constant still map reads as a hold of
+the original file's first picture. Image ranges and other maps remain
+unqualified. These source facts describe saved records. File availability,
+decoding fidelity, and destination support require separate verification.
 
 Qualification compares retained independently authored archives and editor
 read-back with writer-generated controls. See the Resolve authority's
@@ -609,6 +702,31 @@ timing, routing and topology remain explicit. The public routes are unchanged.
   with two independent mono outputs from camera A.
 
 ### Resolve to Premiere editable multicam
+
+The `resolve.multicam_tracks` source receipt preserves each saved picture and
+audio angle track in order, with its UUID, activity flags, member references,
+source coordinates, time maps, and saved audio selectors. Each multicam use
+records its matching track UUID when its saved angle ID is unique within the
+same track kind. Group output selectors and angle-member source selectors
+remain separate. Known member selectors retain the channel numbers verified
+against the source cache. Missing or unknown source and routing facts remain
+explicit in the receipt.
+
+Graph/2 can project a picture angle with multiple pieces when the track is
+enabled and every member has a verified same-rate identity map, in-range trim,
+and nonoverlapping frame-aligned bounds. It keeps the intervening gaps and
+intersects each timeline use with the selected angle's pieces. A mono Group
+with an explicit self-owned mono transport and matching virtual output can
+also project same-rate mono WAV members with verified selectors and timing.
+The internal Premiere export can rebuild the selected picture angles and one
+fixed mono output from these graph bindings. It checks each selected edit
+against the exact intersections of its source angle, then builds one editable
+multicam source item per saved definition. The source retains its own origin,
+canvas, multipart trims, and gaps. A timeline can use separate picture and
+mono multicam items. The same-rate 24 and 23.976 route requires verified
+linked originals and known sizing when the raster differs. A false binding,
+overlap, missing file, or unknown geometry blocks the affected conversion.
+Unresolved uses require `--accept-losses` before they may be left out.
 
 The internal `--premiere` probe also accepts one linked 1080p23.976 Group
 timeline with neutral V1/A1/A2 and two full unretimed DNxHR LB OP1a camera

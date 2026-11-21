@@ -10,17 +10,20 @@ update the roadmap and retain the plan as history.
 
 ## Build and test from a public clone
 
-Use Rust 1.95.0, the release toolchain, and Python 3.11 or later. Check
-`rustc --version` and `cargo --version` in the shell that will run the build.
-The release workflow lists the [Linux build dependencies](.github/workflows/release.yml).
+Use the Rust release pinned in [rust-toolchain.toml](rust-toolchain.toml)
+and Python 3.11 or later. Check `rustc --version` and `cargo --version` in the shell
+that will run the build. Advance the pin when a newer stable release passes
+qualification. The release workflow lists the [Linux build dependencies](.github/workflows/release.yml).
 
-If Homebrew and Rustup are both installed, invoke Rustup explicitly so
-the acceptance runner and its subprocesses use the release toolchain.
-With a standard Rustup installation on macOS, run the public suite from
-the repository root.
+If Homebrew and Rustup are both installed, put the Rustup shims first on
+PATH so the acceptance runner and its subprocesses use the repository pin.
+With a standard Rustup installation on macOS, set it for the current shell
+from the repository root.
 
 ```sh
-"$HOME/.cargo/bin/rustup" run 1.95.0 python3 scripts/public_acceptance.py --output crates/target/public-checks
+export PATH="$HOME/.cargo/bin:$PATH"
+rustc --version
+cargo --version
 ```
 
 Run these commands from the repository root. The public test profile uses

@@ -342,6 +342,7 @@ pub struct PreparedProjectInput {
     pub frame_holds: HashMap<(usize, usize), i64>,
     pub multicams: Vec<super::multicam::PreparedMulticam>,
     pub multicam_uses: Vec<super::multicam::PreparedMulticamUse>,
+    pub multicam_tracks: Vec<super::multicam_tracks::PreparedTrackMulticam>,
     pub picture_subclips: Vec<PreparedPictureSubclip>,
     pub av_subclips: Vec<PreparedAvSubclip>,
     pub av_subclip_uses: Vec<PreparedAvSubclipUse>,
@@ -1354,6 +1355,7 @@ impl PreparedProjectInput {
             frame_holds: HashMap::new(),
             multicams: Vec::new(),
             multicam_uses: Vec::new(),
+            multicam_tracks: Vec::new(),
             picture_subclips: Vec::new(),
             av_subclips: Vec::new(),
             av_subclip_uses: Vec::new(),
@@ -1932,7 +1934,8 @@ impl PreparedProjectInput {
                 }
             }
         }
-        super::multicam::validate(self, &clips)
+        super::multicam::validate(self, &clips)?;
+        super::multicam_tracks::validate(self, &clips)
     }
 }
 

@@ -341,6 +341,13 @@ fn source_read_blocker(
         }
         SourceReadIssue::Bin(message) => ReviewBlocker::new(ProjectSource, message),
         SourceReadIssue::OriginalMedia(message) => ReviewBlocker::new(OriginalMedia, message),
+        SourceReadIssue::OriginalMediaTracks(issue) => {
+            let mut blocker = in_bin(OriginalMedia, issue.message, issue.bin);
+            append_media_edit_details(
+                &mut blocker, &issue.edits, inputs, "Original media verification failed", false,
+            );
+            blocker
+        }
         SourceReadIssue::MediaScan(message) => ReviewBlocker::new(AvidMedia, message),
         SourceReadIssue::SourceFacts(message) => ReviewBlocker::new(SourceContent, message),
     }
@@ -1145,7 +1152,7 @@ fn prepare_job(
             rewrap::Plan::prepare_selected(&model, dir, &roots, &spec.output, &tools.ffmpeg, &tools.ffprobe)
         } else {
             let native_media = rewrap::NativeMediaPreparation {
-                model: &model, writer_input: Some(&mut input), gain: &gain,
+                model: &model, source: &read.graph, writer_input: Some(&mut input), gain: &gain,
                 managed_pictures: luts.managed_pictures,
             };
             native_media.preflight().map_err(blocker(Rewrap))?;

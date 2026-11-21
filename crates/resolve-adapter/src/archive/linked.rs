@@ -10,6 +10,10 @@ use crate::{
 };
 use graph::{Rational, Value};
 
+// Aggregate output cap for linked projects. Templates and individual tracks
+// retain the smaller construction budgets.
+const MAX_LINKED_XML: u64 = 48 << 20;
+
 const TEMPLATE_23976: &str = "4b2895fa6827801bce87bff7f657dae6454f7011459b689d1983bb11a017ccfc";
 const TEMPLATE_24: &str = "e2a3a1ad16be932947914d866b3c8bb49b549ffd5869a06a9fc9eb576bf21bf5";
 const TEMPLATE_STEREO_WAV_24: &str = "43bfa214eac8a096c63bb8b6d8058863c6caf6b0bae03d7da5fc67208e5b910a";
@@ -1288,7 +1292,7 @@ fn build(
     let mut children = vec![String::new(); p.bins.len()];
     let mut media_ids = Vec::new();
     let mut fusion_media_ids = std::collections::HashMap::new();
-    let mut remaining_xml = MAX_XML as usize;
+    let mut remaining_xml = MAX_LINKED_XML as usize;
     let donor = member(layout, MEDIA_DONOR)?;
     let wide_pool = wider_layout.map(|members|
         named(member(members, POOL)?, "Sm2MpTimelineClip", "Native lanes")).transpose()?;
@@ -1474,7 +1478,7 @@ fn build(
         })?;
         members.insert(folder_path(index, p)?, folder);
     }
-    if members.values().map(|s| s.len() as u64).sum::<u64>() > MAX_XML {
+    if members.values().map(|s| s.len() as u64).sum::<u64>() > MAX_LINKED_XML {
         return Err("generated project XML exceeds its budget".into());
     }
     Ok((

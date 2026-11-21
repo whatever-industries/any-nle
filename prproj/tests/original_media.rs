@@ -103,6 +103,7 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         texts: Vec::new(),
         multicams: Vec::new(),
         multicam_uses: Vec::new(),
+        multicam_tracks: Vec::new(),
         picture_subclips: Vec::new(),
         av_subclips: Vec::new(),
         av_subclip_uses: Vec::new(),

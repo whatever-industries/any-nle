@@ -139,7 +139,10 @@ pub(super) fn capture(
         "composition_sha256".into(),
         text(&hex::encode(Sha256::digest(&bytes))),
     ));
-    let edit = grid.edit(node, false)?;
+    let Some(edit) = grid.edit(node)? else {
+        super::omitted(graph, &sequence.id, node.id()?, "timing", super::timing::SUBFRAME_LOSS);
+        return Ok(());
+    };
     sequence.texts.push(SourceText {
         id: node.id()?.into(),
         kind: TextKind::Graphic,

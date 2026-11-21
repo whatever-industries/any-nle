@@ -6,6 +6,25 @@ pub(super) const ADAPTER: &str = "resolve.media_metadata";
 pub(super) const REEL: &str = "BtVideoInfo.VideoMetadata.ActualReelNumber";
 pub(super) const TIMECODE: &str = "BtVideoTime.Timecode";
 
+pub(super) fn capture_pixel_aspect(
+    graph: &mut SourceGraph,
+    media: &str,
+    pixel_aspect: Option<encoding::PixelAspect>,
+) {
+    let Some(pixel_aspect) = pixel_aspect else { return };
+    graph.sidecars.push(Sidecar {
+        adapter: "resolve.media_geometry".into(),
+        object: media.into(),
+        data: Value::Obj(vec![
+            ("pixel_aspect_ratio".into(), Value::Str(pixel_aspect.ratio.to_string())),
+            ("saved_pixel_aspect_bits".into(), Value::Str(format!("{:016x}", pixel_aspect.saved_bits))),
+        ]),
+    });
+    if pixel_aspect.ratio != graph::Rational::integer(1) {
+        super::loss(graph, media, "geometry", "Resolve saved pixel aspect ratio has no qualified destination mapping");
+    }
+}
+
 pub(super) fn capture(
     clip: &Node,
     cache: &Node,

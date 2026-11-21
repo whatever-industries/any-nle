@@ -142,6 +142,7 @@ def package(target,binaries,backend,notices,output,version):
         t.add(resources,arcname='resources'); t.add(bindir/'backend-manifest.json',arcname='backend-manifest.json')
         t.add(ROOT/'packaging/ffmpeg.json',arcname='packaging/ffmpeg.json')
         t.add(ROOT/'crates/gui/Cargo.toml',arcname='crates/gui/Cargo.toml')
+        t.add(ROOT/'rust-toolchain.toml',arcname='rust-toolchain.toml')
         t.add(ROOT/'packaging/appimage-runtime.json',arcname='packaging/appimage-runtime.json')
         for script in ('build_ffmpeg.py','package.py','licenses.py','appimage_runtime.py','windows_pe.py','release_version.py'): t.add(ROOT/'scripts/release'/script,arcname='scripts/release/'+script)
     for p in (output/(stem+extension),provenance):

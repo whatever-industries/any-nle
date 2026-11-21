@@ -11,6 +11,49 @@ pub(crate) mod source;
 mod terminal;
 mod validation;
 
+pub(crate) use backend::{read_stdout as read_media_tool, run as run_media_tool};
+
+pub(crate) fn inspect_staged_atom(tool: &std::path::Path, path: &std::path::Path) -> R<AtomEssence> {
+    let header = avid_reader::mxf::read_identity(path).map_err(|error| error.to_string())?;
+    let probe = backend::probe(tool, path)?;
+    let ([stream], [material], [file]) = (probe.streams.as_slice(), header.material_packages.as_slice(), header.file_packages.as_slice()) else {
+        return Err("expected one staged file package, material package and essence stream".into());
+    };
+    if probe.op != backend::OP_ATOM || !probe.references.is_empty() {
+        return Err("expected a standalone MXF OP-Atom essence file".into());
+    }
+    backend::verify_stream_package(&probe, &header.file_packages)?;
+    Ok(AtomEssence {
+        file: file.clone(), material: material.clone(), timecode: probe.tc, header_timecode: header.start_timecode(),
+        profile: stream.profile.clone(),
+        header_picture_profile: header.picture_essence_coding.and_then(avid_reader::mxf::PictureProfile::from_label),
+        picture_descriptor: header.picture_descriptor,
+        picture_essence_coding: header.picture_essence_coding,
+        codec: stream.codec.clone(), ticks: stream.ticks,
+        packets: stream.packets, raster: (stream.width, stream.height), pix: stream.pix.clone(),
+        channels: stream.channels, sample_rate: stream.samples, bits: stream.bits,
+    })
+}
+
+pub(crate) struct AtomEssence {
+    pub file: String,
+    pub material: String,
+    pub timecode: Option<String>,
+    pub header_timecode: Option<(u64, u16, bool)>,
+    pub profile: String,
+    pub header_picture_profile: Option<avid_reader::mxf::PictureProfile>,
+    pub picture_descriptor: Vec<(&'static str, Vec<u8>)>,
+    pub picture_essence_coding: Option<[u8; 16]>,
+    pub codec: String,
+    pub ticks: i64,
+    pub packets: i64,
+    pub raster: (i64, i64),
+    pub pix: String,
+    pub channels: i64,
+    pub sample_rate: i64,
+    pub bits: i64,
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -133,6 +176,7 @@ struct Job {
     tc: Option<String>,
     rate: Fraction,
     mov: bool,
+    pixel_aspect: Option<mov::PixelAspect>,
     separate_mono: bool,
     wide_audio: Vec<mono::MonoPcm>,
 }

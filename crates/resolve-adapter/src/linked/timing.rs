@@ -1,5 +1,5 @@
 //! Prepare the linked edit's picture timing after transition trims.
-use super::{Media, MovieVideo, Profile};
+use super::{Media, MovieVideo, Profile, SidecarLookup};
 use crate::{
     Result,
     mixed_rate::Cadence,
@@ -37,7 +37,7 @@ pub(super) struct PreparedTiming {
 impl TimingContext<'_> {
     pub(super) fn prepare(
         self,
-        graph: &SourceGraph,
+        sidecars: SidecarLookup<'_>,
         edit: &Placement,
         mut source_in: i64,
         length: i64,
@@ -53,7 +53,7 @@ impl TimingContext<'_> {
             && edit.transform.is_none()
             && edit.effects.is_empty();
         let mut loss = None;
-        let timing = if let Some(saved) = graph.sidecar(retime::LINEAR_ADAPTER, &edit.id) {
+        let timing = if let Some(saved) = sidecars.get(retime::LINEAR_ADAPTER, &edit.id) {
             let Profile::Mov {
                 video: MovieVideo::ProResHq,
                 frames,

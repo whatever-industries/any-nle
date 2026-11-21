@@ -66,11 +66,15 @@ fn replace_bytes(data: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
 
 /// Substitute the output directory `from` with `to` everywhere in a written project.
 fn normalize(written: &[u8], from: &str, to: &str) -> Normalized {
-    let (xml, _) = decompress_prproj(written).unwrap();
-    if !xml.windows(from.len()).any(|w| w == from.as_bytes()) && !contains_in_payloads(written, from) {
+    let (xml, framing) = decompress_prproj(written).unwrap();
+    let mut doc = PremiereDocument::from_xml_bytes(&xml, framing).unwrap();
+    let from_utf16 = utf16(from);
+    if !xml.windows(from.len()).any(|w| w == from.as_bytes())
+        && !contains_in_payloads(&doc, from.as_bytes(), &from_utf16)
+    {
         return Normalized { xml, gzip: written.to_vec(), fields: Vec::new() };
     }
-    let mut doc = PremiereDocument::from_bytes(written).unwrap();
+    let to_utf16 = utf16(to);
     let mut fields = Vec::new();
     let mut renamed: HashMap<String, String> = HashMap::new();
     let nodes: Vec<_> = doc.tree.iter(doc.root).collect();
@@ -87,7 +91,7 @@ fn normalize(written: &[u8], from: &str, to: &str) -> Normalized {
             changed = next;
             encodings.push("UTF-8");
         }
-        if let Some(next) = replace_bytes(&changed, &utf16(from), &utf16(to)) {
+        if let Some(next) = replace_bytes(&changed, &from_utf16, &to_utf16) {
             changed = next;
             encodings.push("UTF-16LE");
         }
@@ -123,14 +127,11 @@ fn normalize(written: &[u8], from: &str, to: &str) -> Normalized {
     Normalized { xml: doc.to_xml_bytes().unwrap(), gzip: doc.to_bytes().unwrap(), fields }
 }
 
-fn contains_in_payloads(written: &[u8], from: &str) -> bool {
-    let doc = PremiereDocument::from_bytes(written).unwrap();
+fn contains_in_payloads(doc: &PremiereDocument, from: &[u8], from_utf16: &[u8]) -> bool {
     let payloads = doc.index_payloads().unwrap();
     payloads.values().any(|p| {
-        p.windows(from.len()).any(|w| w == from.as_bytes()) || {
-            let u = utf16(from);
-            p.windows(u.len()).any(|w| w == u.as_slice())
-        }
+        p.windows(from.len()).any(|w| w == from)
+            || p.windows(from_utf16.len()).any(|w| w == from_utf16)
     })
 }
 
@@ -244,16 +245,12 @@ fn json_strings(value: Option<&Json>) -> Vec<String> {
 
 fn run_cases(cases: Vec<(String, PathBuf, PathBuf, PathBuf, Vec<String>)>, from: &str, to: &str) {
     let mut failures = Vec::new();
-    let mut fields_seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
     eprintln!("{:<42} result", "model");
     for (name, model, out_dir, expected_dir, notes) in cases {
         let (verdict, fields, problems) = check_one(&model, &out_dir, &expected_dir, &notes, from, to);
         eprintln!("{name:<42} {verdict}");
         for f in &fields {
             eprintln!("{:<42}   output location in: {f}", "");
-        }
-        if !fields.is_empty() {
-            fields_seen.insert(name.clone(), fields);
         }
         for p in &problems {
             eprintln!("{:<42}   {p}", "");
@@ -326,14 +323,8 @@ fn in_repo_models() {
 use prproj::convert::model::{py_str_repr, ColorCorrection, Marker, Model};
 use prproj::convert::writer::WriteError;
 
-/// A fresh scratch folder for one case (our own; removed at the end of the test).
-fn scratch(case: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("prproj-writer-regress-{}-{case}", std::process::id()));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn writer_scratch(case: &str) -> common::Scratch {
+    common::Scratch::new(&format!("prproj-writer-regress-{case}"))
 }
 
 fn example_path() -> PathBuf {
@@ -346,7 +337,8 @@ fn example() -> Model {
 
 #[test]
 fn sparse_picture_edits_expand_the_sequence_without_collapsing_tracks() {
-    let dir = scratch("sparse-picture");
+    let scratch = writer_scratch("sparse-picture");
+    let dir = scratch.path();
     let mut model = example();
     let seq = &mut model.sequences[0];
     let mut upper = seq.events[0].clone();
@@ -375,7 +367,6 @@ fn sparse_picture_edits_expand_the_sequence_without_collapsing_tracks() {
     assert_eq!(project.track_clips(audio[0]).len(), 1);
     assert_eq!(project.track_clips(audio[1]).len(), 1);
     assert!(report.notes.iter().any(|n| n.contains("expanded video track capacity to 5")));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 fn marker(name: &str, start: i64, duration: i64, track: &str, owner: &str) -> Marker {
@@ -420,19 +411,20 @@ fn str_repr_matches_python() {
 /// `"<stem> LUTs"` exists as a regular file: Python's `FileExistsError` text, reported (exit 2).
 #[test]
 fn lut_folder_is_a_file() {
-    let dir = scratch("lutfile");
+    let scratch = writer_scratch("lutfile");
+    let dir = scratch.path();
     let mut model = example();
     model.sequences[0].events[0].color_correction = Some(ColorCorrection { saturation: Some(150.0), ..Default::default() });
     std::fs::write(dir.join("o LUTs"), b"").unwrap();
     let error = write_project(&model, dir.join("o.prproj"), &mut SeededUuids::new(SEED)).unwrap_err();
     assert_eq!(error, WriteError::Exists(format!("[Errno 17] File exists: '{}'", dir.join("o LUTs").display())));
     assert!(error.is_reported());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn video_filler_markers_keep_overlapping_ranges_without_covering_picture() {
-    let dir = scratch("marker-carriers");
+    let scratch = writer_scratch("marker-carriers");
+    let dir = scratch.path();
     let mut model = example();
     let frame = 254_016_000_000 / 24;
     let seq = &mut model.sequences[0];
@@ -487,7 +479,6 @@ fn video_filler_markers_keep_overlapping_ranges_without_covering_picture() {
     assert_eq!(marker_name(tree, *saved).unwrap(), "upper filler");
     assert_eq!(marker_start(tree, *saved).unwrap().ticks, 4 * frame);
     assert_eq!(marker_end(tree, *saved).unwrap().ticks, 6 * frame);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -496,7 +487,8 @@ fn merged_marker_clock_notice_requires_the_verified_picture_profile() {
     use prproj::convert::prepared::PreparedProjectInput;
     use prproj::convert::writer::prepare_typed_project;
 
-    let dir = scratch("merged-marker-clock");
+    let scratch = writer_scratch("merged-marker-clock");
+    let dir = scratch.path();
     for (drop_frame, source_frame, track, expect_notice) in [
         (true, 215_784, "V1", false),
         (true, 215_784, "A1", true),
@@ -594,14 +586,14 @@ fn merged_marker_clock_notice_requires_the_verified_picture_profile() {
             std::fs::remove_file(&out).unwrap();
         }
     }
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn animatte_keys_use_the_source_trim_and_refuse_unrepresentable_ticks() {
     use prproj::convert::model::{ticks_per_unit, Matte};
 
-    let dir = scratch("animatte-key-time");
+    let scratch = writer_scratch("animatte-key-time");
+    let dir = scratch.path();
     let mut model = example();
     let frame = ticks_per_unit(model.sequences[0].rate);
     let event = &mut model.sequences[0].events[0];
@@ -637,7 +629,6 @@ fn animatte_keys_use_the_source_trim_and_refuse_unrepresentable_ticks() {
     let error = write_project(&model, &invalid, &mut SeededUuids::new(SEED)).unwrap_err();
     assert!(error.to_string().contains("AniMatte shape 1 key at frame 2147483647 exceeds the Premiere tick range"));
     assert!(!invalid.exists());
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// Absurd-but-valid tick values: a clean error, never an overflow panic.
@@ -646,10 +637,10 @@ fn huge_ticks_do_not_panic() {
     let big = 1i64 << 62;
     let frame = 254_016_000_000 / 24;
     let check = |model: &Model, case: &str| {
-        let dir = scratch(case);
+        let scratch = writer_scratch(case);
+        let dir = scratch.path();
         let error = write_project(model, dir.join("o.prproj"), &mut SeededUuids::new(SEED)).unwrap_err();
         assert!(matches!(error, WriteError::Other(_)), "{case}: {error:?}");
-        std::fs::remove_dir_all(&dir).unwrap();
     };
 
     // a filler marker at 2^62 lasting 2^62 (the adjustment layer would end at 2^63)
@@ -697,7 +688,8 @@ fn missing_model_and_cli() {
         String::from_utf8_lossy(&run.stderr),
         "usage: prproj-write [-h] [--bin-mode {separate,grouped,merged}]\n                    [--match-avid-default-pan] [--seed SEED]\n                    model output\nprproj-write: error: the following arguments are required: model, output\n"
     );
-    let dir = scratch("cli-lutfile");
+    let scratch = writer_scratch("cli-lutfile");
+    let dir = scratch.path();
     let text = std::fs::read_to_string(example_path()).unwrap();
     let edited = text.replacen("\"video_track\": 1,", "\"video_track\": 1, \"color_correction\": {\"saturation\": 150.0},", 1);
     assert_ne!(text, edited);
@@ -706,5 +698,4 @@ fn missing_model_and_cli() {
     let run = std::process::Command::new(exe).arg(dir.join("m.json")).arg(dir.join("o.prproj")).output().unwrap();
     assert_eq!(run.status.code(), Some(2), "{}", String::from_utf8_lossy(&run.stderr));
     assert!(String::from_utf8_lossy(&run.stderr).starts_with("prproj-write: [Errno 17] File exists: '"));
-    std::fs::remove_dir_all(&dir).unwrap();
 }

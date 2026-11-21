@@ -98,6 +98,7 @@ verify(sys.argv[2],v,sys.argv[3]);Path(sys.argv[2]+'.report').write_text('\n'.jo
                 target_path: target.display().to_string(),
                 audio_stream: None,
                 separate_mono: false,
+                pixel_aspect: None,
             });
             let mut audio = c.audio.iter().collect::<Vec<_>>();
             audio.sort_by_key(|a| a.avid_track);
@@ -107,6 +108,7 @@ verify(sys.argv[2],v,sys.argv[3]);Path(sys.argv[2]+'.report').write_text('\n'.jo
                     target_path: target.display().to_string(),
                     audio_stream: Some(i as u32),
                     separate_mono: false,
+                    pixel_aspect: None,
                 });
             }
         }

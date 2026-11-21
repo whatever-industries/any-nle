@@ -1,6 +1,6 @@
 //! Internal Resolve source harness, separate from the product CLI.
 use anynle_resolve_adapter::source::{self, conform};
-use std::{ffi::OsString, fs, path::Path};
+use std::{ffi::OsString, fs, io::{BufWriter, Write}, path::Path};
 use tempfile::NamedTempFile;
 
 mod support;
@@ -129,14 +129,18 @@ fn text(arg: &std::ffi::OsStr) -> Result<&str, Box<dyn std::error::Error>> {
 
 fn publish(
     output: &Path,
-    write: impl FnOnce(&mut fs::File) -> Result<(), Box<dyn std::error::Error>>,
+    write: impl FnOnce(&mut BufWriter<&mut fs::File>) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let mut stage = NamedTempFile::new_in(parent)?;
-    write(stage.as_file_mut())?;
+    {
+        let mut buffer = BufWriter::new(stage.as_file_mut());
+        write(&mut buffer)?;
+        buffer.flush()?;
+    }
     stage.as_file().sync_all()?;
     fs::hard_link(stage.path(), output)?;
     let staged = stage.path().display().to_string();

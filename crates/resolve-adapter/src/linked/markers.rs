@@ -1,4 +1,4 @@
-use super::{MovieVideo, Profile};
+use super::{MovieVideo, Profile, SidecarLookup};
 use crate::{
     premiere::{CROSSES_SPLIT, CROSSES_SPLIT_REASON, EDIT_MARKER_PROVENANCE},
     prepare::{
@@ -17,15 +17,19 @@ pub(super) const LOSS_ASPECT: &str = "marker_ownership";
 
 pub(super) struct TimelineMarkerPreparation<'a> {
     graph: &'a SourceGraph,
+    sidecars: SidecarLookup<'a>,
     sequence: &'a SourceSequence,
     restored_occurrences: HashSet<&'a str>,
     eligible_edits: Vec<(&'a Placement, &'a Value)>,
 }
 
 impl<'a> TimelineMarkerPreparation<'a> {
-    pub(super) fn new(graph: &'a SourceGraph, sequence: &'a SourceSequence) -> Self {
+    pub(super) fn new(
+        graph: &'a SourceGraph, sequence: &'a SourceSequence, sidecars: SidecarLookup<'a>,
+    ) -> Self {
         Self {
             graph,
+            sidecars,
             sequence,
             restored_occurrences: HashSet::new(),
             eligible_edits: Vec::new(),
@@ -40,8 +44,8 @@ impl<'a> TimelineMarkerPreparation<'a> {
     ) -> Result<Vec<PreparedMarker>> {
         let sequence = self.sequence;
         let provenance = self
-            .graph
-            .sidecar(EDIT_MARKER_PROVENANCE, &edit.id)
+            .sidecars
+            .get(EDIT_MARKER_PROVENANCE, &edit.id)
             .filter(|row| {
                 editable_v1
                     && crate::source::supported_marker_rate(sequence.rate)

@@ -1,8 +1,98 @@
 //! Bounded source facts whose destination behavior is still unqualified.
-use super::{encoding, omitted, text, Grid, Node};
+use super::{encoding, omitted, seconds, text, timing::FrameField, Grid, Node};
 use crate::{dissolve, Result};
 use graph::{source::SourceGraph, Sidecar, StreamKind, Value};
 use sha2::{Digest, Sha256};
+
+const UNBOUND_PICTURE: &str = "resolve.unbound_picture";
+const INLINE_OBSERVATION_BYTES: usize = 4096;
+
+/// Retain a picture occurrence with saved effects and no Media Pool identity.
+/// A locator on the edit is evidence only and establishes no source binding.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn unbound_picture(
+    graph: &mut SourceGraph,
+    sequence: &str,
+    node: &Node,
+    track_id: &str,
+    track: i64,
+    grid: Grid,
+    filters: &str,
+    blobs: &mut encoding::Blobs,
+) -> Result<()> {
+    let id = node.id()?;
+    let mut fields = vec![
+        ("occurrence".into(), text(id)),
+        ("track_id".into(), text(track_id)),
+        ("track".into(), Value::Int(track)),
+        ("record_rate".into(), text(&grid.rate.to_string())),
+        ("media_ref".into(), Value::Null),
+    ];
+    for (tag, key) in [
+        ("Name", "name"),
+        ("PrettyType", "type_label"),
+        ("Flags", "saved_flags"),
+        ("Start", "saved_start"),
+        ("Duration", "saved_duration"),
+        ("In", "saved_in"),
+        ("MediaFrameRate", "saved_media_rate"),
+        ("MediaStartTime", "saved_media_start_time"),
+        ("MediaFilePath", "saved_locator"),
+        ("MediaReelNumber", "saved_reel"),
+        ("CurrentSelectorIdx", "saved_selector_index"),
+        ("IsForceConformed", "saved_force_conformed"),
+        ("IsPreConformed", "saved_preconformed"),
+    ] {
+        if let Some(saved) = node.maybe(tag)? {
+            fields.push((key.into(), text(saved)));
+        }
+    }
+    let whole = |tag| -> Result<Option<i64>> {
+        node.maybe(tag)?
+            .map(|saved| FrameField::parse(saved).map(|field| field.integer()))
+            .transpose()
+            .map(Option::flatten)
+    };
+    if let (Some(start), Some(duration)) = (whole("Start")?, whole("Duration")?) {
+        let start = grid.record_start(start, duration)?;
+        fields.push(("record_start".into(), text(&seconds(start, grid.rate)?.to_string())));
+        fields.push(("record_duration".into(), text(&seconds(duration, grid.rate)?.to_string())));
+    }
+    fields.push(("effect_filters".into(), saved_bytes(filters, blobs)?));
+    for (tag, key) in [
+        ("FieldsBlob", "fields_blob"),
+        ("MarkersBA", "markers_blob"),
+        ("ImportExportMetadataBA", "import_export_metadata"),
+        ("PreConformMediaExtents", "preconform_media_extents"),
+    ] {
+        if let Some(saved) = node.maybe(tag)?.filter(|value| !value.is_empty()) {
+            fields.push((key.into(), saved_bytes(saved, blobs)?));
+        }
+    }
+    if let Some(map) = node.maybe("MediaTimemapBA")?.filter(|value| !value.is_empty()) {
+        fields.push(("time_map".into(), time_map(map, blobs)?));
+        if map.len() <= 2 * INLINE_OBSERVATION_BYTES {
+            fields.push(("saved_time_map".into(), text(map)));
+        }
+    }
+    append(graph, UNBOUND_PICTURE, sequence, Value::Obj(fields));
+    omitted(graph, sequence, id, "media",
+        "Resolve picture edit has saved effects and no MediaRef; source binding is unresolved");
+    Ok(())
+}
+
+pub(super) fn saved_bytes(encoded: &str, blobs: &mut encoding::Blobs) -> Result<Value> {
+    let bytes = encoding::hex_bytes(encoded)?;
+    blobs.charge(bytes.len())?;
+    let mut fields = vec![
+        ("byte_count".into(), Value::Int(bytes.len() as i64)),
+        ("sha256".into(), text(&hex::encode(Sha256::digest(&bytes)))),
+    ];
+    if bytes.len() <= INLINE_OBSERVATION_BYTES {
+        fields.push(("saved_hex".into(), text(encoded)));
+    }
+    Ok(Value::Obj(fields))
+}
 
 /// Preserve the native codes independently and attach endpoint evidence for the
 /// qualified profile only when the saved item order and ranges agree.
@@ -385,6 +475,40 @@ fn compact_map(bytes: &[u8]) -> Option<Vec<Value>> {
         .collect()
 }
 
+pub(super) fn still_hold(encoded: &str, blobs: &mut encoding::Blobs) -> Result<bool> {
+    if !encoded.starts_with("00000001") {
+        return Ok(false);
+    }
+    let map = blobs.qt(encoded)?;
+    let end = crate::retime::HOLD_MAP_END;
+    if map.keys().count() != 6
+        || map.text("DbType")? != Some("Sm2TimeMap")
+        || map.real("YMin")? != -1.0 || map.real("YMax")? != -1.0 || map.real("XMax")? != end
+        || map.text("UniqueId")?.and_then(|id| uuid::Uuid::parse_str(id).ok()).is_none()
+    {
+        return Ok(false);
+    }
+    let payload = map.bytes("KeyframesBA")?;
+    let keys = Value::Obj(map_keys(payload).unwrap_or_default());
+    let Some(Value::Arr(points)) = keys.get("keyframes") else { return Ok(false) };
+    let matches = |point: &Value, at: f64| {
+        point.get("record_seconds") == Some(&Value::Float(at))
+            && point.get("source_seconds") == Some(&Value::Float(0.0))
+            && match point.get("saved_handles") {
+                None => true,
+                Some(Value::Arr(handles)) => handles.iter().all(|value| *value == Value::Float(0.0)),
+                _ => false,
+            }
+    };
+    Ok(keys.get("source_origin_seconds").is_none() && match points.as_slice() {
+        // The witnessed compact encoding begins with the field-160 marker
+        // and saves only the terminal key. Source zero remains implicit.
+        [last] => payload.starts_with(&[0x80, 0x0a, 0x00, 0x0a]) && matches(last, end),
+        [first, last] => matches(first, 0.0) && matches(last, end),
+        _ => false,
+    })
+}
+
 fn map_keys(bytes: &[u8]) -> Option<Vec<(String, Value)>> {
     use encoding::Wire;
     let decoded;
@@ -476,6 +600,20 @@ fn double(bytes: &[u8]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unbound_picture_blob_keeps_small_payloads_and_hashes_larger_ones() {
+        let mut blobs = encoding::Blobs::default();
+        let small = saved_bytes("A1b2", &mut blobs).unwrap();
+        assert_eq!(small.get("saved_hex"), Some(&text("A1b2")));
+        assert_eq!(small.get("byte_count"), Some(&Value::Int(2)));
+        let bytes = vec![0xab; INLINE_OBSERVATION_BYTES + 1];
+        let large = saved_bytes(&hex::encode(&bytes), &mut blobs).unwrap();
+        assert_eq!(large.get("byte_count"), Some(&Value::Int(bytes.len() as i64)));
+        assert_eq!(large.get("sha256"), Some(&text(&hex::encode(Sha256::digest(&bytes)))));
+        assert!(large.get("saved_hex").is_none());
+        assert!(saved_bytes("not_hex", &mut blobs).is_err());
+    }
 
     #[test]
     fn constant_hold_map_requires_exact_frame_and_original_extent() {

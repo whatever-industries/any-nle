@@ -206,12 +206,18 @@ with code 2 and a diagnostic. Runs leave source files and user preferences
 untouched, and create no conversion outputs. Keep reports containing real
 project paths in private test storage.
 
+The [bin picker](../crates/gui/src/wizard/bin_picker.rs) shares catalog selection
+and folder expansion with the background driver. The
+[Review renderer](../crates/gui/src/wizard/review.rs) displays findings and
+returns actions to the wizard controller. The controller owns the job inputs,
+worker revisions, cancellation, and conversion.
+
 On completion, the native wizard shows actual output/receipt paths, retained media and a
 searchable report. Open in Premiere is offered only when a local Premiere installation
 is found on macOS or Windows; opening occurs only after the user clicks. Linux can run the
 conversion engine and open output folders, but Premiere Pro is unavailable there.
 
-Build with an isolated Rust 1.95 toolchain or newer:
+Build with the [pinned Rust toolchain](../rust-toolchain.toml).
 
 ```sh
 cargo build --locked --release --manifest-path crates/Cargo.toml -p anynle-gui

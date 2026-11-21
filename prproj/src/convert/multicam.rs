@@ -172,6 +172,28 @@ pub(super) fn build(
             "source sequence extent differs from the prepared group",
         ));
     }
+    attach_source(project, target, g.duration, sequence_element, item_element, master, true, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn attach_source(
+    project: &mut Project, target: ItemId, duration: i64, sequence_element: crate::xml::NodeId,
+    item_element: crate::xml::NodeId, master: crate::xml::NodeId, picture: bool, audio: bool,
+) -> WriteResult<ItemId> {
+    if !picture || !audio {
+        let list = project.doc.tree.child_by_tag(master, "Clips")
+            .ok_or_else(|| write_fail("source clip list missing"))?;
+        let mut index = 0;
+        for entry in project.doc.tree.findall(list, "Clip")? {
+            let kind = project.doc.tree.tag(project.doc.resolve(entry)?);
+            if (!picture && kind == "VideoClip") || (!audio && kind == "AudioClip") {
+                project.doc.tree.remove(list, entry);
+            } else {
+                project.doc.tree.set(entry, "Index", index.to_string());
+                index += 1;
+            }
+        }
+    }
     let clips = project.resolve_all(master, "Clips/Clip")?;
     for &c in &clips {
         let reference = project
@@ -180,7 +202,7 @@ pub(super) fn build(
             .find1(c, "Clip/Source")
             .ok_or_else(|| write_fail("source reference missing"))?;
         let source = project.doc.resolve(reference)?;
-        let duration = project
+        let original_duration = project
             .doc
             .tree
             .child_by_tag(source, "OriginalDuration")
@@ -188,7 +210,7 @@ pub(super) fn build(
         project
             .doc
             .tree
-            .set_text(duration, Some(g.duration.to_string()));
+            .set_text(original_duration, Some(duration.to_string()));
     }
     let tree = &mut project.doc.tree;
     let item_uid = tree
@@ -206,7 +228,7 @@ pub(super) fn build(
     data.parent = Some(target);
     data.master = Some(master);
     data.clip_elements = clips;
-    data.default_out_ticks = Some(g.duration);
+    data.default_out_ticks = Some(duration);
     data.sequence_uid = tree.get(sequence_element, "ObjectUID").map(str::to_owned);
     let item = project.push_item(data);
     project.item_mut(target).children.push(item);

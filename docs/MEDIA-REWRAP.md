@@ -46,6 +46,36 @@ across the new codec paths. The selective route reports non-square or
 non-progressive candidates as pending when the saved descriptor establishes
 those properties. Native interpretation remains separate from wrapping.
 
+### Anamorphic ProRes in the full rewrap route
+
+The explicit native-media rewrap uses the saved graph/2 picture descriptor
+and file package to verify the MXF and probed pixel aspect. The MOV retains
+that ratio. Premiere gets the same exact interpretation on the source
+stream and new timeline placements. The graph and saved-job schemas are
+unchanged. A conflicting descriptor or file package blocks publication.
+
+Offline checks on picture-only 1440×1080p24 ProRes 422 Standard and LT
+preserved 4:3 pixels, all 36 compressed packets and decoded frames, and
+two 24-frame edits with six-frame source trims. Standard passed through
+the direct CLI and saved jobs. The LT saved job also preserved a nonzero
+source timecode.
+
+Premiere 27.0.0 build 88 preserved the 4:3 source interpretation, media
+paths, and exact trims after Save As, close, and reopen. For each profile,
+six exported frames across both edits matched pixel for pixel before and
+after reopen and against fresh Premiere insertions on the same canvas.
+Premiere saved square-pixel values on the timeline items for that canvas,
+with the 4:3 interpretation still on the source stream.
+
+The controls have no verified Avid sequence canvas. The resulting
+1440×1080 square-pixel fallback centers the picture and crops the sides
+of the 16:9 source, as does Premiere on the same canvas. A native sequence
+created from the clip used 1440×1080 with 4:3 pixels. Full-width framing
+on an Avid-authored anamorphic sequence remains a separate qualification.
+Selective rewrap still reports anamorphic managed ProRes as pending.
+
+### PCM siblings
+
 The MXF route carries one mono PCM stream per sibling. The selective MOV
 route also uses a distinct mono stream per sibling. Existing full MOV
 rewrap keeps its qualified packed audio layouts through eight channels.

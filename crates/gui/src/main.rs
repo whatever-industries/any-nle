@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 use anynle_gui::model;
+mod avid_destination;
 mod direction;
 mod icons;
 mod palette;
@@ -34,6 +35,7 @@ fn main() -> eframe::Result {
         }
     }
     let mut job = None;
+    let mut avid_destination = None;
     #[cfg(target_os = "macos")]
     let mut resolve_job = None;
     #[cfg(target_os = "macos")]
@@ -47,7 +49,7 @@ fn main() -> eframe::Result {
             }
             "--help" | "-h" => {
                 println!(
-                    "Any NLE native wizard\nUsage: any-nle-gui [--job SETTINGS.json]\nThe shared engine reads Avid bins and writes a new Premiere project."
+                    "Any NLE native wizard\nUsage: any-nle-gui [--job SETTINGS.json]\nInternal preview: any-nle-gui --avid-destination <premiere|resolve>"
                 );
                 return Ok(());
             }
@@ -74,6 +76,16 @@ fn main() -> eframe::Result {
                 };
                 job = Some(std::path::PathBuf::from(path));
             }
+            "--avid-destination" => {
+                let Some(source) = args.next().and_then(|source| avid_destination::Source::parse(&source)) else {
+                    eprintln!("--avid-destination requires premiere or resolve");
+                    std::process::exit(2);
+                };
+                if avid_destination.replace(source).is_some() {
+                    eprintln!("Select one Avid destination preview per window");
+                    std::process::exit(2);
+                }
+            }
             _ => {
                 eprintln!("Unknown option: {arg}");
                 std::process::exit(2);
@@ -98,6 +110,17 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
+    if let Some(source) = avid_destination {
+        #[cfg(target_os = "macos")]
+        let another_job = resolve_job.is_some() || premiere_import_job.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let another_job = false;
+        if job.is_some() || another_job {
+            eprintln!("Select one job or preview per wizard window");
+            std::process::exit(2);
+        }
+        return avid_destination::run(source, options);
+    }
     #[cfg(target_os = "macos")]
     if let Some(path) = premiere_import_job {
         if job.is_some() || resolve_job.is_some() {

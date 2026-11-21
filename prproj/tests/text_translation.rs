@@ -27,6 +27,7 @@ fn input() -> PreparedProjectInput {
         bins: vec![],
         multicams: vec![],
         multicam_uses: vec![],
+        multicam_tracks: vec![],
         picture_subclips: vec![],
         av_subclips: vec![],
         av_subclip_uses: vec![],

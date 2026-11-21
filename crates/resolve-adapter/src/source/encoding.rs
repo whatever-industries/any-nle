@@ -4,16 +4,30 @@ use graph::Rational;
 use std::collections::BTreeMap;
 
 pub(super) const MAX_BLOB: usize = 1 << 16;
+const MAX_LOCKABLE_FIELDS_BYTES: usize = 256 << 10;
+const MAX_LOCKABLE_BODY_BYTES: usize = 512 << 10;
 
-#[derive(Default)]
-pub(super) struct Blobs(usize);
+pub(super) struct Blobs {
+    used: usize,
+    limit: usize,
+}
+
+impl Default for Blobs {
+    fn default() -> Self {
+        Self::new(32 << 20)
+    }
+}
 
 impl Blobs {
+    pub(super) fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
     pub(super) fn charge(&mut self, bytes: usize) -> Result<()> {
-        self.0 = self
-            .0
+        self.used = self
+            .used
             .checked_add(bytes)
-            .filter(|n| *n <= 32 << 20)
+            .filter(|n| *n <= self.limit)
             .ok_or("Resolve decoded blob budget exceeded")?;
         Ok(())
     }
@@ -24,16 +38,46 @@ impl Blobs {
         qt(&data)
     }
 
+    pub fn lockable_qt(&mut self, encoded: &str) -> Result<Map> {
+        if encoded.len() > MAX_LOCKABLE_FIELDS_BYTES * 2 {
+            return Err("Resolve lockable metadata field exceeds stored size limit".into());
+        }
+        self.charge(encoded.len() / 2)?;
+        qt_with_limit(&hex::decode(encoded)?, MAX_LOCKABLE_FIELDS_BYTES)
+    }
+
     pub fn marker_data(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        self.lockable_body(data, MAX_BLOB)
+    }
+
+    pub fn lockable_metadata(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        self.lockable_body(data, MAX_LOCKABLE_BODY_BYTES)
+    }
+
+    fn lockable_body(&mut self, data: &[u8], limit: usize) -> Result<Vec<u8>> {
         if data.len() < 9
             || data[..4] != 10001u32.to_be_bytes()
             || u32::from_be_bytes(data[4..8].try_into()?) as usize != data.len() - 8
         {
             return Err("malformed Resolve marker blob header".into());
         }
+        let remaining = (self.limit - self.used).min(limit);
+        let payload = &data[9..];
         let raw = match data[8] {
-            0x80 => data[9..].to_vec(),
-            0x81 => zstd::bulk::decompress(&data[9..], MAX_BLOB)?,
+            0x80 if payload.len() <= remaining => payload.to_vec(),
+            0x80 => {
+                return Err("Resolve lockable metadata exceeds decoded size limit or budget".into());
+            }
+            0x81 => {
+                let size = zstd::zstd_safe::get_frame_content_size(payload)
+                    .map_err(|_| "malformed Resolve lockable metadata zstd frame")?;
+                if size.is_some_and(|size| size > remaining as u64) {
+                    return Err(
+                        "Resolve lockable metadata exceeds decoded size limit or budget".into(),
+                    );
+                }
+                zstd::bulk::decompress(payload, remaining)?
+            }
             _ => return Err("unsupported Resolve marker blob encoding".into()),
         };
         self.charge(raw.len())?;
@@ -87,9 +131,15 @@ enum Qt {
     Text(String),
     Bytes(Vec<u8>),
     ByteList(Vec<Vec<u8>>),
+    PixelAspect(u64),
     Unused,
 }
 pub(super) struct Map(BTreeMap<String, Qt>);
+
+pub(super) struct PixelAspect {
+    pub ratio: Rational,
+    pub saved_bits: u64,
+}
 
 impl Map {
     pub fn int(&self, key: &str) -> Result<i64> {
@@ -128,13 +178,58 @@ impl Map {
             _ => Err(format!("invalid Resolve byte list {key}").into()),
         }
     }
+
+    pub fn pixel_aspect(&self) -> Result<Option<PixelAspect>> {
+        let saved_bits = match self.0.get("PixelAspectRatio") {
+            None | Some(Qt::Unused) => return Ok(None),
+            Some(Qt::PixelAspect(bits)) => *bits,
+            _ => return Err("unsupported Resolve pixel aspect ratio encoding".into()),
+        };
+        let value = f64::from_bits(saved_bits);
+        if !value.is_finite() || value <= 0.0 {
+            return Err("invalid Resolve pixel aspect ratio".into());
+        }
+        let ratio = binary64_rational(saved_bits).ok_or("Resolve pixel aspect ratio exceeds graph bounds")?;
+        Ok(Some(PixelAspect { ratio, saved_bits }))
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.0.keys().map(String::as_str)
     }
 }
 
-pub(super) fn qt(mut data: &[u8]) -> Result<Map> {
-    if data.len() > MAX_BLOB || u32::from_be_bytes(number(&mut data)?) != 1 {
+/// Decode a finite IEEE 754 value into a signed significand and a power of two.
+pub(super) fn binary64_parts(bits: u64) -> Option<(i64, i32)> {
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    if exponent == 0x7ff {
+        return None;
+    }
+    let significand = (bits & ((1 << 52) - 1)) | if exponent == 0 { 0 } else { 1 << 52 };
+    if significand == 0 {
+        return Some((0, 0));
+    }
+    let zeros = significand.trailing_zeros();
+    let magnitude = (significand >> zeros) as i64;
+    let signed = if bits >> 63 == 0 { magnitude } else { -magnitude };
+    Some((signed, exponent.max(1) - 1023 - 52 + zeros as i32))
+}
+
+pub(super) fn binary64_rational(bits: u64) -> Option<Rational> {
+    let (significand, power) = binary64_parts(bits)?;
+    let numerator = i128::from(significand);
+    match power {
+        -62..=-1 => Rational::new(numerator, 1 << -power),
+        0..=63 => Rational::new(numerator << power, 1),
+        _ => None,
+    }
+}
+
+pub(super) fn qt(data: &[u8]) -> Result<Map> {
+    qt_with_limit(data, MAX_BLOB)
+}
+
+fn qt_with_limit(mut data: &[u8], limit: usize) -> Result<Map> {
+    if data.len() > limit || u32::from_be_bytes(number(&mut data)?) != 1 {
         return Err("unsupported Resolve Qt map".into());
     }
     let count = u32::from_be_bytes(number(&mut data)?);
@@ -177,6 +272,7 @@ pub(super) fn qt(mut data: &[u8]) -> Result<Map> {
                 take(&mut data, 4)?;
                 Qt::Unused
             }
+            135 if key == "PixelAspectRatio" => Qt::PixelAspect(u64::from_be_bytes(number(&mut data)?)),
             _ => return Err("unsupported Resolve Qt field type".into()),
         };
         if null > 1
@@ -201,12 +297,25 @@ pub(super) enum Wire<'a> {
 }
 
 pub(super) fn fields(data: &[u8]) -> Result<Vec<(u64, Wire<'_>)>> {
-    let mut at = 0;
     let mut fields = Vec::new();
+    visit_fields(data, 4096, |field, value| {
+        fields.push((field, value));
+        Ok(())
+    })?;
+    Ok(fields)
+}
+
+pub(super) fn visit_fields<'a>(
+    data: &'a [u8],
+    limit: usize,
+    mut visit: impl FnMut(u64, Wire<'a>) -> Result<()>,
+) -> Result<()> {
+    let mut at = 0;
+    let mut count = 0;
     while at < data.len() {
         let key = take_varint(data, &mut at)?;
         let field = key >> 3;
-        if field == 0 || field > (1 << 29) - 1 || fields.len() == 4096 {
+        if field == 0 || field > (1 << 29) - 1 || count == limit {
             return Err("invalid or over-budget Resolve protobuf field".into());
         }
         let wire = key & 7;
@@ -231,9 +340,10 @@ pub(super) fn fields(data: &[u8]) -> Result<Vec<(u64, Wire<'_>)>> {
                 Wire::Fixed(bytes)
             }
         };
-        fields.push((field, value));
+        visit(field, value)?;
+        count += 1;
     }
-    Ok(fields)
+    Ok(())
 }
 
 pub(super) fn default_picture_settings(
@@ -308,15 +418,25 @@ pub(super) fn frame_rate(data: &[u8]) -> Result<(Rational, bool)> {
     let fps = f64::from_le_bytes(bytes.try_into()?);
     let (n, d) = match fps {
         x if x.to_bits() == crate::RATE.to_bits() => (24000, 1001),
-        24.0 => (24, 1),
-        25.0 => (25, 1),
         x if x == 30000.0 / 1001.0 => (30000, 1001),
+        x if x == 48000.0 / 1001.0 => (48000, 1001),
+        x if x == 60000.0 / 1001.0 => (60000, 1001),
+        // A two-digit saved frame label can represent indices 0 through 99.
+        x if (1.0..=100.0).contains(&x) && x.fract() == 0.0 => (x as i128, 1),
         _ => return Err("unsupported Resolve source frame rate".into()),
     };
     if *drop == 1 && n != 30000 {
         return Err("unqualified drop-frame flag for Resolve frame rate".into());
     }
     Ok((Rational::new(n, d).expect("known rate"), *drop == 1))
+}
+
+pub(super) fn display_base(rate: Rational) -> Result<u16> {
+    match (rate.num(), rate.den()) {
+        (n @ 1..=100, 1) => Ok(n as u16),
+        (n @ (24000 | 30000 | 48000 | 60000), 1001) => Ok((n / 1000) as u16),
+        _ => Err("unsupported Resolve source timecode base".into()),
+    }
 }
 
 pub(super) fn frames(seconds: f64, rate: Rational) -> Result<i64> {
@@ -329,6 +449,15 @@ pub(super) fn frames(seconds: f64, rate: Rational) -> Result<i64> {
         return Err("Resolve extent is outside the supported frame grid".into());
     }
     Ok(count.round() as i64)
+}
+
+pub(super) fn sample_start(seconds: f64, sample_rate: i64) -> Result<Rational> {
+    let samples = seconds * sample_rate as f64;
+    let rounded = samples.round();
+    if !(0.0..i64::MAX as f64).contains(&samples) || (samples - rounded).abs() > 1e-6 {
+        return Err("Resolve audio starts outside its sample grid".into());
+    }
+    Rational::from_units(rounded as i64, sample_rate).ok_or_else(|| "invalid audio start".into())
 }
 
 pub(super) fn timecode(text: &str, base: i64) -> Result<i64> {
@@ -351,10 +480,15 @@ pub(super) fn timecode(text: &str, base: i64) -> Result<i64> {
 }
 
 pub(super) fn extent(data: &[u8], rate: Rational) -> Result<(i64, i64)> {
+    let (start, length) = extent_seconds(data)?;
+    Ok((frames(start, rate)?, frames(length, rate)?))
+}
+
+pub(super) fn extent_seconds(data: &[u8]) -> Result<(f64, f64)> {
     let (start, length) = data.split_at_checked(8).ok_or("truncated Resolve extent")?;
     Ok((
-        frames(f64::from_le_bytes(start.try_into()?), rate)?,
-        frames(f64::from_le_bytes(length.try_into()?), rate)?,
+        f64::from_le_bytes(start.try_into()?),
+        f64::from_le_bytes(length.try_into()?),
     ))
 }
 
@@ -373,6 +507,97 @@ pub(super) fn raster(data: &[u8]) -> Result<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_lockable_metadata_has_separate_stored_and_decoded_limits() {
+        use crate::binary::{qt as encode_qt, Qt as Field};
+
+        let payload = vec![0; MAX_BLOB + 1];
+        let stored = hex::encode(encode_qt(&[("BlobData", Field::Bytes(&payload))]));
+        let mut blobs = Blobs::default();
+        assert!(blobs.qt(&stored).is_err());
+        assert_eq!(blobs.lockable_qt(&stored).unwrap().bytes("BlobData").unwrap(), payload);
+        assert!(blobs.lockable_qt(&"00".repeat(MAX_LOCKABLE_FIELDS_BYTES + 1)).is_err());
+        assert!(blobs.lockable_qt("00").is_err());
+
+        let compress = |raw: &[u8]| {
+            let compressed = zstd::bulk::compress(raw, 1).unwrap();
+            let mut envelope = 10001u32.to_be_bytes().to_vec();
+            envelope.extend_from_slice(&((compressed.len() + 1) as u32).to_be_bytes());
+            envelope.push(0x81);
+            envelope.extend(compressed);
+            envelope
+        };
+        let envelope = compress(&payload);
+        assert!(blobs.marker_data(&envelope).is_err());
+        assert_eq!(blobs.lockable_metadata(&envelope).unwrap(), payload);
+        assert!(blobs.lockable_metadata(&compress(&vec![0; MAX_LOCKABLE_BODY_BYTES + 1])).is_err());
+
+        let mut budget = Blobs::new(payload.len());
+        budget.charge(1).unwrap();
+        assert!(budget.lockable_metadata(&envelope).is_err());
+        assert!(blobs.lockable_metadata(&envelope[..envelope.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn saved_pixel_aspect_is_an_exact_positive_binary64_ratio() {
+        use crate::binary::{qt as encode_qt, Qt as Field};
+        let encode = |key, value| {
+            let mut map = encode_qt(&[(key, Field::Double(value))]);
+            let type_start = map.len() - 13;
+            map[type_start..type_start + 4].copy_from_slice(&135u32.to_be_bytes());
+            map
+        };
+        for (value, exact) in [(1.0, "1"), (1.125, "9/8"), (4.0 / 3.0, "6004799503160661/4503599627370496")] {
+            let field = qt(&encode("PixelAspectRatio", value)).unwrap().pixel_aspect().unwrap().unwrap();
+            assert_eq!(field.ratio.to_string(), exact);
+            assert_eq!(field.saved_bits, value.to_bits());
+        }
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MIN_POSITIVE, f64::MAX] {
+            assert!(qt(&encode("PixelAspectRatio", value)).unwrap().pixel_aspect().is_err());
+        }
+        assert!(qt(&encode("DifferentField", 1.125)).is_err());
+        let mut truncated = encode("PixelAspectRatio", 1.125);
+        truncated.pop();
+        assert!(qt(&truncated).is_err());
+    }
+
+    #[test]
+    fn saved_thirty_is_distinct_from_the_fractional_drop_frame_rate() {
+        let mut field = [0; 16];
+        field[..8].copy_from_slice(&30.0f64.to_le_bytes());
+        let exact = Rational::integer(30);
+        assert_eq!(frame_rate(&field).unwrap(), (exact, false));
+        assert_eq!(timecode("00:00:59:29", i64::from(display_base(exact).unwrap())).unwrap(), 1799);
+        field[15] = 1;
+        assert!(frame_rate(&field).is_err());
+        field[..8].copy_from_slice(&(30_000.0f64 / 1001.0).to_le_bytes());
+        assert_eq!(frame_rate(&field).unwrap(), (Rational::new(30_000, 1001).unwrap(), true));
+    }
+
+    #[test]
+    fn observed_integral_and_ntsc_picture_rates_keep_exact_clocks() {
+        for (saved, numerator, denominator, base) in [
+            (15.0, 15, 1, 15), (16.0, 16, 1, 16), (20.0, 20, 1, 20),
+            (27.0, 27, 1, 27), (45.0, 45, 1, 45), (56.0, 56, 1, 56),
+            (48000.0 / 1001.0, 48000, 1001, 48), (60000.0 / 1001.0, 60000, 1001, 60),
+        ] {
+            let mut field = [0; 16];
+            field[..8].copy_from_slice(&f64::to_le_bytes(saved));
+            let exact = Rational::new(numerator, denominator).unwrap();
+            assert_eq!(frame_rate(&field).unwrap(), (exact, false));
+            assert_eq!(display_base(exact).unwrap(), base);
+            assert_eq!(timecode(&format!("01:02:03:{:02}", base - 1), i64::from(base)).unwrap(),
+                3724 * i64::from(base) - 1);
+            field[15] = 1;
+            assert!(frame_rate(&field).is_err());
+        }
+        for saved in [0.0, -15.0, 101.0, 47.952, 59.94, f64::NAN, f64::INFINITY] {
+            let mut field = [0; 16];
+            field[..8].copy_from_slice(&saved.to_le_bytes());
+            assert!(frame_rate(&field).is_err());
+        }
+    }
 
     #[test]
     fn project_sizing_does_not_inherit_an_unknown_or_duplicate_value() {

@@ -2,7 +2,7 @@
 use crate::Result;
 use quick_xml::{events::Event, Reader, XmlVersion};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{Read, Seek, SeekFrom},
     ops::Range,
@@ -10,13 +10,24 @@ use std::{
 };
 use zip::ZipArchive;
 
-const MAX_ARCHIVE: u64 = 32 << 20;
-pub(super) const MAX_EXPANDED: u64 = 64 << 20;
+const MAX_ARCHIVE: u64 = 48 << 20;
+pub(super) const MAX_EXPANDED: u64 = 192 << 20;
 const MAX_MEMBERS: usize = 1024;
-const MAX_NODES: usize = 50_000;
+// Bound memory for both an individual tree and the collection of member trees.
+const MAX_MEMBER_NODES: usize = 160_000;
+const MAX_ARCHIVE_NODES: usize = 2_500_000;
 const MAX_DEPTH: usize = 96;
 
-#[derive(Debug)]
+const PROJECT_MAX_ARCHIVE: u64 = 512 << 20;
+pub(super) const PROJECT_MAX_EXPANDED: u64 = 2 << 30;
+const PROJECT_MAX_MEMBERS: usize = 4096;
+const PROJECT_MAX_NODES: usize = 25_000_000;
+const PROJECT_MAX_MEMBER_NODES: usize = 1_600_000;
+const PROJECT_MAX_MEMBER_BYTES: u64 = 128 << 20;
+const PROJECT_MAX_POOL_NODES: usize = 1_600_000;
+const PROJECT_MAX_POOL_BYTES: u64 = 256 << 20;
+
+#[derive(Clone, Debug)]
 pub(super) struct Node {
     pub name: String,
     pub id: Option<String>,
@@ -81,19 +92,33 @@ pub(super) fn read(path: &Path) -> Result<BTreeMap<String, Node>> {
 }
 
 pub(super) fn open_file(path: &Path) -> Result<File> {
+    open_with_limit(path, MAX_ARCHIVE)
+}
+
+fn open_with_limit(path: &Path, limit: u64) -> Result<File> {
     if !std::fs::metadata(path)?.is_file() {
         return Err("expected a regular Resolve archive".into());
     }
     let file = File::open(path)?;
     let meta = file.metadata()?;
-    if !meta.is_file() || meta.len() > MAX_ARCHIVE {
-        return Err("expected a regular Resolve archive no larger than 32 MiB".into());
+    if !meta.is_file() || meta.len() > limit {
+        return Err(format!(
+            "expected a regular Resolve archive no larger than {} MiB", limit >> 20
+        ).into());
     }
     Ok(file)
 }
 
-pub(super) fn checked_zip<R: Read + Seek>(mut input: R) -> Result<ZipArchive<R>> {
-    let (member_count, central_start) = directory(&mut input)?;
+pub(super) fn checked_zip<R: Read + Seek>(input: R) -> Result<ZipArchive<R>> {
+    zip_with_limit(input, MAX_MEMBERS)
+}
+
+pub(super) fn project_zip(path: &Path) -> Result<ZipArchive<File>> {
+    zip_with_limit(open_with_limit(path, PROJECT_MAX_ARCHIVE)?, PROJECT_MAX_MEMBERS)
+}
+
+fn zip_with_limit<R: Read + Seek>(mut input: R, member_limit: usize) -> Result<ZipArchive<R>> {
+    let (member_count, central_start) = directory(&mut input, member_limit)?;
     let mut archive = ZipArchive::new(input)?;
     // The ZIP library indexes by name. Compare with the on-disk count so an
     // exact duplicate cannot be silently collapsed by that index.
@@ -104,6 +129,86 @@ pub(super) fn checked_zip<R: Read + Seek>(mut input: R) -> Result<ZipArchive<R>>
         return Err("duplicate or ambiguous Resolve archive directory".into());
     }
     Ok(archive)
+}
+
+/// Retain the project and Media Pool, and index sequence trees by saved UUID.
+/// The first pass checks the entire archive even if semantic validation later
+/// fails. Each sequence tree is dropped before reading the next one.
+pub(super) fn read_project(path: &Path) -> Result<(BTreeMap<String, Node>, ProjectContainers)> {
+    let mut zip = project_zip(path)?;
+    let mut seen = HashSet::new();
+    let mut pool = BTreeMap::new();
+    let mut index = HashMap::new();
+    let mut remaining = PROJECT_MAX_EXPANDED;
+    let mut pool_bytes = PROJECT_MAX_POOL_BYTES;
+    let mut total_nodes = 0;
+    let mut pool_nodes = 0;
+    for slot in 0..zip.len() {
+        let mut entry = zip.by_index(slot)?;
+        check_member(&entry, &mut seen, remaining)?;
+        let path = entry.name().to_owned();
+        let container = path.starts_with("SeqContainer/") && path.ends_with(".xml");
+        let retained = path == "project.xml" || path.starts_with("MediaPool/") && path.ends_with("/MpFolder.xml");
+        if !container && !retained {
+            remaining -= entry.size();
+            continue;
+        }
+        check_project_member_size(entry.size())?;
+        let member_limit = if retained {
+            pool_bytes = pool_bytes.checked_sub(entry.size()).ok_or("Resolve project and Media Pool exceed their XML size limit")?;
+            PROJECT_MAX_MEMBER_NODES.min(PROJECT_MAX_POOL_NODES - pool_nodes)
+        } else {
+            PROJECT_MAX_MEMBER_NODES
+        };
+        let text = read_member(&mut entry, &mut remaining)?;
+        check_version(&text)?;
+        let before = total_nodes;
+        let node = parse_with_limits(&text, &mut total_nodes, member_limit, PROJECT_MAX_NODES)?;
+        if retained {
+            pool_nodes += total_nodes - before;
+            pool.insert(path, node);
+        } else if index.insert(super::container_owner(&path, &node)?.to_owned(), slot).is_some() {
+            return Err("ambiguous Resolve sequence container registration".into());
+        }
+    }
+    Ok((pool, ProjectContainers { zip, index }))
+}
+
+pub(super) struct ProjectContainers {
+    zip: ZipArchive<File>,
+    index: HashMap<String, usize>,
+}
+
+pub(super) fn check_project_member_size(bytes: u64) -> Result<()> {
+    if bytes > PROJECT_MAX_MEMBER_BYTES {
+        return Err("Resolve project XML member exceeds its size limit".into());
+    }
+    Ok(())
+}
+
+pub(super) fn parse_project_member(text: &str) -> Result<Node> {
+    parse_with_limits(text, &mut 0, PROJECT_MAX_MEMBER_NODES, PROJECT_MAX_NODES)
+}
+
+impl ProjectContainers {
+    pub(super) fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub(super) fn load(&mut self, sequence: &str) -> Result<Option<Node>> {
+        let Some(&slot) = self.index.get(sequence) else { return Ok(None) };
+        let mut entry = self.zip.by_index(slot)?;
+        // Recheck the actual expanded size and CRC when loading the tree.
+        check_project_member_size(entry.size())?;
+        let mut remaining = PROJECT_MAX_MEMBER_BYTES;
+        let text = read_member(&mut entry, &mut remaining)?;
+        check_version(&text)?;
+        let tree = parse_project_member(&text)?;
+        if super::container_owner(entry.name(), &tree)? != sequence {
+            return Err("Resolve sequence container changed during read".into());
+        }
+        Ok(Some(tree))
+    }
 }
 
 pub(super) fn read_zip(input: impl Read + Seek) -> Result<BTreeMap<String, Node>> {
@@ -176,7 +281,7 @@ pub(super) fn check_version(xml: &str) -> Result<()> {
     Ok(())
 }
 
-fn directory(input: &mut (impl Read + Seek)) -> Result<(usize, u64)> {
+fn directory(input: &mut (impl Read + Seek), member_limit: usize) -> Result<(usize, u64)> {
     // The retained .drp cohort uses a regular single-disk ZIP32 directory.
     let length = input.seek(SeekFrom::End(0))?;
     let tail_size = length.min(22 + u64::from(u16::MAX));
@@ -196,7 +301,7 @@ fn directory(input: &mut (impl Read + Seek)) -> Result<(usize, u64)> {
     let start = u64::from(u32::from_le_bytes(record[16..20].try_into()?));
     if record[4..8] != [0; 4]
         || usize::from(local) != count
-        || !(1..=MAX_MEMBERS).contains(&count)
+        || !(1..=member_limit).contains(&count)
         || start + bytes != tail_start + offset as u64
     {
         return Err("unsupported or over-budget Resolve ZIP directory".into());
@@ -205,19 +310,32 @@ fn directory(input: &mut (impl Read + Seek)) -> Result<(usize, u64)> {
 }
 
 pub(super) fn parse(text: &str, total_nodes: &mut usize) -> Result<Node> {
+    parse_with_limits(text, total_nodes, MAX_MEMBER_NODES, MAX_ARCHIVE_NODES)
+}
+
+fn parse_with_limits(
+    text: &str,
+    total_nodes: &mut usize,
+    member_limit: usize,
+    archive_limit: usize,
+) -> Result<Node> {
     let mut reader = Reader::from_str(text);
     reader.config_mut().expand_empty_elements = true;
     reader.config_mut().check_comments = true;
     let mut stack: Vec<Node> = Vec::new();
     let mut root = None;
+    let starting_nodes = *total_nodes;
     loop {
         let position = usize::try_from(reader.buffer_position())?;
         match reader.read_event()? {
             Event::Start(tag) => {
-                *total_nodes += 1;
-                if *total_nodes > MAX_NODES || stack.len() >= MAX_DEPTH {
+                if *total_nodes >= archive_limit {
+                    return Err("Resolve XML exceeds the archive node limit".into());
+                }
+                if *total_nodes - starting_nodes >= member_limit || stack.len() >= MAX_DEPTH {
                     return Err("Resolve XML exceeds node or depth limit".into());
                 }
+                *total_nodes += 1;
                 let mut id = None;
                 for attr in tag.attributes() {
                     let attr = attr?;
@@ -303,6 +421,25 @@ fn append(stack: &mut [Node], text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_stream_rejects_ambiguous_sequence_ownership_before_loading_graph() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duplicate.drp");
+        let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+        for n in [1, 2] {
+            let id = uuid::Uuid::from_u128(n);
+            zip.start_file(format!("SeqContainer/{id}.xml"), zip::write::SimpleFileOptions::default()).unwrap();
+            writeln!(zip, r#"<?xml version="1.0"?>
+<!--DbAppVer="21.2.0.0006" DbPrjVer="17"-->
+<Sm2SequenceContainer DbId="{id}"><VideoTrackVec><Element><Sm2TiTrack>
+<Type>0</Type><Sequence>same</Sequence></Sm2TiTrack></Element></VideoTrackVec>
+<AudioTrackVec/></Sm2SequenceContainer>"#).unwrap();
+        }
+        zip.finish().unwrap();
+        assert_eq!(read_project(&path).err().unwrap().to_string(), "ambiguous Resolve sequence container registration");
+    }
     use std::io::{Cursor, Write};
     use zip::{write::SimpleFileOptions, ZipWriter};
 
@@ -334,6 +471,26 @@ mod tests {
         )
         .is_err());
         assert!(parse("<A><B/><B/></A>", &mut 0).unwrap().one("B").is_err());
+    }
+
+    #[test]
+    fn xml_members_and_archive_have_independent_node_budgets() {
+        let full = format!("<A>{}</A>", "<B/>".repeat(MAX_MEMBER_NODES - 1));
+        let mut nodes = 0;
+        for _ in 0..2 {
+            drop(parse(&full, &mut nodes).unwrap());
+        }
+        assert_eq!(nodes, 2 * MAX_MEMBER_NODES);
+
+        let over = format!("<A>{}</A>", "<B/>".repeat(MAX_MEMBER_NODES));
+        let error = parse(&over, &mut 0).unwrap_err();
+        assert_eq!(error.to_string(), "Resolve XML exceeds node or depth limit");
+
+        let mut nodes = MAX_ARCHIVE_NODES - 2;
+        parse("<A><B/></A>", &mut nodes).unwrap();
+        assert_eq!(nodes, MAX_ARCHIVE_NODES);
+        let error = parse("<A/>", &mut nodes).unwrap_err();
+        assert_eq!(error.to_string(), "Resolve XML exceeds the archive node limit");
     }
 
     #[test]

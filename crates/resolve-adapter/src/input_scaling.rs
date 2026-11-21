@@ -1,5 +1,5 @@
 //! Plain raster-mismatch controls on Resolve video edits.
-use crate::Result;
+use crate::{linked::SidecarLookup, Result};
 use graph::{Sidecar, Value, source::SourceGraph};
 
 pub(crate) const PREMIERE: &str = "premiere.input_scaling";
@@ -37,9 +37,9 @@ fn observed(value: Option<&Value>) -> Result<Option<Sizing>> {
     }
 }
 
-fn explicit(graph: &SourceGraph, edit: &str) -> Result<Option<Sizing>> {
-    let premiere = graph.sidecar(PREMIERE, edit);
-    let resolve = graph.sidecar(RESOLVE, edit);
+fn explicit(sidecars: SidecarLookup<'_>, edit: &str) -> Result<Option<Sizing>> {
+    let premiere = sidecars.get(PREMIERE, edit);
+    let resolve = sidecars.get(RESOLVE, edit);
     if premiere.is_some() && resolve.is_some() {
         return Err("ambiguous input sizing owners".into());
     }
@@ -47,12 +47,12 @@ fn explicit(graph: &SourceGraph, edit: &str) -> Result<Option<Sizing>> {
 }
 
 pub(crate) fn prepare(
-    graph: &SourceGraph, sequence: &str, edit: &str, raster_mismatch: bool,
+    sidecars: SidecarLookup<'_>, sequence: &str, edit: &str, raster_mismatch: bool,
 ) -> Result<Option<Sizing>> {
-    if let Some(sizing) = explicit(graph, edit)? {
+    if let Some(sizing) = explicit(sidecars, edit)? {
         return Ok((raster_mismatch || sizing == Sizing::CenterCrop).then_some(sizing));
     }
-    if let Some(source) = graph.sidecar(crate::source::ADAPTER, sequence).filter(|_| raster_mismatch) {
+    if let Some(source) = sidecars.get(crate::source::ADAPTER, sequence).filter(|_| raster_mismatch) {
         let sizing = observed(source.get(PROJECT_SETTING))?
             .ok_or("unresolved inherited Resolve input sizing")?;
         return Ok(Some(sizing));
@@ -63,7 +63,7 @@ pub(crate) fn prepare(
 pub(crate) fn matches_readback(
     graph: &SourceGraph, sequence: &str, edit: &str, expected: Option<Sizing>,
 ) -> Result<bool> {
-    let clip = explicit(graph, edit)?;
+    let clip = explicit(SidecarLookup::Linear(graph), edit)?;
     Ok(match expected {
         Some(Sizing::Fit) if clip.is_none() => {
             let project = graph.sidecar(crate::source::ADAPTER, sequence);

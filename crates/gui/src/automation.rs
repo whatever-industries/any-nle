@@ -1,5 +1,5 @@
 //! Developer-only scenarios. All wizard actions run in an isolated session.
-use super::{App, BinPath, BinSelection, Page, Tree, egui, job, storage};
+use super::{App, Page, egui, job, storage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, Write};
@@ -134,19 +134,7 @@ fn apply(
             wait_for_worker(app, ctx)?;
         }
         Action::SetFolderExpanded { path, expanded } => {
-            let catalog = catalog(app)?;
-            let tree = Tree::build(catalog);
-            let mut node = &tree;
-            if path.as_os_str().is_empty() {
-                return Err("Choose a catalog folder by its project-relative path.".into());
-            }
-            for part in path.components() {
-                node = node
-                    .folders
-                    .get(part.as_os_str())
-                    .ok_or_else(|| format!("Unknown catalog folder: {}", path.display()))?;
-            }
-            app.expansion.set_open(&node.relative, false, expanded);
+            app.bin_picker.set_folder_expanded(&path, expanded)?;
         }
         Action::SetEntireProject { enabled } => {
             let before = app.wizard.snapshot();
@@ -154,14 +142,9 @@ fn apply(
             app.apply_settings_changes(&before);
         }
         Action::SetBinSelected { path, selected } => {
-            if app.wizard.inputs.entire_project {
-                return Err(
-                    "Turn off entire-project selection before selecting individual bins.".into(),
-                );
-            }
-            let path = select_bin(catalog(app)?, &path)?.path.clone();
             let before = app.wizard.snapshot();
-            BinSelection::new(&mut app.wizard.inputs.bins).set(std::iter::once(&path), selected);
+            app.bin_picker
+                .set_bin_selected(&mut app.wizard.inputs, &path, selected)?;
             app.apply_settings_changes(&before);
         }
         Action::OpenMedia | Action::RunReview => {
@@ -194,32 +177,6 @@ fn apply(
     Ok(())
 }
 
-fn catalog(app: &App) -> Result<&[BinPath], String> {
-    app.catalog
-        .as_deref()
-        .ok_or_else(|| "Run find_bins first.".into())
-}
-
-fn select_bin<'a>(catalog: &'a [BinPath], path: &Path) -> Result<&'a BinPath, String> {
-    let mut matches = catalog.iter().filter(|bin| {
-        if path.is_absolute() {
-            bin.path == path
-        } else {
-            bin.relative == path
-        }
-    });
-    let bin = matches
-        .next()
-        .ok_or_else(|| format!("Unknown catalog bin: {}", path.display()))?;
-    if matches.next().is_some() {
-        return Err(format!(
-            "Ambiguous catalog bin: {}. Use its full path.",
-            path.display()
-        ));
-    }
-    Ok(bin)
-}
-
 fn wait_for_worker(app: &mut App, ctx: &egui::Context) -> Result<(), String> {
     while app.busy {
         let event = app.rx.recv().map_err(|err| err.to_string())?;
@@ -238,31 +195,26 @@ fn snapshot(app: &App) -> Result<State, String> {
         Ok(None)
     }
     .map_err(|err| err.to_string())?;
-    let catalog = app.catalog.as_ref().map(|bins| {
-        let mut folders = Vec::new();
-        let tree = Tree::build(bins);
-        list_folders(&tree, &mut folders);
-        Catalog {
-            bins: bins
-                .iter()
-                .map(|bin| CatalogBin {
-                    path: bin.path.clone(),
-                    relative: bin.relative.clone(),
-                })
-                .collect(),
-            folders: folders
-                .into_iter()
-                .map(|path| CatalogFolder {
-                    expanded: app.expansion.is_open(&path, bins.len(), false),
-                    path,
-                })
-                .collect(),
-        }
+    let catalog = app.bin_picker.catalog().map(|bins| Catalog {
+        bins: bins
+            .iter()
+            .map(|bin| CatalogBin {
+                path: bin.path.clone(),
+                relative: bin.relative.clone(),
+            })
+            .collect(),
+        folders: app
+            .bin_picker
+            .folders(bins)
+            .into_iter()
+            .map(|(path, expanded)| CatalogFolder { path, expanded })
+            .collect(),
     });
     let selected_bins = if spec.entire_project {
-        app.catalog
+        app.bin_picker
+            .catalog()
+            .unwrap_or_default()
             .iter()
-            .flatten()
             .map(|bin| bin.path.clone())
             .collect()
     } else {
@@ -276,13 +228,6 @@ fn snapshot(app: &App) -> Result<State, String> {
         job: spec,
         review,
     })
-}
-
-fn list_folders(tree: &Tree, folders: &mut Vec<PathBuf>) {
-    for folder in tree.folders.values() {
-        folders.push(folder.relative.clone());
-        list_folders(folder, folders);
-    }
 }
 
 fn wizard_frame(
@@ -312,7 +257,7 @@ fn wizard_frame(
 }
 
 fn require_project_picker(app: &App, operation: &str) -> Result<(), String> {
-    if app.wizard.page != Page::Direction || catalog(app)?.is_empty() {
+    if app.wizard.page != Page::Direction || app.bin_picker.found_bins()?.is_empty() {
         return Err(format!("{operation} on Project after finding source bins."));
     }
     Ok(())
@@ -338,6 +283,7 @@ fn project_layout(app: &mut App, ctx: &egui::Context) -> Result<ProjectLayout, S
             .ok_or_else(|| format!("Project layout has no fully visible {name} label."))
     };
     let source = app
+        .bin_picker
         .source_viewport
         .ok_or("No source list in Project layout.")?;
     let destination = label("Destination")?;
@@ -457,21 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn bin_selectors_require_an_exact_unique_catalog_entry() {
-        let catalog = ["Editorial", "Sound"].map(|folder| BinPath {
-            path: Path::new("project").join(folder).join("Selects.avb"),
-            relative: "Selects.avb".into(),
-        });
-        assert!(
-            select_bin(&catalog, Path::new("Selects.avb"))
-                .unwrap_err()
-                .contains("Ambiguous")
-        );
-        assert!(
-            select_bin(&catalog, Path::new("Other.avb"))
-                .unwrap_err()
-                .contains("Unknown")
-        );
+    fn driver_refuses_conversion_actions() {
         assert!(serde_json::from_value::<Action>(json!({"action": "convert"})).is_err());
     }
 }

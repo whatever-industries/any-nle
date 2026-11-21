@@ -174,7 +174,6 @@ fn borrowed_attrs<'a>(ctx: &Ctx<'a>, node: &Node) -> &'a [(String, Value)] {
         _ => &[],
     }
 }
-const MAX_INPUT_TRANSFORM_BYTES: usize = 16 * 1024;
 fn input_transform_text<'a>(ctx: &Ctx<'a>, file: &Node) -> Option<Result<&'a str, &'static str>> {
     if int(file, "mob_type_id") != Some(MOB_SOURCE) {
         return None;

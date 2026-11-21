@@ -828,6 +828,7 @@ fn color_adapter_receipt_binds_only_the_owned_picture_placement() {
             reordered_picture_file: None,
             transform: RANGE.into(),
             neutral_wrapper: true,
+            plain_same_rate_linked_input: true,
             wrapper_clip_color: Some([48_896; 3]),
             managed_picture_span: None,
         })),
@@ -1841,6 +1842,59 @@ fn named_aac_and_smpte_ds_source_groups_preserve_declared_order() {
         assert_eq!(out.graph.sidecar("avid.source",&out.graph.items[0].id).unwrap().get("raw_groups"),Some(&Value::Arr(vec![s(raw)])));
         assert!(out.audio_group_issues.is_empty());
     }
+}
+
+#[test]
+fn original_probe_review_groups_only_edits_for_the_failed_file() {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("Original.wav");
+    let other = scratch.path().join("Other.wav");
+    std::fs::write(&path, b"synthetic original").unwrap();
+    let (mut facts, _) = fixture(3);
+    let master = &mut facts.masters[0];
+    master.originals = (1..=3).map(|channel| Some(av::OriginalTrack {
+        locators: vec![(if channel == 3 { &other } else { &path }).to_str().unwrap().to_owned()],
+        descriptor_class: "PCMA".into(),
+        descriptor_rate: 48000.0,
+        descriptor_length: 96000,
+        channels: Some(2),
+        sample_rate: Some(48000.0),
+        stored_quantization_bits: Some(24),
+        display_raster: None,
+        file_track: Some(if channel == 3 { 1 } else { channel }),
+        motion_audio_track_start: None,
+    })).collect();
+    let selected = sequence(vec![
+        event("left", 1, 1, 12, 24, None),
+        event("right", 2, 2, 12, 24, None),
+        event("other file", 3, 3, 12, 24, None),
+    ]);
+    facts.sequences = vec![selected];
+    let failed_probe = |p: &Path| {
+        assert_eq!(p, path.canonicalize().unwrap());
+        Err("synthetic probe failure".into())
+    };
+    let direct = original::OriginalIndex::scan_with(
+        &facts, &Default::default(), failed_probe,
+    ).err().expect("the probe should block");
+    let options = original::OriginalOptions {
+        collect_blocked_locators: true,
+        ..Default::default()
+    };
+    let SourceReadIssue::OriginalMediaTracks(issue) =
+        original::OriginalIndex::scan_with_review_details(&facts, &options, failed_probe)
+            .err().expect("Review should surface the failed probe")
+    else {
+        panic!("expected failed original with saved edit details");
+    };
+    assert_eq!(issue.message, direct);
+    assert_eq!(issue.bin, 0);
+    assert!(!issue.edits.truncated);
+    let [timeline] = issue.edits.timelines.as_slice() else { panic!("expected one timeline") };
+    assert_eq!(timeline.id, facts.sequences[0].id);
+    assert_eq!(timeline.edits.iter().map(|edit| edit.id.as_str()).collect::<Vec<_>>(), ["left", "right"]);
+    assert_eq!(timeline.edits[0].offset, Rational::new(1, 2));
+    assert!(!other.exists());
 }
 
 #[test]

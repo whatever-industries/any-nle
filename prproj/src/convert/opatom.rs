@@ -11,6 +11,8 @@ use crate::build::media::{self as m, opatom as op};
 use crate::convert::model::{ticks_per_unit, AudioFile, Clip, Fraction, VideoFile, TICKS_PER_SECOND};
 use crate::error::Error;
 use crate::ids::UuidSource;
+use crate::model::footage::{FootageInterpretation, ParInput};
+use crate::model::validators::Num;
 use crate::model::project::resolve_path;
 use crate::model::{ItemId, Project};
 
@@ -75,6 +77,7 @@ pub struct MediaTable {
     media: HashMap<String, (String, String)>,
     pub(crate) mono_views: std::collections::HashSet<String>,
     pub(crate) rewrap_formats: HashMap<String, String>,
+    pub(crate) rewrap_aspects: HashMap<String, (u32, u32)>,
     pub(crate) direct_dnxhr: HashMap<String, DirectDnxhrFile>,
 }
 
@@ -303,6 +306,12 @@ pub(crate) fn ensure_video_media(project: &mut Project, media: &mut MediaTable, 
         let codec = if media.is_direct_dnxhr_picture(&video.path) { "AVdh" } else { &video.codec };
         let vi = op::VideoInfo { frame_rate_ticks: frame_rate, duration: video.duration, width: video.width, height: video.height, codec };
         let stream = op::video_stream(&mut project.doc.tree, &vi)?;
+        if let Some(&(n, d)) = media.rewrap_aspects.get(&video.path) {
+            FootageInterpretation { stream, source: None }.set_pixel_aspect_ratio(
+                &mut project.doc.tree,
+                ParInput::Pair(Num::Int(n.into()), Num::Int(d.into())),
+            )?;
+        }
         let stream_id = project.register(stream)?;
         let element = op::opatom_media(
             &mut project.doc.tree,

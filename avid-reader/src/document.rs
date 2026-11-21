@@ -287,6 +287,59 @@ impl AvbDocument {
         Ok(id)
     }
 
+    /// Append an unedited saved object while keeping its references and any
+    /// bytes the typed reader does not represent. Use the new ID for edits.
+    pub fn duplicate_saved_object(&mut self, id: u32, class: [u8; 4]) -> Result<u32> {
+        let record = self.records.get(id as usize)
+            .filter(|record| record.is_original())
+            .ok_or_else(|| Error::new("expected an unedited saved object", 0))?;
+        let node = record.node.as_ref().filter(|node| node.class == class)
+            .ok_or_else(|| Error::new("saved object has the wrong class", 0))?;
+        let chunk = self.original_chunk(id)
+            .ok_or_else(|| Error::new("missing saved object bytes", 0))?.to_vec();
+        let new_id = u32::try_from(self.records.len())
+            .map_err(|_| Error::new("object count exceeds u32", 0))?;
+        self.records.push(Record {
+            original_node: Some(node.clone()),
+            node: Some(node.clone()),
+            copied_chunk: Some(chunk),
+        });
+        Ok(new_id)
+    }
+
+    /// Finish a copied bin with the root after its registered compositions.
+    /// The vacated slot becomes an empty Attributes record, so all other
+    /// object IDs and untouched payloads stay where they were.
+    pub fn finish_bin_copy(&mut self) -> Result<()> {
+        let root_id = self.root_id;
+        if root_id as usize == self.object_count() {
+            return Ok(());
+        }
+        if !self.root().is_some_and(|node| matches!(&node.class, b"ABIN" | b"BINF"))
+            || self.records.iter().skip(1).any(|record| {
+                record.node.as_ref().is_none_or(|node| direct_refs(node).contains(&root_id))
+            })
+        {
+            return Err(Error::new("cannot move a referenced or unverified bin root", 0));
+        }
+        let mut root = self.records[root_id as usize].clone();
+        root.copied_chunk = self.original_chunk(root_id).map(<[u8]>::to_vec);
+        let placeholder = Arc::new(attributes_node());
+        let bytes = encode_supported_chunk(
+            &placeholder, None, self.big_endian, None, MAX_FILE_BYTES as usize,
+        )?;
+        let new_id = u32::try_from(self.records.len())
+            .map_err(|_| Error::new("object count exceeds u32", 0))?;
+        self.records[root_id as usize] = Record {
+            original_node: Some(placeholder.clone()),
+            node: Some(placeholder),
+            copied_chunk: Some(bytes),
+        };
+        self.records.push(root);
+        self.root_id = new_id;
+        Ok(())
+    }
+
     /// Create a filler component. The edit rate and length are in the track's
     /// edit units; they are never inferred from the container's frame rate.
     pub fn create_filler(&mut self, edit_rate: f64, media_kind_id: i64, length: u32) -> Result<u32> {
@@ -434,6 +487,20 @@ impl AvbDocument {
     }
 
     pub fn add_bin_item(&mut self, mob_id: u32) -> Result<()> {
+        self.add_bin_mob(mob_id, true)
+    }
+
+    /// Register a source mob for resolution without placing it in the bin view.
+    pub fn add_bin_source(&mut self, mob_id: u32) -> Result<()> {
+        if self.node(mob_id).and_then(|node| node.get("mob_type_id"))
+            != Some(&Value::Int(MobKind::Source.stored_id()))
+        {
+            return Err(Error::new("hidden bin source must be a source mob", 0));
+        }
+        self.add_bin_mob(mob_id, false)
+    }
+
+    fn add_bin_mob(&mut self, mob_id: u32, user_placed: bool) -> Result<()> {
         let mob = self
             .node(mob_id)
             .ok_or_else(|| Error::new(format!("missing mob {mob_id}"), 0))?;
@@ -456,7 +523,7 @@ impl AvbDocument {
                 ("x", Value::Int(-30000)),
                 ("y", Value::Int(-30000)),
                 ("keyframe", Value::Int(0)),
-                ("user_placed", Value::Bool(true)),
+                ("user_placed", Value::Bool(user_placed)),
             ],
         })));
         self.set_field(root, "items", Value::List(items))
@@ -622,14 +689,11 @@ impl AvbDocument {
                 }
             }
         }
-        if self
-            .records
-            .iter()
-            .enumerate()
-            .skip(1)
-            .all(|(id, record)| self.original_chunk(id as u32).is_some() && record.is_original())
-        {
-            if let Some(index) = &self.original {
+        if let Some(index) = &self.original {
+            if self.root_id == index.root_index
+                && self.records.len() == index.object_count()
+                && self.records.iter().skip(1).all(|record| record.is_original())
+            {
                 return Ok(index.original_bytes().to_vec());
             }
         }
@@ -1114,6 +1178,44 @@ mod tests {
             assert_eq!(actual.chunk(id), index.chunk(id), "object {id}");
         }
         assert_eq!(actual_bytes, expected);
+    }
+
+    #[test]
+    fn finished_bin_copy_registers_appended_composition_before_root() {
+        for big_endian in [false, true] {
+            let source = fresh(big_endian).to_bytes().unwrap();
+            let before = AvbIndex::from_bytes(source.clone()).unwrap();
+            let mut doc = AvbDocument::from_bytes(source).unwrap();
+            let id = MobId::unique_with_material(crate::io::Uuid {
+                data1: 7, data2: 8, data3: 9, data4: [1; 8],
+            });
+            let comp = doc.create_composition("Copy", MobKind::Composition, id, 24, 0).unwrap();
+            doc.add_bin_item(comp).unwrap();
+            doc.finish_bin_copy().unwrap();
+            let bytes = doc.to_bytes().unwrap();
+            let after = AvbIndex::from_bytes(bytes.clone()).unwrap();
+            let file = AvbFile::parse(&bytes).unwrap();
+            let items = crate::bin_nav::BinNavigator::new(&file).unwrap().toplevel().unwrap();
+            assert_eq!(items[0].object_index, comp);
+            assert_eq!(after.root_index as usize, after.object_count() - 1);
+            assert!(after.root_index > comp);
+            assert_eq!(after.object(before.root_index).unwrap().class, *b"ATTR");
+            for id in 1..before.root_index {
+                assert_eq!(after.chunk(id), before.chunk(id));
+            }
+        }
+    }
+
+    #[test]
+    fn root_relocation_alone_is_serialized_for_a_loaded_bin() {
+        let mut src = fresh(false);
+        src.create_filler(24.0, 1, 24).unwrap();
+        let bytes = src.to_bytes().unwrap();
+        let mut doc = AvbDocument::from_bytes(bytes).unwrap();
+        doc.finish_bin_copy().unwrap();
+        let index = AvbIndex::from_bytes(doc.to_bytes().unwrap()).unwrap();
+        assert_eq!(index.root_index as usize, index.object_count() - 1);
+        assert_eq!(index.object(4).unwrap().class, *b"ATTR");
     }
 
     #[test]

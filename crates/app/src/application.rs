@@ -730,6 +730,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     let prepared_stills = typed.as_ref().map_or(0, |p| p.png_mattes.stills.len());
     let native_media = a.rewrap_media.then(|| rewrap::NativeMediaPreparation {
         model,
+        source: &graph,
         writer_input: typed,
         gain: &gain,
         managed_pictures: managed_lt_pictures,

@@ -1,5 +1,5 @@
 use crate::model::{Choices, ClipMode, Page, Preset, RequiredInput, Snapshot, Wizard};
-use crate::report::{Filter, PAGE_SIZE, ReportBrowser};
+use crate::report::ReportBrowser;
 use crate::{direction, icons::Glyph, palette, storage};
 use anynle_app::job::{
     self, BinPath, BlockerKind, CancelToken, Completion, CompletionStatus, Inventory, JobSpec, PreparedJob,
@@ -7,11 +7,14 @@ use anynle_app::job::{
 };
 use eframe::egui::{self, Color32, RichText};
 use mapping::{AvidToPremiere, BinMode};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::Duration;
+
+mod bin_picker;
+mod review;
+use bin_picker::BinPicker;
 
 #[cfg(feature = "wizard-automation")]
 #[path = "automation.rs"]
@@ -35,7 +38,6 @@ const AMBER: Color32 = Color32::from_rgb(244, 199, 137);
 const ERROR_SURFACE: Color32 = Color32::from_rgb(61, 41, 54);
 const ERROR_INK: Color32 = Color32::from_rgb(255, 187, 201);
 const SOURCE_LIST_HEIGHT: f32 = 196.;
-const PROJECT_TAIL_SPACE: f32 = 156.;
 const CONVERTING: &str = "Converting project";
 const SAVING_PREFLIGHT: &str = "Saving preflight report";
 const WHY: &str = include_str!("../../../docs/DECISIONS-EXPLAINED.md");
@@ -77,169 +79,16 @@ enum MediaJump {
     OriginalMappings,
     Tools,
 }
-#[derive(Clone, Copy)]
 enum ReviewAction {
     Step(Page),
     Choose(Pick),
     Media(MediaJump),
     SwitchToSeparate { enable_offline_media: bool },
     Recheck,
+    ClearRewrap,
+    #[cfg(target_os = "macos")]
+    ShowError(String),
 }
-#[derive(Default)]
-struct Tree {
-    relative: PathBuf,
-    folders: BTreeMap<OsString, Tree>,
-    files: Vec<usize>,
-}
-
-#[derive(Default)]
-struct FolderExpansion {
-    browse: BTreeMap<PathBuf, bool>,
-    search: BTreeMap<PathBuf, bool>,
-}
-
-impl FolderExpansion {
-    fn is_open(&self, path: &Path, bin_count: usize, filtering: bool) -> bool {
-        let state = if filtering { &self.search } else { &self.browse };
-        state.get(path).copied().unwrap_or(filtering || bin_count <= 16)
-    }
-
-    fn set_open(&mut self, path: &Path, filtering: bool, open: bool) {
-        let state = if filtering { &mut self.search } else { &mut self.browse };
-        state.insert(path.to_path_buf(), open);
-    }
-}
-
-struct BinSelection<'a> {
-    paths: &'a mut Vec<PathBuf>,
-    checked: HashSet<PathBuf>,
-}
-
-impl<'a> BinSelection<'a> {
-    fn new(paths: &'a mut Vec<PathBuf>) -> Self {
-        let checked = paths.iter().cloned().collect();
-        Self { paths, checked }
-    }
-
-    fn set<'p>(&mut self, bins: impl Iterator<Item = &'p PathBuf>, checked: bool) {
-        if checked {
-            for bin in bins {
-                if self.checked.insert(bin.clone()) {
-                    self.paths.push(bin.clone());
-                }
-            }
-        } else {
-            for bin in bins {
-                self.checked.remove(bin);
-            }
-            self.paths.retain(|path| self.checked.contains(path));
-        }
-    }
-}
-
-impl Tree {
-    fn build(bins: &[BinPath]) -> Self {
-        let mut tree = Self::default();
-        for (i, bin) in bins.iter().enumerate() {
-            let relative = &bin.relative;
-            let mut node = &mut tree;
-            if let Some(parent) = relative.parent() {
-                for part in parent.components() {
-                    let name = part.as_os_str().to_owned();
-                    node = node.folders.entry(name.clone()).or_insert_with(|| Self {
-                        relative: node.relative.join(name),
-                        ..Default::default()
-                    });
-                }
-            }
-            node.files.push(i);
-        }
-        tree
-    }
-    fn indices(&self) -> Vec<usize> {
-        self.files
-            .iter()
-            .copied()
-            .chain(self.folders.values().flat_map(Self::indices))
-            .collect()
-    }
-    fn show(
-        &self,
-        ui: &mut egui::Ui,
-        catalog: &[BinPath],
-        selected: &mut BinSelection<'_>,
-        matches: Option<&[bool]>,
-        entire: bool,
-        expansion: &mut FolderExpansion,
-    ) {
-        for (name, node) in &self.folders {
-            let indices = node.indices();
-            if matches.is_some_and(|matches| !indices.iter().any(|&i| matches[i])) {
-                continue;
-            }
-            let filtering = matches.is_some();
-            let id = ui.make_persistent_id(("bin-folder", name, filtering));
-            let open = expansion.is_open(&node.relative, catalog.len(), filtering);
-            let mut state =
-                egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, open);
-            state.set_open(open);
-            let header = state
-                .show_header(ui, |ui| {
-                    let bins = || indices.iter().map(|&i| &catalog[i].path);
-                    let mut all = entire || bins().all(|path| selected.checked.contains(path));
-                    let partial = !all && bins().any(|path| selected.checked.contains(path));
-                    let checkbox = egui::Checkbox::new(&mut all, name.to_string_lossy())
-                        .indeterminate(partial);
-                    if ui
-                        .add_enabled(!entire, checkbox)
-                        .on_hover_text("Select every bin in this folder and its subfolders")
-                        .changed()
-                    {
-                        selected.set(bins(), all);
-                    }
-                    ui.label(
-                        RichText::new(counted(indices.len(), "bin", "bins"))
-                            .small()
-                            .color(MUTED),
-                    );
-                });
-            let now_open = header.is_open();
-            if now_open != open {
-                expansion.set_open(&node.relative, filtering, now_open);
-            }
-            let (toggle, _, _) = header.body(|ui| {
-                node.show(ui, catalog, selected, matches, entire, expansion);
-            });
-            let action = if now_open { "Collapse" } else { "Expand" };
-            let label = format!("{action} {}", name.to_string_lossy());
-            toggle.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
-            toggle.on_hover_text(label);
-        }
-        for i in &self.files {
-            let bin = &catalog[*i];
-            if matches.is_some_and(|matches| !matches[*i]) {
-                continue;
-            }
-            ui.push_id(&bin.path, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(ui.spacing().indent);
-                    let mut value = entire || selected.checked.contains(&bin.path);
-                    if ui
-                        .add_enabled(
-                            !entire,
-                            egui::Checkbox::new(&mut value, path_name(&bin.path)),
-                        )
-                        .on_hover_text(bin.path.display().to_string())
-                        .changed()
-                    {
-                        selected.set(std::iter::once(&bin.path), value);
-                    }
-                });
-            });
-        }
-    }
-}
-
 #[derive(Default)]
 struct Activity {
     errors: VecDeque<String>,
@@ -327,10 +176,7 @@ fn semibold(size: f32) -> egui::FontId {
 pub struct App {
     wizard: Wizard,
     remember_choices: bool,
-    catalog: Option<Vec<BinPath>>,
-    expansion: FolderExpansion,
-    #[cfg(feature = "wizard-automation")]
-    source_viewport: Option<egui::Rect>,
+    bin_picker: BinPicker,
     inventory: Option<Inventory>,
     prepared: Option<PreparedJob>,
     rewrap_size: crate::rewrap_size::SizeControl,
@@ -348,7 +194,6 @@ pub struct App {
     activity: Activity,
     highlight_required_input: bool,
     notice: Option<String>,
-    search: String,
     report: ReportBrowser,
     custom_color: String,
     why: Option<String>,
@@ -397,10 +242,7 @@ impl App {
         Self {
             wizard: Wizard::default(),
             remember_choices: false,
-            catalog: None,
-            expansion: FolderExpansion::default(),
-            #[cfg(feature = "wizard-automation")]
-            source_viewport: None,
+            bin_picker: BinPicker::default(),
             inventory: None,
             prepared: None,
             rewrap_size: Default::default(),
@@ -422,7 +264,6 @@ impl App {
             activity: Default::default(),
             highlight_required_input: false,
             notice: None,
-            search: String::new(),
             report: ReportBrowser::default(),
             custom_color: String::new(),
             why: None,
@@ -440,7 +281,7 @@ impl App {
             premiere_status: Default::default(),
         }
     }
-    fn theme(ctx: &egui::Context) {
+    pub(super) fn theme(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
         for (name, data) in [
             ("Inter", include_bytes!("../resources/inter/Inter-Regular.ttf").as_slice()),
@@ -577,7 +418,7 @@ impl App {
         }
         self.invalidate();
         if before.choices.include_trash_attic != self.wizard.choices.include_trash_attic {
-            self.catalog = None;
+            self.bin_picker.clear_catalog();
         }
         true
     }
@@ -854,8 +695,8 @@ impl App {
                 self.ffprobe = s.ffprobe;
                 self.wizard.invalidate();
                 self.invalidate();
-                self.catalog = None;
-                self.expansion = FolderExpansion::default();
+                self.bin_picker.clear_catalog();
+                self.bin_picker.reset_expansion();
                 self.inventory = None;
                 self.notice = Some(
                     "Job settings loaded. Check the paths, then run a fresh pre-flight.".into(),
@@ -887,7 +728,7 @@ impl App {
                         self.notice = Some("Cancelled.".into());
                     } else if revision == self.wizard.revision() {
                         match result {
-                            Ok(catalog) => self.catalog = Some(catalog),
+                            Ok(catalog) => self.bin_picker.set_catalog(catalog),
                             Err(error) => self.error = Some(error),
                         }
                     }
@@ -960,18 +801,14 @@ impl App {
                                     self.wizard.inputs.project_folder = None;
                                     self.wizard.inputs.entire_project = false;
                                     self.wizard.inputs.add_bins(paths.clone());
-                                    self.catalog = None;
-                                    self.expansion = FolderExpansion::default();
-                                    self.search.clear();
+                                    self.bin_picker = BinPicker::default();
                                     self.inventory = None;
                                 }
                                 Pick::Project => {
                                     self.wizard.inputs.project_folder = Some(path.clone());
                                     self.wizard.inputs.entire_project = true;
                                     self.wizard.inputs.bins.clear();
-                                    self.catalog = None;
-                                    self.expansion = FolderExpansion::default();
-                                    self.search.clear();
+                                    self.bin_picker = BinPicker::default();
                                     self.inventory = None;
                                     find_bins = true;
                                 }
@@ -1119,10 +956,6 @@ impl App {
         ready
     }
     fn direction(&mut self, ui: &mut egui::Ui) {
-        #[cfg(feature = "wizard-automation")]
-        {
-            self.source_viewport = None;
-        }
         let required_input = if self.highlight_required_input {
             self.wizard.inputs.check_required_paths().err()
         } else {
@@ -1166,7 +999,7 @@ impl App {
                         "Import entire project",
                     );
                 });
-            } else if self.catalog.is_none() && !self.wizard.inputs.bins.is_empty() {
+            } else if self.bin_picker.catalog().is_none() && !self.wizard.inputs.bins.is_empty() {
                 ui.label(
                     RichText::new(format!("{} selected", counted(self.wizard.inputs.bins.len(), "bin", "bins")))
                         .color(MUTED),
@@ -1174,88 +1007,16 @@ impl App {
             }
             if self.wizard.inputs.project_folder.is_some() || !self.wizard.inputs.bins.is_empty() {
                 ui.horizontal_wrapped(|ui| {
-                    let action = if self.catalog.is_some() { "Refresh bins" } else { "Find bins" };
+                    let action = if self.bin_picker.catalog().is_some() { "Refresh bins" } else { "Find bins" };
                     if ui.button(action).clicked() {
                         self.find_bins(ui.ctx());
                     }
-                    if self.catalog.is_some() {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .hint_text("Search bins and folders")
-                                .desired_width(220.),
-                        );
+                    if self.bin_picker.catalog().is_some() {
+                        self.bin_picker.search_field(ui);
                     }
                 });
             }
-            if let Some(catalog) = &self.catalog {
-                let inputs = &mut self.wizard.inputs;
-                let search = self.search.trim().to_lowercase();
-                let matches: Option<Vec<_>> = (!search.is_empty()).then(|| {
-                    catalog.iter()
-                        .map(|bin| {
-                            bin.relative
-                                .to_string_lossy()
-                                .to_lowercase()
-                                .contains(&search)
-                        })
-                        .collect()
-                });
-                if catalog.is_empty() {
-                    ui.small("No bins found.");
-                } else if matches
-                    .as_ref()
-                    .is_none_or(|matches| matches.iter().any(|&matched| matched))
-                {
-                    let height = ui.available_height() - PROJECT_TAIL_SPACE;
-                    let _list = source_list(ui, ("bin-tree", &inputs.project_folder), Some(height), |ui| {
-                        ui.spacing_mut().indent = 14.;
-                        ui.visuals_mut().indent_has_left_vline = false;
-                        let mut selected = BinSelection::new(&mut inputs.bins);
-                        Tree::build(catalog).show(
-                            ui,
-                            catalog,
-                            &mut selected,
-                            matches.as_deref(),
-                            inputs.entire_project,
-                            &mut self.expansion,
-                        );
-                    });
-                    #[cfg(feature = "wizard-automation")]
-                    {
-                        let mut visible = _list.inner_rect;
-                        visible.set_height(visible.height().min(_list.content_size.y));
-                        self.source_viewport = Some(visible);
-                    }
-                } else {
-                    ui.small("No bins match your search.");
-                }
-                ui.small(format!(
-                    "{} bins available · {} selected",
-                    catalog.len(),
-                    if self.wizard.inputs.entire_project {
-                        catalog.len()
-                    } else {
-                        self.wizard.inputs.bins.len()
-                    }
-                ));
-            } else if !self.wizard.inputs.bins.is_empty() {
-                let mut remove = None;
-                let height = ui.available_height() - PROJECT_TAIL_SPACE;
-                source_list(ui, "picked-bins", Some(height), |ui| {
-                    for (i, p) in self.wizard.inputs.bins.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("×").clicked() {
-                                remove = Some(i);
-                            }
-                            ui.add(egui::Label::new(path_name(p)).truncate())
-                                .on_hover_text(p.display().to_string());
-                        });
-                    }
-                });
-                if let Some(i) = remove {
-                    self.wizard.inputs.bins.remove(i);
-                }
-            }
+            self.bin_picker.show(ui, &mut self.wizard.inputs);
 
         });
         ui.add_space(8.);
@@ -1601,198 +1362,6 @@ impl App {
         }
         ui.small("Current effect handling is fixed by the qualified translation. Choices appear only when the engine supports alternatives; all approximations and skips are listed in Review.");
     }
-    fn blocker_card(
-        ui: &mut egui::Ui,
-        issue: &ReviewBlocker,
-        browser: &mut ReportBrowser,
-    ) -> Option<ReviewAction> {
-        use BlockerKind::*;
-        let (title, next, (label, target)) = match issue.kind {
-            ProjectSource => (
-                "Check the Avid source",
-                "Check the selected bins or project folder on Project, then return here to run preflight.",
-                ("Go to Project", ReviewAction::Step(Page::Direction)),
-            ),
-            ProjectOutput => (
-                "Choose a project destination",
-                "Select a new .prproj file in an available folder, then check again.",
-                ("Choose project file…", ReviewAction::Choose(Pick::Output)),
-            ),
-            AvidMedia => (
-                "Check Avid media",
-                "Add or correct the Avid media folders. If there are duplicate copies, select the intended source folders. Then return to Review.",
-                (
-                    "Open media locations",
-                    ReviewAction::Media(MediaJump::Locations),
-                ),
-            ),
-            RewrapMissingMedia => (
-                "Required media is missing",
-                "Locate the source media to rewrap, or switch to Separate files to preserve the edits as offline clips.",
-                ("Locate media", ReviewAction::Media(MediaJump::Locations)),
-            ),
-            RewrapMissingOriginal => (
-                "Required linked original is missing",
-                "Reconnect the original drive or map the saved path to its current folder. You can switch to Separate files to review offline links.",
-                (
-                    "Open saved-path mappings",
-                    ReviewAction::Media(MediaJump::OriginalMappings),
-                ),
-            ),
-            LegacyMxfPackage => (
-                "Check legacy MXF packages",
-                "Use the package IDs and lanes below to check the files in the selected Avid media folders. If several copies claim the same package ID, select only the intended source folders.",
-                (
-                    "Open media locations",
-                    ReviewAction::Media(MediaJump::Locations),
-                ),
-            ),
-            OriginalLocator => (
-                "Locate the linked original",
-                "Reconnect the original drive or map the saved path prefix to its current folder. Then return to Review.",
-                (
-                    "Open saved-path mappings",
-                    ReviewAction::Media(MediaJump::OriginalMappings),
-                ),
-            ),
-            OriginalMedia => (
-                "Linked original could not be used",
-                "Check the file and the reason below. If its format is unsupported, select a bin with compatible originals or prepare compatible media in Avid.",
-                ("Review selected bins", ReviewAction::Step(Page::Direction)),
-            ),
-            NewMedia => (
-                "Choose a new media folder",
-                "Choose a parent folder with room for the new media, then check again.",
-                ("Choose media parent…", ReviewAction::Choose(Pick::NewMedia)),
-            ),
-            ProxyMedia => (
-                "Check the proxy output folder",
-                "Choose an existing folder with space for the rewrapped proxies, or use the existing proxies only.",
-                (
-                    "Choose proxy folder…",
-                    ReviewAction::Choose(Pick::ProxyMedia),
-                ),
-            ),
-            MediaTools => (
-                "Check the media tools",
-                "Review the FFmpeg and ffprobe paths, or reset them to the bundled tools. Then return to Review.",
-                ("Open media tools", ReviewAction::Media(MediaJump::Tools)),
-            ),
-            Effects => (
-                "Check saved effect choices",
-                "Clear saved effect choices to use the supported settings for these bins, then return to Review.",
-                ("Go to Effects", ReviewAction::Step(Page::Effects)),
-            ),
-            Rewrap => (
-                "Media preparation blocked",
-                "Check the reason below. Review the clip mode and new media folder, or change the selected bins if the source is unsupported.",
-                ("Go to Clips & media", ReviewAction::Step(Page::Clips)),
-            ),
-            GroupClipMode => (
-                "Use Separate files for editable Avid Groups",
-                "Switch clip mode, then return to Review to check the Group and its original media.",
-                (
-                    "Switch to Separate files",
-                    ReviewAction::SwitchToSeparate {
-                        enable_offline_media: false,
-                    },
-                ),
-            ),
-            SourceContent => (
-                "Selected content could not be converted",
-                "Check the affected source below. Adjust the source in Avid or narrow the bin selection, then run preflight again.",
-                ("Review selected bins", ReviewAction::Step(Page::Direction)),
-            ),
-            SequenceTiming => (
-                "Sequence timing could not be translated",
-                "In a copy of the Avid sequence, replace the affected edits with media at the sequence frame rate. You can also select bins that do not contain the affected sequence.",
-                ("Review selected bins", ReviewAction::Step(Page::Direction)),
-            ),
-            Retry => (
-                "Run preflight again",
-                "Wait for any changes to finish before checking again.",
-                ("Check again", ReviewAction::Recheck),
-            ),
-        };
-        let mut action = None;
-        Self::card_with_fill(ui, ERROR_SURFACE, |ui| {
-            let description = |ui: &mut egui::Ui| {
-                ui.colored_label(ERROR_INK, RichText::new(title).font(semibold(14.)));
-                ui.small(next);
-            };
-            if recovery_button(ui, label, description) {
-                action = Some(target);
-            }
-            if matches!(issue.kind, RewrapMissingMedia | RewrapMissingOriginal)
-                && ui.button("Switch to Separate files").clicked()
-            {
-                action = Some(ReviewAction::SwitchToSeparate {
-                    enable_offline_media: true,
-                });
-            }
-            let details_label = if issue.affected.is_empty() {
-                "Blocker details".into()
-            } else {
-                format!("Affected details · {}", issue.affected.len())
-            };
-            egui::CollapsingHeader::new(details_label)
-                .id_salt(("blocker-details", title))
-                .show(ui, |ui| {
-                    ui.label(&issue.message);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Copy details").clicked() {
-                            let mut details = vec![issue.message.as_str()];
-                            details.extend(issue.affected.iter().map(String::as_str));
-                            ui.ctx().copy_text(details.join("\n"));
-                        }
-                        if ui.button("Save preflight report").clicked() {
-                            action = Some(ReviewAction::Choose(Pick::SavePreflightReport));
-                        }
-                    });
-                    Self::blocker_details(ui, &issue.affected, &issue.timeline_groups, browser);
-                });
-        });
-        action
-    }
-    fn blocker_details(
-        ui: &mut egui::Ui,
-        details: &[String],
-        timelines: &[job::ReviewGroup],
-        browser: &mut ReportBrowser,
-    ) {
-        if details.len() <= 8 && timelines.is_empty() {
-            for detail in details {
-                ui.label(detail);
-            }
-            return;
-        }
-        let changed = ui.horizontal_wrapped(|ui| {
-            let changed = Self::report_group_filter(ui, timelines, &mut browser.timeline,
-                "report-timeline", "All timelines");
-            ui.add(
-                egui::TextEdit::singleline(&mut browser.search)
-                    .hint_text("Search affected details")
-                    .desired_width(220.),
-            ).changed() || changed
-        }).inner;
-        if changed {
-            browser.refilter_details(details, timelines);
-        }
-        if browser.count(details.len()) == 0 {
-            ui.label("No affected details match your search.");
-            return;
-        }
-        let page_changed = Self::report_pages(ui, browser, details.len(), "Details");
-        let mut rows = egui::ScrollArea::vertical().id_salt("blocker-details").max_height(260.);
-        if changed || page_changed {
-            rows = rows.vertical_scroll_offset(0.);
-        }
-        rows.show(ui, |ui| {
-            for index in browser.page_indices(details.len()) {
-                ui.label(&details[index]);
-            }
-        });
-    }
     fn take_review_action(&mut self, action: ReviewAction, ctx: &egui::Context) {
         match action {
             ReviewAction::Step(page) => self.wizard.page = page,
@@ -1810,6 +1379,12 @@ impl App {
                 self.wizard.page = Page::Clips;
             }
             ReviewAction::Recheck => self.prepare(ctx),
+            ReviewAction::ClearRewrap => {
+                self.wizard.inputs.rewrap_needed = None;
+                self.invalidate();
+            }
+            #[cfg(target_os = "macos")]
+            ReviewAction::ShowError(error) => self.error = Some(error),
         }
     }
     fn review(&mut self, ui: &mut egui::Ui) {
@@ -1820,409 +1395,34 @@ impl App {
         if self.busy && matches!(self.task.as_str(), CONVERTING | SAVING_PREFLIGHT) {
             return;
         }
-        let width = ui.available_width();
-        if width >= 600. {
-            let output_width = 196.;
-            ui.horizontal_top(|ui| {
-                let findings_width = width - output_width - ui.spacing().item_spacing.x;
-                column(ui, findings_width, |ui| self.review_findings(ui));
-                column(ui, output_width, |ui| self.review_output(ui));
-            });
-        } else {
-            self.review_findings(ui);
-            ui.add_space(10.);
-            self.review_output(ui);
-        }
-    }
-    fn review_output(&mut self, ui: &mut egui::Ui) {
-        let i = &self.wizard.inputs;
-        let choices = &self.wizard.choices;
-        let rewrap = choices.mode == ClipMode::Rewrap;
-        let review = self.prepared.as_ref().map(PreparedJob::review);
-        let creates_media = review.is_some_and(|review| review.estimated_bytes.is_some());
-        Self::card(ui, |ui| {
-            ui.strong("Output");
-            if i.output.as_os_str().is_empty() {
-                ui.label(RichText::new("Choose a project file on the Project step.").color(MUTED));
-            } else {
-                review_path(ui, "Premiere project", &i.output);
-            }
-            ui.small("Clips");
-            ui.label(choices.mode.label());
-            ui.small("Source");
-            ui.label(if i.entire_project {
-                "Entire project".into()
-            } else {
-                counted(i.bins.len(), "bin", "bins")
-            });
-            if !rewrap {
-                ui.label(if choices.uses_camera_originals() {
-                    "Primary media · Prefer camera originals for picture"
-                } else {
-                    "Primary media · Use the media in the Avid edit"
-                });
-                if choices.attaches_avid_proxies() {
-                    ui.label(if i.proxy_rewrap_dir.is_some() {
-                        "Proxies · Attach matching Avid media and allow stereo rewrap"
-                    } else {
-                        "Proxies · Link matching Avid media in place"
-                    });
+        review::layout(ui, |ui, panel| match panel {
+            review::Panel::Findings => {
+                let media_ready = self.media_linking_ready();
+                let findings = review::Findings {
+                    busy: self.busy,
+                    choices: &self.wizard.choices,
+                    issue: self.review_blocker.as_ref(),
+                    prepared: self.prepared.as_ref().map(PreparedJob::review),
+                    media_ready,
+                    browser: &mut self.report,
+                    why: &mut self.why,
+                    rewrap_size: &mut self.rewrap_size,
+                    #[cfg(target_os = "macos")]
+                    premiere_status: &self.premiere_status,
+                };
+                // Apply recovery before drawing the output summary with the current inputs.
+                for action in findings.show(ui) {
+                    self.take_review_action(action, ui.ctx());
                 }
             }
-            if creates_media {
-                ui.colored_label(AMBER, RichText::new("Creates new media.").strong());
-                if let Some(path) = if rewrap { i.new_media.as_ref() } else {
-                    i.rewrap_needed.as_ref().or(i.proxy_rewrap_dir.as_ref())
-                } {
-                    review_path(ui, "Media folder", path);
-                }
-            } else if rewrap && review.is_none() {
-                ui.label(RichText::new("A new media folder is needed for native OP-Atom rewraps.").color(MUTED));
-                if let Some(path) = &i.new_media {
-                    review_path(ui, "Media folder", path);
-                }
-            }
-            if let Some(review) = review {
-                self.rewrap_size.show(ui, &review.rewrap_sources);
-            }
+            review::Panel::Output => review::output(
+                ui,
+                &self.wizard.inputs,
+                &self.wizard.choices,
+                self.prepared.as_ref().map(PreparedJob::review),
+                &mut self.rewrap_size,
+            ),
         });
-    }
-    fn review_findings(&mut self, ui: &mut egui::Ui) {
-        let blocked = self.review_blocker.is_some();
-        if let Some(issue) = &self.review_blocker {
-            if let Some(action) = Self::blocker_card(ui, issue, &mut self.report) {
-                self.take_review_action(action, ui.ctx());
-                return;
-            }
-            self.rewrap_size.show(ui, &issue.rewrap_sources);
-        }
-        let media_ready = self.media_linking_ready();
-        let choices = &self.wizard.choices;
-        let review = self.prepared.as_ref().map(PreparedJob::review);
-        let creates_media = review.is_some_and(|review| review.estimated_bytes.is_some());
-
-        let mut save_report = false;
-        let mut choose_rewrap = false;
-        let mut clear_rewrap = false;
-        if !blocked {
-            ui.vertical(|ui| {
-                if let Some(review) = review {
-                    let inv = &review.inventory;
-                    let changes = self.report.changes;
-                    let (status, color) = if !media_ready {
-                        ("Waiting for Premiere", AMBER)
-                    } else if changes == 0 {
-                        ("Ready to convert", GOOD)
-                    } else {
-                        ("Ready to convert with changes", AMBER)
-                    };
-                    ui.colored_label(color, RichText::new(status).strong());
-                    ui.label(format!(
-                        "{} checked · {} of {} found{}",
-                        counted(inv.bins.len(), "bin", "bins"),
-                        inv.found_media,
-                        counted(inv.total_media, "media file", "media files"),
-                        if inv.ume_originals == 0 {
-                            String::new()
-                        } else {
-                            format!(" · {}", counted(inv.ume_originals, "qualified original", "qualified originals"))
-                        }
-                    ));
-                    if inv.ume_originals > 0 && inv.native_media == 0 {
-                        ui.label("Links to available originals in place.");
-                    }
-                    if let Some(media) = &review.media_linking {
-                        ui.add_space(6.);
-                        ui.strong("Media linking");
-                        if !media.rewrap_available.is_empty() {
-                            ui.colored_label(AMBER, format!("Rewrap available for {} managed clips.", media.rewrap_available.len()));
-                            ui.collapsing("Affected clips", |ui| {
-                                for clip in &media.rewrap_available { ui.label(clip); }
-                            });
-                            choose_rewrap = ui.button("Choose folder to rewrap affected clips…").clicked();
-                        }
-                        if !media.rewrapped_clips.is_empty() {
-                            ui.label(format!("{} managed clips will be rewrapped.", media.rewrapped_clips.len()));
-                            clear_rewrap = ui.button("Continue without rewrapping").clicked();
-                        }
-                        if !media.conversion_pending.is_empty() {
-                            ui.colored_label(AMBER, format!("Conversion pending for {} recognized clips.", media.conversion_pending.len()));
-                            ui.collapsing("Show clips with pending conversion", |ui| {
-                                for clip in &media.conversion_pending { ui.label(clip); }
-                            });
-                        }
-                        if media.premiere_files.is_empty() {
-                            ui.label(format!("{} link directly in place.",
-                                counted(media.direct_files, "verified file", "verified files")));
-                        } else {
-                            #[cfg(target_os = "macos")]
-                            if let Err(error) = self.premiere_status.show(ui) {
-                                self.error = Some(error);
-                            }
-                            egui::CollapsingHeader::new("Files that need Premiere").show(ui, |ui| {
-                                for path in &media.premiere_files {
-                                    review_path(ui, "Original", Path::new(path));
-                                }
-                            });
-                        }
-                    }
-                    if creates_media {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Space reserved for preparation").color(MUTED));
-                            ui.strong(bytes(review.estimated_bytes));
-                            ui.label(RichText::new("· Available").color(MUTED));
-                            ui.label(bytes(review.available_bytes));
-                        });
-                    }
-                    if choices.uses_camera_originals() {
-                        if review.camera_originals.is_empty() {
-                            ui.label("No camera-original matches. Using the media in the Avid edits.");
-                        } else {
-                            let count = review.camera_originals.len();
-                            egui::CollapsingHeader::new(format!("Camera-original matches · {count}")).show(ui, |ui| {
-                                for link in &review.camera_originals {
-                                    ui.strong(&link.name);
-                                    review_path(ui, "Picture", &link.picture);
-                                    if !link.audio_channels.is_empty() {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.small("Audio from camera file");
-                                            for (track, channel) in &link.audio_channels {
-                                                ui.small(format!("· A{track}"));
-                                                ui.add(crate::icons::arrow(ui, 11., "to"));
-                                                ui.small(format!("channel {channel}"));
-                                            }
-                                        });
-                                    }
-                                    if let Some(proxy) = &link.proxy {
-                                        review_path(ui, "Proxy", proxy);
-                                    }
-                                    ui.add_space(5.);
-                                }
-                            });
-                        }
-                    }
-                    if changes > 0 {
-                        ui.add_space(7.);
-                        ui.colored_label(AMBER, RichText::new(
-                            counted(changes, "translation change", "translation changes")
-                        ).strong());
-                        egui::CollapsingHeader::new("Affected edits")
-                            .id_salt("preflight-affected-edits")
-                            .show(ui, |ui| {
-                                for &index in &self.report.change_examples {
-                                    let note = &review.notes[index];
-                                    if let Some(name) = review.subjects.get(&note.object) {
-                                        ui.strong(name);
-                                    }
-                                    ui.label(&note.message);
-                                }
-                            });
-                    }
-                    if self.report.warnings > 0 {
-                        ui.colored_label(AMBER, counted(self.report.warnings, "warning", "warnings"));
-                    }
-                    let label = format!("Full preflight report · {}", counted(review.notes.len(), "note", "notes"));
-                    egui::CollapsingHeader::new(label)
-                        .id_salt("preflight-report")
-                        .show(ui, |ui| {
-                            Self::report(ui, &review.notes, Some(&review.subjects),
-                                &review.timeline_groups, &review.source_groups, &mut self.report, &mut self.why);
-                            if !inv.notes.is_empty() {
-                                egui::CollapsingHeader::new(format!("Inventory notes · {}", inv.notes.len()))
-                                    .show(ui, |ui| {
-                                        egui::ScrollArea::vertical().max_height(180.).show(ui, |ui| {
-                                            for note in &inv.notes {
-                                                ui.label(RichText::new(note).color(MUTED));
-                                            }
-                                        });
-                                    });
-                            }
-                        });
-                    save_report = ui
-                        .add_enabled(!self.busy, egui::Button::new("Save preflight report"))
-                        .clicked();
-                } else {
-                    ui.strong(if self.busy { "Preflight in progress" } else { "Preflight" });
-                    ui.label(RichText::new("Checks media, translation limits and disk space before creating any output.").color(MUTED));
-                }
-            });
-        }
-
-        egui::CollapsingHeader::new("Conversion settings").show(ui, |ui| {
-            let p = AvidToPremiere::from_json_text(&choices.policy_json).unwrap_or_default();
-            ui.label(format!(
-                "Dependencies {} · Trash / Attic {}",
-                on_off(choices.include_dependencies),
-                on_off(choices.include_trash_attic),
-            ));
-            ui.label(format!(
-                "Marker priority: {} · move losing marker to sequence {} · Avid info {} · default pan {}",
-                if p.source_marker_wins { "source" } else { "edit" },
-                on_off(p.conflict_loser_to_sequence),
-                on_off(p.marker_avid_info),
-                on_off(p.match_avid_default_pan)
-            ));
-        });
-        if let Some(review) = review {
-            egui::CollapsingHeader::new("Command-line replay").show(ui, |ui| {
-                if review.cli_equivalent.is_empty() {
-                    ui.label("Use Save job settings and run any-nle run --job SETTINGS.json.");
-                } else {
-                    let mut command = review.cli_equivalent.as_str();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut command)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_rows(3),
-                    );
-                    if ui.button("Copy CLI command").clicked() {
-                        ui.ctx().copy_text(review.cli_equivalent.clone());
-                    }
-                }
-            });
-        }
-        if choose_rewrap {
-            self.pick(Pick::RewrapNeeded, ui.ctx());
-        }
-        if clear_rewrap {
-            self.wizard.inputs.rewrap_needed = None;
-            self.invalidate();
-        }
-        if save_report {
-            self.pick(Pick::SavePreflightReport, ui.ctx());
-        }
-    }
-    fn report_group_filter(
-        ui: &mut egui::Ui,
-        groups: &[job::ReviewGroup],
-        selection: &mut Option<usize>,
-        id: &str,
-        all: &str,
-    ) -> bool {
-        if groups.is_empty() {
-            return false;
-        }
-        let label = |group: &job::ReviewGroup| match &group.bin {
-            Some(bin) => format!("{} · {}", group.name, bin.display()),
-            None => group.name.clone(),
-        };
-        let selected = selection.and_then(|index| groups.get(index))
-            .map_or_else(|| all.to_owned(), label);
-        let mut changed = false;
-        egui::ComboBox::from_id_salt(id)
-            .selected_text(selected)
-            .wrap_mode(egui::TextWrapMode::Truncate)
-            .height(240.)
-            .show_ui(ui, |ui| {
-                changed |= ui.selectable_value(selection, None, all).changed();
-                for (index, group) in groups.iter().enumerate() {
-                    changed |= ui.selectable_value(selection, Some(index), label(group))
-                        .on_hover_text(&group.id)
-                        .changed();
-                }
-            });
-        changed
-    }
-    fn report(
-        ui: &mut egui::Ui,
-        notes: &[job::ReportNote],
-        subjects: Option<&HashMap<String, String>>,
-        timelines: &[job::ReviewGroup],
-        sources: &[job::ReviewGroup],
-        browser: &mut ReportBrowser,
-        why: &mut Option<String>,
-    ) {
-        let changed = ui.horizontal_wrapped(|ui| {
-            let filters = [
-                (Filter::All, format!("All · {}", notes.len())),
-                (Filter::Changes, format!("Changes · {}", browser.changes)),
-                (Filter::Warnings, format!("Warnings · {}", browser.warnings)),
-            ];
-            let mut changed = false;
-            for (filter, label) in filters {
-                changed |= ui.selectable_value(&mut browser.filter, filter, label).changed();
-            }
-            changed |= Self::report_group_filter(ui, timelines, &mut browser.timeline,
-                "report-timeline", "All timelines");
-            changed |= Self::report_group_filter(ui, sources, &mut browser.source_clip,
-                "report-source-clip", "All source clips");
-            let search_changed = ui.add(
-                egui::TextEdit::singleline(&mut browser.search)
-                    .hint_text("Search report")
-                    .desired_width(180.),
-            ).changed();
-            changed || search_changed
-        }).inner;
-        if changed {
-            browser.refilter(notes, subjects, timelines, sources);
-        }
-        let count = browser.count(notes.len());
-        if count == 0 {
-            ui.label(if notes.is_empty() {
-                "No translation notes reported."
-            } else {
-                "No notes match these filters."
-            });
-            return;
-        }
-        let page_changed = Self::report_pages(ui, browser, notes.len(), "Notes");
-        let mut rows = egui::ScrollArea::vertical().id_salt("report-rows").max_height(360.);
-        if changed || page_changed {
-            rows = rows.vertical_scroll_offset(0.);
-        }
-        rows.show(ui, |ui| {
-            for index in browser.page_indices(notes.len()) {
-                let n = &notes[index];
-                let subject = subjects.and_then(|names| names.get(&n.object)).map(String::as_str);
-                Self::card(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(&n.severity).small().color(
-                            match n.severity.to_lowercase().as_str() {
-                                "error" | "failure" => Color32::LIGHT_RED,
-                                "loss" | "warning" => AMBER,
-                                _ => MUTED,
-                            },
-                        ));
-                        ui.strong(subject.unwrap_or(&n.object)).on_hover_text(&n.object);
-                        if ui.link("Why?").clicked() {
-                            *why = Some(if n.why.is_empty() {
-                                n.message.clone()
-                            } else {
-                                n.why.clone()
-                            });
-                        }
-                    });
-                    ui.label(&n.message);
-                });
-            }
-        });
-    }
-    fn report_pages(
-        ui: &mut egui::Ui,
-        browser: &mut ReportBrowser,
-        total: usize,
-        label: &str,
-    ) -> bool {
-        let previous_page = browser.page;
-        let count = browser.count(total);
-        let page_count = count.div_ceil(PAGE_SIZE);
-        ui.horizontal_wrapped(|ui| {
-            if page_count > 1 {
-                if ui.add_enabled(browser.page > 0, egui::Button::new("Previous")).clicked() {
-                    browser.page -= 1;
-                }
-                let mut page_number = browser.page + 1;
-                ui.label("Page");
-                ui.add(egui::DragValue::new(&mut page_number).range(1..=page_count));
-                browser.page = page_number - 1;
-                ui.label(format!("of {page_count}"));
-                if ui.add_enabled(browser.page + 1 < page_count, egui::Button::new("Next")).clicked() {
-                    browser.page += 1;
-                }
-            }
-            let range = browser.page_range(total);
-            ui.small(format!("{label} {}–{} of {count}", range.start + 1, range.end));
-        });
-        browser.page != previous_page
     }
     fn finish(&mut self, ui: &mut egui::Ui) {
         let Some(c) = self.completion.as_ref() else {
@@ -2299,7 +1499,7 @@ impl App {
             "Conversion report · {}",
             counted(c.report.len(), "note", "notes")
         ))
-        .show(ui, |ui| Self::report(ui, &c.report, Some(&self.completion_subjects), &[], &[],
+        .show(ui, |ui| review::report(ui, &c.report, Some(&self.completion_subjects), &[], &[],
             &mut self.report, &mut self.why));
         if ui.button("Convert another project").clicked() {
             self.invalidate();
@@ -2636,38 +1836,6 @@ impl eframe::App for App {
         self.relink.show(&ctx, self.ffmpeg.as_deref(), self.ffprobe.as_deref());
     }
 }
-fn column(ui: &mut egui::Ui, width: f32, content: impl FnOnce(&mut egui::Ui)) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 0.),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            ui.set_width(width);
-            content(ui);
-        },
-    );
-}
-
-fn recovery_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    description: impl FnOnce(&mut egui::Ui),
-) -> bool {
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let text_width = ui.fonts_mut(|fonts| fonts.layout_no_wrap(label.into(), font, INK).size().x);
-    let button_width = text_width + 2. * ui.spacing().button_padding.x + 2.;
-    let body_width = ui.available_width() - button_width - ui.spacing().item_spacing.x;
-    if body_width >= 160. {
-        ui.horizontal_top(|ui| {
-            column(ui, body_width, description);
-            ui.button(label).clicked()
-        })
-        .inner
-    } else {
-        description(ui);
-        ui.button(label).clicked()
-    }
-}
-
 pub(crate) fn source_list<R>(
     ui: &mut egui::Ui,
     id: impl egui::AsIdSalt,
@@ -2747,21 +1915,6 @@ fn path_list(ui: &mut egui::Ui, label: &str, paths: &mut Vec<PathBuf>) {
     }
     if let Some(i) = remove {
         paths.remove(i);
-    }
-}
-fn bytes(value: Option<u64>) -> String {
-    match value {
-        None => "not available".into(),
-        Some(v) if v >= 1_073_741_824 => format!("{:.1} GiB", v as f64 / 1_073_741_824.),
-        Some(v) if v >= 1_048_576 => format!("{:.1} MiB", v as f64 / 1_048_576.),
-        Some(v) => format!("{v} bytes"),
-    }
-}
-fn on_off(b: bool) -> &'static str {
-    if b {
-        "on"
-    } else {
-        "off"
     }
 }
 fn new_media_name() -> String {
@@ -2957,7 +2110,7 @@ pub(crate) mod report_view_tests {
             let ctx = egui::Context::default();
             let mut browser = ReportBrowser::default();
             let mut initial = ctx.run_ui(egui::RawInput::default(), |ui| {
-                App::blocker_card(ui, &issue, &mut browser);
+                review::blocker_card(ui, &issue, &mut browser);
             });
             initial.textures_delta.clear();
             let can_switch = initial.shapes.iter().any(|shape| {
@@ -2976,7 +2129,7 @@ pub(crate) mod report_view_tests {
             )), "{kind:?}");
             let mut selected = None;
             let mut output = ctx.run_ui(click(button_center), |ui| {
-                selected = App::blocker_card(ui, &issue, &mut browser);
+                selected = review::blocker_card(ui, &issue, &mut browser);
             });
             output.textures_delta.clear();
             assert!(matches!(selected, Some(ReviewAction::Media(jump)) if jump == expected), "{kind:?}");
@@ -2984,111 +2137,43 @@ pub(crate) mod report_view_tests {
     }
 
     #[test]
-    fn source_bin_tree_indents_and_selects_duplicate_names_by_path() {
-        let relative = ["Editorial/Sequences/Selects.avb", "Sound/Selects.avb"];
-        let catalog: Vec<_> = relative
-                .iter()
-                .map(|path| BinPath {
-                    path: Path::new("project").join(path),
-                    relative: path.into(),
-                })
-                .collect();
-        let ctx = egui::Context::default();
-        App::theme(&ctx);
-        let tree = Tree::build(&catalog);
-        let mut expansion = FolderExpansion::default();
-        let mut render = |raw, paths: &mut Vec<PathBuf>| {
-            let mut frame = ctx.run_ui(raw, |ui| {
-                let mut selected = BinSelection::new(paths);
-                source_list(ui, "test-tree", None, |ui| {
-                    tree.show(ui, &catalog, &mut selected, None, false, &mut expansion);
-                });
-            });
-            frame.textures_delta.clear();
-            frame
+    fn report_recovery_ignores_stale_and_cancelled_preflight_results() {
+        let context = egui::Context::default();
+        let mut app = App::session(&context);
+        let revision = app.wizard.revision();
+        app.wizard.page = Page::Review;
+        app.wizard.inputs.bins.push("Source.avb".into());
+        app.wizard.inputs.output = "Converted.prproj".into();
+        let issue = || ReviewBlocker::new(BlockerKind::RewrapMissingMedia, "Media is missing.");
+        app.review_blocker = Some(issue());
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut draw = |app: &mut App, mut input: egui::RawInput| {
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO, egui::vec2(880., 620.),
+            ));
+            let mut output = context.run_ui(input, |ui| eframe::App::ui(app, ui, &mut frame));
+            output.textures_delta.clear();
+            output
         };
-        let mut bins = vec![];
-        let first = render(egui::RawInput::default(), &mut bins);
-        let editorial = text_center(&first, "Editorial").unwrap();
-        let duplicate_labels: Vec<_> = first
-            .shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::Text(shape) if shape.galley.job.text == "Selects.avb" => {
-                    Some(shape.pos + shape.galley.rect.center().to_vec2())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(duplicate_labels.len(), 2);
-        assert!(duplicate_labels[0].x > duplicate_labels[1].x);
-        render(click(duplicate_labels[1]), &mut bins);
-        assert_eq!(bins, [catalog[1].path.clone()]);
-        render(click(editorial), &mut bins);
-        assert_eq!(
-            bins,
-            [
-                catalog[1].path.clone(),
-                catalog[0].path.clone()
-            ]
-        );
-        render(click(editorial), &mut bins);
-        assert_eq!(bins, [catalog[1].path.clone()]);
-    }
+        let output = draw(&mut app, egui::RawInput::default());
+        let switch = text_center(&output, "Switch to Separate files").unwrap();
+        draw(&mut app, click(switch));
+        assert_eq!(app.wizard.page, Page::Clips);
+        assert_eq!(app.wizard.choices.mode, ClipMode::Separate);
+        assert!(app.wizard.choices.allow_offline_media);
+        assert!(app.wizard.revision() > revision);
+        assert!(app.review_blocker.is_none());
 
-    #[test]
-    fn large_bin_tree_preserves_space_and_can_scroll_filtered_results() {
-        let catalog: Vec<_> = (0..40)
-                .map(|i| {
-                    let relative = PathBuf::from(format!("Editorial/Reels/Bin {i:02}.avb"));
-                    BinPath {
-                        path: Path::new("project").join(&relative),
-                        relative,
-                    }
-                })
-                .collect();
-        let ctx = egui::Context::default();
-        App::theme(&ctx);
-        let tree = Tree::build(&catalog);
-        let mut bins = vec![];
-        let mut layout = None;
-        let mut expansion = FolderExpansion::default();
-        let matching = [true; 40];
-        let mut draw = |input, matches| {
-            let mut frame = ctx.run_ui(input, |ui| {
-                let mut selected = BinSelection::new(&mut bins);
-                layout = Some(source_list(ui, "test-scroll-tree", None, |ui| {
-                    tree.show(ui, &catalog, &mut selected, matches, false, &mut expansion);
-                }));
-            });
-            frame.textures_delta.clear();
-            (frame, layout.take().unwrap())
-        };
-        let (folded, short) = draw(egui::RawInput::default(), None);
-        assert!(text_center(&folded, "Editorial").is_some());
-        assert!(text_center(&folded, "Bin 00.avb").is_none());
-        assert!(short.content_size.y <= short.inner_rect.height());
-        let (expanded, long) = draw(egui::RawInput::default(), Some(matching.as_slice()));
-        assert!(text_center(&expanded, "Bin 00.avb").is_some());
-        assert!(long.inner_rect.height() <= SOURCE_LIST_HEIGHT);
-        assert!(long.content_size.y > SOURCE_LIST_HEIGHT);
-        let (_, scrolled) = draw(
-            egui::RawInput {
-                events: vec![
-                    egui::Event::PointerMoved(long.inner_rect.center()),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0., -100.),
-                        phase: egui::TouchPhase::Move,
-                        source: egui::MouseWheelSource::Unknown,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-                ..Default::default()
-            },
-            Some(matching.as_slice()),
+        app.receive_events(&context, Some(Event::Prepared(revision, Err(issue()))));
+        assert!(app.review_blocker.is_none());
+        assert_eq!(app.notice.as_deref(), Some("Settings changed; check again before converting."));
+        app.cancel.cancel();
+        app.receive_events(
+            &context, Some(Event::Prepared(app.wizard.revision(), Err(issue()))),
         );
-        assert!(scrolled.state.clamped_offset().y > 0.);
+        assert!(app.review_blocker.is_none());
+        assert!(!app.wizard.can_convert());
+        assert_eq!(app.notice.as_deref(), Some("Cancelled; no project was published."));
     }
 
     #[test]
@@ -3138,7 +2223,7 @@ pub(crate) mod report_view_tests {
         let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), None);
         app.wizard = Wizard::default();
         app.wizard.inputs.project_folder = Some("project".into());
-        app.catalog = Some((0..40).map(|i| {
+        app.bin_picker.set_catalog((0..40).map(|i| {
             let relative = PathBuf::from(format!("Reels {i:02}/Source.avb"));
             BinPath { path: Path::new("project").join(&relative), relative }
         }).collect());
@@ -3202,7 +2287,7 @@ pub(crate) mod report_view_tests {
         let mut browser = ReportBrowser::default();
         let mut frame = |raw| {
             let mut output = ctx.run_ui(raw, |ui| {
-                App::blocker_card(ui, &issue, &mut browser);
+                review::blocker_card(ui, &issue, &mut browser);
             });
             output.textures_delta.clear();
             output
@@ -3254,7 +2339,7 @@ pub(crate) mod report_view_tests {
         ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.);
         let mut frame = |input| {
             let mut output = ctx.run_ui(input, |ui| {
-                App::blocker_card(ui, &issue, &mut browser);
+                review::blocker_card(ui, &issue, &mut browser);
             });
             output.textures_delta.clear();
             output
@@ -3293,7 +2378,7 @@ pub(crate) mod report_view_tests {
         ] {
             report.page = page;
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                App::report(ui, &notes, None, &[], &[], &mut report, &mut why);
+                review::report(ui, &notes, None, &[], &[], &mut report, &mut why);
             });
             output.textures_delta.clear();
             let shown = |text| output.shapes.iter().any(|shape| {
@@ -3329,7 +2414,7 @@ pub(crate) mod report_view_tests {
         ctx.style_mut_of(egui::Theme::Light, |style| style.animation_time = 0.);
         let mut frame = |input| {
             let mut output = ctx.run_ui(input, |ui| {
-                App::report(ui, &notes, None, &timelines, &sources, &mut browser, &mut why);
+                review::report(ui, &notes, None, &timelines, &sources, &mut browser, &mut why);
             });
             output.textures_delta.clear();
             output

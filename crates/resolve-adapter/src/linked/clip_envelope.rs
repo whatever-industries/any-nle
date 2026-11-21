@@ -1,5 +1,5 @@
 //! Prepare clip gain, volume keys and fades for linked Resolve timelines.
-use super::Profile;
+use super::{Profile, SidecarLookup};
 use crate::{
     audio::{self, Envelope, Fades},
     Result,
@@ -11,7 +11,7 @@ use graph::{
 use std::collections::{HashMap, HashSet};
 
 pub(super) struct ClipEnvelopePreparation<'a> {
-    graph: &'a SourceGraph,
+    sidecars: SidecarLookup<'a>,
     rate: Rational,
     premiere_clock: bool,
     has_a1_crossfade: bool,
@@ -25,9 +25,10 @@ impl<'a> ClipEnvelopePreparation<'a> {
         graph: &'a SourceGraph,
         sequence: &SourceSequence,
         has_a1_crossfade: bool,
+        sidecars: SidecarLookup<'a>,
     ) -> Self {
         Self {
-            graph,
+            sidecars,
             rate: sequence.rate,
             premiere_clock: sequence
                 .clock
@@ -52,7 +53,7 @@ impl<'a> ClipEnvelopePreparation<'a> {
         lane: usize,
         profile: &Profile,
     ) -> Result<Option<&'a Value>> {
-        let fades = self.graph.sidecar(audio::PREMIERE_FADE_ADAPTER, &edit.id);
+        let fades = self.sidecars.get(audio::PREMIERE_FADE_ADAPTER, &edit.id);
         if fades.is_some()
             && (!matches!(lane, 1 | 2)
                 || !matches!(profile, Profile::Wav { .. })
@@ -78,13 +79,13 @@ impl<'a> ClipEnvelopePreparation<'a> {
             return Ok(None);
         }
         if self
-            .graph
-            .sidecar(audio::UNQUALIFIED_FADE_ADAPTER, &edit.id)
+            .sidecars
+            .get(audio::UNQUALIFIED_FADE_ADAPTER, &edit.id)
             .is_some()
         {
             return Err(format!("{}: unqualified Resolve clip fade points", edit.id).into());
         }
-        let receipt = self.graph.sidecar(crate::source::ADAPTER, &edit.id);
+        let receipt = self.sidecars.get(crate::source::ADAPTER, &edit.id);
         if (receipt.is_some() || edit.volume_db.is_some() || !edit.volume_keys.is_empty())
             && !matches!(profile, Profile::Wav { .. })
         {

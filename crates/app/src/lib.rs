@@ -10,6 +10,10 @@ mod output;
 mod premiere_preparation;
 #[doc(hidden)]
 pub mod premiere_import;
+#[doc(hidden)]
+pub mod avid_processing;
+#[doc(hidden)]
+pub mod avid_media;
 mod source_luts;
 mod premiere_route;
 mod rewrap;

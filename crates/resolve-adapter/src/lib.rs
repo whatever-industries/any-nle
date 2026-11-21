@@ -41,7 +41,12 @@ pub use media::{
     verify_binding, verify_group_binding, BindingSpec, StreamSelector, VerifiedBinding,
 };
 pub use prepare::{prepare, PreparedResolve};
-pub use premiere::{MediaLinkReview, list_premiere_sequences, prepare_premiere_project, prepare_premiere_turnover, read_premiere_media_graph};
+pub use premiere::{MediaLinkReview, list_premiere_sequences, prepare_premiere_project, prepare_premiere_turnover, read_premiere_avid_graph, read_premiere_media_graph};
+pub fn read_resolve_avid_graph(
+    path: &std::path::Path, sequence: &str, ffprobe: &std::path::Path,
+) -> Result<graph::source::SourceGraph> {
+    premiere_export::read_resolve_avid_graph(path, sequence, ffprobe)
+}
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const RATE: f64 = 24000.0 / 1001.0;

@@ -310,6 +310,8 @@ fn extend_effect_issue<'a>(
         }
         if let Some(range) = av::SourceColorRange::from_saved_xml(&adapter.transform) {
             facts.push(("linear_range", super::color_range_receipt(range)));
+        } else if let Some(cdl) = av::SourceClampedCdl::from_saved_xml(&adapter.transform) {
+            facts.push(super::clamped_cdl_receipt(cdl));
         }
         if let Some(stack) = av::SourceColorStack::from_saved_xml(&adapter.transform) {
             let range = obj(vec![
@@ -859,6 +861,9 @@ pub(super) fn append(
         }
         if let Some(adapter) = &issue.color_adapter {
             budget.charge(1024 + adapter.transform.len())?;
+            if av::SourceClampedCdl::from_saved_xml(&adapter.transform).is_some() {
+                budget.charge(1024)?;
+            }
             if let Observed::Unresolved(reason) = &adapter.picture_file {
                 budget.charge(reason.len())?;
             }

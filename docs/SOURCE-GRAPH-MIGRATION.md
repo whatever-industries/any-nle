@@ -340,6 +340,18 @@ cube, then composes the edit's two steps into one clip Color Mode LUT
 without changing their order in graph/2.
 [Composition and render checks](PREMIERE-27-COLOR-MODE.md#ordered-avid-color-adapters)
 
+The `affine_cdl` and `clamped_cdl` receipts describe a standalone saved
+10-bit `ColorDecision` with clamping enabled and unit saturation.
+They carry per-channel slope, offset and power. `affine_cdl` has unit
+power and `clamped_cdl` has an explicit non-unity power on at least
+one channel. A saved scalar Power applies to all three channels.
+The receipt accompanies the original XML on the saved file-package
+record and the timeline occurrence. Avid's
+`ASC_SOP` and `ASC_SAT` bin columns are logging metadata. Color Adapter
+application requires the saved transform. Avid Processing can use the
+same source interpretation to build the opt-in editable RGB Curves
+trial. [Avid Processing scope](ROADMAP.md#timeline-and-effects)
+
 Premiere's Separate files preparation can translate video-to-full scaling on a
 plain 1080p24 picture edit of the qualified picture-only ProRes HQ original
 with an editable ASC CDL. It uses per-channel slope (1023/876) and
@@ -1256,6 +1268,37 @@ opaque. The app releases the typed writer model before media execution. LUTs ret
 validated recipes and expected hashes rather than duplicate full external payloads;
 publication regenerates and verifies them without drawing UUIDs or rebuilding the
 document.
+
+### Saved graph loading and Resolve preparation
+
+Resolve linked preparation builds a borrowed sidecar index after graph
+validation. Lookups by adapter and object ID reuse that index in the edit
+loop. The text decoder moves the parsed sidecar payloads into the graph.
+Both decoder entry points share the same shape checks and validation.
+Source types, validation, reading, and bounded writing have separate
+modules within graph/2.
+
+On macOS arm64, Rust 1.100.0 and FFmpeg 8.1, five paired release runs
+measured the following medians. Parentheses show the observed ranges.
+
+| Measurement | Baseline | Final |
+| --- | ---: | ---: |
+| Resolve preparation, 32 timelines × 512 edits | 3.47 s (3.44–3.54) | 0.62 s (0.62–0.64) |
+| Peak RSS loading the 64 MiB sidecar-heavy graph | 197.9 MiB (197.9–198.0) | 133.6 MiB (133.5–133.7) |
+| DRP writing and staged read-back, four timelines × 128 edits | 342 ms (337–346) | 346 ms (344–376) |
+
+Both optimizations passed their performance gates in isolation. The
+final build repeated the gains and stayed within the small fixture's
+runtime and memory tolerances. At the time of this benchmark, the
+32-timeline stress case hit the 8 MiB archive XML budget after
+preparation, so the write measurement uses the smaller fixture.
+The full case later passed [linked archive qualification](RESOLVE-PROJECT-CORE.md#archive-validation-and-limits).
+
+Graph re-encoding matched byte for byte through both decoder entry
+points. The retained selection, editable multicam, and fractional
+clip-edge fade replays produced matching DRP XML and decoded fields
+after mapping generated IDs. The replay also kept the same refusal
+messages for invalid graph inputs and fade ownership or length.
 
 ## Publication and failures
 

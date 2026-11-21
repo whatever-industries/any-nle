@@ -40,8 +40,8 @@ Detailed checklists cover [media choices by route](#media-relinking-and-proxies-
 ## Next work
 
 1. **Improve Avid → Premiere media Review.** Extend occurrence details
-   to earlier media blocking stages and carry verified source geometry
-   into the anamorphic ProRes rewrap trial.
+   beyond original locator and probe failures, and carry verified source
+   geometry into the anamorphic ProRes rewrap trial.
    [Batch diagnostics](#project-import-user-2026-10-14)
    · [Media rewrap](#media-linking-user-2026-10-14)
 2. **Finish the combined Avid → Resolve project check.** Repeat the
@@ -1190,7 +1190,7 @@ each writer with the receiving editor's own controls and renders.
 
 | Shared priority | Premiere → Resolve | Resolve → Premiere |
 | --- | --- | --- |
-| Editable multicam | Two 23.976 OP1a cameras, A/B/A picture, and two fixed camera-A mono lanes verified after reopen and render. A fresh insertion kept both mono lanes and used camera A for picture. | The same Group returns as an editable Premiere multicam. Reopen and render verified all nine edits. A fresh insertion kept both fixed mono lanes and used Premiere's native picture default. Graph/2 also retains the actual reference audio source when Resolve saves a different angle label. |
+| Editable multicam | Two 23.976 OP1a cameras, A/B/A picture, and two fixed camera-A mono lanes verified after reopen and render. A fresh insertion kept both mono lanes and used camera A for picture. | The same Group returns as an editable Premiere multicam. The 24 fps route also preserves linked multipart picture angles, gaps, and a fixed independent mono output. Premiere 27 reopened the multipart control with exact picture and PCM against a flat reference. [Profile and limits](RESOLVE-SOURCE-READER.md#resolve-to-premiere-editable-multicam) |
 | Mixed-rate picture and independent audio | The internal writer preserves plain 1080p ProRes HQ Frame Sampling in both directions between 24 and 23.976 fps. Reopened Resolve controls matched every Premiere frame selection, with separate WAV trims and verified mono lanes. | The internal Premiere writer reproduces both Premiere-origin maps and Resolve-authored default Nearest conform between 24 and 23.976 fps in both directions. It also preserves native 25 and 29.97 fps picture on a 23.976 timeline. Reopened projects matched every source selection and both mono WAV trims. A longer native 24-to-23.976 case used editable Time Remapping to preserve varying skip positions. |
 | Editable nests, styled captions, and color | Qualify each receiving editor's controls and renders using the same source facts where possible. | Track unsupported controls by occurrence and preserve their facts through graph/2. |
 
@@ -1911,16 +1911,64 @@ Adobe documents the linked AAF workflow, including unmerging Premiere
 merged clips and a separate relink step in Media Composer. Any NLE has no
 end-to-end Avid destination route yet. [Adobe AAF export](https://helpx.adobe.com/premiere/desktop/render-and-export/export-files/export-aaf-files.html)
 
-- [ ] **Establish the shared native Avid destination.** Use the existing
-      AVB writer research for both incoming graph/2 routes, with **Link to
-      originals** as the default. Start with one same-rate sequence using
-      linked ProRes MOV picture and separate left and right selections from
-      a stereo PCM WAV at independent, nonzero trims. Use Avid-authored
-      links to establish the saved UME picture identity and the actual WAV
-      link provider. Compare file paths, reel, source and sequence timecode,
-      trims, and both channel assignments after Media Composer saves and
-      reopens the bin. Qualify existing Avid-managed OP-Atom packages
-      separately by verified package and sibling identity.
+- [x] **Stage managed Avid media independently of project translation.** The
+      shared preview offers original links, managed media for originals that
+      cannot link, and managed media for the full selection. The internal
+      stage builds numbered-folder OP-Atom media and records each package
+      UMID for indexing and future graph/2 binding. [Managed media foundation](AVID-MANAGED-MEDIA-STAGING.md)
+- [x] **Qualify native indexing on a standalone drive.** Media Composer
+      generated the MDB and PMR for staged 1080p24 DNxHR SQ and two PCM24
+      mono MXFs. Both databases matched the package identities. The MDB
+      preserved the exact source clock and duration for all three tracks.
+      [Native indexing pilot](AVID-MANAGED-MEDIA-STAGING.md#native-indexing-pilot)
+- [x] **Verify a reusable managed master in Media Composer.** A prototype
+      AVB with embedded source records saved and reopened with one V1/A1/A2
+      master. A 24 fps export matched the order of all 12 picture frames
+      and all 24,000 PCM24 samples on each of the two mono lanes.
+      [Reusable master pilot](AVID-MANAGED-MEDIA-STAGING.md#reusable-managed-master-pilot)
+- [x] **Write a reusable managed master in the converter.** The internal
+      probe uses a stage manifest and verified MXFs for a 1080p24 DNxHR SQ
+      and PCM24 V1/A1/A2 master. Output was online on first open in Media
+      Composer. The native save and reopen retained the clock and package
+      links, all 12 picture frames, and 24,000 exact samples per mono lane.
+      [Converter-written master](AVID-MANAGED-MEDIA-STAGING.md#converter-written-managed-master)
+- [x] **Verify fresh insertion of a generated managed master.** Media
+      Composer inserted V1/A1/A2 from the generated master. After
+      independent trims and a project reopen, the saved sequence
+      retained the source clock and all three ranges. The export matched
+      six picture frames, four filler frames, and all 20,000 PCM24
+      samples per lane, including silence outside each edit.
+      [Native timeline insertion](AVID-MANAGED-MEDIA-STAGING.md#native-timeline-insertion)
+- [x] **Verify Avid's original-link records.** A donor-backed AVB with
+      linked 24 fps ProRes picture and two independent mono selections
+      from one stereo PCM24 WAV saved and reopened in Media Composer.
+      Both original paths, the source clocks, and all three trims
+      survived. Six decoded picture frames and all 20,000 samples on
+      each mono lane matched their references.
+      [Native original-link pilot](AVID-MANAGED-MEDIA-STAGING.md#native-original-link-pilot)
+- [x] **Replay one linked Avid sequence from graph/2.** The internal
+      AVB probe uses a verified native donor for the ProRes MOV and
+      stereo WAV source records. Media Composer saved and reopened
+      the PCM24 pilot with the new sequence clock, independent trims,
+      and both channel selections. The rendered picture and both
+      discrete audio lanes matched the native reference.
+      [Graph/2 replay with a native link donor](AVID-MANAGED-MEDIA-STAGING.md#graph2-replay-with-a-native-link-donor)
+- [x] **Generate the original-link records for the first Avid profile.**
+      The internal probe generates the native ProRes MOV and stereo
+      WAV records directly from graph/2 and verified media. The PCM24
+      control matched the donor-backed picture and both mono lanes
+      after Media Composer saved and reopened the generated bin.
+      [Generated original links](AVID-MANAGED-MEDIA-STAGING.md#generate-native-links-from-verified-originals)
+- [x] **Connect the incoming source readers to the Avid writer.** The
+      internal probe converts a neutral 1080p24 cut with original ProRes
+      picture and separate mono selections from a stereo WAV. Premiere
+      and Resolve saves both passed Avid reopen and exact picture and
+      PCM checks through graph/2.
+      [Saved project replays](AVID-MANAGED-MEDIA-STAGING.md#replay-saved-premiere-and-resolve-projects)
+- [ ] **Connect the shared Avid destination to the wizard.** Use **Link
+      to originals** as the default with Review reporting qualified
+      source media. Qualify Avid-managed OP-Atom separately by verified
+      package and sibling identity.
       [Destination architecture](ARCHITECTURE.md#adr-0004-more-programs-go-through-one-neutral-graph-2026-10-26)
 - [ ] **Qualify a Premiere-authored cut and fade.** Reuse the Premiere
       reader for exact source ranges, saved locators, and audio selectors.
@@ -1937,16 +1985,15 @@ end-to-end Avid destination route yet. [Adobe AAF export](https://helpx.adobe.co
 
 Resolve can export standalone AAF. For an unedited imported Avid timeline,
 its round-trip workflow can also carry unsupported material through from
-the original AAF. Any NLE has no end-to-end route here. Use a Resolve-authored
-linked timeline as the core comparison. [Resolve AAF export](https://documents.blackmagicdesign.com/UserManuals/DaVinciResolveReferenceManual.pdf?_v=1783666810000#page=4162)
+the original AAF. Any NLE's linked path is qualified in the internal probe
+for the neutral MOV/WAV profile. [Resolve AAF export](https://documents.blackmagicdesign.com/UserManuals/DaVinciResolveReferenceManual.pdf?_v=1783666810000#page=4162)
 
-- [ ] **Connect the Resolve reader to the shared Avid destination.** Start
-      with a linked same-rate MOV/WAV sequence, known reel and source
-      timecode, and distinct mono selectors. Compare the reopened native
-      AVB with the saved Resolve edit and render. Resolve's standalone AAF
-      is available for a targeted readiness benchmark. Reuse the direct
-      DNxHR package observations for a separate managed media test.
-      [Resolve source profiles](RESOLVE-SOURCE-READER.md)
+- **Managed media.** Reuse the shared [Avid destination media foundation](AVID-MANAGED-MEDIA-STAGING.md) and its drive and indexing workflow.
+- [x] **Connect the Resolve reader to the shared Avid destination.** A
+      same-rate MOV/WAV sequence with independent mono selectors retained
+      its paths, clocks and trims through save and reopen. The render
+      matched the original references on both mono tracks and picture.
+      [Saved project replays](AVID-MANAGED-MEDIA-STAGING.md#replay-saved-premiere-and-resolve-projects)
 - [ ] **Carry source edits and annotations.** Add sequence markers,
       nonzero source trims and a dissolve, then clip gain, pan and fades.
       Qualify same-rate speed, reverse and still frames before mixed-rate
@@ -2225,6 +2272,11 @@ Implemented fixes, tests and remaining native gates.
       a missing, malformed, or ambiguous locator. The bounded report identifies
       affected bins and occurrences. The additional checks resolve paths using
       the current mappings and stop short of probing the media.
+      When an existing original fails the stream probe or early profile
+      verification, Review groups the saved affected edits by timeline
+      and bin. A failed probe includes the tracks sharing that original
+      on the same master. Stream-selection failures identify the selected
+      track. The primary refusal and publication guards stay in effect.
       A legacy MXF package refusal also triggers a report of other absent or
       ambiguous package IDs on the affected clip and later clips, using the
       existing media index. Duplicate package details include up to eight
@@ -2414,14 +2466,24 @@ Implemented fixes, tests and remaining native gates.
       export frames matched across the wrappers. The Premiere writer
       now carries that effective ratio onto a new placement.
       [Native evidence](PRORES-DURATION-2026-11-07.md#premiere-27-read-back).
-- [ ] **Qualify Avid anamorphic ProRes LT for automatic MOV rewrap.**
-      Start with the matching 1440×1080 ProRes bin and MXF control. Carry
-      exact geometry into Premiere preparation and verify the extent,
-      trims, and reopen. Review now reports non-square source aspect
-      independently of codec and scan type.
-      The retained example has a 446/447 duration/index conflict and a
-      separately verified 21,952-byte terminal nonframe. Its AVB and file
-      package identities disagree.
+- [x] **Verify anamorphic ProRes MOV Save As, reopen and fresh insertion.**
+      Full rewrap now uses the graph/2 descriptor, physical MXF and probe
+      to preserve exact pixel aspect in the MOV and Premiere source and
+      placements. Offline Standard and LT controls at 1440×1080p24 with
+      4:3 pixels preserved every packet and decoded frame, the source
+      clocks and both trims. Premiere 27 Save As and reopen retained the
+      source aspect and exact edits. Six rendered frames per profile
+      matched before and after reopen and matched fresh native placements
+      on the same canvas.
+      [Full rewrap scope](MEDIA-REWRAP.md#anamorphic-prores-in-the-full-rewrap-route).
+- [ ] **Verify framing from a known anamorphic Avid sequence canvas.**
+      The synthetic controls have no verified native sequence canvas.
+      The 1440×1080 square-pixel fallback center-crops the 16:9 source.
+      Use a known full-width Avid sequence to qualify canvas mapping.
+      Selective rewrap continues to report these candidates as pending.
+      The older production example has a 446/447 duration/index conflict
+      and a separately verified 21,952-byte terminal nonframe. Its AVB
+      and file package identities disagree.
       [Source evidence](PRORES-DURATION-2026-11-07.md#source-evidence-and-index-interpretation).
 - [x] **Rewrap admitted Avid ProRes LT OP-Atom to MOV** (User, 2026-11-07).
       Premiere originally raised “Frame substitution recursion” on a ProRes LT
@@ -3295,6 +3357,69 @@ retiming semantics, and malformed-input controls remain under test.
       [Resolve → Avid](#resolve--avid) route gates. Prove the current link
       provider, source clocks, mono channel selection and native Save As
       before widening the supported authoring surface.
+- [ ] **Avid → Avid Processing for Color Adapters.** Avid's Remove Color
+      Adapters command on a duplicate sequence leaves master Source Settings
+      available to other sequences. The internal `avid-process-probe --review`
+      inventories individual adapter occurrences by saved sequence MobID and
+      record range. The explicit `--write-trial` path creates a disposable bin
+      for testing editable Color Correction in Rec.709 SDR. Appending
+      the copied composition after its edited track, binding its bin origin,
+      and writing the bin root last resolved the `rootComp` assertion in the
+      full-to-video trial. Media Composer 25.12.0 build 58863 saved a Brightness
+      edit and showed it in Color Correction after a clean restart and reopen.
+      The source master still showed the same adapter in Source Settings.
+      Video levels to full range now uses a two-point RGB Master Curve.
+      On the independent saturated chart its 24 reopened frames differed
+      from the adapter by at most two 10-bit codes anywhere in the frame
+      and one code at patch centers. Both masters and the unselected
+      sibling retained their original adapters. The same curve also
+      passed a native save, reopen, and a 72-frame render comparison at
+      `24000/1001`. One eligibility rule now checks a neutral direct
+      picture span, matching saved clocks, and progressive 10-bit
+      video levels with consistent Rec.709 descriptor labels. A
+      96-frame 25 fps timeline tested both 1080p ProRes HQ and 720p
+      DNxHR HQX through the same rule. After native save and reopen,
+      all treated frames matched within two codes and the other
+      frames matched exactly. Contradictory file clocks or color
+      labels keep the affected adapter.
+      [SMPTE Rec.709 labels](https://pub.smpte.org/latest/rdd44/rdd44-2022.pdf)
+
+      The shared reader matches standalone range transforms by their
+      saved fields. Media Composer rendered the same expansion with
+      inter-element whitespace, reordered fields, leading zeroes,
+      an XML declaration, and comments between fields. Whitespace
+      inside a numerical value changed the native render. That form,
+      contradictory values and extra transform steps stay unresolved.
+
+      Full range to video levels floors each scaled RGB channel at video
+      black and preserves highlights above nominal white. An editable
+      nested trial uses HSL Contrast to reserve headroom before the
+      Master Curve floors the shadows, then a second correction restores
+      the scale. Both range directions share the same source profile.
+      On the 25 fps mixed-raster control, Media Composer saved, closed,
+      and reopened the two nested effects with their original trims and
+      master adapters. Across all 48 compressed frames the largest
+      difference from the source adapter was four 10-bit luma codes and
+      three chroma codes. The original adapter stays in place by default.
+      `--accept-approximations` enables the measured trial per run.
+      The same trial can replace a saved standalone clamped ASC CDL
+      with editable red, green and blue Curves when power and saturation
+      are unity. Graph/2 retains the source package, edit occurrence and
+      saved controls. Metadata columns alone are insufficient to establish
+      application. After save, close and reopen at 25 fps, all 72 graded
+      chart frames matched within four luma and three chroma codes across
+      three sets of slope and offset values. The dry edit was identical.
+      The opt-in trial also maps clamped slope, offset and Power with
+      unit saturation. It samples the native response in at most 16
+      editable points per channel and admits powers from 0.75 through
+      1.5. A 96-frame 25 fps batch exercised one Avid-authored unequal
+      RGB Power payload and two coefficient variants, including a scalar
+      Power. After native save and reopen, the dry edit was identical
+      and the three graded edits matched within five luma and three
+      chroma codes. Graph/2 retains the saved RGB Power values and
+      file and edit owners. The route remains internal. Non-unity
+      saturation and two-step source adapter stacks require separate
+      qualification.
 
 ## More programs: the neutral graph (ADR-0004, User 2026-10-26)
 
@@ -3861,6 +3986,10 @@ for the exact read, write, reopen and render scope.
       controls. Review shows affected clips and available fixes. The app
       supports saved jobs, media-size estimates, and a session Activity
       report. [Current wizard](GUI-WIZARD.md).
+- [x] **Separate bin picking and Review presentation from the wizard controller.**
+      Keep path-only browsing and share selection with the background driver.
+      The controller still applies recovery actions and owns the job lifecycle.
+      [Background wizard scenarios](GUI-WIZARD.md#background-wizard-scenarios).
 - [x] **Run the published Apple Silicon package through Premiere.** The wizard and
       bundled backend converted a small 23.976 Avid split-edit bin. Both sequences
       opened online and played to the end in Premiere 26.5.2. Sampled picture and

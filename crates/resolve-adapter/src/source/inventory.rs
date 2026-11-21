@@ -52,9 +52,9 @@ fn version_header(xml: &str) -> Option<VersionHeader<'_>> {
 /// Inspect the directory and project metadata without admitting an edit graph.
 pub fn write_archive(path: &Path, writer: &mut impl Write) -> Result<()> {
     let timeline_export = archive_is_drt(path)?;
-    let mut zip = xml::checked_zip(xml::open_file(path)?)?;
+    let mut zip = xml::project_zip(path)?;
     let mut seen = HashSet::new();
-    let mut remaining = xml::MAX_EXPANDED;
+    let mut remaining = xml::PROJECT_MAX_EXPANDED;
     let mut members = Vec::with_capacity(zip.len());
     let mut project_xml = None;
     for i in 0..zip.len() {
@@ -63,6 +63,7 @@ pub fn write_archive(path: &Path, writer: &mut impl Write) -> Result<()> {
         let path = entry.name().to_owned();
         let size = entry.size();
         let kind = if path == "project.xml" {
+            xml::check_project_member_size(size)?;
             project_xml = Some(xml::read_member(&mut entry, &mut remaining)?);
             "project"
         } else {
@@ -87,7 +88,7 @@ pub fn write_archive(path: &Path, writer: &mut impl Write) -> Result<()> {
     members.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     let mut metadata = None;
     if let Some(xml) = project_xml.as_deref() {
-        let node = xml::parse(xml, &mut 0)?;
+        let node = xml::parse_project_member(xml)?;
         expect(&node, "SM_Project")?;
         let project_version = node
             .maybe("ProjectVersion")?

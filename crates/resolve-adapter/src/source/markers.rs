@@ -6,10 +6,13 @@ use graph::{
     source::{SourceBinding, SourceMarker},
     Label, MarkerOwner, TrackRef,
 };
+use sha2::{Digest, Sha256};
 
 pub(crate) const POOL_ADAPTER: &str = "resolve.pool_markers";
 pub(crate) const EDIT_ADAPTER: &str = "resolve.edit_markers";
 pub(crate) const EDIT_MARKER_LOSS: &str = "resolve.edit_marker_timing";
+const LOCKABLE_METADATA: &str = "resolve.lockable_metadata";
+const MAX_LOCKABLE_WIRE_FIELDS: usize = 32_768;
 
 pub(super) fn read(
     project: &Node,
@@ -58,7 +61,7 @@ pub(super) fn read(
         if node.name == "Sm2MpItemLockableBlob" {
             let owner = node.get("BlobOwner")?;
             if let (Some(&index), Some(master)) = (pool.get(owner), masters.get(owner)) {
-                if let Some(rows) = read_rows(node, master.rate, owner, blobs)? {
+                if let Some(rows) = read_rows(node, master.rate, owner, graph, blobs)? {
                     if !pool_owners.insert(owner) {
                         return Err("duplicate Resolve source marker owner".into());
                     }
@@ -150,7 +153,7 @@ pub(super) fn read(
             continue;
         };
         let rate = graph.sequences[index].rate;
-        let Some(rows) = read_rows(node, rate, owner, blobs)? else {
+        let Some(rows) = read_rows(node, rate, owner, graph, blobs)? else {
             continue;
         };
         let (markers, data) = marker_facts(graph, owner, rows);
@@ -291,17 +294,114 @@ fn read_rows(
     node: &Node,
     rate: Rational,
     owner: &str,
+    graph: &mut SourceGraph,
     blobs: &mut Blobs,
 ) -> Result<Option<Vec<MarkerRow>>> {
-    let encoded = blobs.qt(node.get("FieldsBlob")?)?;
-    let body = blobs.marker_data(encoded.bytes("BlobData")?)?;
-    decode_rows(&body, rate, owner)
+    let saved = node.get("FieldsBlob")?;
+    if saved.is_empty() {
+        observations::append(
+            graph,
+            LOCKABLE_METADATA,
+            owner,
+            Value::Obj(vec![
+                ("blob_id".into(), text(node.id()?)),
+                ("class".into(), text(&node.name)),
+                ("status".into(), text("empty_fields_blob")),
+            ]),
+        );
+        return Ok(None);
+    }
+    let encoded = blobs.lockable_qt(saved)?;
+    let envelope = encoded.bytes("BlobData")?;
+    let body = blobs.lockable_metadata(envelope)?;
+    let payload = marker_payload(&body)?;
+    if payload.field6_records > 0 {
+        observations::append(
+            graph,
+            LOCKABLE_METADATA,
+            owner,
+            Value::Obj(vec![
+                ("blob_id".into(), text(node.id()?)),
+                ("class".into(), text(&node.name)),
+                ("status".into(), text("saved_non_marker_fields")),
+                ("stored_bytes".into(), Value::Int(envelope.len() as i64)),
+                ("stored_sha256".into(), text(&hex::encode(Sha256::digest(envelope)))),
+                ("decoded_bytes".into(), Value::Int(body.len() as i64)),
+                ("decoded_sha256".into(), text(&hex::encode(Sha256::digest(&body)))),
+                ("non_marker_field_count".into(), Value::Int(payload.other_fields)),
+                ("field6_byte_record_count".into(), Value::Int(payload.field6_records)),
+            ]),
+        );
+    }
+    payload
+        .table
+        .map(|table| decode_marker_table(table, rate, owner))
+        .transpose()
+}
+
+#[derive(Default)]
+struct MarkerPayload<'a> {
+    table: Option<&'a [u8]>,
+    other_fields: i64,
+    field6_records: i64,
+}
+
+fn marker_payload(body: &[u8]) -> Result<MarkerPayload<'_>> {
+    let mut payload = MarkerPayload::default();
+    encoding::visit_fields(body, MAX_LOCKABLE_WIRE_FIELDS, |field, value| {
+        if field == 2 {
+            match value {
+                Wire::Bytes(table) if payload.table.is_none() => payload.table = Some(table),
+                _ => return Err("ambiguous Resolve protobuf field".into()),
+            }
+        } else {
+            payload.other_fields += 1;
+            if field == 6 && matches!(value, Wire::Bytes(_)) {
+                payload.field6_records += 1;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binary::pb_bytes;
+
+    #[test]
+    fn separates_a_marker_table_from_many_saved_non_marker_fields() {
+        let records = 4_097;
+        let mut body = Vec::new();
+        for _ in 0..records {
+            pb_bytes(6, b"saved", &mut body);
+        }
+        let payload = marker_payload(&body).unwrap();
+        assert_eq!(payload.other_fields, records);
+        assert_eq!(payload.field6_records, records);
+        assert!(payload.table.is_none());
+
+        pb_bytes(2, &[0x12, 0], &mut body);
+        assert_eq!(marker_payload(&body).unwrap().table, Some(&[0x12, 0][..]));
+        pb_bytes(2, &[], &mut body);
+        assert!(marker_payload(&body).is_err());
+
+        let mut excess = Vec::new();
+        for _ in 0..=MAX_LOCKABLE_WIRE_FIELDS {
+            pb_bytes(6, &[], &mut excess);
+        }
+        assert!(marker_payload(&excess).is_err());
+    }
 }
 
 fn decode_rows(body: &[u8], rate: Rational, owner: &str) -> Result<Option<Vec<MarkerRow>>> {
-    let Some(marks) = pb_bytes(body, 2)? else {
-        return Ok(None);
-    };
+    encoding::pb_bytes(body, 2)?
+        .map(|table| decode_marker_table(table, rate, owner))
+        .transpose()
+}
+
+fn decode_marker_table(marks: &[u8], rate: Rational, owner: &str) -> Result<Vec<MarkerRow>> {
     let mut decoded = BTreeMap::new();
     for (_, value) in fields(marks)?.into_iter().filter(|(key, _)| *key == 2) {
         let Wire::Bytes(value) = value else {
@@ -323,7 +423,7 @@ fn decode_rows(body: &[u8], rate: Rational, owner: &str) -> Result<Option<Vec<Ma
             return Err("duplicate Resolve marker frame".into());
         }
     }
-    Ok(Some(decoded.into_values().collect()))
+    Ok(decoded.into_values().collect())
 }
 
 fn marker_facts(

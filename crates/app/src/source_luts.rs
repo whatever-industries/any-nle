@@ -1,6 +1,6 @@
 //! Qualify saved Avid source color controls for one Premiere picture edit.
 use crate::source_input::{original_stamp, recheck_originals, OriginalStamp};
-use avid_reader::source::{is_canonical_external_cube, SourceColorRange, SourceColorStack, SourceInput};
+use avid_reader::source::{is_canonical_external_cube, saved_color_transforms_match, SourceColorRange, SourceColorStack, SourceInput};
 use graph::{source::SourceGraph, Rational, StreamKind, Value};
 use prproj::{
     convert::{
@@ -703,7 +703,7 @@ pub(crate) fn apply(
                         stack.zip(saved_transform.and_then(SourceColorStack::from_saved_xml))
                             .is_some_and(|(edit, file)| edit.is_reordered(file))
                     } else {
-                        saved_transform == Some(xml)
+                        saved_transform.is_some_and(|saved| saved_color_transforms_match(xml, saved))
                     };
                     let edit_owned = stack.is_none() && (nested || (color_media == ColorMedia::Rewrap
                         && facts.get("managed_picture_span").is_some()))

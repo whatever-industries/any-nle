@@ -1793,6 +1793,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         frame_holds: Default::default(),
         multicams: Vec::new(),
         multicam_uses: Vec::new(),
+        multicam_tracks: Vec::new(),
         picture_subclips: Vec::new(),
         av_subclips: Vec::new(),
         av_subclip_uses: Vec::new(),

@@ -41,6 +41,11 @@ pub(super) fn capture_adapter(
     let master_track = int(input, "track_id").filter(|track| *track > 0)?;
     let source_in = int(input, "start_time")?;
     let wrapper_attrs = borrowed_attrs(ctx, effect);
+    let neutral_linked_wrapper = neutral
+        || (wrapper_attrs.len() == 2
+            && managed_wrapper_attributes(wrapper_attrs, false)
+            && effect.get("left_bob") == Some(&Value::Null)
+            && neutral_controls(ctx, effect));
     let wrapper_clip_color = match CLIP_RGB.map(|key| {
         unique_attribute(wrapper_attrs, key).and_then(Value::as_int)
             .and_then(|value| u16::try_from(value).ok())
@@ -73,6 +78,12 @@ pub(super) fn capture_adapter(
     let direct_span = (!use_24fps_profiles).then_some((rate, source_in, length));
     let picture = subclip.as_ref().map(|source| (source.file_id, source.file))
         .or_else(|| direct_picture_file(ctx, master_id, master_track, ambiguous, direct_span));
+    let plain_same_rate_linked_input = neutral_linked_wrapper && at_edit_rate(program, rate)
+        && if use_24fps_profiles {
+            direct_picture_file(ctx, master_id, master_track, ambiguous, Some((rate, source_in, length))).is_some()
+        } else {
+            picture.is_some()
+        };
     let centered_still_fit = fitted_still.is_some() && subclip.is_none()
         && picture.is_some_and(|(_, file)| still_raster(ctx, file));
     let managed_cache = use_24fps_profiles && master_track == 1
@@ -82,8 +93,8 @@ pub(super) fn capture_adapter(
     let input_attrs = borrowed_attrs(ctx, input);
     let conflicting_input_transform = managed_range
         && input_attrs.iter().any(|(name, _)| name == "_COLOR_INPUT_TRANSFORMATION")
-        && unique_attribute(input_attrs, "_COLOR_INPUT_TRANSFORMATION").and_then(Value::as_str)
-            != Some(transform);
+        && !unique_attribute(input_attrs, "_COLOR_INPUT_TRANSFORMATION").and_then(Value::as_str)
+            .is_some_and(|saved| saved_color_transforms_match(transform, saved));
     let managed_picture_span = picture.and_then(|(id, file)| {
         if !managed_range || !managed_wrapper_attributes(wrapper_attrs, false)
             || !neutral_managed_input(ctx, input, Some(transform))
@@ -145,7 +156,8 @@ pub(super) fn capture_adapter(
         Some(_) if conflicting_input_transform => Observed::Unresolved(copy_text(
             budget, MANAGED_INPUT_TRANSFORM_CONFLICT,
         )),
-        Some((id, file)) if input_transform_text(ctx, file) == Some(Ok(transform)) => Observed::Known(id),
+        Some((id, file)) if input_transform_text(ctx, file).and_then(Result::ok)
+            .is_some_and(|saved| saved_color_transforms_match(transform, saved)) => Observed::Known(id),
         Some((id, file)) if managed_picture_span.is_some() && input_transform_text(ctx, file).is_none() =>
             Observed::Known(id),
         Some(_) => Observed::Unresolved(copy_text(
@@ -178,6 +190,7 @@ pub(super) fn capture_adapter(
         reordered_picture_file,
         transform: copy_text(budget, transform),
         neutral_wrapper: neutral,
+        plain_same_rate_linked_input,
         wrapper_clip_color,
         managed_picture_span,
         centered_still_fit,
@@ -316,7 +329,8 @@ fn neutral_managed_input(ctx: &Ctx<'_>, input: &Node, adapter_transform: Option<
         unique_attribute(attrs, name).is_some_and(|value| match name.as_str() {
             "_IMAGE_BOUNDS_OVERRIDE" => value.as_str().is_some_and(matte::equal_1600_picture_bounds),
             // Avid renders this exact copy as part of the existing adapter.
-            "_COLOR_INPUT_TRANSFORMATION" => adapter_transform.is_some_and(|xml| value.as_str() == Some(xml)),
+            "_COLOR_INPUT_TRANSFORMATION" => adapter_transform.zip(value.as_str())
+                .is_some_and(|(edit, saved)| saved_color_transforms_match(edit, saved)),
             // The normal component walk already records the markers in the input clock.
             "_TMP_CRM" => ctx.deref(Some(value)).is_some_and(|list| {
                 list.class == *b"TMCS"
@@ -829,12 +843,35 @@ mod tests {
         let reverse = xml("full range to video levels", "<Inverted/>");
         assert_eq!(SourceColorRange::from_saved_xml(&forward), Some(SourceColorRange::VideoToFull));
         assert_eq!(SourceColorRange::from_saved_xml(&reverse), Some(SourceColorRange::FullToVideo));
+        let formatted = format!("<?xml version=\"1.0\"?>\n{}", forward
+            .replace("><", ">\n  <")
+            .replace("<Black>64</Black>", "<Black>064</Black>"));
+        assert!(saved_color_transforms_match(&forward, &formatted));
+        assert!(!saved_color_transforms_match(&reverse, &formatted));
+        let reordered = forward.replace("<White>940</White>", "")
+            .replace("<LinearLut>", "<LinearLut><White>940</White>");
+        assert!(saved_color_transforms_match(&forward, &reordered));
+        let expanded_flag = reverse.replace("<Inverted/>", "<Inverted></Inverted>");
+        assert!(saved_color_transforms_match(&reverse, &expanded_flag));
         assert_eq!(SourceColorRange::from_saved_xml(&xml("video levels to full range", "<Inverted/>")), None);
         assert_eq!(SourceColorRange::from_saved_xml(&reverse.replace("<Inverted/>", "")), None);
         assert_eq!(SourceColorRange::from_saved_xml(&forward.replace("940", "939")), None);
         let extra = forward.replace("</ColorTransformationList>",
             "<ColorTransformation><ExternalLut/></ColorTransformation></ColorTransformationList>");
         assert_eq!(SourceColorRange::from_saved_xml(&extra), None);
+        for changed in [
+            forward.replace("</White>", "</White><White>940</White>"),
+            forward.replace("<Black>", "<Black enabled=\"true\">"),
+            forward.replace("<Black>64</Black>", "<Black> 64 </Black>"),
+            forward.replace("<Black>64</Black>", "<Black>6&#52;</Black>"),
+            forward.replace("<LinearLut>", "<LinearLut xmlns=\"urn:other\">"),
+            forward.replace("<Black>64", "<Black><Value/>64"),
+            forward.replace("</LinearLut>", "</LinearLut><?unknown settings?>"),
+            reverse.replace("<Inverted/>", "<Inverted>false</Inverted>"),
+        ] {
+            assert_eq!(SourceColorRange::from_saved_xml(&changed), None);
+            assert!(!saved_color_transforms_match(&forward, &changed));
+        }
     }
 
     #[test]

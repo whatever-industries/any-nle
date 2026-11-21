@@ -17,12 +17,15 @@ verified bundle.
 
 ## Reproduce a candidate
 
-Use Rust 1.95.0 and the committed lockfile. Read the release version with
+Use the Rust version pinned in [rust-toolchain.toml](../rust-toolchain.toml)
+and the committed lockfile. The release workflow reads this pin for each target,
+and the provenance archive includes it. Read the release version with
 `python3 scripts/release/release_version.py` using Python 3.11 or later.
 For a new release, update the GUI Cargo version, refresh the Cargo lockfile
-with Cargo, and update the release notes heading and download links. If several Rust installations are on
-your PATH, put the rustup shims first and set `RUSTUP_TOOLCHAIN=1.95.0` before
-running the scripts. Check `rustc --version` and `cargo --version` in that shell.
+with Cargo, and update the release notes heading and download links. If several Rust
+installations are on your PATH, put the Rustup shims first as described in the
+[contributor guide](../CONTRIBUTING.md#build-and-test-from-a-public-clone).
+Check `rustc --version` and `cargo --version` in that shell.
 `packaging/ffmpeg.json` pins the source
 archive and configuration; `scripts/release/build_ffmpeg.py` checks the archive
 hash before building. No installed FFmpeg is copied. GPL, nonfree and version3

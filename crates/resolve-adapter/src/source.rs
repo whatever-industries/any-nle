@@ -3,6 +3,7 @@ mod atom;
 pub mod compare;
 pub mod conform;
 pub mod drt;
+mod embedded_audio;
 mod effects;
 mod encoding;
 mod fairlight;
@@ -16,8 +17,12 @@ mod metadata;
 pub(crate) mod mixer;
 mod multicam;
 pub(crate) use multicam::{native_group_default_unavailable, REFERENCE_AUDIO_SWITCH};
+pub(crate) use multicam::selection::OBSERVED_GAP as MULTICAM_OBSERVED_GAP;
 mod observations;
+mod still;
+mod timing;
 mod title;
+mod virtual_audio;
 pub(crate) mod relink;
 mod report;
 mod wav;
@@ -37,6 +42,7 @@ use graph::{
 };
 use mixer::Mixer;
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
@@ -73,8 +79,8 @@ pub(crate) fn is_empty_stereo_loss(loss: &Loss, owner: &str, track: &str) -> boo
 
 /// Read an exported .drp without opening media or making application calls.
 pub fn read(path: &Path) -> Result<SourceGraph> {
-    let members = xml::read(path)?;
-    read_members(&members, false)
+    let (members, containers) = xml::read_project(path)?;
+    read_project(&members, Some(containers), false, Blobs::new(384 << 20))
 }
 
 fn read_drp_bytes(bytes: &[u8]) -> Result<SourceGraph> {
@@ -91,7 +97,15 @@ fn archive_is_drt(path: &Path) -> Result<bool> {
 }
 
 fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<SourceGraph> {
-    let mut blobs = Blobs::default();
+    read_project(members, None, inspect_drt, Blobs::default())
+}
+
+fn read_project<'a>(
+    members: &'a BTreeMap<String, Node>,
+    archive: Option<xml::ProjectContainers>,
+    inspect_drt: bool,
+    mut blobs: Blobs,
+) -> Result<SourceGraph> {
     let project = members
         .get("project.xml")
         .ok_or("missing Resolve project.xml")?;
@@ -100,7 +114,11 @@ fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<S
         return Err("unsupported Resolve project version".into());
     }
     let folders = folders(members, project, &mut blobs)?;
-    let containers = containers(members)?;
+    let audio_caches = virtual_audio::index(folders.iter().map(|(folder, _)| *folder))?;
+    let containers = match archive {
+        Some(archive) => Containers::Archive(archive),
+        None => Containers::Borrowed(containers(members)?),
+    };
     let mut graph = SourceGraph {
         project: Project {
             name: project.get("ProjectName")?.into(),
@@ -151,9 +169,15 @@ fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<S
             match clip.name.as_str() {
                 "Sm2MpVideoClip" => {
                     if clip.optional("Video")?.is_some() {
-                        let master = media(clip, &mut blobs, &mut graph)?;
-                        masters.insert(clip_id, master);
-                        bin.items.push(clip_id.into());
+                        if let Some(master) = media(clip, &audio_caches, &mut blobs, &mut graph)? {
+                            masters.insert(clip_id, master);
+                            bin.items.push(clip_id.into());
+                        } else {
+                            omitted(
+                                &mut graph, bin_id, clip_id, "media",
+                                "Resolve video cache lacks a codec and is outside the qualified still profile",
+                            );
+                        }
                     } else {
                         omitted(
                             &mut graph,
@@ -293,7 +317,7 @@ fn read_members(members: &BTreeMap<String, Node>, inspect_drt: bool) -> Result<S
                 container_ref_agrees = qt(&bytes).ok()
                     .is_some_and(|map| map.text("SeqRef").ok().flatten() == Some(container_id));
             }
-            read_tracks(&mut context, container, grid, &mut sequence, false, false)?;
+            read_tracks(&mut context, &container, grid, &mut sequence, false, false)?;
         }
         receipt(&mut context.graph, id, vec![
             ("kind", text("compound")),
@@ -353,9 +377,9 @@ fn active_timeline_receipt(project: &Node, sequences: &[SourceSequence]) -> Valu
 
 struct Context<'a> {
     masters: HashMap<&'a str, Master>,
-    groups: HashMap<&'a str, multicam::Group<'a>>,
-    containers: HashMap<&'a str, &'a Node>,
-    ids: HashSet<&'a str>,
+    groups: HashMap<&'a str, multicam::Group>,
+    containers: Containers<'a>,
+    ids: HashSet<uuid::Uuid>,
     pool_items: HashSet<&'a str>,
     nested: HashMap<&'a str, (&'a Node, &'static str)>,
     used_containers: HashSet<&'a str>,
@@ -367,9 +391,13 @@ struct Context<'a> {
 }
 
 impl<'a> Context<'a> {
-    fn container(&mut self, sequence_id: &'a str, length: i64) -> Result<Option<&'a Node>> {
+    fn container(&mut self, sequence_id: &'a str, length: i64) -> Result<Option<Cow<'a, Node>>> {
         claim(&mut self.ids, sequence_id)?;
-        match self.containers.get(sequence_id).copied() {
+        let found = match &mut self.containers {
+            Containers::Borrowed(map) => map.get(sequence_id).map(|&node| Cow::Borrowed(node)),
+            Containers::Archive(archive) => archive.load(sequence_id)?.map(Cow::Owned),
+        };
+        match found {
             Some(node) => {
                 claim(&mut self.ids, node.id()?)?;
                 self.used_containers.insert(sequence_id);
@@ -377,6 +405,20 @@ impl<'a> Context<'a> {
             }
             None if length == 0 => Ok(None),
             None => Err("missing Resolve sequence container".into()),
+        }
+    }
+}
+
+enum Containers<'a> {
+    Borrowed(HashMap<&'a str, &'a Node>),
+    Archive(xml::ProjectContainers),
+}
+
+impl Containers<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(map) => map.len(),
+            Self::Archive(archive) => archive.len(),
         }
     }
 }
@@ -392,8 +434,8 @@ fn same(found: &str, expected: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn claim<'a>(ids: &mut HashSet<&'a str>, id: &'a str) -> Result<()> {
-    if !ids.insert(id) {
+fn claim(ids: &mut HashSet<uuid::Uuid>, id: &str) -> Result<()> {
+    if !ids.insert(uuid::Uuid::parse_str(id)?) {
         return Err("duplicate Resolve object identity".into());
     }
     Ok(())
@@ -582,20 +624,26 @@ fn containers(members: &BTreeMap<String, Node>) -> Result<HashMap<&str, &Node>> 
         .iter()
         .filter(|(name, _)| name.starts_with("SeqContainer/"))
     {
-        expect(node, "Sm2SequenceContainer")?;
-        if *path != format!("SeqContainer/{}.xml", node.id()?) {
-            return Err("Resolve sequence container path differs from its identity".into());
-        }
-        let mut ids = HashSet::new();
-        for (_, track) in tracks(node)? {
-            ids.insert(track.get("Sequence")?.trim());
-        }
-        // Empty containers can be attached only when a sequence witness exists.
-        if ids.len() != 1 || result.insert(*ids.iter().next().unwrap(), node).is_some() {
+        if result.insert(container_owner(path, node)?, node).is_some() {
             return Err("ambiguous Resolve sequence container registration".into());
         }
     }
     Ok(result)
+}
+
+fn container_owner<'a>(path: &str, node: &'a Node) -> Result<&'a str> {
+    expect(node, "Sm2SequenceContainer")?;
+    if path != format!("SeqContainer/{}.xml", node.id()?) {
+        return Err("Resolve sequence container path differs from its identity".into());
+    }
+    let mut owner = None;
+    for (_, track) in tracks(node)? {
+        let id = track.get("Sequence")?.trim();
+        if owner.replace(id).is_some_and(|previous| previous != id) {
+            return Err("ambiguous Resolve sequence container registration".into());
+        }
+    }
+    owner.ok_or_else(|| "ambiguous Resolve sequence container registration".into())
 }
 
 fn tracks(node: &Node) -> Result<Vec<(StreamKind, &Node)>> {
@@ -625,19 +673,35 @@ struct Master {
     prores_hq: bool,
     camera_pcm: bool,
     native_mono_movie: bool,
+    saved_aac_clock: bool,
+    external_audio: bool,
     wav_samples: Option<i64>,
+    standalone_audio: Option<wav::Standalone>,
+    still: bool,
     standalone_mono_atom: bool,
     stereo_pool_route: bool,
     native_stereo_pcm: bool,
     split_atom_audio: bool,
 }
 
-fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Master> {
+fn media(
+    clip: &Node,
+    audio_caches: &virtual_audio::CacheIndex<'_>,
+    blobs: &mut Blobs,
+    graph: &mut SourceGraph,
+) -> Result<Option<Master>> {
     let id = clip.id()?;
     let video = clip.one("Video")?.entry()?;
     expect(video, "BtVideoInfo")?;
     same(video.get("Type")?, "STANDARD_CLIP", "video media type")?;
     let timing = blobs.qt(video.get("Time")?)?;
+    let cached = cache_record(video, blobs)?;
+    if let Some(still) = still::read(clip, video, &timing, &cached, blobs, graph)? {
+        return Ok(Some(still));
+    }
+    if cached.codec.is_none() {
+        return Ok(None);
+    }
     let (rate, drop) = frame_rate(timing.bytes("FrameRate")?)?;
     if timing.int("StartFrame")? != 0 {
         return Err("unsupported nonzero Resolve media cache origin".into());
@@ -647,7 +711,7 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
         return Err("invalid Resolve media duration".into());
     }
     let saved_timecode = timing.text("Timecode")?.filter(|value| !value.is_empty());
-    let base = crate::linked::display_base(rate);
+    let base = encoding::display_base(rate)?;
     let start = if drop {
         let label = saved_timecode.ok_or("drop-frame Resolve media cache has no timecode")?;
         timecode(label, i64::from(base))?;
@@ -658,7 +722,8 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
     };
     let geometry = blobs.qt(video.get("Geometry")?)?;
     let size = raster(geometry.bytes("Resolution")?)?;
-    let (path, codec) = cache(video, blobs)?;
+    let pixel_aspect = geometry.pixel_aspect()?;
+    let (path, codec) = cached.with_codec()?;
     let mut item = SourceItem {
         id: id.into(),
         name: clip.get("Name")?.into(),
@@ -695,6 +760,7 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
             original: None,
         },
     );
+    metadata::capture_pixel_aspect(graph, &format!("{id}/video"), pixel_aspect);
     let proxy = proxy_observation(clip, blobs).unwrap_or_default();
     let pcm = proxy.as_ref().and_then(|v| match v.get("audio_bits") {
         Some(Value::Int(bits)) => Some(*bits), _ => None,
@@ -705,6 +771,8 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
     let mut native_stereo_pcm = false;
     let mut camera_pcm = false;
     let mut native_mono_movie = false;
+    let mut saved_aac_clock = false;
+    let mut external_audio = false;
     if let Some(embedded) = clip.optional("EmbeddedAudioVec")? {
         let mut entries = embedded.elements()?;
         match (entries.next(), entries.next()) {
@@ -741,7 +809,7 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
                 if timecoded_camera || native_mono_movie || default_stereo_movie
                     || start == 0 && (avc_audio || hevc_audio)
                 {
-                    read_embedded_stereo(
+                    saved_aac_clock = read_embedded_stereo(
                         clip, node, &path, length, rate, start, &audio_codec, None, blobs, graph, &mut item,
                     )?;
                     audio = BTreeMap::from([(0, 0), (1, 1)]);
@@ -761,17 +829,14 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
                     audio = BTreeMap::from([(0,0),(1,1)]);
                     stereo_pool_route = true;
                 } else {
-                    audio = audio_media(
-                        clip,
-                        node,
-                        &audio_codec,
-                        &path,
-                        start,
-                        rate,
-                        blobs,
-                        graph,
-                        &mut item,
+                    external_audio = virtual_audio::capture(
+                        clip, node, &audio_codec, audio_caches, blobs, graph,
                     )?;
+                    if !external_audio {
+                        audio = audio_media(
+                            clip, node, &audio_codec, &path, start, rate, blobs, graph, &mut item,
+                        )?;
+                    }
                 }
             }
             (Some(first), Some(second)) if entries.next().is_none() => {
@@ -813,10 +878,12 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
         graph.sidecars.push(graph::Sidecar { adapter:"resolve.proxy".into(),object:id.into(),data:proxy });
     }
     graph.items.push(item);
-    Ok(Master {
+    Ok(Some(Master {
         prores_hq: codec == "apch",
         camera_pcm,
         native_mono_movie,
+        saved_aac_clock,
+        external_audio,
         rate,
         length,
         start,
@@ -824,11 +891,13 @@ fn media(clip: &Node, blobs: &mut Blobs, graph: &mut SourceGraph) -> Result<Mast
         path,
         size,
         wav_samples: None,
+        standalone_audio: None,
+        still: false,
         standalone_mono_atom: false,
         stereo_pool_route,
         native_stereo_pcm,
         split_atom_audio,
-    })
+    }))
 }
 
 fn native_mono_selectors(clip: &Node, blobs: &mut Blobs) -> Result<Option<[String; 2]>> {
@@ -868,6 +937,22 @@ pub(crate) fn imported_selectors(path: &Path, id: &str) -> Result<Option<[String
 }
 
 fn cache(node: &Node, blobs: &mut Blobs) -> Result<(String, String)> {
+    cache_record(node, blobs)?.with_codec()
+}
+
+struct CacheRecord {
+    path: String,
+    codec: Option<String>,
+    same_file_name: bool,
+}
+
+impl CacheRecord {
+    fn with_codec(self) -> Result<(String, String)> {
+        Ok((self.path, self.codec.ok_or("missing Resolve media cache field")?))
+    }
+}
+
+fn cache_record(node: &Node, blobs: &mut Blobs) -> Result<CacheRecord> {
     let data = blobs.envelope(node.get("Clip")?)?;
     let get = |field| -> Result<&str> {
         Ok(std::str::from_utf8(
@@ -895,7 +980,14 @@ fn cache(node: &Node, blobs: &mut Blobs) -> Result<(String, String)> {
     } else {
         "/"
     };
-    Ok((format!("{folder}{separator}{name}"), get(5)?.into()))
+    let codec = pb_bytes(&data, 5)?.map(std::str::from_utf8).transpose()?.map(str::to_owned);
+    let same_file_name = matches!(codec.as_deref(), None | Some("HEVC"))
+        && pb_bytes(&data, 6)? == Some(name.as_bytes());
+    Ok(CacheRecord {
+        path: format!("{folder}{separator}{name}"),
+        codec,
+        same_file_name,
+    })
 }
 
 fn add_media(graph: &mut SourceGraph, item: &mut SourceItem, media: SourceMedia) {
@@ -977,7 +1069,7 @@ fn read_embedded_stereo(
     blobs: &mut Blobs,
     graph: &mut SourceGraph,
     item: &mut SourceItem,
-) -> Result<()> {
+) -> Result<bool> {
     let tracks = blobs.qt(node.get("TracksBA")?)?;
     let routes = audio_routes(clip, blobs)?;
     if !tracks.keys().eq(["0"]) || !routes.keys().eq(["0"]) {
@@ -986,6 +1078,7 @@ fn read_embedded_stereo(
     let track = qt(tracks.bytes("0")?)?;
     let route = qt(routes.bytes("0")?)?;
     let depth = track.int("BitDepth")?;
+    let sample_rate = track.int("SampleRate")?;
     let pcm = match (codec, depth) {
         ("Linear PCM", 1) => Some(16),
         ("Linear PCM", 2) => Some(24),
@@ -1002,28 +1095,41 @@ fn read_embedded_stereo(
     {
         return Err("invalid embedded stereo sample extent".into());
     }
-    let duration = Rational::new(samples.into(), 48_000).ok_or("invalid embedded stereo extent")?;
+    let saved_aac_clock = codec == "AAC" && sample_rate == 44_100;
+    if !saved_aac_clock && sample_rate != 48_000 {
+        return Err("unqualified embedded stereo sample clock or format".into());
+    }
+    let duration = Rational::from_units(samples, sample_rate).ok_or("invalid embedded stereo extent")?;
+    let track_origin = track.real("StartTime")?;
     let route_extent = route.bytes("MediaExtents")?;
-    let route_agrees = {
+    let (audio_start, clock_agrees) = {
         let [origin, duration] = route_extent.as_chunks::<8>().0 else {
             return Err("invalid embedded stereo sample extent".into());
         };
-        route_extent.len() == 16
-            && frames(f64::from_le_bytes(*origin), rate)? == start
-            && (f64::from_le_bytes(*duration) == samples as f64 / 48_000.0
-                || extent(route_extent, rate).ok() == Some((start, length)))
+        if route_extent.len() != 16 {
+            return Err("invalid embedded stereo sample extent".into());
+        }
+        let route_origin = f64::from_le_bytes(*origin);
+        let matching_samples = f64::from_le_bytes(*duration) == samples as f64 / sample_rate as f64;
+        if saved_aac_clock {
+            // The audio cache has its own sample clock. The virtual stereo
+            // route must agree with it before either channel is published.
+            let audio_start = encoding::sample_start(track_origin, sample_rate)?;
+            (audio_start, matching_samples && encoding::sample_start(route_origin, sample_rate)? == audio_start)
+        } else {
+            (Rational::ZERO, frames(route_origin, rate)? == start
+                && frames(track_origin, rate)? == start
+                && (matching_samples || extent(route_extent, rate).ok() == Some((start, length))))
+        }
     };
     if track.int("NumChannels")? != 2
         || track.int("IdxTrack")? != 0
-        || track.int("SampleRate")? != 48000
         || (pcm.is_none() && track.int("ChannelLayout")? != 2)
         || track.text("CodecName")? != Some(codec)
-        || frames(track.real("StartTime")?,rate)? != start
-        || track.int("Duration")? != samples
         || route.int("Type")? != 0
         || route.text("CodecName")? != Some(codec)
         || (pcm.is_some() && route.int("BitDepth")? != depth)
-        || !route_agrees
+        || !clock_agrees
     {
         return Err("unqualified embedded stereo sample clock or format".into());
     }
@@ -1038,7 +1144,12 @@ fn read_embedded_stereo(
         } else {
             0
         };
-        if row.text("MediaRef")? != Some(node.id()?) || saved != channel as i64 {
+        let physical_track = if saved_aac_clock && row.keys().any(|key| key == "TrackIdx") {
+            row.int("TrackIdx")?
+        } else {
+            0
+        };
+        if row.text("MediaRef")? != Some(node.id()?) || saved != channel as i64 || physical_track != 0 {
             return Err("embedded stereo selector contradicts its cache".into());
         }
         let label = channel as i64 + 1;
@@ -1047,6 +1158,13 @@ fn read_embedded_stereo(
             receipt(graph, &stream_id, vec![
                 ("saved_cache_track", Value::Int(0)),
                 ("saved_channel", Value::Int(saved)),
+            ]);
+        }
+        if saved_aac_clock {
+            receipt(graph, &stream_id, vec![
+                ("saved_cache_track", Value::Int(0)),
+                ("saved_channel", Value::Int(saved)),
+                ("saved_sample_count", Value::Int(samples)),
             ]);
         }
         add_media(
@@ -1063,18 +1181,26 @@ fn read_embedded_stereo(
                 }),
                 frame_size: None,
                 rate: None,
-                sample_rate: Some(48000),
+                sample_rate: Some(sample_rate),
                 bits: pcm,
                 duration,
-                start: Some(Rational::ZERO),
+                start: Some(audio_start),
                 clock: None,
                 stream: Some(label),
                 online: None,
                 original: None,
             },
         );
+        if saved_aac_clock {
+            // Cache sample positions are known. The file-relative origin and
+            // AAC priming have not been verified against the original.
+            item.media.last_mut().expect("embedded channel added").source_offset = None;
+        }
     }
-    Ok(())
+    if saved_aac_clock {
+        item.stream_groups.push(vec![1, 2]);
+    }
+    Ok(saved_aac_clock)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1206,7 +1332,7 @@ fn clock(id: &str, field: &str, count: i64, rate: Rational) -> Result<SourceCloc
     Ok(SourceClock {
         effective_count: count,
         rate,
-        display_base: crate::linked::display_base(rate),
+        display_base: encoding::display_base(rate)?,
         drop: false,
         provenance: SourceClockProvenance {
             origin_count: count,
@@ -1230,15 +1356,38 @@ struct Grid {
 
 impl Grid {
     fn read(node: &Node) -> Result<Self> {
+        let (grid, fractional_duration) = Self::read_with_fractional_duration(node)?;
+        if fractional_duration.is_some() {
+            return Err("Resolve extent is outside the supported frame grid".into());
+        }
+        Ok(grid)
+    }
+
+    fn read_with_fractional_duration(node: &Node) -> Result<(Self, Option<Rational>)> {
         let (rate, drop) = frame_rate(&hex_bytes(node.get("FrameRate")?)?)?;
-        let (origin, length) = extent(&hex_bytes(node.get("MediaExtents")?)?, rate)?;
-        Ok(Self {
+        let (start, duration) = encoding::extent_seconds(&hex_bytes(node.get("MediaExtents")?)?)?;
+        let origin = frames(start, rate)?;
+        let (length, fractional_duration) = match frames(duration, rate) {
+            Ok(length) => (length, None),
+            Err(error) => {
+                let count = duration * rate.num() as f64 / rate.den() as f64;
+                if !(0.0..=10_000_000.0).contains(&count) {
+                    return Err(error);
+                }
+                let exact = encoding::binary64_rational(duration.to_bits())
+                    .ok_or("Resolve fractional sequence extent exceeds graph bounds")?;
+                // The grid counts only complete frames. Callers must use
+                // the separate exact duration for a fractional extent.
+                (count.floor() as i64, Some(exact))
+            }
+        };
+        Ok((Self {
             rate,
             drop,
             origin,
             length,
             size: raster(&hex_bytes(node.get("Resolution")?)?)?,
-        })
+        }, fractional_duration))
     }
 
     fn clock(self, id: &str) -> Result<SourceClock> {
@@ -1247,41 +1396,34 @@ impl Grid {
         Ok(clock)
     }
 
-    fn edit(self, node: &Node, wav: bool) -> Result<Edit> {
-        self.audio_edit(node, wav, false)
+    fn edit(self, node: &Node) -> Result<Option<Edit>> {
+        self.audio_edit(node, false, false)
     }
 
-    fn audio_edit(self, node: &Node, wav: bool, standalone_mono_atom: bool) -> Result<Edit> {
-        let duration = node.get("Duration")?;
-        let length = if standalone_mono_atom {
-            wav::integer_atom_frame(duration)?
-        } else if wav {
-            wav::integer_wav_frame(duration)?
-        } else {
-            duration.parse()?
+    fn audio_edit(self, node: &Node, wav: bool, standalone_mono_atom: bool) -> Result<Option<Edit>> {
+        let on_grid = |value: &str| {
+            let saved = timing::FrameField::parse(value)?;
+            Ok::<_, Box<dyn std::error::Error>>(if standalone_mono_atom || wav {
+                wav::whole_frame(&saved, standalone_mono_atom)
+            } else {
+                saved.integer()
+            })
         };
+        let length = on_grid(node.get("Duration")?)?;
         let source_in = match node.get("In")? {
-            "" => 0, // Native serialization of default zero.
-            text if standalone_mono_atom => wav::integer_atom_frame(text)?,
-            text if wav => wav::integer_wav_frame(text)?,
-            text => text.parse::<i64>()?,
+            "" => Some(0), // Native serialization of default zero.
+            value => on_grid(value)?,
         };
-        self.edit_at(node, length, source_in)
+        let start = timing::FrameField::parse(node.get("Start")?)?.integer();
+        match (start, length, source_in) {
+            (Some(start), Some(length), Some(source_in)) => self.edit_at(start, length, source_in).map(Some),
+            _ => Ok(None),
+        }
     }
 
-    fn edit_at(self, node: &Node, length: i64, source_in: i64) -> Result<Edit> {
-        let start: i64 = node.get("Start")?.parse()?;
-        let start = start
-            .checked_sub(self.origin)
-            .ok_or("Resolve record start overflow")?;
-        if start < 0
-            || length <= 0
-            || source_in < 0
-            || start
-                .checked_add(length)
-                .is_none_or(|end| end > self.length)
-            || source_in.checked_add(length).is_none()
-        {
+    fn edit_at(self, start: i64, length: i64, source_in: i64) -> Result<Edit> {
+        let start = self.record_start(start, length)?;
+        if source_in < 0 || source_in.checked_add(length).is_none() {
             return Err("Resolve edit lies outside its declared sequence extent".into());
         }
         Ok(Edit {
@@ -1289,6 +1431,21 @@ impl Grid {
             length,
             source_in,
         })
+    }
+
+    fn record_start(self, start: i64, length: i64) -> Result<i64> {
+        let start = start
+            .checked_sub(self.origin)
+            .ok_or("Resolve record start overflow")?;
+        if start < 0
+            || length <= 0
+            || start
+                .checked_add(length)
+                .is_none_or(|end| end > self.length)
+        {
+            return Err("Resolve edit lies outside its declared sequence extent".into());
+        }
+        Ok(start)
     }
 }
 
@@ -1338,7 +1495,7 @@ fn sequence<'a>(
         let default_nearest = can_inherit_nearest && inherits_project;
         let default_input_fit =
             context.input_scaling_default == Some(crate::input_scaling::FIT) && default_nearest;
-        let track_flags = read_tracks(context, container, grid, &mut out, default_nearest, default_input_fit)?;
+        let track_flags = read_tracks(context, &container, grid, &mut out, default_nearest, default_input_fit)?;
         if inherits_project && can_inherit_sizing
             && out.placements.iter().any(|edit| {
                 edit.video_track.is_some()
@@ -1553,7 +1710,7 @@ fn unqualified_mute(graph: &mut SourceGraph, id: &str) {
 
 fn read_tracks<'a>(
     context: &mut Context<'a>,
-    container: &'a Node,
+    container: &Node,
     grid: Grid,
     out: &mut SourceSequence,
     default_nearest: bool,
@@ -1659,11 +1816,15 @@ fn read_tracks<'a>(
         }
         let mut entries = track.one("Items")?.elements()?.peekable();
         let mut previous = None;
+        let mut standalone_track = false;
         while let Some(entry) = entries.next() {
             let node = entry.entry()?;
             let before = previous.replace(node);
             let id = node.id()?;
             claim(&mut context.ids, id)?;
+            if matches!(node.name.as_str(), "Sm2TiVideoClip" | "Sm2TiAudioClip" | "Sm2TiTransition" | "Sm2TiGenerator") {
+                timing::observe_edit(&mut context.graph, &out.id, node, grid.rate)?;
+            }
             if node.name == "Sm2TiTransition" {
                 observations::transition(
                     &mut context.graph,
@@ -1681,13 +1842,35 @@ fn read_tracks<'a>(
                 )?;
                 continue;
             }
+            if kind == StreamKind::Audio && node.name == "Sm2TiAudioClip" {
+                if let Some(master) = node.maybe("MediaRef")?.and_then(|id| context.masters.get(id))
+                    .filter(|master| master.external_audio)
+                {
+                    virtual_audio::observe_edit(
+                        master.rate, node, track, index, &out.id, out.rate,
+                        &mut context.graph, &mut context.blobs,
+                    )?;
+                    continue;
+                }
+                if let Some(master) = node.maybe("MediaRef")?.and_then(|id| context.masters.get(id))
+                    .filter(|master| master.saved_aac_clock)
+                {
+                    embedded_audio::observe_edit(
+                        master.rate, node, track, index, out, &mut context.graph, &mut context.blobs,
+                    )?;
+                    continue;
+                }
+            }
             if supported && kind == StreamKind::Video && node.name == "Sm2TiGenerator"
                 && node.maybe("PrettyType")? == Some("Solid Color") && node.maybe("Flags")? == Some("0")
                 && node.maybe("FieldsBlob")?.is_none_or(str::is_empty)
                 && node.maybe("MarkersBA")?.is_none_or(str::is_empty)
             {
                 if let Some(rgb) = crate::generator::rgb(node.maybe("EffectFiltersBA")?.unwrap_or_default()) {
-                    let edit = grid.edit(node, false)?;
+                    let Some(edit) = grid.edit(node)? else {
+                        omitted(&mut context.graph, &out.id, id, "timing", timing::SUBFRAME_LOSS);
+                        continue;
+                    };
                     let solid = crate::generator::Solid { start: edit.start, duration: edit.length, rgb };
                     observations::append(&mut context.graph, crate::generator::ADAPTER, &out.id, solid.receipt(id, index));
                     continue;
@@ -1709,10 +1892,28 @@ fn read_tracks<'a>(
                 && node
                     .maybe("MediaRef")?
                     .is_some_and(|target| context.nested.contains_key(target));
-            if (!supported && !saved_audio_nest)
+            let standalone = if kind == StreamKind::Audio && node.name == "Sm2TiAudioClip"
+                && matches!(flags, "0" | "1" | "2" | "3") && matches!(track.get("SubType")?, "0" | "1")
+            {
+                node.maybe("MediaRef")?.and_then(|target| context.masters.get(target)).filter(|master| {
+                    master.standalone_audio.is_some() && (master.wav_samples.is_none() || !supported)
+                })
+            } else {
+                None
+            };
+            if (!supported && !saved_audio_nest && standalone.is_none())
                 || !ordinary_item(node, kind, &out.id, &mut context.graph)?
             {
                 continue;
+            }
+            if kind == StreamKind::Video && node.maybe("MediaRef")?.is_none() {
+                if let Some(filters) = node.maybe("EffectFiltersBA")?.filter(|value| !value.is_empty()) {
+                    observations::unbound_picture(
+                        &mut context.graph, &out.id, node, track_id, index, grid,
+                        filters, &mut context.blobs,
+                    )?;
+                    continue;
+                }
             }
             if context.inspect_drt {
                 let mut missing = Vec::new();
@@ -1741,13 +1942,25 @@ fn read_tracks<'a>(
                 }
             }
             let target = node.get("MediaRef")?;
-            if let Some(group) = context.groups.get(target) {
+            if let Some(master) = standalone {
+                if let Some(p) = wav::edit(master, node, grid, index, track.get("SubType")? == "0",
+                    &out.id, &mut context.graph, &mut context.blobs)?
+                {
+                    out.placements.push(p);
+                    standalone_track |= !supported;
+                }
+            } else if let Some(group) = context.groups.get(target) {
                 if stereo {
                     omitted(&mut context.graph, &out.id, id, "audio_routing",
                         "Resolve stereo multicam track is outside the linked PCM profile");
                     continue;
                 }
-                let edit = grid.edit(node, false)?;
+                let Some(edit) = grid.edit(node)? else {
+                    record_unqualified_timing(
+                        &mut context.graph, node, &out.id, group.grid.rate, grid.rate, &mut context.blobs,
+                    )?;
+                    continue;
+                };
                 multicam::placement(
                     group,
                     node,
@@ -1760,6 +1973,14 @@ fn read_tracks<'a>(
                     &mut context.blobs,
                 )?;
             } else if let Some(master) = context.masters.get(target) {
+                if master.still && kind == StreamKind::Video {
+                    if let Some(p) = still::edit(master, node, grid, index, &out.id,
+                        &mut context.graph, &mut context.blobs)?
+                    {
+                        out.placements.push(p);
+                    }
+                    continue;
+                }
                 if master.rate != grid.rate
                     && !((kind == StreamKind::Video && index == 1
                         || kind == StreamKind::Audio && master.camera_pcm)
@@ -1805,14 +2026,22 @@ fn read_tracks<'a>(
                     out.placements.push(p);
                 }
             } else if let Some(&(child, class)) = context.nested.get(target) {
-                let edit = grid.edit(node, false)?;
                 let child_grid = Grid::read(child)?;
+                let Some(edit) = grid.edit(node)? else {
+                    record_unqualified_timing(
+                        &mut context.graph, node, &out.id, child_grid.rate, grid.rate, &mut context.blobs,
+                    )?;
+                    continue;
+                };
+                let child_origin = seconds(child_grid.origin, child_grid.rate)?;
                 let audio = kind == StreamKind::Audio;
                 let neutral = index == 1
                     && grid.rate == Rational::integer(24) && child_grid.rate == grid.rate
                     && child_grid.length > 0
                     && child_grid.size == grid.size
-                    && node.maybe("MediaStartTime")?.and_then(|v| v.parse::<f64>().ok()) == Some(child_grid.origin as f64 / 24.0)
+                    && node.maybe("MediaStartTime")?.is_some_and(|saved| {
+                        timing::clock_matches(saved, child_origin, child_grid.rate).unwrap_or(false)
+                    })
                     && node.maybe("MediaFrameRate")? == Some("00000000000038400000000000000000")
                     && node.maybe("MediaTimemapBA")?.is_some_and(|v| nests::identity_map(v, child_grid.length))
                     && node.maybe("MixedFrameRateAlignment")? == Some("0")
@@ -1939,6 +2168,15 @@ fn read_tracks<'a>(
                 return Err("unresolved Resolve placement media reference".into());
             }
         }
+        if standalone_track {
+            observations::append(&mut context.graph, "resolve.standalone_audio_tracks", &out.id,
+                Value::Obj(vec![
+                    ("id".into(), text(track_id)),
+                    ("track".into(), Value::Int(index)),
+                    ("saved_flags".into(), text(flags)),
+                    ("saved_subtype".into(), text(track.get("SubType")?)),
+                ]));
+        }
     }
     if has_track_state {
         let (aspect, reason) = crate::track_state::LOSS;
@@ -1953,7 +2191,7 @@ fn read_tracks<'a>(
 
 fn read_captions<'a>(
     context: &mut Context<'a>,
-    vector: &'a Node,
+    vector: &Node,
     grid: Grid,
     out: &mut SourceSequence,
 ) -> Result<()> {
@@ -2063,6 +2301,17 @@ fn direct(
     blobs: &mut Blobs,
 ) -> Result<Option<Placement>> {
     use observations::PictureTiming;
+    let start = timing::FrameField::parse(node.get("Start")?)?.integer();
+    let duration = timing::FrameField::parse(node.get("Duration")?)?;
+    let length = if kind == StreamKind::Audio && (master.wav_samples.is_some() || master.standalone_mono_atom) {
+        wav::whole_frame(&duration, master.standalone_mono_atom)
+    } else {
+        duration.integer()
+    };
+    let (Some(start), Some(length)) = (start, length) else {
+        record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+        return Ok(None);
+    };
     let timing = if kind == StreamKind::Video
         && track == 1
         && grid.rate == Rational::integer(24)
@@ -2098,8 +2347,7 @@ fn direct(
     let mut linear_map = None;
     let (edit, speed, sampled) = match (mixed, timing) {
         (Some(crate::mixed_rate::ResolveTrim::Adjusted(cadence, source_in)), _) => {
-            let length = node.get("Duration")?.parse()?;
-            let edit = grid.edit_at(node, length, source_in)?;
+            let edit = grid.edit_at(start, length, source_in)?;
             let last = cadence.last_frame(source_in, length)
                 .ok_or("invalid Resolve mixed-rate trim")?;
             leaf_range_matches(master, node, last, 1, owner, graph)?;
@@ -2110,10 +2358,9 @@ fn direct(
             (edit, None, Some((seconds(source_in, grid.rate)?, map)))
         }
         (Some(crate::mixed_rate::ResolveTrim::DefaultConform(trim)), _) => {
-            let length = node.get("Duration")?.parse()?;
             // The timeline shape is on the record clock. The placement's
             // exact trim is set separately on its native file clock.
-            let edit = grid.edit_at(node, length, 0)?;
+            let edit = grid.edit_at(start, length, 0)?;
             let last = trim.last_frame(length).ok_or("invalid Resolve default conform duration")?;
             leaf_range_matches(master, node, last, 1, owner, graph)?;
             record_saved_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
@@ -2133,10 +2380,16 @@ fn direct(
             }
         }
         (None, Some(PictureTiming::Speed(speed))) => {
-            let length = node.get("Duration")?.parse()?;
-            let source_in = speed.file_source_in(node.get("In")?, length, master.length)
-                .ok_or("invalid Resolve retime in-point")?;
-            let edit = grid.edit_at(node, length, source_in)?;
+            let raw_in = node.get("In")?;
+            let source_in = match speed.file_source_in(raw_in, length, master.length) {
+                Some(source_in) => source_in,
+                None if raw_in.contains('|') => {
+                    record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+                    return Ok(None);
+                }
+                None => return Err("invalid Resolve retime in-point".into()),
+            };
+            let edit = grid.edit_at(start, length, source_in)?;
             record_saved_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
             leaf_range_matches(
                 master, node, edit.source_in, speed.sampled_source_frames(edit.length)?,
@@ -2150,15 +2403,17 @@ fn direct(
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
             && node.maybe("MixedFrameRateAlignment")? == Some("0") =>
         {
-            let length = node.get("Duration")?.parse()?;
-            let record_in = node.get("In")?.parse::<i64>()?;
+            let Some(record_in) = timing::FrameField::parse(node.get("In")?)?.integer() else {
+                record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+                return Ok(None);
+            };
             let count = crate::retime::hold_count(length).ok_or("invalid Resolve Linear retime edit length")?;
             blobs.charge(count * size_of::<i64>())?;
             let map = crate::retime::LinearMap::new(record_in, keys, master.length)?;
             let samples = map.samples(length)?;
             let source_in = samples[0];
             let source_length = samples[count - 1] - source_in + 1;
-            let edit = grid.edit_at(node, length, source_in)?;
+            let edit = grid.edit_at(start, length, source_in)?;
             leaf_range_matches(master, node, source_in, source_length, owner, graph)?;
             record_saved_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
             linear_map = Some(map);
@@ -2170,14 +2425,13 @@ fn direct(
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
             && node.get("In")? == crate::retime::HOLD_IN =>
         {
-            let length = node.get("Duration")?.parse()?;
             record_saved_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
             let Some(count) = crate::retime::hold_count(length) else {
                 omitted(graph, owner, node.id()?, "timing",
                     "Resolve freeze has no supported whole-frame record length in graph/2");
                 return Ok(None);
             };
-            let edit = grid.edit_at(node, length, frame)?;
+            let edit = grid.edit_at(start, length, frame)?;
             leaf_range_matches(master, node, frame, 1, owner, graph)?;
             blobs.charge(count * size_of::<i64>())?;
             (edit, None, Some((seconds(frame, grid.rate)?, vec![frame; count])))
@@ -2187,11 +2441,14 @@ fn direct(
                 record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
                 return Ok(None);
             }
-            let edit = grid.audio_edit(
+            let Some(edit) = grid.audio_edit(
                 node,
                 kind == StreamKind::Audio && master.wav_samples.is_some(),
                 kind == StreamKind::Audio && master.standalone_mono_atom,
-            )?;
+            )? else {
+                record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+                return Ok(None);
+            };
             if !leaf_matches(master, node, grid, edit, owner, graph, blobs)? {
                 return Ok(None);
             }
@@ -2581,6 +2838,12 @@ fn leaf_matches(
     graph: &mut SourceGraph,
     blobs: &mut Blobs,
 ) -> Result<bool> {
+    if master.still || master.standalone_audio.is_some() && master.wav_samples.is_none()
+        || (master.saved_aac_clock || master.external_audio) && node.name == "Sm2TiAudioClip"
+    {
+        record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+        return Ok(false);
+    }
     let map_matches = match master.wav_samples {
         Some(samples) => wav::identity_timemap(node, samples, master.rate)?,
         None => identity_timemap(node, master.length, master.rate)?,
@@ -2605,10 +2868,16 @@ fn leaf_range_matches(
     graph: &mut SourceGraph,
 ) -> Result<()> {
     if source_in < 0 || source_in.checked_add(source_length).is_none_or(|end| end > master.length)
-        || frames(node.get("MediaStartTime")?.parse()?, master.rate)? != master.start
+        || !timing::clock_matches(
+            node.get("MediaStartTime")?, seconds(master.start, master.rate)?, master.rate,
+        )?
     {
         return Err("Resolve edit contradicts media cache clock or extent".into());
     }
+    report_locator(master, node, owner, graph)
+}
+
+fn report_locator(master: &Master, node: &Node, owner: &str, graph: &mut SourceGraph) -> Result<()> {
     if let Some(saved) = node.maybe("MediaFilePath")?.filter(|x| !x.is_empty()) {
         if saved != master.path {
             omitted(
@@ -2631,10 +2900,14 @@ fn identity_timemap(node: &Node, length: i64, rate: Rational) -> Result<bool> {
     if value.len() != 8 {
         return Ok(false);
     }
-    Ok(frames(f64::from_be_bytes(value.try_into()?), rate)? == length - 1)
+    let endpoint = f64::from_be_bytes(value.try_into()?);
+    if !endpoint.is_finite() || endpoint < 0.0 {
+        return Err("invalid Resolve compact time-map endpoint".into());
+    }
+    Ok(frames(endpoint, rate).ok() == Some(length - 1))
 }
 
-fn mono(node: &Node, blobs: &mut Blobs, group: bool, embedded_movie: bool) -> Result<Option<i64>> {
+fn mono(node: &Node, blobs: &mut Blobs, group: bool, slot_zero_override: bool) -> Result<Option<i64>> {
     let virtual_track = blobs.qt(node.get("VirtualAudioTrackBA")?)?;
     if virtual_track.int("AudioType")? != 1 {
         return Ok(None);
@@ -2650,9 +2923,8 @@ fn mono(node: &Node, blobs: &mut Blobs, group: bool, embedded_movie: bool) -> Re
         (false, 0x8001) | (true, 0x4002) => 1,
         _ => return Ok(None),
     };
-    // A native embedded-movie edit can use physical stream zero and override
-    // its channel, or select the corresponding split Media Pool track.
-    if qualified != selector && !(embedded_movie && selector == 0) {
+    // Some saved profiles let slot zero carry a per-edit virtual channel.
+    if qualified != selector && !(slot_zero_override && selector == 0) {
         return Err("Resolve mono selector contradicts virtual channel".into());
     }
     Ok(Some(qualified))

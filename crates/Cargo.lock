@@ -225,7 +225,7 @@ version = "0.1.0"
 
 [[package]]
 name = "anynle-gui"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 dependencies = [
  "anynle-app",
  "anynle-mapping",
@@ -525,6 +525,7 @@ name = "avid-reader"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
+ "roxmltree",
 ]
 
 [[package]]

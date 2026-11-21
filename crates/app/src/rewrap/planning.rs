@@ -6,10 +6,11 @@ use super::source::{free_space, id_value, pcm_essence_bytes, stamp};
 use super::validation::timecode;
 use super::{Input, Job, LtRangePictures, Plan, R};
 use graph::json::Value;
+use graph::source::SourceGraph;
 use prproj::convert::model::{ticks_per_unit, Fraction, Model, TICKS_PER_SECOND as TPS};
 use prproj::convert::prepared::PreparedProjectInput;
 use prproj::convert::rewrap::supported_rate;
-use std::collections::{HashMap, HashSet};
+use std::{cell::LazyCell, collections::{HashMap, HashSet}};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -39,6 +40,7 @@ impl From<&str> for PrepareIssue {
 /// Shared read-only preparation for the native DNx, ProRes and saved Gain route.
 pub(crate) struct NativeMediaPreparation<'input, 'graph> {
     pub model: &'input Model,
+    pub source: &'graph SourceGraph,
     pub writer_input: Option<&'input mut PreparedProjectInput>,
     pub gain: &'input GainPaths<'graph>,
     pub managed_pictures: LtRangePictures,
@@ -62,7 +64,7 @@ impl NativeMediaPreparation<'_, '_> {
         ffprobe: &Path,
     ) -> Result<Plan, PrepareIssue> {
         let plan = Plan::prepare_media_review(
-            self.model, directory, media_roots, project, graph, ffmpeg, ffprobe, true, false, self.gain,
+            self.model, Some(self.source), directory, media_roots, project, graph, ffmpeg, ffprobe, true, false, self.gain,
             self.managed_pictures,
         )?;
         if let Some(input) = self.writer_input {
@@ -205,6 +207,7 @@ impl Plan {
                 target_path: target_path.clone(),
                 audio_stream: ordinal.checked_sub(1).map(|lane| if wide_audio { 0 } else { lane as u32 }),
                 separate_mono: job.separate_mono,
+                pixel_aspect: if ordinal == 0 { job.pixel_aspect } else { None },
             })
         })
     }
@@ -260,7 +263,7 @@ impl Plan {
         ffprobe: &Path,
         allow_mov: bool,
     ) -> R<Self> {
-        Self::prepare_media_review(model, directory, media_roots, project, graph, ffmpeg, ffprobe, allow_mov, false, &HashMap::new(), HashMap::new())
+        Self::prepare_media_review(model, None, directory, media_roots, project, graph, ffmpeg, ffprobe, allow_mov, false, &HashMap::new(), HashMap::new())
             .map_err(PrepareIssue::into_message)
     }
 
@@ -268,12 +271,13 @@ impl Plan {
         model: &Model, directory: &Path, media_roots: &[String], project: &Path,
         ffmpeg: &Path, ffprobe: &Path,
     ) -> Result<Self, PrepareIssue> {
-        Self::prepare_media_review(model, directory, media_roots, project, None, ffmpeg, ffprobe,
+        Self::prepare_media_review(model, None, directory, media_roots, project, None, ffmpeg, ffprobe,
             true, true, &HashMap::new(), HashMap::new())
     }
 
     fn prepare_media_review(
         model: &Model,
+        source: Option<&SourceGraph>,
         directory: &Path,
         media_roots: &[String],
         project: &Path,
@@ -335,6 +339,7 @@ impl Plan {
         let mut recipes = HashMap::<Vec<usize>, usize>::new();
         let mut owners = HashMap::<usize, Vec<usize>>::new();
         let mut mono_sources = HashMap::<&str, usize>::new();
+        let saved_descriptors = LazyCell::new(|| super::mov::saved_picture_descriptors(source));
         if model.clips.is_empty() {
             return Err("no clips selected for rewrapping".into());
         }
@@ -416,6 +421,7 @@ impl Plan {
                 && source_id.file_tracks == [(24, 1, video.duration / ticks_per_unit(video.rate))]
                 && source_id.file_packages.len() == 1;
             let mut recipe = Vec::new();
+            let mut pixel_aspect = None;
             let mut audio: Vec<_> = clip.audio.iter().collect();
             if audio.iter().any(|a| a.bits != audio[0].bits) {
                 return Err("mixed PCM bit depths in one OP1a file are not supported; no media created or samples converted".into());
@@ -499,7 +505,12 @@ impl Plan {
                 }
                 if at == 0 {
                     if mov {
-                        super::mov::validate_source(stream, &input.probe.raw, video)?;
+                        pixel_aspect = super::mov::validate_source(stream, &input.probe.raw, video)?;
+                        if let Some(aspect) = pixel_aspect {
+                            let saved = saved_descriptors.get(video.path.as_str())
+                                .map(Vec::as_slice).unwrap_or_default();
+                            super::mov::verify_pixel_aspect(video, aspect, &input_clock, saved)?;
+                        }
                     } else if stream.kind != "video"
                         || stream.codec != "dnxhd"
                         || !["yuv422p", "yuv422p10le", "yuv422p12le", "yuv444p10le", "yuv444p12le",
@@ -710,6 +721,9 @@ impl Plan {
                 if plan.jobs[j].tc != tc {
                     return Err("shared source has conflicting timecode".into());
                 }
+                if plan.jobs[j].pixel_aspect != pixel_aspect {
+                    return Err("shared ProRes source has conflicting pixel aspects".into());
+                }
                 plan.jobs[j].clips.push(clip_facts)
             } else {
                 let j = plan.jobs.len();
@@ -735,6 +749,7 @@ impl Plan {
                     tc,
                     rate: video.rate,
                     mov,
+                    pixel_aspect,
                     separate_mono,
                     wide_audio,
                 });

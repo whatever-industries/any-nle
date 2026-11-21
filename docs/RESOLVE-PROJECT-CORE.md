@@ -238,8 +238,18 @@ the prepared identities, ownership, ranges and channel selections before
 exclusive publication. Original hashes are rechecked immediately before
 publication. Limits include 64 selected timelines, 256 media bindings,
 256 source bins, 512 edits per lane, 16 bin levels, 2 GiB per physical file,
-8 GiB per selected media set, and 8 MiB generated XML. The source graph
-and archive reader retain their separate bounds.
+8 GiB per selected media set, and 48 MiB of aggregate generated XML
+for linked projects. Templates and per-track XML construction retain
+their 8 MiB budgets. Staged output must also pass the source reader's
+archive, member, node, and depth limits.
+
+The picture-only stress fixture passed staged read-back and native
+Resolve Studio 21.2.0.0006 import, save, close, reopen, and re-export.
+All 32 timelines retained their order, starts, and 16,384 one-frame edits
+of the same verified original. The written archive contained 34.1 MiB
+of expanded XML and 741,692 parsed nodes. The native re-export contained
+34.4 MiB and 741,701 parsed nodes, with at most 23,080 in each member.
+The local release conversion peaked at about 301 MiB resident memory.
 
 Same-build scripting checks saved, closed, reopened and re-exported the
 multi-timeline, duplicate-name, two-rate and stereo-source candidates.

@@ -44,7 +44,7 @@ pub(super) fn bounded(mut r: impl Read, max: usize) -> std::io::Result<(Vec<u8>,
     }
     Ok((out, overflow))
 }
-pub(super) fn run(cmd: &mut Command) -> R<String> {
+pub(crate) fn run(cmd: &mut Command) -> R<String> {
     let (bytes, large) = read_stdout(cmd, |stdout| {
         bounded(stdout, LIMIT).map_err(|e| e.to_string())
     })?;
@@ -53,7 +53,7 @@ pub(super) fn run(cmd: &mut Command) -> R<String> {
     }
     String::from_utf8(bytes).map_err(|_| "backend output is not UTF-8".into())
 }
-pub(super) fn read_stdout<T>(
+pub(crate) fn read_stdout<T>(
     cmd: &mut Command,
     read: impl FnOnce(ChildStdout) -> R<T>,
 ) -> R<T> {

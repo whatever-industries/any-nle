@@ -1,5 +1,8 @@
 //! Exact saved-locator/root-map lookup and bounded read-only physical-stream probes.
-use crate::{OriginalLocatorIssue, OriginalLocatorKind, SelectedMediaIndex, SourceReadIssue};
+use crate::{
+    OriginalLocatorIssue, OriginalLocatorKind, OriginalMediaTrackIssue, SelectedMediaIndex,
+    SourceReadIssue,
+};
 use avid_reader::source as av;
 use graph::{source::OriginalStream, Rational, StreamKind, Value};
 use std::{
@@ -1651,8 +1654,16 @@ impl OriginalIndex {
     pub(crate) fn scan_with(
         facts: &av::SourceProject,
         options: &OriginalOptions,
-        mut inspect: impl FnMut(&Path) -> Result<Value, String>,
+        inspect: impl FnMut(&Path) -> Result<Value, String>,
     ) -> Result<Self, String> {
+        Self::scan_with_review_details(facts, options, inspect).map_err(SourceReadIssue::into_message)
+    }
+    #[cfg(test)]
+    pub(crate) fn scan_with_review_details(
+        facts: &av::SourceProject,
+        options: &OriginalOptions,
+        mut inspect: impl FnMut(&Path) -> Result<Value, String>,
+    ) -> Result<Self, SourceReadIssue> {
         Self::scan_with_control(
             facts, false, None,
             options,
@@ -1666,7 +1677,6 @@ impl OriginalIndex {
             },
             &mut || Ok(()),
         )
-        .map_err(SourceReadIssue::into_message)
     }
     pub fn scan_controlled(
         facts: &av::SourceProject,
@@ -1960,6 +1970,25 @@ impl OriginalIndex {
                     }
                 }
                 let describe = |why: String| format!("{:?} · {}: {why}", m.master.name, path.display());
+                let media_issue = |message, whole_file, check: &mut dyn FnMut() -> Result<(), String>| {
+                    if !options.collect_blocked_locators {
+                        return SourceReadIssue::OriginalMedia(message);
+                    }
+                    let track = std::iter::once((master_index, i));
+                    let details = if whole_file {
+                        super::locator_uses::collect_saved_paths(facts, track, check)
+                    } else {
+                        super::locator_uses::collect_tracks(facts, track, check)
+                    };
+                    match details {
+                        Ok(edits) => SourceReadIssue::OriginalMediaTracks(OriginalMediaTrackIssue {
+                            message,
+                            bin: m.master.bin,
+                            edits,
+                        }),
+                        Err(error) => SourceReadIssue::OriginalMedia(error),
+                    }
+                };
                 let cached = probes.iter().position(|(p, _)| p == &path);
                 let fresh_probe = cached.is_none();
                 if let Some(index) = cached {
@@ -1972,15 +2001,16 @@ impl OriginalIndex {
                     // Pin bytes on both sides of the probe. Neither mtime nor a post-probe
                     // hash alone establishes which bytes supplied the stream facts.
                     let before = crate::revision::file_revision_checked(&path, check)
-                        .map_err(|e| format!("original revision read failed: {e}"))?;
+                        .map_err(|e| media_issue(format!("original revision read failed: {e}"), true, check))?;
                     if pinned.get(&path).is_some_and(|old| old != &before) {
-                        return Err("original content changed between source selections".into());
+                        return Err(media_issue("original content changed between source selections".into(), true, check));
                     }
-                    let observed = inspect(&path, check).map_err(describe)?;
+                    let observed = inspect(&path, check)
+                        .map_err(|error| media_issue(describe(error), true, check))?;
                     let after = crate::revision::file_revision_checked(&path, check)
-                        .map_err(|e| format!("original revision recheck failed: {e}"))?;
+                        .map_err(|e| media_issue(format!("original revision recheck failed: {e}"), true, check))?;
                     if before != after {
-                        return Err("original content changed during stream probe".into());
+                        return Err(media_issue("original content changed during stream probe".into(), true, check));
                     }
                     if !pinned.contains_key(&path) {
                         used = used
@@ -2033,7 +2063,7 @@ impl OriginalIndex {
                             }
                             continue 'master;
                         }
-                        result => result.map_err(&describe)?,
+                        result => result.map_err(|error| media_issue(describe(error), false, check))?,
                     };
                     if let Some((selected, defaulted)) = selected {
                         used = used.checked_add(selection_cost(m, raw, &path))
@@ -2047,7 +2077,9 @@ impl OriginalIndex {
                         continue;
                     }
                 }
-                if let Some(selected) = additional_media::select(m, i, &path, physical).map_err(&describe)? {
+                if let Some(selected) = additional_media::select(m, i, &path, physical)
+                    .map_err(|error| media_issue(describe(error), false, check))?
+                {
                     used = used.checked_add(selection_cost(m, raw, &path))
                         .filter(|n| *n <= MAX_ORIGINAL_INDEX_BYTES)
                         .ok_or("original index exceeds 64 MiB")?;
@@ -2063,7 +2095,7 @@ impl OriginalIndex {
                         out.omit_media(m, describe(e), &mut used)?;
                         continue 'master;
                     }
-                    otherwise => otherwise.map_err(&describe)?,
+                    otherwise => otherwise.map_err(|error| media_issue(describe(error), true, check))?,
                 };
                 let Value::Arr(streams) = v.get("streams").ok_or("probe lacks streams")? else {
                     return Err("probe streams malformed".into());

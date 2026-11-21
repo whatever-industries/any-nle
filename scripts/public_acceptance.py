@@ -5,19 +5,23 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]
 SUITES=[('gui',['-p','anynle-gui','--lib'],6),('inventory',['-p','anynle-app','--lib','job::inventory'],6 if os.name=='nt' else 7),('job_engine',['-p','anynle-app','--lib','job::engine'],9),('backend_bundle',['-p','anynle-app','--lib','backend_bundle'],2),('graph',['-p','anynle-graph','--lib'],27),('avid_adapter',['-p','anynle-avid-adapter','--lib'],27 if os.name=='nt' else 28),('mapping',['-p','anynle-mapping','--lib'],2)]
 APP_TESTS=['rewrap::source::space_tests::available_space_queries_existing_volume','rewrap::source::space_tests::available_space_missing_path_refuses','rewrap::tests::existing_destination_is_refused_before_backend_or_inputs','rewrap::tests::pcm_counter_rejects_truncated_klv_and_counts_payload_bytes','rewrap::tests::private_klv_keys_are_allowed_only_inside_declared_header_metadata','rewrap::tests::exact_timecode_and_invalid_origins','rewrap::tests::mov_lane_admission_refuses_unqualified_width_before_source_access','rewrap::execution::ownership_tests::exclusive_creation_reports_only_the_owned_media_directory']
 APP_TESTS += ['rewrap::mov::tests::prores_alpha_rewrite_changes_only_qualified_sample_depth']
+APP_TESTS += ['rewrap::mov::tests::anamorphic_picture_requires_matching_saved_and_physical_geometry']
 APP_TESTS += ['rewrap::mono::tests::wide_wav_stores_only_exact_source_sample_references']
+APP_TESTS += ['avid_media::master::tests::managed_master_places_referenced_objects_before_the_bin_root']
 def run(output):
     output=pathlib.Path(output); output.mkdir(parents=True,exist_ok=True)
     results=[]; failures=[]
     workspace=ROOT/'crates/Cargo.toml'
     selected=[(n,args,minimum,workspace) for n,args,minimum in SUITES+[(n,['-p','anynle-app','--lib',n],1) for n in APP_TESTS]]
     selected += [
+        ('gui_bin_picker', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'wizard::bin_picker::tests'], 4, workspace),
         ('gui_report', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'report'], 3, workspace),
         ('gui_svg_arrow', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'icons::tests'], 1, workspace),
         ('media_verification', ['-p', 'anynle-media-verification', '--lib'], 4, workspace),
         ('premiere_preparation', ['-p', 'anynle-premiere-adapter', '--test', 'preparation'], 54, workspace),
         ('premiere_import_worker', ['-p', 'anynle-app', '--lib', 'premiere_import::worker'], 2, workspace),
         ('graph_output', ['-p', 'anynle-app', '--test', 'graph_output'], 11 if os.name == 'nt' else 13, workspace),
+        ('avid_processing', ['-p', 'anynle-app', '--lib', 'avid_processing'], 1, workspace),
     ]
     if platform.system() == 'Darwin':
         selected.append(('premiere_review', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'premiere_review'], 1, workspace))
