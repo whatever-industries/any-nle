@@ -32,10 +32,11 @@ pub(super) fn interpret(
     item: TrackItemId,
     kind: StreamKind,
     data: &Value,
-    source_in: i64,
-    source_out: i64,
+    source_range: (i64, i64),
     frame_ticks: i64,
+    linear_retime: bool,
 ) -> Result<Option<ClipControl>> {
+    let (source_in, source_out) = source_range;
     let item = project.track_item(item);
     let ([id], [], Value::Arr(components)) = (
         item.components.as_slice(),
@@ -79,6 +80,8 @@ pub(super) fn interpret(
                     return Ok(neutral_motion(tree, &component.properties, &[5])?
                         .then_some(ClipControl::LinearRoll(roll)));
                 }
+            }
+            if linear_retime || frame_ticks == TICKS_PER_SECOND / 24 {
                 if let Some(transform) = static_warp(params) {
                     return Ok(neutral_motion(tree, &component.properties, &[5, 8, 9, 10, 11])?
                         .then_some(ClipControl::StaticMotion(transform)));

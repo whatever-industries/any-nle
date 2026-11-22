@@ -849,8 +849,12 @@ fn compare_edits(
                     diff,
                     "edit.inherited_input_scaling",
                     &context,
-                    left.receipt(&left.seq.id, input_scaling::PROJECT_SETTING).map(graph_value),
-                    right.receipt(&right.seq.id, input_scaling::PROJECT_SETTING).map(graph_value),
+                    left.receipt(&left.seq.id, input_scaling::SEQUENCE_SETTING)
+                        .or_else(|| left.receipt(&left.seq.id, input_scaling::PROJECT_SETTING))
+                        .map(graph_value),
+                    right.receipt(&right.seq.id, input_scaling::SEQUENCE_SETTING)
+                        .or_else(|| right.receipt(&right.seq.id, input_scaling::PROJECT_SETTING))
+                        .map(graph_value),
                 );
             }
         }

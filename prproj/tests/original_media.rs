@@ -120,6 +120,7 @@ fn input(c: OriginalClip) -> PreparedProjectInput {
         track_states: Default::default(),
         timeline_marks: Default::default(),
         non_drop_sequences: Default::default(),
+        fit_picture: Default::default(),
         picture_effects: Vec::new(),
         source_luts: Vec::new(),
         extended_sdr_grades: Default::default(),
@@ -426,6 +427,34 @@ fn sequence(events: Vec<Event>) -> Sequence {
         audio_crossfades: vec![],
         start: 0,
     }
+}
+
+#[test]
+fn custom_linked_canvas_requires_fit_for_mismatched_picture() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("fitted.prproj");
+    let mut project = input(original("prores_hq"));
+    let mut picture = event();
+    picture.stereo.clear();
+    picture.source_in = ticks_per_unit(Fraction::new(24, 1));
+    project.sequences.push(sequence(vec![picture]));
+    project.sequences[0].width = 3840;
+    project.sequences[0].height = 1920;
+
+    let prepare = |project: &PreparedProjectInput| {
+        prepare_typed_project(project, &path, &mut SeededUuids::new("custom"), &[], false)
+    };
+    assert!(prepare(&project).is_err());
+    assert!(!path.exists());
+    project.fit_picture.insert((0, 1));
+    assert!(prepare(&project).is_err());
+    project.fit_picture.clear();
+    project.fit_picture.insert((0, 0));
+    prepare(&project).unwrap().publish().unwrap();
+    let saved = xml(&path);
+    assert!(saved.contains("<FrameRect>0,0,3840,1920</FrameRect>"));
+    assert_eq!(saved.matches("<ScaleToFramePolicy>1</ScaleToFramePolicy>").count(), 1);
+    assert!(saved.contains("<InPoint>10584000000</InPoint>"));
 }
 
 #[test]

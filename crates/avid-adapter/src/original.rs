@@ -16,6 +16,8 @@ use std::{
 mod still;
 mod source_media;
 mod additional_media;
+#[doc(hidden)]
+pub use additional_media::{inspect_mp3_presentation, Mp3Extent};
 mod same_rate_movie;
 pub(super) mod legacy_mxf;
 const MAX_ORIGINAL_INDEX_BYTES: usize = 64 << 20;

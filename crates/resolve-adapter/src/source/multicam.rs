@@ -8,6 +8,8 @@ use graph::source::{
 
 const UNKNOWN_PICTURE_DEFAULT: &str =
     "Resolve Group-wide picture default is unqualified; edit selectors are separate";
+pub(crate) const PARTIAL_PICTURE: &str =
+    "one or more Resolve Group picture angles remain unqualified";
 pub(crate) const REFERENCE_AUDIO_SWITCH: (&str, &str) = (
     "multicam_reference_audio_envelope",
     "Resolve's saved angle differs from the reference audio source; the native cut-edge envelope has no qualified destination mapping",
@@ -33,7 +35,6 @@ struct AngleTrack {
 
 pub(super) struct Group {
     pub(super) grid: Grid,
-    fractional_extent: bool,
     single_audio_slot: bool,
     picture: Vec<(String, String, Member)>,
     extended_picture: Vec<AngleTrack>,
@@ -93,10 +94,6 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
                     }
                     continue;
                 };
-                if fractional_extent {
-                    record_saved_timing(&mut context.graph, item, id, master.rate, grid.rate, &mut context.blobs)?;
-                    continue;
-                }
                 let Some(edit) = grid.edit(item)? else {
                     omitted(&mut context.graph, id, item_id, "timing", timing::SUBFRAME_LOSS);
                     continue;
@@ -169,7 +166,11 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
     if !picture_complete || picture.len() != 2 {
         picture.clear();
     }
-    if !picture.is_empty() || !complete_extended_picture {
+    if fractional_extent && !complete_extended_picture {
+        extended_picture.retain(|track| saved_tracks.unique_picture(&track.angle));
+    }
+    let partial_picture = fractional_extent && !complete_extended_picture && !extended_picture.is_empty();
+    if !picture.is_empty() || !fractional_extent && !complete_extended_picture {
         extended_picture.clear();
     }
     let mut audio = None;
@@ -214,10 +215,10 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
     let mut lanes = Vec::new();
     if !picture.is_empty() || !extended_picture.is_empty() {
         let alternatives = if picture.is_empty() {
-            extended_picture.iter().map(|track| track_alternative(id, track, StreamKind::Video, grid)).collect::<Result<_>>()?
+            extended_picture.iter().map(|track| track_alternative(id, track, StreamKind::Video, grid, fractional_duration)).collect::<Result<_>>()?
         } else {
             picture.iter().map(|(track, _, member)| {
-                alternative(id, track, StreamKind::Video, 1, member, grid)
+                alternative(id, track, StreamKind::Video, 1, member, grid, fractional_duration)
             }).collect::<Result<_>>()?
         };
         lanes.push(MulticamLane {
@@ -248,6 +249,7 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
                     lane,
                     member,
                     grid,
+                    fractional_duration,
                 )?],
                 reason: None,
             });
@@ -258,7 +260,7 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
             index: 1,
             selected: None,
             alternatives: mono_angles.iter()
-                .map(|track| track_alternative(id, track, StreamKind::Audio, grid))
+                .map(|track| track_alternative(id, track, StreamKind::Audio, grid, fractional_duration))
                 .collect::<Result<_>>()?,
             reason: Some("Resolve Group-wide audio default is unqualified; edit selectors are separate".into()),
         });
@@ -279,9 +281,13 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
             None if grid.length > 0 => Some(seconds(grid.length, grid.rate)?),
             None => None,
         },
-        reason: lanes
-            .is_empty()
-            .then(|| "unqualified Resolve Group topology".into()),
+        reason: if lanes.is_empty() {
+            Some("unqualified Resolve Group topology".into())
+        } else if partial_picture {
+            Some(PARTIAL_PICTURE.into())
+        } else {
+            None
+        },
         lanes,
     });
     let mut facts = vec![
@@ -303,8 +309,6 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
         ];
     if fractional_extent {
         facts.push(("saved_media_extents".into(), text(node.get("MediaExtents")?)));
-        loss(&mut context.graph, id, "timing",
-            "Resolve Group has a fractional saved duration and no qualified playback mapping");
     }
     if let Some(saved) = single_audio_slot {
         facts.push(("single_audio_slot".into(), Value::Obj(vec![
@@ -317,7 +321,6 @@ pub(super) fn definition<'a>(context: &mut Context<'a>, clip: &'a Node) -> Resul
     receipt(&mut context.graph, id, facts);
     Ok(Group {
         grid,
-        fractional_extent,
         single_audio_slot: single_audio_slot.is_some(),
         picture,
         extended_picture,
@@ -430,12 +433,13 @@ fn alternative(
     lane: i64,
     member: &Member,
     grid: Grid,
+    duration: Option<Rational>,
 ) -> Result<MulticamAlternative> {
-    alternative_pieces(id, track, kind, lane, std::slice::from_ref(member), grid)
+    alternative_pieces(id, track, kind, lane, std::slice::from_ref(member), grid, duration)
 }
 
-fn track_alternative(id: &str, track: &AngleTrack, kind: StreamKind, grid: Grid) -> Result<MulticamAlternative> {
-    alternative_pieces(id, &track.id, kind, 1, &track.members, grid)
+fn track_alternative(id: &str, track: &AngleTrack, kind: StreamKind, grid: Grid, duration: Option<Rational>) -> Result<MulticamAlternative> {
+    alternative_pieces(id, &track.id, kind, 1, &track.members, grid, duration)
 }
 
 fn alternative_pieces(
@@ -445,6 +449,7 @@ fn alternative_pieces(
     lane: i64,
     members: &[Member],
     grid: Grid,
+    duration: Option<Rational>,
 ) -> Result<MulticamAlternative> {
     let mut pieces = Vec::new();
     let mut append = |start, length, source: Option<&Member>| -> Result<()> {
@@ -468,6 +473,11 @@ fn alternative_pieces(
         end = member.start + member.length;
     }
     append(end, grid.length - end, None)?;
+    if let Some(duration) = duration {
+        let start = seconds(grid.length, grid.rate)?;
+        let duration = duration.checked_sub(start).ok_or("Resolve Group fractional tail overflows")?;
+        pieces.push(MulticamPiece { start, duration, item: None, stream: None, source_in: None });
+    }
     // Track identifiers are native. The lane suffix distinguishes the two audio routes.
     Ok(MulticamAlternative {
         id: format!("{id}/{track}/{}/{lane}", kind.as_str()),
@@ -507,7 +517,7 @@ pub(super) fn placement(
     } else {
         None
     };
-    let compatible_grid = !group.fractional_extent && group.grid.rate == grid.rate
+    let compatible_grid = group.grid.length > 0 && group.grid.rate == grid.rate
         && rate(&hex_bytes(node.get("MediaFrameRate")?)?)? == grid.rate
         && identity_timemap(node, group.grid.length, group.grid.rate)?;
     let selected = match kind {
@@ -654,7 +664,7 @@ mod tests {
                 Member { item: "second".into(), start: 20, length: 10, source_in: 8 },
             ],
         };
-        let picture = track_alternative("group", &track, StreamKind::Video, grid).unwrap();
+        let picture = track_alternative("group", &track, StreamKind::Video, grid, None).unwrap();
         let [first, gap, second] = picture.pieces.as_slice() else {
             panic!("expected two source pieces and the intervening gap");
         };

@@ -106,6 +106,9 @@ pub(super) fn capture(
                 refuse("saved clip transition references disagree with the cut endpoints").into(),
             );
         }
+        if out.frame_map.is_some() || input.frame_map.is_some() {
+            return Err(refuse("transition endpoints with sampled picture timing are unqualified").into());
+        }
         pending.push((saved, outgoing, incoming));
     }
     if !claims.is_empty() {

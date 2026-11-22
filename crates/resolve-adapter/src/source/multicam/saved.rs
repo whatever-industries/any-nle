@@ -12,6 +12,10 @@ pub(super) struct Tracks {
 }
 
 impl Tracks {
+    pub(super) fn unique_picture(&self, angle: &str) -> bool {
+        self.picture.get(angle).is_some_and(Option::is_some)
+    }
+
     pub(super) fn capture(
         &mut self,
         kind: StreamKind,

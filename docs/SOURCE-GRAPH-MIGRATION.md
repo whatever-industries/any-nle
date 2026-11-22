@@ -934,7 +934,51 @@ BT.709 transfer characteristic. Test the swapped source choice at 25%,
 where the two assignments give different values. Compare the outer
 samples of the two scaled edits to isolate generated background color.
 The offline harness discriminates these cases on synthetic output.
-Native Avid render evidence is pending. [ITU-R BT.709](https://www.itu.int/rec/R-REC-BT.709-6-201506-I/en)
+
+Avid Media Composer 25.12.0.58863 controls used the same source trims
+and a continuous 32-frame V2 overlap. Each 24p export had 36 frames.
+At 0% and 100%, the decoded frame stamps matched the lower and upper
+source ranges respectively. At 25%, all 32 frames matched the Rec.709
+code-value blend at the three band centers. The unswapped codes were
+288, 368 and 496. Enabling Swap Sources yielded 608, 464 and 336.
+The saved foreground opacity and swap control are already retained
+in `avid.source.warp_inputs`. The native effect saves filler in slot 1
+with a `TRKR` proxy at relative scope 1, track −1. Slot 2 holds the
+trimmed upper source and a scope 0, track −1 proxy. Graph/2 keeps each
+proxy on its own numbered slot in `avid.source.warp_inputs`. An absent
+proxy has no field, a dangling or unsupported proxy is null, and a
+saved picture TrackRef retains its signed relative scope and track.
+The reference still needs to be resolved across lower-track cuts,
+gaps, and nested effects before writing a destination composite.
+The scaled Background Color test and non-neutral key modes remain open.
+[ITU-R BT.709](https://www.itu.int/rec/R-REC-BT.709-6-201506-I/en)
+
+#### Native Superimpose and Picture-in-Picture calibration
+
+Superimpose (`EFF2_BLEND_SUPER`) saves static Opacity as a floating-point
+percentage in parameter `8d56813d-847e-11d5-935a-50f857c10000`. The
+0% and 100% controls select the same respective source ranges as Full
+Key. At 50%, all 32 overlap frames gave luma codes 448, 416 and 416,
+exactly matching the code-value blend at the three band centers.
+Superimpose and Picture-in-Picture save the same slot and proxy pattern
+as the tested Full Key occurrence.
+
+Picture-in-Picture (`EFF2_BLEND_PIP`) uses the same parameter for
+Foreground Level. The tested edit used 46% level, 50% scale on both
+axes and horizontal position 157. The measured foreground edge
+agreed with a 301.44-pixel horizontal offset on a 1920-pixel canvas
+within one pixel. Changing only Left Crop from 0 to 302 shifted the
+measured left edge from x=781 to x=1071 and kept the right edge fixed.
+The interior swatches matched the 46% code-value blend. The uncropped
+control reopened with editable values and re-exported with identical
+decoded picture across all 36 frames. This comparison covers static
+controls and opaque Rec.709 sources. Graph/2 preserves each effect's
+identity, controls, trim and proxy references on its occurrence under
+`avid.source.picture_blend_inputs`. The two scale parameters retain
+their original IDs and raw values pending independent axis checks.
+Both effects still report unsupported two-input routing. Editable
+destination mappings require input ownership and blend qualification.
+The local research ledger records the calibration as `CONV-0204`.
 
 ### Animated 3D Warp Z Rotation
 

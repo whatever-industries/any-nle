@@ -40,6 +40,12 @@ impl FrameField {
     }
 }
 
+pub(crate) fn exact_frame_offset(saved: &str, origin: i64) -> Option<Rational> {
+    let frame = FrameField::parse(saved).ok()?;
+    let whole = Rational::integer(frame.whole.checked_sub(origin)?);
+    whole.checked_add(encoding::binary64_rational(frame.fraction.to_bits())?)
+}
+
 /// Record the native coordinate even when its clock interpretation or playback
 /// is unqualified. The signed significand times two to the saved power is exact.
 pub(super) fn observe_edit(
@@ -179,11 +185,17 @@ mod tests {
             Some((1, -1))
         );
         assert_eq!(
+            exact_frame_offset("103832|000000000000e03f", 86160),
+            Rational::new(35345, 2)
+        );
+        assert_eq!(exact_frame_offset("6", 0), Some(Rational::integer(6)));
+        assert_eq!(
             FrameField::parse("7|0000000000000000").unwrap().integer(),
             Some(7)
         );
         assert!(FrameField::parse("7|000000000000f87f").is_err());
         assert!(FrameField::parse("7|0012").is_err());
+        assert!(exact_frame_offset("7|000000000000f87f", 0).is_none());
     }
 
     #[test]

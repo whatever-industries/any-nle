@@ -5,12 +5,19 @@ use std::io::{Read, Seek, SeekFrom};
 
 const MPEG_FRAME_SAMPLES: i64 = 1152;
 
-pub(super) struct Mp3Extent {
-    channels: i64,
-    sample_rate: i64,
-    samples: i64,
-    coded_samples: i64,
+pub struct Mp3Extent {
+    pub channels: i64,
+    pub sample_rate: i64,
+    pub samples: i64,
+    pub coded_samples: i64,
+    pub start_samples: i64,
     avid_delay_samples: Option<i64>,
+}
+
+/// Physical presentation only. The Avid-specific Info-frame convention stays
+/// private and does not change the file-relative sample origin.
+pub fn inspect_mp3_presentation(path: &Path, tool: &Path) -> Result<Mp3Extent, String> {
+    probe_mp3(path, tool, &probe_metadata(path, tool)?)
 }
 
 // Avid counts the leading Info frame of this MPEG-1 Layer III stereo profile.
@@ -256,6 +263,7 @@ pub(super) fn probe_mp3(path: &Path, tool: &Path, metadata: &Value) -> Result<Mp
         sample_rate,
         samples,
         coded_samples,
+        start_samples: start / ticks_per_sample,
         avid_delay_samples: if channels == 2 {
             avid_mp3_delay(path, metadata, coded_samples, start / ticks_per_sample, sample_rate)
         } else {

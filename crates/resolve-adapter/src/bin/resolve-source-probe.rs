@@ -23,6 +23,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     match args.as_slice() {
+        [mode, input, ffprobe, output] if mode == "--premiere-review" => {
+            let output = Path::new(output);
+            match fs::symlink_metadata(output) {
+                Ok(_) => return Err(format!("{} exists; the converter never overwrites", output.display()).into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let input = Path::new(input);
+            let graph = if input.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("drp")) {
+                source::read(input)?
+            } else {
+                graph::source::SourceGraph::from_json_text(&support::read(
+                    input, graph::source::MAX_SOURCE_GRAPH_BYTES,
+                )?)?
+            };
+            publish(output, |report| {
+                anynle_resolve_adapter::premiere_export::review::write(
+                    &graph, Path::new(ffprobe), report,
+                )
+            })
+        }
         [mode, input, id, ffprobe, output, flags @ ..] if mode == "--premiere" => {
             let accept_losses = match flags {
                 [] => false,
@@ -77,7 +98,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let graph = source::read(input)?;
             publish(Path::new(output), |file| Ok(graph.write_json(file)?))
         }
-        _ => Err("usage: resolve-source-probe INPUT.drp OUTPUT.graph.json\n       resolve-source-probe --inspect-archive INPUT OUTPUT.json\n       resolve-source-probe --inspect-drt INPUT.drt OUTPUT.json\n       resolve-source-probe --graph-drt INPUT.drt OUTPUT.graph.json\n       resolve-source-probe --diff LEFT LEFT_TIMELINE_ID RIGHT RIGHT_TIMELINE_ID OUTPUT.json\n       resolve-source-probe --diff-blob LEFT LEFT_OBJECT_ID RIGHT RIGHT_OBJECT_ID FIELD OUTPUT.json\n       resolve-source-probe --inventory-effects INPUT OUTPUT.json\n       resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj [--accept-losses]\n       resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json [--all-frames] [--moves MOVES.json [--checksums MANIFEST.json]] [--renders REFERENCE.mov CANDIDATE.mov FFMPEG FFPROBE]".into()),
+        _ => Err("usage: resolve-source-probe INPUT.drp OUTPUT.graph.json\n       resolve-source-probe --inspect-archive INPUT OUTPUT.json\n       resolve-source-probe --inspect-drt INPUT.drt OUTPUT.json\n       resolve-source-probe --graph-drt INPUT.drt OUTPUT.graph.json\n       resolve-source-probe --diff LEFT LEFT_TIMELINE_ID RIGHT RIGHT_TIMELINE_ID OUTPUT.json\n       resolve-source-probe --diff-blob LEFT LEFT_OBJECT_ID RIGHT RIGHT_OBJECT_ID FIELD OUTPUT.json\n       resolve-source-probe --inventory-effects INPUT OUTPUT.json\n       resolve-source-probe --premiere INPUT.graph.json SEQUENCE_ID FFPROBE OUTPUT.prproj [--accept-losses]\n       resolve-source-probe --premiere-review INPUT.drp|INPUT.graph.json FFPROBE REPORT.json\n       resolve-source-probe --conform REFERENCE REFERENCE_ID CANDIDATE CANDIDATE_ID OUTPUT.json [--all-frames] [--moves MOVES.json [--checksums MANIFEST.json]] [--renders REFERENCE.mov CANDIDATE.mov FFMPEG FFPROBE]".into()),
     }
 }
 

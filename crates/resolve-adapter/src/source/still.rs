@@ -65,7 +65,7 @@ pub(super) fn read(
     graph.items.push(item);
     Ok(Some(Master {
         rate, length: 1, start: 0, audio: BTreeMap::new(), path: cache.path.clone(), size,
-        prores_hq: false, camera_pcm: false, native_mono_movie: false, saved_aac_clock: false,
+        prores_hq: false, avc: false, camera_pcm: false, native_mono_movie: false, saved_aac_clock: false,
         external_audio: false, wav_samples: None,
         standalone_audio: None, still: true, standalone_mono_atom: false, stereo_pool_route: false,
         native_stereo_pcm: false, split_atom_audio: false,

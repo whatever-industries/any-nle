@@ -648,7 +648,8 @@ fn probe_original(
         Some(ext) if ext.eq_ignore_ascii_case("wav") => "wav",
         _ => return Err("expected an original MOV, MP4 or WAV file".into()),
     };
-    let identity = if matches!(mode, ProbeMode::Camera | ProbeMode::Review) {
+    let destination_link = matches!(mode, ProbeMode::Resolve | ProbeMode::Camera);
+    let identity = if destination_link || mode == ProbeMode::Review {
         MediaIdentity::File(crate::media::stamp(fs::metadata(&path)?)?)
     } else {
         let digest: [u8; 32] = hex::decode(&spec.sha256)?
@@ -659,7 +660,13 @@ fn probe_original(
         }
         MediaIdentity::Digest(digest)
     };
-    let probe = probe_file(tool, &path, format)?;
+    // Destination links check every picture packet below. Read the stream
+    // headers first so unsupported originals can fail without an essence scan.
+    let probe = if destination_link {
+        crate::media::probe_json(tool, &path, &["-f", format, "-show_streams", "-show_format"])?
+    } else {
+        probe_file(tool, &path, format)?
+    };
     let streams = probe["streams"]
         .as_array()
         .ok_or("missing physical media streams")?;
@@ -841,9 +848,8 @@ fn probe_original(
             MovieVideo::Imported => false,
         };
         let supported_clock = supported_rate(rate)
-            || video == MovieVideo::Avc && avc_rate(rate)
-            || mode == ProbeMode::Resolve && video == MovieVideo::ProResHq && streams.len() == 1
-                && crate::mixed_rate::Cadence::for_resolve_source(rate, crate::prepare::rate()).is_some();
+            || avc_rate(rate) && (video == MovieVideo::Avc
+                || video == MovieVideo::ProResHq && streams.len() == 1);
         if !supported_clock
             || frames <= 0
             || frames > i64::from(i32::MAX)
@@ -852,7 +858,7 @@ fn probe_original(
             || stream["field_order"] != "progressive"
             || stream["sample_aspect_ratio"] != "1:1"
             || stream["start_pts"] != 0
-            || stream["nb_read_packets"]
+            || !destination_link && stream["nb_read_packets"]
                 .as_str()
                 .and_then(|n| n.parse().ok())
                 != Some(frames)
@@ -1822,15 +1828,27 @@ pub(crate) fn prepare_project(
                 let (media_index, selectors) = selected
                     .get(edit.item.as_str())
                     .ok_or_else(|| format!("no verified file binding for item {}", edit.item))?;
-                let mixed_rate = match &media[*media_index].profile {
-                    Profile::Mov { rate, video: MovieVideo::ProResHq, aac: false, pcm: None,
-                        quicktime_timecode: None | Some(0), avid_source_timecode: None, .. }
-                        if canvas == (1920, 1080) && !stereo
-                            && native_dissolves.is_empty() && source_dissolves.is_empty() =>
+                let linear = sidecars.get(crate::retime::LINEAR_ADAPTER, &edit.id);
+                let (mixed_rate, mixed_linear) = match &media[*media_index].profile {
+                    Profile::Mov { rate, video, aac: false, pcm: None,
+                        quicktime_timecode, avid_source_timecode: None, .. }
+                        if *video == MovieVideo::Avc
+                            || *video == MovieVideo::ProResHq && canvas == (1920, 1080) =>
                     {
-                        crate::mixed_rate::Cadence::between(*rate, sequence.rate)
+                        if linear.is_some() {
+                            (None, true)
+                        } else if !stereo && *video == MovieVideo::ProResHq
+                            && quicktime_timecode.is_none_or(|start| start == 0)
+                            && native_dissolves.is_empty() && source_dissolves.is_empty()
+                        {
+                            (crate::mixed_rate::Cadence::between(*rate, sequence.rate), false)
+                        } else {
+                            (None, false)
+                        }
                     }
-                    _ => None,
+                    Profile::Mov { video: MovieVideo::Imported, aac: false, pcm: None, .. }
+                        if linear.is_some() => (None, true),
+                    _ => (None, false),
                 };
                 let raster_mismatch =
                     matches!(&media[*media_index].profile, Profile::Mov { raster, .. } if *raster != canvas);
@@ -1861,7 +1879,7 @@ pub(crate) fn prepare_project(
                         }
                         (1, None)
                     }
-                    (Some(1), [], [], Profile::Mov { rate, .. }) if *rate == sequence.rate || mixed_rate.is_some() => {
+                    (Some(1), [], [], Profile::Mov { rate, .. }) if *rate == sequence.rate || mixed_rate.is_some() || mixed_linear => {
                         (0, None)
                     }
                     (Some(2), [], [], Profile::Mov { rate, .. })
@@ -1909,15 +1927,19 @@ pub(crate) fn prepare_project(
                     Some(index) => (*index, Some(0)),
                     None => (*media_index, channel),
                 };
-                if media[media_index].native.is_some() && (canvas != (1920, 1080)
-                    || !crate::native_import::supported_rate(sequence.rate) || !matches!(lane, 0 | 1 | 2)
-                    || stereo_edit || edit.speed.is_some() || edit.frame_map.is_some()
-                    || edit.transform.is_some() || !edit.effects.is_empty()
-                    || !source_dissolves.is_empty() || !native_dissolves.is_empty())
-                {
-                    return Err(format!("{}: native import requires a same-rate 1080p straight cut", edit.id).into());
-                }
                 if let Some(native) = &media[media_index].native {
+                    let linear_picture = lane == 0 && linear.is_some();
+                    // TimingContext checks the exact clocks, frame samples, and framing below.
+                    if canvas != (1920, 1080)
+                        || !crate::native_import::supported_rate(sequence.rate) || !matches!(lane, 0 | 1 | 2)
+                        || stereo_edit || edit.speed.is_some()
+                        || edit.frame_map.is_some() && !linear_picture
+                        || edit.transform.is_some() && !(linear_picture && native.audio_clock().is_none())
+                        || !edit.effects.is_empty()
+                        || !source_dissolves.is_empty() || !native_dissolves.is_empty()
+                    {
+                        return Err(format!("{}: native import requires a same-rate 1080p straight cut", edit.id).into());
+                    }
                     if lane != 0 {
                         native.check_audio_end(edit).map_err(|error| format!("{}: {error}", edit.id))?;
                     }
@@ -1933,7 +1955,11 @@ pub(crate) fn prepare_project(
                     edit, lane, &media[media_index].profile,
                 )?;
                 let mut start = frames_on(edit.record_start, sequence.rate)?;
-                let mut source_in = frames_on(edit.source_in, sequence.rate)?;
+                let trim_rate = match (&media[media_index].profile, linear) {
+                    (Profile::Mov { rate, .. }, Some(_)) => *rate,
+                    _ => sequence.rate,
+                };
+                let mut source_in = frames_on(edit.source_in, trim_rate)?;
                 let mut length = frames_on(edit.duration, sequence.rate)?;
                 if let Some(&preroll) = transition_heads.get(edit.id.as_str()) {
                     start = start.checked_add(preroll).ok_or("dissolve start overflow")?;
@@ -1953,10 +1979,15 @@ pub(crate) fn prepare_project(
                     transition_trimmed: transition_heads.contains_key(edit.id.as_str())
                         || transition_tails.contains_key(edit.id.as_str()),
                     mixed_rate,
+                    mixed_linear,
                     can_review_losses: review_caption_omissions.is_some(),
-                }.prepare(sidecars, edit, source_in, length)?;
+                }.prepare(linear, edit, source_in, length)?;
                 destination_losses.extend(loss);
                 if is_2997(sequence.rate) && matches!(lane, 1 | 2) {
+                    if matches!(media[media_index].profile, Profile::Wav { .. }) {
+                        check_premiere_audio_record_grid(origin, start, sequence.rate)
+                            .map_err(|error| format!("{} A{lane} ({}): {error}", sequence.name, edit.id))?;
+                    }
                     let aligned_record = whole_sample_count(start, sequence.rate).is_ok();
                     let exact = aligned_record && [source_in, length]
                         .into_iter().all(|frame| whole_sample_count(frame, sequence.rate).is_ok());
@@ -1975,7 +2006,7 @@ pub(crate) fn prepare_project(
                 }
                 let available = match &media[media_index].profile {
                     Profile::Mov { frames, .. } | Profile::MonoAtom { frames, .. } => *frames,
-                    Profile::Wav { samples, .. } => samples / samples_per_frame(sequence.rate)?,
+                    Profile::Wav { samples, .. } => wav_playable_frames(*samples, sequence.rate)?,
                     Profile::BoundMxf(binding) => binding.frames,
                 };
                 if length <= 0 || source_end > available {
@@ -1994,7 +2025,9 @@ pub(crate) fn prepare_project(
                 let video = if prepared_pin.is_some() {
                     None
                 } else {
-                    crate::video::prepare(edit, sequence.rate, source_in, length, available)
+                    crate::video::prepare(
+                        edit, sequence.rate, source_in, length, available, matches!(timing, Timing::Linear(_)),
+                    )
                         .map_err(|e| format!("{}: {e}", edit.id))?
                 };
                 let mut grade = crate::grade::prepare_with_sidecars(sidecars, &edit.id)?;
@@ -2454,6 +2487,22 @@ pub(crate) fn samples_per_frame(rate: Rational) -> Result<i64> {
     whole_sample_count(1, rate)
 }
 
+fn wav_playable_frames(samples: i64, rate: Rational) -> Result<i64> {
+    if !is_2997(rate) {
+        return Ok(samples / samples_per_frame(rate)?);
+    }
+    // Use the WAV's sample extent because one 29.97 frame spans 1601.6 samples.
+    let frames = i128::from(samples) * i128::from(rate.num()) / (48_000 * i128::from(rate.den()));
+    Ok(frames.try_into()?)
+}
+
+pub(crate) fn wav_timemap_endpoint(samples: i64, rate: Rational) -> Result<f64> {
+    if is_2997(rate) {
+        return Ok(samples as f64 / 48_000.0 - rate.den() as f64 / rate.num() as f64);
+    }
+    Ok((samples - samples_per_frame(rate)?) as f64 / 48_000.0)
+}
+
 fn whole_sample_count(frame_count: i64, rate: Rational) -> Result<i64> {
     let samples = sample_count(frame_count, rate)?;
     if samples.den() != 1 {
@@ -2515,6 +2564,14 @@ mod tests {
         assert_eq!(whole_sample_count(5, rate).unwrap(), 8008);
         assert_eq!(whole_sample_count(40, rate).unwrap(), 64064);
         assert_eq!(movie_audio_sample_extent(48, rate).unwrap(), 76876);
+    }
+
+    #[test]
+    fn ntsc_mono_wav_uses_its_sample_extent() {
+        let rate = Rational::new(30000, 1001).unwrap();
+        assert_eq!(wav_playable_frames(8_007, rate).unwrap(), 4);
+        assert_eq!(wav_playable_frames(8_008, rate).unwrap(), 5);
+        assert_eq!(wav_timemap_endpoint(2_304_000, rate).unwrap(), 47.966633333333334);
     }
 
     #[test]

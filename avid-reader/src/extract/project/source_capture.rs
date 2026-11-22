@@ -993,7 +993,7 @@ pub(super) struct Capture {
     adapter_issues: Vec<SourceIssue>,
     texts: Vec<TextFact>,
     group_uses: Vec<groups::UseFact>,
-    warp_inputs: Vec<SourceWarpInputs>,
+    picture_blend_inputs: Vec<SourcePictureBlendInputs>,
     charged_ops: usize,
     problem_ops: usize,
     primary_timecode_seen: bool,
@@ -1082,7 +1082,7 @@ impl Capture {
             adapter_issues: Vec::new(),
             texts: Vec::new(),
             group_uses: Vec::new(),
-            warp_inputs: Vec::new(),
+            picture_blend_inputs: Vec::new(),
             charged_ops: 0,
             problem_ops: 0,
             primary_timecode_seen: false,
@@ -1882,18 +1882,26 @@ impl Capture {
         plain_layers
     }
 
-    /// Retain the native branch facts and identify direct composites with exact gap timing.
-    pub(super) fn warp_inputs(&mut self, ctx: &Ctx<'_>, effect: &Node, record: i64, track: i64) -> bool {
+    /// Retain native branch facts. Only the existing two-picture Warp case
+    /// uses these observations to identify a gap with exact record timing.
+    pub(super) fn picture_blend_inputs(
+        &mut self, ctx: &Ctx<'_>, effect: &Node, record: i64, track: i64, kind: SourcePictureBlendKind,
+    ) -> bool {
         let Some(scope) = self.stack.last().map(|i| &self.scopes[*i]) else { return false };
         let Some(effect_length) = int(effect, "length").filter(|n| *n > 0) else { return false };
-        if !reserve(&self.budget, &mut self.warp_inputs, 1) {
+        if !reserve(&self.budget, &mut self.picture_blend_inputs, 1) {
             return false;
         }
         let position_known = scope.position_known && !scope.retimed
             && self.stack.iter().rev().skip(1).all(|&i| self.scopes[i].class == *b"SEQU");
-        let (controls, swap_sources) = saved_warp_controls(ctx, effect, &self.budget);
+        let (controls, swap_sources) = saved_blend_controls(ctx, effect, kind, &self.budget);
         let inputs = saved_warp_inputs(ctx, effect);
-        self.warp_inputs.push(SourceWarpInputs {
+        let filler_proxies = match numbered_two_tracks(effect) {
+            Some(tracks) => tracks.map(|track| saved_filler_proxy(ctx, track)),
+            None => [SourceFillerProxy::Unresolved; 2],
+        };
+        self.picture_blend_inputs.push(SourcePictureBlendInputs {
+            kind,
             owner: copy_text(&self.budget, &scope.id),
             track,
             record_start: position_known.then_some(record),
@@ -1902,9 +1910,11 @@ impl Capture {
             effect_length,
             swap_sources,
             inputs,
+            filler_proxies,
             controls,
         });
-        position_known && record >= 0 && record.checked_add(effect_length).is_some()
+        kind == SourcePictureBlendKind::Warp
+            && position_known && record >= 0 && record.checked_add(effect_length).is_some()
             && inputs.iter().all(|input| matches!(input, SourceWarpInput::Picture(_)))
     }
 
@@ -2290,8 +2300,37 @@ fn saved_warp_inputs(ctx: &Ctx<'_>, effect: &Node) -> [SourceWarpInput; 2] {
     })
 }
 
-fn saved_warp_controls(
-    ctx: &Ctx<'_>, effect: &Node, budget: &SharedBudget,
+fn saved_filler_proxy(ctx: &Ctx<'_>, track: &Node) -> SourceFillerProxy {
+    let proxy = track.get("filler_proxy");
+    if matches!(proxy, None | Some(Value::Null | Value::Ref(0))) {
+        return SourceFillerProxy::Absent;
+    }
+    let Some(reference) = ctx.deref(proxy).filter(|node| {
+        node.class == *b"TRKR" && int(node, "media_kind_id") == Some(KIND_PICTURE)
+    }) else {
+        return SourceFillerProxy::Unresolved;
+    };
+    match (int(reference, "relative_scope"), int(reference, "relative_track")) {
+        (Some(scope), Some(track)) => SourceFillerProxy::Relative { scope, track },
+        _ => SourceFillerProxy::Unresolved,
+    }
+}
+
+// Parameter UUIDs in file order. Picture-in-Picture geometry remains in its
+// saved value space, including both scale values.
+const BLEND_OPACITY: (&str, &str) = (
+    "3d81568d7e84d511935a50f857c10000", "foreground_opacity_percent",
+);
+const PIP_PARAMETERS: &[(&str, &str)] = &[
+    BLEND_OPACITY,
+    ("2581568d7e84d511935a50f857c10000", "position_x_raw"),
+    ("2e81568d7e84d511935a50f857c10000", "crop_left_raw"),
+    ("3781568d7e84d511935a50f857c10000", "scale_raw"),
+    ("3a81568d7e84d511935a50f857c10000", "scale_raw"),
+];
+
+fn saved_blend_controls(
+    ctx: &Ctx<'_>, effect: &Node, kind: SourcePictureBlendKind, budget: &SharedBudget,
 ) -> (Vec<SourceWarpControl>, Option<bool>) {
     use SourceWarpControlCurve as Curve;
     use SourceWarpControlValue as Scalar;
@@ -2305,6 +2344,11 @@ fn saved_warp_controls(
     if items.len() > 256 {
         return (controls, None);
     }
+    let parameters = match kind {
+        SourcePictureBlendKind::Warp => WARP_COMPOSITING_PARAMETERS,
+        SourcePictureBlendKind::Superimpose => std::slice::from_ref(&BLEND_OPACITY),
+        SourcePictureBlendKind::PictureInPicture => PIP_PARAMETERS,
+    };
     let mut complete = true;
     for reference in items {
         let Some((node, id)) = ctx.deref(Some(reference)).and_then(|node| {
@@ -2317,7 +2361,7 @@ fn saved_warp_controls(
             continue;
         };
         let id = crate::color::file_order_hex(id);
-        let Some(&(parameter_id, name)) = WARP_COMPOSITING_PARAMETERS.iter()
+        let Some(&(parameter_id, name)) = parameters.iter()
             .find(|&&(parameter_id, _)| parameter_id == id)
         else {
             continue;
@@ -3668,7 +3712,7 @@ fn finish_source(
         unresolved,
         texts,
         group_uses,
-        warp_inputs: capture.warp_inputs,
+        picture_blend_inputs: capture.picture_blend_inputs,
     }
 }
 
@@ -4122,6 +4166,9 @@ mod warp_input_tests {
         let foreground = bin.create_source_clip(24.0, 1, 48, mob(2), 1, 13).unwrap();
         let wrong_rate = bin.create_source_clip(25.0, 1, 48, mob(2), 1, 13).unwrap();
         let filler = bin.create_filler(24.0, 1, 48).unwrap();
+        let proxy = crate::document_extra::create_with_defaults(&mut bin, "TrackRef").unwrap();
+        bin.set_field(proxy, "media_kind_id", Value::Int(KIND_PICTURE)).unwrap();
+        bin.set_field(proxy, "relative_scope", Value::Int(1)).unwrap();
         let bytes = bin.to_bytes().unwrap();
         let file = AvbFile::parse(&bytes).unwrap();
         let ctx = Ctx { file: &file, mobs: HashMap::new() };
@@ -4157,6 +4204,24 @@ mod warp_input_tests {
             [SourceWarpInput::Unresolved; 2]);
         assert_eq!(saved_warp_inputs(&ctx, &effect(vec![track(1, filler), track(2, wrong_rate)])),
             [SourceWarpInput::Filler, SourceWarpInput::Unresolved]);
+        let proxy_track = |reference| {
+            let Value::Node(mut node) = track(1, filler) else { unreachable!() };
+            node.fields.push(("filler_proxy", Value::Ref(reference)));
+            Value::Node(node)
+        };
+        for (reference, expected) in [
+            (proxy, SourceFillerProxy::Relative { scope: 1, track: -1 }),
+            (0, SourceFillerProxy::Absent),
+            (filler, SourceFillerProxy::Unresolved),
+            (u32::MAX, SourceFillerProxy::Unresolved),
+        ] {
+            let probe = effect(vec![track(2, foreground), proxy_track(reference)]);
+            let tracks = numbered_two_tracks(&probe).unwrap();
+            assert_eq!(tracks.map(|track| saved_filler_proxy(&ctx, track)),
+                [expected, SourceFillerProxy::Absent]);
+            assert_eq!(saved_warp_inputs(&ctx, &probe),
+                [SourceWarpInput::Filler, source(2, 13)]);
+        }
     }
 }
 

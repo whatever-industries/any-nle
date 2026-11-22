@@ -3,7 +3,7 @@ use super::*;
 use crate::dissolve::{self, Dissolve};
 use crate::{
     linked::{
-        is_2997, mixer::DirectMixer, movie_audio_sample_extent, samples_per_frame, Media,
+        is_2997, mixer::DirectMixer, movie_audio_sample_extent, samples_per_frame, wav_timemap_endpoint, Media,
         MovieVideo, PreparedProject, Profile, Timeline, timing::Timing,
     },
     turnover::Templates,
@@ -883,8 +883,12 @@ fn write_timeline<'a>(
             set(&mut clip, "Name", &xml(&source.name))?;
             set(&mut clip, "MediaRef", &media_ids[edit.media])?;
             set(&mut clip, "MediaFilePath", &xml(utf8_path(&source.path)?))?;
-            if let Timing::MixedRate(cadence) = &edit.timing {
-                set(&mut clip, "MediaFrameRate", &hex::encode(rate_bytes(cadence.source_rate())))?;
+            let media_rate = match &edit.timing {
+                Timing::MixedRate(cadence) => cadence.source_rate(),
+                other => other.trim_rate(rate),
+            };
+            if media_rate != rate {
+                set(&mut clip, "MediaFrameRate", &hex::encode(rate_bytes(media_rate)))?;
             } else {
                 set(&mut clip, "MediaFrameRate", &rate_hex)?;
             }
@@ -911,13 +915,11 @@ fn write_timeline<'a>(
             let end = match &source.profile {
                 Profile::Mov { frames, .. } => {
                     if let Some(start) = source.profile.movie_timecode() {
-                        set(&mut clip, "MediaStartTime", &(start as f64 / fps(rate)).to_string())?;
+                        set(&mut clip, "MediaStartTime", &(start as f64 / fps(media_rate)).to_string())?;
                     }
                     (frames - 1) as f64 / fps(rate)
                 }
-                Profile::Wav { samples, .. } => {
-                    (samples - samples_per_frame(rate)?) as f64 / 48000.0
-                }
+                Profile::Wav { samples, .. } => wav_timemap_endpoint(*samples, rate)?,
                 Profile::MonoAtom { frames, start, .. } => {
                     set(&mut clip, "MediaStartTime", &seconds(*start).to_string())?;
                     seconds(frames - 1)
@@ -933,7 +935,11 @@ fn write_timeline<'a>(
             };
             let (saved_in, map) = match (&edit.timing, &source.profile) {
                 (Timing::Linear(linear), Profile::Mov { .. }) => {
-                    set(&mut clip, "EffectFiltersBA", crate::retime::NEAREST)?;
+                    // MediaStartTime retains the source clock. The map uses
+                    // record frames on x and file-relative source frames on y.
+                    if edit.video.is_none() {
+                        set(&mut clip, "EffectFiltersBA", crate::retime::NEAREST)?;
+                    }
                     (linear.record_in.to_string(), linear.encode(&uid()))
                 }
                 (Timing::Linear(_), _) => return Err("Resolve Linear retime requires a plain linked MOV edit".into()),
@@ -1970,7 +1976,7 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
                     wanted.timing.matches_readback(&graph, edit, wanted.source_in, wanted.length)?;
                 if edit.item != ids.media[wanted.media]
                     || frame(edit.record_start)? != wanted.start
-                    || frame(edit.source_in)? != wanted.source_in
+                    || crate::prepare::frames_on(edit.source_in, wanted.timing.trim_rate(p.rate))? != wanted.source_in
                     || frame(edit.duration)? != wanted.length
                     || !matches_timing
                     || crate::grade::prepare(&graph, &edit.id)?.map(|grade| grade.0)

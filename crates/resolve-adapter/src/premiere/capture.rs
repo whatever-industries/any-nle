@@ -541,7 +541,7 @@ impl VerifiedBinding {
         Ok(channels)
     }
 
-    pub(super) fn mono_wav(&self) -> bool {
+    fn mono_wav(&self) -> bool {
         self.physical.container == "wav"
             && matches!(self.physical.audio.as_slice(), [audio] if audio.channels == Some(1))
     }
@@ -802,21 +802,23 @@ fn placement(
             );
         }
         if let Some(param) = remap {
+            let rate_error = "Linear Time Remapping requires plain V1 with a verified source clock, matching raster and Frame Sampling";
+            let source_rate = picture.rate.ok_or(rate_error)?;
+            let mixed_profile = canvas == Some((1920, 1080)) && picture.codec == "prores"
+                && physical.container == "mov" && physical.audio.is_empty();
             let has_components = !native.components.is_empty() || !native.selection_components.is_empty();
-            if !super::retime::plain_linear_picture(index, rate, canvas, has_components)
-                || picture.rate != Some(rate) || picture.size != canvas
-                || physical.container != "mov" || picture.codec != "prores"
-                || !physical.audio.is_empty()
-                || physical.timecode.as_deref().is_some_and(|code| code != "00:00:00:00")
+            if index != 1 || canvas.is_none() || has_components
+                || (source_rate != rate && !mixed_profile) || picture.size != canvas
+                || !matches!(physical.container, "mov" | "mp4")
                 || hold.is_some() || !super::retime::frame_sampling(project, clip)?
             {
-                return Err("Linear Time Remapping requires plain same-rate 1080p24 V1 with Frame Sampling".into());
+                return Err(rate_error.into());
             }
-            let extent = crate::prepare::frames_on(picture.duration, rate)?;
-            let (frames, receipts) = super::retime::capture(
-                project, param, occurrence, (a, b), extent, component_budget, sampled_frame_count,
+            let extent = crate::prepare::frames_on(picture.duration, source_rate)?;
+            let (trim, frames, receipts) = super::retime::capture(
+                project, param, occurrence, (a, b), extent, (frame_ticks, source_rate), component_budget, sampled_frame_count,
             )?;
-            source_in = Rational::new(frames[0].into(), 24).ok_or("invalid Linear retime source In")?;
+            source_in = trim;
             frame_map = Some(frames);
             graph.sidecars.extend(receipts);
         } else if picture.rate != Some(rate) {

@@ -1,6 +1,6 @@
 //! Standalone audio caches and their saved physical channel routing.
 use super::*;
-use crate::linked::samples_per_frame;
+use crate::linked::{is_2997, samples_per_frame, wav_timemap_endpoint};
 
 #[derive(Debug)]
 pub(super) struct Standalone {
@@ -63,7 +63,7 @@ pub(super) fn identity_timemap(node: &Node, samples: i64, rate: Rational) -> Res
         return Ok(false);
     };
     let saved = f64::from_be_bytes(value.try_into()?);
-    let expected = (samples - samples_per_frame(rate)?) as f64 / 48000.0;
+    let expected = wav_timemap_endpoint(samples, rate)?;
     Ok(close(saved, expected))
 }
 
@@ -226,7 +226,8 @@ pub(super) fn read(
     let start = if atom { frames(start_seconds, rate)? } else { 0 };
     let source_start = if atom { seconds(start, rate)? } else { encoding::sample_start(start_seconds, sample_rate)? };
     let qualified_wav = suffix.as_deref() == Some("wav") && source_start == Rational::ZERO
-        && sample_rate == 48000 && bits.is_some() && samples_per_frame(rate).is_ok();
+        && sample_rate == 48000 && bits.is_some()
+        && (samples_per_frame(rate).is_ok() || channels == 1 && is_2997(rate));
     let mxf_packages = if atom {
         if rate != crate::prepare::rate() || channels != 1 || samples % samples_per_frame(rate)? != 0
             || !(0..crate::DAY).contains(&start) || length <= 0
@@ -375,6 +376,7 @@ pub(super) fn read(
         path,
         size: (0, 0),
         prores_hq: false,
+        avc: false,
         camera_pcm: false,
         native_mono_movie: false,
         saved_aac_clock: false,

@@ -1101,9 +1101,35 @@ pub struct SourceWarpControl {
     pub curve: SourceWarpControlCurve,
 }
 
-/// Saved input slots and controls on a Warp occurrence, before evaluation.
+/// A saved track's filler proxy, independently of its component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceFillerProxy {
+    Absent,
+    Relative { scope: i64, track: i64 },
+    Unresolved,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourcePictureBlendKind {
+    Warp,
+    Superimpose,
+    PictureInPicture,
+}
+
+impl SourcePictureBlendKind {
+    pub fn effect_id(self) -> &'static str {
+        match self {
+            Self::Warp => "EFF2_SBLEND",
+            Self::Superimpose => "EFF2_BLEND_SUPER",
+            Self::PictureInPicture => "EFF2_BLEND_PIP",
+        }
+    }
+}
+
+/// Saved input slots and controls on a picture blend occurrence, before evaluation.
 #[derive(Debug)]
-pub struct SourceWarpInputs {
+pub struct SourcePictureBlendInputs {
+    pub kind: SourcePictureBlendKind,
     pub owner: String,
     pub track: i64,
     pub record_start: Option<i64>,
@@ -1112,6 +1138,7 @@ pub struct SourceWarpInputs {
     pub effect_length: i64,
     pub swap_sources: Option<bool>,
     pub inputs: [SourceWarpInput; 2],
+    pub filler_proxies: [SourceFillerProxy; 2],
     pub controls: Vec<SourceWarpControl>,
 }
 
@@ -1134,7 +1161,7 @@ pub struct SourceSequence {
     pub unresolved: Vec<SourceIssue>,
     pub texts: Vec<SourceText>,
     pub group_uses: Vec<SourceGroupUse>,
-    pub warp_inputs: Vec<SourceWarpInputs>,
+    pub picture_blend_inputs: Vec<SourcePictureBlendInputs>,
 }
 
 #[derive(Debug)]
@@ -1270,7 +1297,7 @@ impl SourceSequence {
             unresolved: Vec::new(),
             texts: Vec::new(),
             group_uses: Vec::new(),
-            warp_inputs: Vec::new(),
+            picture_blend_inputs: Vec::new(),
         }
     }
 }

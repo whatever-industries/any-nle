@@ -451,7 +451,6 @@ fn capture_sequence(
     let mut muted_tracks = Vec::new();
     let mut track_pans = [0; 2];
     let mut stereo_edits = 0;
-    let mut has_mono_wav = false;
     let active = |tracks: &[TrackId], index| tracks.iter().any(|&id| {
         let track = project.track(id);
         track.index == index && !track.clips.is_empty()
@@ -726,36 +725,38 @@ fn capture_sequence(
                 }
                 let hold = frame_hold::FrameHold::read(project, clip)
                     .map_err(|err| format!("{placement_id}: {err}"))?;
-                let cadence = binding.streams.iter().find(|stream| kind == StreamKind::Video && stream.channel.is_none())
-                    .and_then(|stream| graph.media.iter().find(|m| m.id == stream.media_id))
+                let picture = binding.streams.iter().find(|stream| kind == StreamKind::Video && stream.channel.is_none())
+                    .and_then(|stream| graph.media.iter().find(|m| m.id == stream.media_id));
+                let cadence = picture
                     .and_then(|original| original.rate)
                     .and_then(|source_rate| mixed_rate::Cadence::between(source_rate, rate));
                 let frame_map = if let Some(param) = remap {
-                    let unsupported = || format!("{placement_id}: Linear Time Remapping requires plain same-rate 1080p24 V1 with Frame Sampling");
+                    let unsupported = || format!("{placement_id}: Linear Time Remapping requires plain V1 with a verified source clock, matching raster and Frame Sampling");
                     if !capture_components || kind != StreamKind::Video
-                        || !retime::plain_linear_picture(index, rate, Some((canvas.0.into(), canvas.1.into())), has_components)
-                        || speed.is_some() || hold.is_some() || !track.transitions.is_empty()
+                        || index != 1
+                        || speed.is_some() || hold.is_some()
                         || !retime::frame_sampling(project, clip)?
                     {
                         return Err(unsupported().into());
                     }
-                    let original = binding.streams.iter().find(|stream| stream.channel.is_none())
-                        .and_then(|stream| graph.media.iter().find(|media| media.id == stream.media_id))
-                        .filter(|media| media.codec.as_deref() == Some("prores")
-                            && media.kind == StreamKind::Video && media.rate == Some(rate)
-                            && media.frame_size == Some((1920, 1080))
-                            && media.start.is_none_or(|start| start == Rational::ZERO))
-                        .filter(|_| binding.streams.len() == 1)
+                    let original = binding.streams.iter().filter(|stream| stream.channel.is_none())
+                        .filter_map(|stream| graph.media.iter().find(|media| media.id == stream.media_id))
+                        .find(|media| media.kind == StreamKind::Video
+                            && media.frame_size == Some((canvas.0.into(), canvas.1.into())))
                         .ok_or_else(unsupported)?;
-                    let extent = crate::prepare::frames_on(original.duration, rate)?;
-                    let (frames, receipts) = retime::capture(
-                        project, param, &placement_id, (source_in, source_out), extent,
+                    let source_rate = original.rate.ok_or_else(unsupported)?;
+                    let extent = crate::prepare::frames_on(original.duration, source_rate)?;
+                    let (trim, frames, receipts) = retime::capture(
+                        project, param, &placement_id, (source_in, source_out), extent, (frame_ticks, source_rate),
                         &mut component_budget, sampled_frame_count,
                     ).map_err(|error| format!("{placement_id}: {error}"))?;
-                    source_in = frames[0].checked_mul(frame_ticks).ok_or("Premiere remap source In overflows")?;
+                    source_in = trim.to_units(TICKS_PER_SECOND).ok_or("Premiere remap source In is outside the tick grid")?;
                     graph.sidecars.extend(receipts);
                     Some(frames)
                 } else if let Some(cadence) = cadence {
+                    if picture.and_then(|original| original.start).is_some_and(|start| start != Rational::ZERO) {
+                        return Err(format!("{placement_id}: mixed-rate Premiere picture with nonzero source timecode requires qualified Linear Time Remapping").into());
+                    }
                     if !capture_components || index != 1 || canvas != (1920, 1080) || has_components
                         || speed.is_some() || hold.is_some()
                         || project.time_interpolation_type(clip)? != prproj::model::enums::TimeInterpolationType::FrameSampling
@@ -764,6 +765,8 @@ fn capture_sequence(
                     }
                     Some(cadence.capture(source_in / frame_ticks, span / frame_ticks, sampled_frame_count)
                         .map_err(|err| format!("{placement_id}: {err}"))?)
+                } else if picture.is_some_and(|original| original.rate != Some(rate)) {
+                    return Err(format!("{placement_id}: mixed-rate Premiere picture requires qualified Linear Time Remapping for this clock").into());
                 } else if let Some(hold) = hold {
                     let unsupported = || format!("{placement_id}: unsupported Premiere Frame Hold mode, clock, or source");
                     if !capture_components || kind != StreamKind::Video || index != 1
@@ -818,9 +821,9 @@ fn capture_sequence(
                             clip,
                             kind,
                             &saved.data,
-                            source_in,
-                            source_out,
+                            (source_in, source_out),
                             frame_ticks,
+                            remap.is_some(),
                         )? {
                             appearance_loss = None;
                             match control {
@@ -841,6 +844,12 @@ fn capture_sequence(
                         graph.sidecars.push(saved);
                     }
                 }
+                if remap.is_some() && has_components
+                    && (appearance_loss.is_some() || !picture_effects.is_empty()
+                        || !transform.as_ref().is_some_and(crate::video::retime_motion_supported))
+                {
+                    return Err(format!("{placement_id}: Linear Time Remapping with effects requires qualified static Motion or centered crop, scale, and rotation").into());
+                }
                 if let Some(reason) = appearance_loss {
                     graph.losses.push(Loss {
                         object: placement_id.clone(),
@@ -849,8 +858,6 @@ fn capture_sequence(
                     });
                 }
                 stereo_edits += usize::from(stereo);
-                has_mono_wav |= kind == StreamKind::Audio
-                    && verified.as_ref().is_some_and(capture::VerifiedBinding::mono_wav);
                 out.placements.push(Placement {
                     id: placement_id,
                     item: binding.item_id.clone(),
@@ -884,9 +891,6 @@ fn capture_sequence(
             ).count() == stereo_edits;
         if kind == StreamKind::Audio && stereo_edits > 0 && !stereo_layout {
             return Err("Premiere A1 cannot mix mono and stereo edits".into());
-        }
-        if kind == StreamKind::Audio && has_mono_wav && !stereo_layout {
-            return Err("Premiere 25 fps standalone mono WAV requires stereo A1 and mono A2".into());
         }
         if track_indexes.len() != expected as usize
             && !(kind == StreamKind::Audio && (track_indexes.is_empty() || nests.stereo_parent(sequence)))
@@ -1190,30 +1194,41 @@ fn bind(
     spec.sha256 = verified.digest_hex()?;
     let (tb, count) = (*tb, *count);
     if let Some(native) = &verified.native {
-        if native.rate() != rate || !components::is_current_project(project)? {
+        let mixed_picture = kind == StreamKind::Video
+            && native.audio_clock().is_none()
+            && native.raster() == canvas;
+        if (native.rate() != rate && !mixed_picture) || !components::is_current_project(project)? {
             return Err("Premiere native import requires a current same-rate project".into());
         }
         let binding = capture::VerifiedBinding::bind_native(project, item, saved, &mut spec, native, bin, graph)?;
         return Ok((spec, Some(binding)));
     }
     if let Profile::Mov { rate: file_rate, video: linked::MovieVideo::ProResHq,
-        pcm: None, quicktime_timecode: Some(start), .. } = &verified.profile
+        aac: false, pcm: None, quicktime_timecode, .. } = &verified.profile
     {
-        if *start != 0 {
-            if kind != StreamKind::Video || !crate::source::supported_marker_rate(*file_rate) || *file_rate != rate
-                || !components::is_current_project(project)?
-            {
-                return Err("nonzero Premiere source timecode requires the qualified same-rate 24 or 23.976 fps ProRes HQ picture profile".into());
-            }
+        let timecoded = quicktime_timecode.is_some_and(|start| start != 0);
+        let needs_mixed_binding = *file_rate != rate
+            && mixed_rate::Cadence::between(*file_rate, rate).is_none();
+        if (timecoded || needs_mixed_binding) && kind == StreamKind::Video
+            && components::is_current_project(project)?
+        {
             let binding = capture::VerifiedBinding::bind_standalone_movie(
                 project, item, saved, &mut spec, verified, tb, count, bin, graph,
             )?;
             return Ok((spec, Some(binding)));
         }
+        if timecoded {
+            return Err("nonzero Premiere source timecode requires a qualified ProRes HQ picture profile".into());
+        }
     }
     metadata::check_source_origin(tree, media)?;
-    if let Profile::Mov { rate: file_rate, video: linked::MovieVideo::Avc | linked::MovieVideo::HevcMain10, .. } = &verified.profile {
-        if *file_rate != rate || !components::is_current_project(project)? {
+    if let Profile::Mov { rate: file_rate, video: video @ (linked::MovieVideo::Avc | linked::MovieVideo::HevcMain10),
+        raster, aac, pcm, .. } = &verified.profile
+    {
+        // Preparation still requires a checked Linear map for mixed-rate AVC.
+        let mixed_linear_picture = *video == linked::MovieVideo::Avc
+            && kind == StreamKind::Video && *raster == canvas && !aac && pcm.is_none();
+        if (*file_rate != rate && !mixed_linear_picture) || !components::is_current_project(project)? {
             return Err("Premiere AVC or HEVC turnover requires a current same-rate project".into());
         }
         let binding = capture::VerifiedBinding::bind_standalone_movie(
@@ -1223,6 +1238,7 @@ fn bind(
     }
     if kind == StreamKind::Audio
         && (rate == Rational::integer(25) && matches!(verified.profile, Profile::Wav { channels: 1 | 2, .. })
+            || linked::is_2997(rate) && matches!(verified.profile, Profile::Wav { channels: 1, .. })
             || stereo_nest_child && matches!(verified.profile, Profile::Wav { channels: 2, .. }))
         && components::is_current_project(project)?
     {

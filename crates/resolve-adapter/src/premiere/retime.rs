@@ -10,16 +10,6 @@ use prproj::{
     xml::NodeId,
 };
 
-pub(super) fn plain_linear_picture(
-    track: i64,
-    rate: Rational,
-    canvas: Option<(i64, i64)>,
-    has_components: bool,
-) -> bool {
-    track == 1 && rate == Rational::integer(24)
-        && canvas == Some((1920, 1080)) && !has_components
-}
-
 pub(super) fn frame_sampling(project: &Project, clip: TrackItemId) -> Result<bool> {
     Ok(project.time_interpolation_type(clip)? == TimeInterpolationType::FrameSampling)
 }
@@ -52,10 +42,18 @@ pub(super) fn capture(
     owner: &str,
     trim: (i64, i64),
     available: i64,
+    clocks: (i64, Rational),
     budget: &mut super::components::Budget,
     sampled_frame_count: &mut usize,
-) -> Result<(Vec<i64>, [Sidecar; 2])> {
-    let frame_ticks = TICKS_PER_SECOND / 24;
+) -> Result<(Rational, Vec<i64>, [Sidecar; 2])> {
+    let (frame_ticks, source_rate) = clocks;
+    let record_rate = Rational::new(TICKS_PER_SECOND.into(), frame_ticks.into())
+        .ok_or("invalid Premiere retime record clock")?;
+    let mixed = source_rate != record_rate;
+    let fps = source_rate.num() as f64 / source_rate.den() as f64;
+    let source_ticks = Rational::new(source_rate.den().into(), source_rate.num().into())
+        .and_then(|time| time.to_units(TICKS_PER_SECOND))
+        .ok_or("invalid Premiere retime source clock")?;
     let (in_ticks, out_ticks) = trim;
     let span = out_ticks
         .checked_sub(in_ticks)
@@ -94,21 +92,48 @@ pub(super) fn capture(
     if saved.len() > 64 * 1024 {
         return Err("Premiere Time Remapping keys exceed the size limit".into());
     }
-    let mut keys = Vec::new();
-    for entry in saved.trim_end_matches(';').split(';') {
+    let mut keys: Vec<[i64; 2]> = Vec::new();
+    let mut entries = saved.trim_end_matches(';').split(';').peekable();
+    while let Some(entry) = entries.next() {
         let fields: Vec<_> = entry.split(',').collect();
         let [record, source, "6", "0", "0", "0", "0", "0"] = fields.as_slice() else {
             return Err("Premiere Time Remapping requires Linear keys without handles".into());
         };
         let record: i64 = record.parse()?;
-        if record < 0 || record % frame_ticks != 0 || keys.len() == MAX_LINEAR_KEYS {
+        if record < 0 {
             return Err("Premiere Time Remapping keys exceed the count or record grid".into());
         }
-        let frame = source_frame(source)?;
+        let saved_seconds: f64 = source.parse()?;
+        let frame = source_frame(saved_seconds, fps)?;
+        // A mixed-rate native save can append the exclusive file end
+        // one source frame after the last playable key, with up to one tick
+        // of rounding in the observed saves.
+        // The last playable key covers all sampled record positions.
+        if mixed && entries.peek().is_none() && frame == available
+            && keys.last().is_some_and(|[previous, source]| {
+                let delta = record - previous * frame_ticks;
+                *source == available - 1
+                    && (source_ticks..=source_ticks + 1).contains(&delta)
+            })
+        {
+            break;
+        }
+        if record % frame_ticks != 0 || keys.len() == MAX_LINEAR_KEYS {
+            return Err("Premiere Time Remapping keys exceed the count or record grid".into());
+        }
+        if mixed && (in_ticks..out_ticks).contains(&record) {
+            // At a sampled knot, Premiere can request the previous file frame
+            // if conversion of the saved ordinate lands one tick early.
+            let exact_ticks = frame.checked_mul(source_ticks)
+                .ok_or("invalid Premiere retime source key clock")?;
+            if (saved_seconds * TICKS_PER_SECOND as f64) < exact_ticks as f64 {
+                return Err("mixed-rate Premiere Linear key lands before its source frame tick".into());
+            }
+        }
         keys.push([record / frame_ticks, frame]);
     }
     if keys.len() < 3
-        || source_frame(&read("UpperBound")?.ok_or("missing Premiere remap extent")?)? != available
+        || source_frame(read("UpperBound")?.ok_or("missing Premiere remap extent")?.parse()?, fps)? != available
     {
         return Err("Premiere Time Remapping contradicts the verified original extent".into());
     }
@@ -127,7 +152,7 @@ pub(super) fn capture(
         keys[last][0] -= 1;
         keys[last][1] -= 1;
     }
-    let map = LinearMap::new(in_ticks / frame_ticks, keys, available)?;
+    let map = LinearMap::new(in_ticks / frame_ticks, keys, available, source_rate, record_rate)?;
     let receipt = Sidecar {
         adapter: "premiere.time_remapping".into(),
         object: owner.into(),
@@ -137,11 +162,12 @@ pub(super) fn capture(
             ("keys".into(), Value::Str(saved)),
         ]),
     };
-    Ok((map.samples(length)?, [map.receipt(owner), receipt]))
+    let samples = map.samples(length)?;
+    Ok((map.source_time(samples[0])?, samples, [map.receipt(owner), receipt]))
 }
 
-fn source_frame(value: &str) -> Result<i64> {
-    let frame = value.parse::<f64>()? * 24.0;
+fn source_frame(seconds: f64, fps: f64) -> Result<i64> {
+    let frame = seconds * fps;
     if !(0.0..=10_000_000.0).contains(&frame) || (frame - frame.round()).abs() > 1e-7 {
         return Err("Premiere Time Remapping is outside the whole source frame grid".into());
     }

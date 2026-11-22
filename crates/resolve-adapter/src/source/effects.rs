@@ -88,7 +88,7 @@ pub(super) fn picture_control(
         }
         if all_animated {
             let crop_curves = if let Some(crop) = crop {
-                let Some(slots) = source_crop_slots(crop)? else {
+                let Some(slots) = source_crop_slots(crop, 6)? else {
                     return Ok(None);
                 };
                 let mut edges: [Curve; 4] = Default::default();
@@ -106,48 +106,30 @@ pub(super) fn picture_control(
                 .map(PictureControl::LinearMotion));
         }
     }
-    let (Some(x), Some(y), Some(sx), Some(sy), Some(rotation)) = (
-        static_slot(&motion, X, 0.0)?,
-        static_slot(&motion, Y, 0.0)?,
-        static_slot(&motion, SCALE_X, 1.0)?,
-        static_slot(&motion, SCALE_Y, 1.0)?,
-        static_slot(&motion, ROTATION, 0.0)?,
-    ) else {
+    let Some(mut t) = static_motion(&motion, false)? else {
         return Ok(None);
     };
-    if (sx != 1.0 || sy != 1.0) && motion[2].is_empty() {
-        return Ok(None);
-    }
-    let mut edges = [0.0; 4];
     if let Some(crop) = crop {
-        let Some(slots) = source_crop_slots(crop)? else {
+        let Some(edges) = static_crop(crop, 6)? else {
             return Ok(None);
         };
-        for (edge, control) in edges.iter_mut().zip(CROP) {
-            let Some(value) = static_slot(&slots, control, 0.0)? else {
-                return Ok(None);
-            };
-            *edge = value;
-        }
+        t.crop = edges;
     }
     let Some(anchor) = anchor_slot(motion[ANCHOR.0])? else {
         return Ok(None);
     };
-    if has_anchor && (x != 0.0 || y != 0.0) {
+    if has_anchor && t.position != (0.0, 0.0) {
         return Ok(None);
     }
-    let t = Transform {
-        position: if has_anchor { anchor } else { (x, -y) },
-        scale: (sx * 100.0, sy * 100.0),
-        rotation: if rotation == 0.0 { 0.0 } else { -rotation },
-        anchor,
-        crop: edges,
-    };
+    if has_anchor {
+        t.position = anchor;
+    }
+    t.anchor = anchor;
     let centered_crop = crate::video::centered_crop_profile(&t);
     if has_anchor && !crate::video::rotation_axis_profile(&t) {
         return Ok(None);
     }
-    if rotation != 0.0 && !motion[2].is_empty() && !centered_crop {
+    if t.rotation != 0.0 && !motion[2].is_empty() && !centered_crop {
         return Ok(None);
     }
     if reflection.active() {
@@ -158,9 +140,109 @@ pub(super) fn picture_control(
         .then_some(PictureControl::Transform(t)))
 }
 
-fn source_crop_slots(crop: &[u8]) -> Result<Option<Vec<&[u8]>>> {
+/// A Linear retime with static picture geometry and frame sampling.
+pub(super) fn retime_motion(encoded: &str, blobs: &mut Blobs) -> Result<Option<Transform>> {
+    let bytes = blobs.envelope(encoded)?;
+    let outer = fields(&bytes)?;
+    let (motion, crop, sampling) = match outer.as_slice() {
+        [(1, Wire::Bytes(crop)), (1, Wire::Bytes(sampling))] if crop.starts_with(&[8, 6]) =>
+            (None, Some(*crop), *sampling),
+        [(1, Wire::Bytes(motion)), (1, Wire::Bytes(sampling))] =>
+            (Some(*motion), None, *sampling),
+        [(1, Wire::Bytes(motion)), (1, Wire::Bytes(crop)), (1, Wire::Bytes(sampling))] =>
+            (Some(*motion), Some(*crop), *sampling),
+        _ => return Ok(None),
+    };
+    if sampling != crate::retime::NEAREST_SECTION {
+        return Ok(None);
+    }
+    let mut transform = if let Some(motion) = motion {
+        let Some(slots) = section_slots(motion, 4, crate::video::RETIME_MOTION_FLAGS)? else {
+            return Ok(None);
+        };
+        if slots.len() != 12 || slots[6..].iter().any(|slot| !slot.is_empty())
+            || !matches!(slots[2], [] | [8, 44, 26, 4, 10, 2, 40, 0])
+        {
+            return Ok(None);
+        }
+        let Some(transform) = static_motion(&slots, false)? else {
+            return Ok(None);
+        };
+        if crop.is_none() && transform.rotation != 0.0 && !slots[2].is_empty() {
+            return Ok(None);
+        }
+        transform
+    } else {
+        Transform {
+            position: (0.0, 0.0),
+            scale: (100.0, 100.0),
+            rotation: 0.0,
+            anchor: (0.0, 0.0),
+            crop: [0.0; 4],
+        }
+    };
+    if let Some(crop) = crop {
+        let Some(edges) = static_crop(crop, crate::video::RETIME_CROP_FLAGS)? else {
+            return Ok(None);
+        };
+        transform.crop = edges;
+    }
+    Ok(crate::video::retime_motion_supported(&transform).then_some(transform))
+}
+
+/// A single static scale and translation stage, independent of input fitting.
+pub(super) fn fitted_static_motion(encoded: &str, blobs: &mut Blobs) -> Result<Option<Transform>> {
+    let bytes = blobs.envelope(encoded)?;
+    let outer = fields(&bytes)?;
+    let [(1, Wire::Bytes(motion))] = outer.as_slice() else { return Ok(None) };
+    let Some(slots) = section_slots(motion, 4, 0)? else { return Ok(None) };
+    if slots.len() != 12 || slots[5..].iter().any(|slot| !slot.is_empty())
+        || !matches!(slots[2], [] | [8, 44, 26, 4, 10, 2, 40, 0])
+    {
+        return Ok(None);
+    }
+    Ok(static_motion(&slots, true)?.filter(crate::video::fitted_motion))
+}
+
+fn static_motion(slots: &[&[u8]], independent_uniform: bool) -> Result<Option<Transform>> {
+    let (Some(x), Some(y), Some(sx), Some(sy), Some(rotation)) = (
+        static_slot(slots, X, 0.0)?,
+        static_slot(slots, Y, 0.0)?,
+        static_slot(slots, SCALE_X, 1.0)?,
+        static_slot(slots, SCALE_Y, 1.0)?,
+        static_slot(slots, ROTATION, 0.0)?,
+    ) else {
+        return Ok(None);
+    };
+    if (sx != 1.0 || sy != 1.0) && slots[2].is_empty() && !(independent_uniform && sx == sy) {
+        return Ok(None);
+    }
+    Ok(Some(Transform {
+        position: (x, -y),
+        scale: (sx * 100.0, sy * 100.0),
+        rotation: if rotation == 0.0 { 0.0 } else { -rotation },
+        anchor: (0.0, 0.0),
+        crop: [0.0; 4],
+    }))
+}
+
+fn static_crop(crop: &[u8], flags: u64) -> Result<Option<[f64; 4]>> {
+    let Some(slots) = source_crop_slots(crop, flags)? else {
+        return Ok(None);
+    };
+    let mut edges = [0.0; 4];
+    for (edge, control) in edges.iter_mut().zip(CROP) {
+        let Some(value) = static_slot(&slots, control, 0.0)? else {
+            return Ok(None);
+        };
+        *edge = value;
+    }
+    Ok(Some(edges))
+}
+
+fn source_crop_slots(crop: &[u8], flags: u64) -> Result<Option<Vec<&[u8]>>> {
     // Softness and Retain Image Position must be absent for source-space crop.
-    Ok(section_slots(crop, 6, 6)?
+    Ok(section_slots(crop, 6, flags)?
         .filter(|slots| slots.len() == 6 && slots[4..].iter().all(|slot| slot.is_empty())))
 }
 
@@ -554,6 +636,80 @@ mod tests {
         body[flag] = 1;
         let altered = crate::binary::pack(&body).unwrap();
         assert!(decode(&altered).is_none());
+    }
+
+    #[test]
+    fn retime_motion_requires_the_saved_nearest_section() {
+        let motion = "080438144a0f082a1a0b0a0911000000000000f13f4a0f082b1a0b0a0911000000000000f13f4a08082c1a040a0228004a0f08281a0b0a09119a9999999999993f4a004a004a004a004a004a004a004a00";
+        let mut body = Vec::new();
+        crate::binary::pb_bytes(1, &hex::decode(motion).unwrap(), &mut body);
+        let motion_only = crate::binary::pack(&body).unwrap();
+        assert!(retime_motion(&motion_only, &mut Blobs::default()).unwrap().is_none());
+
+        crate::binary::pb_bytes(1, crate::retime::NEAREST_SECTION, &mut body);
+        let combined = crate::binary::pack(&body).unwrap();
+        let transform = retime_motion(&combined, &mut Blobs::default()).unwrap().unwrap();
+        assert_eq!(transform.position, (0.025, 0.0));
+        assert_eq!(transform.scale, (106.25, 106.25));
+
+        crate::binary::pb_bytes(1, crate::retime::NEAREST_SECTION, &mut body);
+        let ambiguous = crate::binary::pack(&body).unwrap();
+        assert!(retime_motion(&ambiguous, &mut Blobs::default()).unwrap().is_none());
+    }
+
+    #[test]
+    fn retime_motion_preserves_centered_rotation() {
+        let motion = "080438144a004a004a004a004a004a0f082f1a0b0a09110000000000002ec04a004a004a004a004a004a00";
+        let mut body = Vec::new();
+        crate::binary::pb_bytes(1, &hex::decode(motion).unwrap(), &mut body);
+        crate::binary::pb_bytes(1, crate::retime::NEAREST_SECTION, &mut body);
+        let encoded = crate::binary::pack(&body).unwrap();
+        let rotation = retime_motion(&encoded, &mut Blobs::default()).unwrap().unwrap();
+        assert_eq!(rotation.rotation, 15.0);
+        assert_eq!(rotation.position, (0.0, 0.0));
+        assert_eq!(rotation.scale, (100.0, 100.0));
+    }
+
+    #[test]
+    fn retime_crop_preserves_edges_and_refuses_retain_position() {
+        let crop = hex::decode("0806381a4a004a004a0f08381a0b0a0911b81e85eb51b8ae3f4a0f08391a0b0a09119a9999999999b93f4a004a00").unwrap();
+        let decode = |crop: &[u8]| {
+            let mut body = Vec::new();
+            crate::binary::pb_bytes(1, crop, &mut body);
+            crate::binary::pb_bytes(1, crate::retime::NEAREST_SECTION, &mut body);
+            let encoded = crate::binary::pack(&body).unwrap();
+            retime_motion(&encoded, &mut Blobs::default()).unwrap()
+        };
+        let transform = decode(&crop).unwrap();
+        assert_eq!(transform.crop, [0.0, 0.06, 0.0, 0.10]);
+        assert_eq!(transform.scale, (100.0, 100.0));
+
+        let mut retain = crop;
+        retain.truncate(retain.len() - 2);
+        crate::binary::pb_bytes(9, &[1], &mut retain);
+        assert!(decode(&retain).is_none());
+    }
+
+    #[test]
+    fn retimed_crop_scale_and_rotation_require_the_saved_section_order() {
+        let motion = hex::decode(concat!(
+            "080438144a0f082a1a0b0a0911cdccccccccccec3f4a0f082b1a0b0a0911666666666666ee3f",
+            "4a08082c1a040a0228004a004a004a0f082f1a0b0a09110000000000002ec04a004a004a004a004a004a00",
+        )).unwrap();
+        let crop = hex::decode("0806381a4a004a004a0f08381a0b0a0911b81e85eb51b8ae3f4a0f08391a0b0a09119a9999999999b93f4a004a00").unwrap();
+        let decode = |first: &[u8], second: &[u8]| {
+            let mut body = Vec::new();
+            for section in [first, second, crate::retime::NEAREST_SECTION] {
+                crate::binary::pb_bytes(1, section, &mut body);
+            }
+            let encoded = crate::binary::pack(&body).unwrap();
+            retime_motion(&encoded, &mut Blobs::default()).unwrap()
+        };
+        let transform = decode(&motion, &crop).unwrap();
+        assert_eq!(transform.scale, (90.0, 95.0));
+        assert_eq!(transform.rotation, 15.0);
+        assert_eq!(transform.crop, [0.0, 0.06, 0.0, 0.10]);
+        assert!(decode(&crop, &motion).is_none());
     }
 
     #[test]

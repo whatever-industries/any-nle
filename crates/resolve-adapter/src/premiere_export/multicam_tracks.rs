@@ -1,4 +1,6 @@
 //! Resolve graph/2 angle tracks and independently selected mono sources.
+mod omissions;
+mod picture_subset;
 use super::*;
 use graph::{
     source::{Multicam, MulticamAlternative, MulticamUse},
@@ -25,6 +27,8 @@ pub(super) fn legacy_profile(graph: &SourceGraph, sequence: &SourceSequence) -> 
         && candidates.len() == 1
         && graph.multicams.iter().any(|group| {
             candidates.contains(group.id.as_str())
+                && group.reason.as_deref() != Some(crate::source::MULTICAM_PARTIAL_PICTURE)
+                && group.duration.is_none_or(|duration| frames_on(duration, sequence.rate).is_ok())
                 && group
                     .lanes
                     .iter()
@@ -45,13 +49,13 @@ pub(super) fn legacy_profile(graph: &SourceGraph, sequence: &SourceSequence) -> 
         })
 }
 
-pub(super) fn write(
+pub(super) fn prepare(
     mut graph: SourceGraph,
     sequence_index: usize,
-    ffprobe: &Path,
+    originals: &mut Originals<'_>,
     output: &Path,
     accept_losses: bool,
-) -> Result<Vec<Loss>> {
+) -> Result<(PreparedProject, Vec<Loss>)> {
     let sequence = &graph.sequences[sequence_index];
     let fail = |reason: &str| format!("{}: {reason}", sequence.id);
     let size = sequence
@@ -65,22 +69,17 @@ pub(super) fn write(
         .as_ref()
         .is_some_and(|clock| !clock.drop && clock.provenance.route == "Resolve archive clock")
         || !sequence.transitions.is_empty()
-        || !sequence.texts.is_empty()
         || !sequence.disabled_placements.is_empty()
-        || [
-            crate::generator::ADAPTER,
-            "resolve.nested_uses",
-            crate::dissolve::ADAPTER,
-        ]
-        .into_iter()
-        .any(|adapter| graph.sidecar(adapter, &sequence.id).is_some())
+        || graph.sidecar(crate::generator::ADAPTER, &sequence.id).is_some()
     {
         return Err(
             fail("unsupported Resolve linked multicam timeline timing or structure").into(),
         );
     }
-    crate::linked::check_origin(sequence).map_err(|error| format!("{}: {error}", sequence.id))?;
+    let origin = crate::linked::check_origin(sequence)
+        .map_err(|error| format!("{}: {error}", sequence.id))?;
     let mut uses: BTreeMap<&str, Vec<&MulticamUse>> = BTreeMap::new();
+    let mut unresolved_picture = Vec::new();
     let mut omitted_uses = HashSet::new();
     let mut losses = Vec::new();
     for edit in graph
@@ -100,6 +99,9 @@ pub(super) fn write(
                 .into());
             }
             omitted_uses.insert(edit.id.as_str());
+            if edit.kind == StreamKind::Video {
+                unresolved_picture.push((group.as_str(), edit.id.as_str()));
+            }
             losses.push(Loss {
                 object: edit.id.clone(),
                 aspect: "multicam_binding".into(),
@@ -118,6 +120,11 @@ pub(super) fn write(
         .iter()
         .map(|group| (group.id.as_str(), group))
         .collect();
+    for (group, edit) in unresolved_picture {
+        if definitions[group].reason.as_deref() == Some(crate::source::MULTICAM_PARTIAL_PICTURE) {
+            return Err(format!("{edit}: unresolved selected picture in a partially bound Resolve Group").into());
+        }
+    }
     let original_items: HashMap<_, _> = graph
         .items
         .iter()
@@ -141,17 +148,24 @@ pub(super) fn write(
         let source = graph
             .sidecar(TRACKS_ADAPTER, id)
             .ok_or_else(|| invalid("recapture the Resolve archive to retain the source raster"))?;
-        if group.reason.is_some()
-            || group.rate != Some(sequence.rate)
-            || source.get("frame_size")
-                != Some(&Value::Arr(vec![Value::Int(size.0), Value::Int(size.1)]))
-        {
-            return Err(invalid(
-                "unqualified Resolve multicam clock, source canvas, or definition",
-            )
-            .into());
+        let partial = group.reason.as_deref() == Some(crate::source::MULTICAM_PARTIAL_PICTURE);
+        if let Some(reason) = group.reason.as_deref().filter(|_| !partial) {
+            return Err(format!("{id}: unqualified Resolve multicam definition: {reason}").into());
         }
-        let duration = ticks(group.duration, id)?;
+        if group.rate != Some(sequence.rate) {
+            return Err(invalid("Resolve multicam rate disagrees with its timeline").into());
+        }
+        if source.get("frame_size") != Some(&Value::Arr(vec![Value::Int(size.0), Value::Int(size.1)])) {
+            return Err(invalid("Resolve multicam source canvas disagrees with its timeline").into());
+        }
+        let (duration, omitted_tail) = group_duration(group, sequence.rate)?;
+        if omitted_tail {
+            losses.push(Loss {
+                object: id.into(),
+                aspect: "multicam_fractional_tail".into(),
+                reason: "Premiere uses the complete-frame Group extent. The saved fractional gap remains in graph/2.".into(),
+            });
+        }
         let origin = match source.get("record_origin") {
             Some(Value::Str(value)) => ticks(Rational::parse(value), id)?,
             _ => return Err(invalid("unresolved Resolve multicam origin").into()),
@@ -164,6 +178,9 @@ pub(super) fn write(
             .lanes
             .iter()
             .find(|lane| lane.kind == StreamKind::Audio && lane.index == 1);
+        if partial {
+            losses.extend(picture_subset::omitted_angles(&graph, group, source, picture, &edits)?);
+        }
         if group.lanes.len() != usize::from(picture.is_some()) + usize::from(audio.is_some()) {
             return Err(invalid("expected picture and at most one independent mono lane").into());
         }
@@ -207,7 +224,7 @@ pub(super) fn write(
                 .filter(|lane| Some(lane.index) == edit.lane)
                 .and_then(|lane| lane.alternatives.get(edit.selected.unwrap_or(-1) as usize))
                 .ok_or_else(|| format!("{}: absent Resolve multicam angle or lane", edit.id))?;
-            require_binding(group, edit, alternative, &placements, &mut claimed)?;
+            require_binding(duration, edit, alternative, &placements, &mut claimed)?;
             out.uses.push(Use {
                 angle,
                 track: edit.track,
@@ -266,6 +283,7 @@ pub(super) fn write(
         groups.push(out);
     }
 
+    let omissions = omissions::collect(&graph, sequence, &groups, &claimed, origin)?;
     let mut used: HashSet<String> = groups
         .iter()
         .flat_map(|group| group.picture.iter().flatten().chain(&group.mono))
@@ -291,6 +309,8 @@ pub(super) fn write(
         .chain(used_media.iter().map(String::as_str))
         .chain(sequence.placements.iter().map(|p| p.id.as_str()))
         .collect();
+    let still_grades = still::grade_omissions(&graph, sequence, &claimed);
+    let still_grade_owners: HashSet<_> = still_grades.iter().map(|loss| loss.object.as_str()).collect();
     losses.extend(
         graph
             .losses
@@ -305,9 +325,15 @@ pub(super) fn write(
                         && loss.aspect == "multicam_binding")
                     && !(loss.aspect == "multicam_binding"
                         && loss.reason == crate::source::MULTICAM_OBSERVED_GAP)
+                    && !(loss.aspect == "grade" && still_grade_owners.contains(loss.object.as_str()))
+                    && !omissions.replaces(loss, &sequence.id)
             })
             .cloned(),
     );
+    losses.extend(still_grades);
+    if !omissions.is_empty() && !accept_losses {
+        return Err(omissions.approval_error(&sequence.id));
+    }
     if !accept_losses && !losses.is_empty() {
         let first = &losses[0];
         return Err(format!(
@@ -323,6 +349,7 @@ pub(super) fn write(
     graph.sequences[0]
         .placements
         .retain(|edit| !claimed.contains(&edit.id));
+    graph.sequences[0].texts.clear();
     graph.multicams.clear();
     graph.multicam_uses.clear();
     graph.losses.clear();
@@ -343,8 +370,24 @@ pub(super) fn write(
             .map(|edit| edit.id.clone()),
     );
     graph.sidecars.retain(|row| scoped.contains(&row.object));
-    let verified = verify_originals(&mut graph, ffprobe)?;
+    let fit = fit_custom_canvas(&graph, size)?;
+    let fitted_stills = still::prepare(&mut graph)?;
+    let verified = bind_originals(&mut graph, originals, true)?;
     let mut prepared = premiere_adapter::prepare_resolve_originals(&graph, &Options::default())?;
+    still::apply_fit(&mut prepared, fitted_stills)?;
+    for (owner, source_size) in fit {
+        let &(sequence, event) = prepared.ownership.get(&owner)
+            .ok_or_else(|| format!("{owner}: Resolve input fitting lost its prepared edit"))?;
+        if let Some(motion) = &mut prepared.input.sequences[sequence].events[event].transform {
+            // Resolve applies the saved position to the fitted image. Premiere
+            // Motion uses the original raster even with Scale to Frame Size.
+            let fit = (size.0 as f64 / source_size.0 as f64)
+                .min(size.1 as f64 / source_size.1 as f64);
+            motion.position.0 *= fit;
+            motion.position.1 *= fit;
+        }
+        prepared.input.fit_picture.insert((sequence, event));
+    }
     let group_bin = prepared.input.bins.len();
     prepared.input.bins.push(prproj::convert::model::Bin {
         name: "Multicam Sources".into(),
@@ -359,6 +402,8 @@ pub(super) fn write(
         }
     }
     prepared.input.multicam_tracks = groups;
+    omissions.check_prepared_end(&prepared.input)?;
+    losses.extend(omissions.into_losses());
     let staged = prepare_typed_project_for_premiere_27(
         &prepared.input,
         output,
@@ -369,17 +414,76 @@ pub(super) fn write(
         },
         None,
     )?;
-    for entry in verified.values() {
-        entry.0.recheck()?;
-    }
-    staged.publish()?;
+    verified.recheck()?;
     losses.extend(prepared.losses);
-    Ok(losses)
+    Ok((staged, losses))
+}
+
+fn fit_custom_canvas(graph: &SourceGraph, canvas: (i64, i64)) -> Result<Vec<(String, (i64, i64))>> {
+    use crate::input_scaling::{self, Sizing};
+    use prproj::convert::{model::Fraction, writer::{preset, Report}};
+
+    let sequence = &graph.sequences[0];
+    let rate = Fraction::new(sequence.rate.num(), sequence.rate.den());
+    if preset(&sequence.name, rate, canvas.0, canvas.1, &mut Report::default()).is_ok() {
+        return Ok(Vec::new());
+    }
+    let items: HashMap<_, _> = graph.items.iter().map(|item| (item.id.as_str(), item)).collect();
+    let media: HashMap<_, _> = graph.media.iter().map(|source| (source.id.as_str(), source)).collect();
+    let sidecars = linked::SidecarLookup::Linear(graph);
+    let mut fit = Vec::new();
+    for edit in sequence.placements.iter().filter(|edit| edit.video_track.is_some()) {
+        let source = items[edit.item.as_str()].media.iter()
+            .map(|link| media[link.media.as_str()])
+            .find(|source| source.kind == StreamKind::Video)
+            .ok_or_else(|| format!("{}: missing picture for custom canvas", edit.id))?;
+        let source_size = source.frame_size.filter(|&(w, h)| w > 0 && h > 0)
+            .ok_or_else(|| format!("{}: missing linked picture raster for custom canvas", edit.id))?;
+        if source_size == canvas || still::Format::from_codec(source.codec.as_deref()).is_some() {
+            continue;
+        }
+        let sizing = input_scaling::prepare(sidecars, &sequence.id, &edit.id, true)
+            .map_err(|error| format!("{}: {error}", edit.id))?;
+        if sizing != Some(Sizing::Fit)
+            || source.rate != Some(sequence.rate)
+            || edit.transform.as_ref().is_some_and(|motion| !crate::video::fitted_motion(motion))
+            || edit.speed.is_some() || edit.frame_map.is_some() || !edit.effects.is_empty()
+        {
+            return Err(format!("{}: custom canvas needs verified fitting and supported static picture controls", edit.id).into());
+        }
+        fit.push((edit.id.clone(), source_size));
+    }
+    Ok(fit)
 }
 
 fn ticks(time: Option<Rational>, owner: &str) -> Result<i64> {
     time.and_then(|time| time.to_units(prproj::build::time::TICKS_PER_SECOND))
         .ok_or_else(|| format!("{owner}: missing or inexact multicam time").into())
+}
+
+fn group_duration(group: &Multicam, rate: Rational) -> Result<(i64, bool)> {
+    let fail = || format!("{}: unverified fractional multicam duration", group.id);
+    let duration = group.duration.ok_or_else(fail)?;
+    let count = i128::from(duration.num()) * i128::from(rate.num())
+        / (i128::from(duration.den()) * i128::from(rate.den()));
+    let whole = Rational::new(count * i128::from(rate.den()), i128::from(rate.num()))
+        .filter(|time| *time > Rational::ZERO)
+        .ok_or_else(fail)?;
+    if whole == duration {
+        return Ok((ticks(Some(duration), &group.id)?, false));
+    }
+    // Every qualified alternative must prove that the fractional tail is empty.
+    if group.lanes.is_empty() || group.lanes.iter().any(|lane| {
+        lane.alternatives.is_empty() || lane.alternatives.iter().any(|alternative| {
+            alternative.reason.is_some() || !alternative.pieces.last().is_some_and(|piece| {
+                piece.item.is_none() && piece.start <= whole
+                    && piece.start.checked_add(piece.duration) == Some(duration)
+            })
+        })
+    }) {
+        return Err(fail().into());
+    }
+    Ok((ticks(Some(whole), &group.id)?, true))
 }
 
 fn prepare_pieces(
@@ -415,6 +519,9 @@ fn prepare_pieces(
                 format!("{}: unresolved original offset or channel", alternative.id).into(),
             );
         }
+        if picture && still::Format::from_codec(media[links[0].media.as_str()].codec.as_deref()).is_some() {
+            return Err(format!("{}: linked stills inside multicam angles are unqualified", alternative.id).into());
+        }
         pieces.push(Piece {
             clip: item.clone(),
             fit: false,
@@ -432,7 +539,7 @@ fn prepare_pieces(
 }
 
 fn require_binding<'a>(
-    group: &Multicam,
+    group_duration: i64,
     edit: &'a MulticamUse,
     alternative: &MulticamAlternative,
     placements: &HashMap<&str, &graph::Placement>,
@@ -448,7 +555,7 @@ fn require_binding<'a>(
     let end = from
         .checked_add(ticks(edit.duration, &edit.id)?)
         .ok_or_else(fail)?;
-    if end > ticks(group.duration, &group.id)? || alternative.reason.is_some() {
+    if end > group_duration || alternative.reason.is_some() {
         return Err(fail().into());
     }
     let record = ticks(edit.record_start, &edit.id)?;
@@ -510,4 +617,54 @@ fn require_binding<'a>(
         return Err(fail().into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graph::source::{MulticamLane, MulticamPiece};
+
+    #[test]
+    fn fractional_group_projection_requires_an_empty_tail_on_each_angle() {
+        let source = MulticamPiece {
+            start: Rational::ZERO,
+            duration: Rational::integer(1),
+            item: Some("source".into()),
+            stream: Some(1),
+            source_in: Some(Rational::ZERO),
+        };
+        let gap = MulticamPiece {
+            start: Rational::integer(1),
+            duration: Rational::new(1, 32).unwrap(),
+            item: None,
+            stream: None,
+            source_in: None,
+        };
+        let mut group = Multicam {
+            id: "group".into(),
+            name: "Group".into(),
+            rate: Some(Rational::integer(24)),
+            duration: Some(Rational::new(33, 32).unwrap()),
+            lanes: vec![MulticamLane {
+                kind: StreamKind::Video,
+                index: 1,
+                selected: Some(0),
+                alternatives: vec![MulticamAlternative {
+                    id: "angle".into(),
+                    pieces: vec![source, gap],
+                    reason: None,
+                }],
+                reason: None,
+            }],
+            reason: None,
+        };
+        let rate = group.rate.unwrap();
+        assert_eq!(group_duration(&group, rate).unwrap(), (TICKS_PER_SECOND, true));
+
+        let tail = &mut group.lanes[0].alternatives[0].pieces[1];
+        tail.item = Some("source".into());
+        tail.stream = Some(1);
+        tail.source_in = Some(Rational::integer(1));
+        assert!(group_duration(&group, rate).is_err());
+    }
 }

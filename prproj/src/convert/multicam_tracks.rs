@@ -246,13 +246,7 @@ pub(super) fn build<'a>(
                 leaf(&piece.clip).ok_or_else(|| fail("picture original was not imported"))?;
             let placed = project.add_clip(track, item, Time::new(piece.start), ids)?;
             if piece.fit {
-                let clip = project.track_item(placed).clip;
-                crate::xml::mutations::append_leaf(
-                    &mut project.doc.tree,
-                    clip,
-                    "ScaleToFramePolicy",
-                    "1",
-                );
+                super::writer::fit_picture_edit(project, placed);
             }
             trim(
                 project,

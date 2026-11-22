@@ -362,6 +362,8 @@ pub(super) enum PictureTiming {
 pub(super) fn picture_timing(
     encoded: &str,
     available: i64,
+    source_rate: graph::Rational,
+    record_rate: graph::Rational,
     blobs: &mut encoding::Blobs,
 ) -> Result<Option<PictureTiming>> {
     use crate::retime::{PictureSpeed, HOLD_MAP_END};
@@ -378,18 +380,22 @@ pub(super) fn picture_timing(
         return Ok(None);
     }
     let linear = (|| {
-        let rate = graph::Rational::integer(24);
-        let payload = map.bytes("KeyframesBA").ok()?.strip_prefix(&[0x80])?;
+        let saved = map.bytes("KeyframesBA").ok()?;
+        let payload = match saved {
+            [0x80, bytes @ ..] => bytes.into(),
+            [0x81, 0x28, 0xb5, 0x2f, 0xfd, ..] => keyframe_payload(saved)?,
+            _ => return None,
+        };
         use encoding::Wire;
-        let fields = encoding::fields(payload).ok()?;
+        let fields = encoding::fields(&payload).ok()?;
         if !(3..=crate::retime::MAX_LINEAR_KEYS).contains(&fields.len())
             || fields.iter().any(|(tag, wire)| *tag != 1 || !matches!(wire, Wire::Bytes(_)))
         {
             return None;
         }
-        let points = Value::Obj(map_keys(payload)?);
+        let points = Value::Obj(map_key_fields(fields)?);
         let Value::Arr(points) = points.get("keyframes")? else { return None };
-        let coordinate = |point: &Value, name| match point.get(name)? {
+        let coordinate = |point: &Value, name, rate| match point.get(name)? {
             Value::Float(value) => encoding::frames(*value, rate).ok(),
             _ => None,
         };
@@ -397,18 +403,18 @@ pub(super) fn picture_timing(
             if point.get("saved_handles").is_some() {
                 return None;
             }
-            Some([coordinate(point, "record_seconds")?, coordinate(point, "source_seconds")?])
+            Some([coordinate(point, "record_seconds", record_rate)?, coordinate(point, "source_seconds", source_rate)?])
         }).collect::<Option<Vec<_>>>()?;
         let &[record_end, source_end] = decoded.last()?;
-        if encoding::frames(map.real("XMax").ok()?, rate).ok()? != record_end
-            || encoding::frames(map.real("LastValidYOffset").ok()?, rate).ok()? != source_end
+        if encoding::frames(map.real("XMax").ok()?, record_rate).ok()? != record_end
+            || encoding::frames(map.real("LastValidYOffset").ok()?, source_rate).ok()? != source_end
         {
             return None;
         }
         crate::retime::LinearMap::validate_keys(&decoded, available).ok()?;
         Some(PictureTiming::Linear(decoded))
     })();
-    if linear.is_some() {
+    if linear.is_some() || source_rate != record_rate || record_rate != graph::Rational::integer(24) {
         return Ok(linear);
     }
     let observed = (|| {
@@ -509,24 +515,29 @@ pub(super) fn still_hold(encoded: &str, blobs: &mut encoding::Blobs) -> Result<b
     })
 }
 
-fn map_keys(bytes: &[u8]) -> Option<Vec<(String, Value)>> {
-    use encoding::Wire;
-    let decoded;
-    let bytes = if bytes.starts_with(&[0x81, 0x28, 0xb5, 0x2f, 0xfd]) {
-        decoded = zstd::bulk::decompress(&bytes[1..], 16 << 10).ok()?;
-        &decoded
+fn keyframe_payload(bytes: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    if bytes.starts_with(&[0x81, 0x28, 0xb5, 0x2f, 0xfd]) {
+        return Some(zstd::bulk::decompress(&bytes[1..], 16 << 10).ok()?.into());
+    }
+    // Resolve's uncompressed envelope starts with 0x80. The documented
+    // bare protobuf marker (field 160 = 0) starts with the same byte.
+    Some(if bytes.starts_with(&[0x80, 0x0a, 0x00, 0x0a]) {
+        bytes.into()
     } else {
-        // Resolve's uncompressed envelope starts with 0x80. The documented
-        // bare protobuf marker (field 160 = 0) starts with the same byte.
-        if bytes.starts_with(&[0x80, 0x0a, 0x00, 0x0a]) {
-            bytes
-        } else {
-            bytes.strip_prefix(&[0x80]).unwrap_or(bytes)
-        }
-    };
+        bytes.strip_prefix(&[0x80]).unwrap_or(bytes).into()
+    })
+}
+
+fn map_keys(bytes: &[u8]) -> Option<Vec<(String, Value)>> {
+    let payload = keyframe_payload(bytes)?;
+    map_key_fields(encoding::fields(&payload).ok()?)
+}
+
+fn map_key_fields(fields: Vec<(u64, encoding::Wire<'_>)>) -> Option<Vec<(String, Value)>> {
+    use encoding::Wire;
     let mut keys = Vec::new();
     let mut origin = None;
-    for (id, wire) in encoding::fields(bytes).ok()? {
+    for (id, wire) in fields {
         match (id, wire) {
             (160, Wire::Int(0)) => {}
             (2, Wire::Fixed(bytes)) if origin.is_none() => origin = Some(double(bytes)?),
@@ -616,16 +627,58 @@ mod tests {
     }
 
     #[test]
+    fn linear_map_keys_round_trip_on_the_saved_movie_clock() {
+        let mut blobs = encoding::Blobs::default();
+        let id = "b27cdc8f-3d5a-4fe5-89b1-5226e9c4b506";
+        let keys = vec![[0, 0], [12, 6], [24, 24], [47, 47]];
+        let base = graph::Rational::integer(24);
+        for (num, den) in [(24_000, 1001), (25, 1), (30_000, 1001)] {
+            let rate = graph::Rational::new(num, den).unwrap();
+            let map = crate::retime::LinearMap::new(6, keys.clone(), 48, rate, rate).unwrap();
+            let saved = hex::encode(map.encode(id));
+            assert!(matches!(picture_timing(&saved, 48, rate, rate, &mut blobs).unwrap(),
+                Some(PictureTiming::Linear(decoded)) if decoded == keys));
+            assert!(picture_timing(&saved, 48, base, base, &mut blobs).unwrap().is_none());
+        }
+        let source = crate::prepare::rate();
+        let map = crate::retime::LinearMap::new(6, keys.clone(), 48, source, base).unwrap();
+        let saved = hex::encode(map.encode(id));
+        assert!(matches!(picture_timing(&saved, 48, source, base, &mut blobs).unwrap(),
+            Some(PictureTiming::Linear(decoded)) if decoded == keys));
+        assert!(picture_timing(&saved, 48, base, base, &mut blobs).unwrap().is_none());
+        assert!(picture_timing(&saved, 48, source, source, &mut blobs).unwrap().is_none());
+
+        // Resolve zstd-compresses the keyframes in some reopened saves.
+        use crate::binary::{qt, Qt};
+        let native = blobs.qt(&saved).unwrap();
+        let raw = native.bytes("KeyframesBA").unwrap().strip_prefix(&[0x80]).unwrap();
+        let mut compressed = vec![0x81];
+        compressed.extend(zstd::bulk::compress(raw, 1).unwrap());
+        let saved = hex::encode(qt(&[
+            ("YMin", Qt::Double(-1.0)),
+            ("YMax", Qt::Double(-1.0)),
+            ("XMax", Qt::Double(native.real("XMax").unwrap())),
+            ("UniqueId", Qt::Text(id)),
+            ("LastValidYOffset", Qt::Double(native.real("LastValidYOffset").unwrap())),
+            ("KeyframesBA", Qt::Bytes(&compressed)),
+            ("DbType", Qt::Text("Sm2TimeMap")),
+        ]));
+        assert!(matches!(picture_timing(&saved, 48, source, base, &mut blobs).unwrap(),
+            Some(PictureTiming::Linear(decoded)) if decoded == keys));
+    }
+
+    #[test]
     fn constant_hold_map_requires_exact_frame_and_original_extent() {
         let mut blobs = encoding::Blobs::default();
         let id = "b27cdc8f-3d5a-4fe5-89b1-5226e9c4b506";
+        let rate = graph::Rational::integer(24);
         for frame in [0, 17, 95] {
             let saved = hex::encode(crate::retime::encode_hold(frame, 96, id).unwrap());
             assert!(matches!(
-                picture_timing(&saved, 96, &mut blobs).unwrap(),
+                picture_timing(&saved, 96, rate, rate, &mut blobs).unwrap(),
                 Some(PictureTiming::Hold(selected)) if selected == frame
             ));
-            assert!(picture_timing(&saved, 97, &mut blobs).unwrap().is_none());
+            assert!(picture_timing(&saved, 97, rate, rate, &mut blobs).unwrap().is_none());
         }
         assert!(crate::retime::encode_hold(96, 96, id).is_err());
     }

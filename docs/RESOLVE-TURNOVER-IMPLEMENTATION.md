@@ -75,7 +75,9 @@ can still prevent publication. The converter leaves existing scratch
 content in place.
 
 The assisted profile covers 1080p straight cuts at exact `24000/1001`,
-24, 25, and `30000/1001`. The original may be progressive square-pixel
+24, 25, and `30000/1001`, and qualified
+[Linear picture retimes](#linear-retiming-with-resolve-assisted-media).
+The original may be progressive square-pixel
 MOV or MP4 at its verified raster, with picture only or embedded 48 kHz
 stereo PCM16, PCM24, or AAC-LC assigned to two independent mono lanes.
 Graph/2 owns the edit clocks, trims and selectors. Resolve supplies the
@@ -1561,14 +1563,22 @@ The original Premiere key records and trims remain on the edit in
 `premiere.time_remapping`. The turnover job and standalone Premiere
 source probe share that capture.
 
-The first profile covers picture-only V1 at 1920×1080 and exact 24 fps
-with linked, zero-origin ProRes HQ MOV and Frame Sampling. It requires
-increasing whole-frame keys on both axes, no curve handles, and
+The writer uses the verified picture clock for both axes of a same-rate
+V1 edit with Frame Sampling. Standalone MOV and MP4 linking establish
+the source rate, extent, raster, and saved source timecode independently.
+The media record carries the timecode origin. The Linear keys and sampled
+frames stay relative to the file, with the clip In on the retimed axis.
+The raster must match the timeline canvas admitted by the writer.
+Audio on a separate timeline edit keeps its own source trim and physical
+channel selection. The curve requires increasing whole-frame keys on
+both axes, no curve handles, and
 coverage of the full edit. When Premiere ends the map at the exclusive
 file boundary, a unity-speed final segment lets the writer move the
 terminal key back one frame on both axes for Resolve. Off-grid source
 In, reverse segments, holds, effects on the retimed edit, and retimed
-audio are outside this profile. The writer verifies each key, the
+audio are outside this profile. Resolve-assisted linking, proxy picture,
+and mismatched source and canvas rasters require separate qualification.
+The writer verifies each key, the
 trim, and the sampled frames in the staged archive.
 [Pinned pr2resolve time-map reference](https://github.com/Ersiter/pr2resolve/blob/61c8c9ec2a76496721718130f250c5b64fccd789/pr2_native_time.py)
 
@@ -1589,6 +1599,320 @@ comparison renders on every decoded frame. Bezier handles, nonmonotone
 keys, off-grid keys, and a graph curve that contradicted its sampled
 frames all failed before publication. The retained half-speed,
 double-speed, and reverse controls passed their regression checks.
+
+The expanded controls used 23.976 AVC MP4 at 1920×1080 and 3840×2160
+with embedded AAC-LC on two independent mono lanes, and 25 fps AVC MOV
+at 1920×1080 with a separate stereo PCM16 WAV. The Premiere controls
+were derived from retained native saves. The turnover and standalone
+capture paths agreed on the Linear keys and sampled frames. Serialized
+graph/2 replay and staged and reopened DRP read-back preserved the
+picture clock, map, and audio trims. After Resolve save, close, and
+reopen, the edits matched all 112 decoded source-frame selections
+against a control built with one-frame cuts. All isolated AAC audio and
+both PCM channels matched the corresponding unretimed audio controls
+sample for sample. The original 24 fps ProRes control also matched all
+48 retained render frames.
+
+Two additional Premiere saves derived from 24 and 23.976 fps ProRes HQ
+controls used a source timecode of `10:00:01:00`. Each 48-frame timeline
+had a trimmed 24-frame Linear edit followed by a straight cut. The
+retimed In of 6 selected file frame 3. Separate PCM16 and PCM24 WAV edits
+started at source frames 3 and 6, respectively. Both Premiere capture
+paths, serialized graph/2 replay, and Resolve archive read-back preserved
+those clocks and ranges. After save, close, and reopen in Resolve Studio
+21.2.0 build 00006, all 96 decoded frames matched the explicit file-frame
+controls. Both isolated lanes matched the retained native audio renders
+sample for sample. A clock contradiction and a map whose source trim
+included the display origin both failed before publication.
+
+### 23.976 picture retimed on a 24 fps timeline
+
+The same graph/2 map uses 24 fps record-frame coordinates and exact
+`24000/1001` file-frame coordinates. The edit's source In is stored as
+exact seconds on the file clock. Resolve keeps the native source rate
+on the clip and encodes each axis in seconds at its own rate. Native
+saves can compress the key list or leave a zero In empty. Both encodings
+are read back as the same editable map.
+
+The first controls used picture-only, square-pixel 1080p ProRes HQ MOV
+with a zero file origin and plain V1 Frame Sampling. Premiere can append
+an exclusive file-end key one file frame and one tick beyond the final
+playable key. Capture preserves the saved key list in its source receipt
+and excludes that sentinel from the portable map. Before publication,
+the converter refuses a sampled key whose saved Premiere time lands
+early and a curve with samples less than or equal to 1/400 of a file
+frame below the next frame. The latter leaves a margin around the
+observed 0.002-frame advance. Both conditions produced different native
+frame selections in the boundary investigation.
+
+Premiere 27.0.0 build 88 saved and reopened two controls with a
+16-frame same-rate lead-in and a 1,059-frame retimed edit. The positive
+retimed In of 24 selected file frame 15. The zero trim selected file
+frame 0. After Save Project As, close, and reopen in Resolve Studio
+21.2.0 build 00006, all 2,150 decoded frame selections matched the
+Premiere renders. The independent mono WAV trims remained at 4,000 and
+6,000 samples. All 2,150,000 sample frames per isolated lane matched the
+native Resolve audio controls exactly on each timeline. Saved graph
+replays reproduced both results. A malformed terminal key, a graph trim
+on the wrong clock, and a contradictory sampled map all failed before
+publication.
+
+### 24 fps picture retimed on a 23.976 fps timeline
+
+The two-clock Linear map also works for picture-only 1080p ProRes HQ
+MOV at exact 24 fps in a `24000/1001` timeline. The saved Premiere
+controls added an exclusive terminal key exactly one source frame
+beyond the last playable key. The portable map stops at the last
+playable key and the source receipt retains the complete saved list.
+The same frame-boundary check applies in both directions.
+
+The two Premiere 27 controls each used a 16-frame lead-in and a
+1,059-frame retimed edit. Their retimed In values of 24 and zero
+selected source frames 15 and zero, respectively. After Save Project
+As, close, and reopen in Resolve Studio 21.2.0 build 00006, all 2,150
+numbered frame selections matched the Premiere renders. Both isolated
+mono lanes matched the retained straight-cut Resolve renders sample
+for sample over 2,152,150 sample frames per lane. The trims remained
+4,004 samples on A1 and 6,006 on A2. Both Premiere capture paths and
+serialized graph/2 replay preserved the keys, trims, and selectors.
+An edit with samples inside the frame-boundary margin was refused
+before a project was written.
+
+### Nonzero source timecode on mixed-rate Linear edits
+
+Both 23.976 ↔ 24 fps pairings also support picture-only 1080p ProRes HQ
+MOV with a verified nonzero QuickTime timecode. Resolve writes the
+Media Pool clock and edit's `MediaStartTime` on the source rate. The
+Linear map continues to use the timeline rate for its record axis and
+file-relative frames for its source axis. Archive read-back verifies
+the edit clock against the Media Pool and checks the file range.
+
+Four Premiere 27 controls used a source start of `10:00:01:00`, with
+zero and positive retimed trims in each direction. Resolve Studio 21.2.0
+build 00006 kept that timecode and all Linear keys through Save Project
+As, close, and reopen. All 4,300 numbered frame selections matched
+the Premiere renders. At 24 fps the independent A1 and A2 WAV trims were
+4,000 and 6,000 samples. At 23.976 fps they were 4,004 and 6,006.
+Every isolated lane matched its straight-cut Resolve reference sample
+for sample. Serialized graph/2 replay reproduced the clocks, keys,
+frames, and audio. A Premiere clock off by one file frame and a graph
+trim with the display origin added were refused in both directions.
+
+### Clock and frame-selection validation for mixed-rate Linear edits
+
+Mixed-rate Linear admission uses the verified original and timeline
+clocks, the whole-frame keys, and the frame selections across the
+complete edit. The comparison checks the first file-relative frame,
+playable extent, and the existing frame-boundary margin before writing.
+Verified picture-only 1080p ProRes HQ, 1080p H.264 and UHD H.264 MP4
+originals use this rule across supported clocks without a separate
+rate-pair entry. The original and timeline must have matching rasters.
+Ordinary mixed-rate cuts use the compact conform mapping described above.
+
+Two additional Premiere 27 controls used 25 fps and `30000/1001` picture
+on `24000/1001` timelines. After Save Project As, close, and reopen in
+Resolve Studio 21.2.0 build 00006, both kept the editable keys and
+matched all 2,146 numbered frame selections from Premiere. The 48 kHz
+mono WAV lanes kept their independent offsets of 4,004 and 6,006 samples.
+Each isolated lane matched its native Resolve reference over 2,148,146
+sample frames. Reopening and rendering the graph/2 replays reproduced
+both results. The separate 29.97 fps boundary control selected three
+different frames from the exact floor and was refused before publication.
+
+Two further controls used 24 fps picture on 25 fps and drop-frame
+`30000/1001` timelines. Each matched all 240 numbered frame selections
+from Premiere 27 after Resolve Save Project As, close, and reopen. The
+Linear keys and original paths survived, and the reopened graph/2
+replays matched the original conversions. The separate 48 kHz mono
+WAVs kept A1/A2 source trims of 3,840/5,760 samples at 25 fps and
+8,008/16,016 samples at 29.97 fps. Each isolated lane matched its native
+Resolve reference sample for sample over 460,800 and 384,384 sample
+frames respectively. Resolve saved explicit full-range Out marks on
+the 29.97 timeline after reopening. The reader retained those marks.
+
+The linked writer checks 29.97 standalone WAV ranges against their
+physical sample extent. The timeline origin, edit start, source trim,
+and duration must land on whole 48 kHz samples for this profile.
+
+An additional native control used a picture-only 1080p24 H.264 MP4 on
+the same 25 fps timeline with separate mono PCM16 WAV originals. The
+standalone writer linked all three originals. After Resolve Save
+Project As, close, and reopen, the Linear keys survived and all 240
+numbered frame selections matched Premiere. The two audio trims stayed
+at 3,840 and 5,760 samples, and each isolated lane matched its native
+reference over 460,800 sample frames. Saved graph/2 replay reproduced
+the result. Missing Linear keys and contradictory frame selections
+were refused before publication.
+
+The UHD control used a verified 3840×2160 H.264 MP4 at `24000/1001`
+on a 25 fps UHD timeline, with the same two mono WAVs. The standalone
+writer linked all three originals. After Resolve Save Project As and
+reopen, the output remained UHD and all 240 numbered frame selections
+matched Premiere. The saved keys and both independent trims survived.
+Each isolated lane matched 460,800 sample frames from its native
+Resolve reference. A saved graph/2 replay reproduced the result.
+Missing keys and contradictory frame selections still refused before
+publication. Source graphs from the retained HD mixed-rate and UHD
+same-rate controls were byte-identical.
+
+The mixed-rate writer also admits a separate stereo WAV on the existing
+neutral 1080p25 A1 profile. A trimmed 24 fps H.264 MP4 retained its
+Linear keys and matched all 40 numbered frames from Premiere after
+Resolve Save Project As and reopen. The linked 48 kHz PCM24 WAV stayed
+on one editable stereo A1 with left/right order and an independent
+13,440-sample trim. Each channel matched all 76,800 samples from the
+native Resolve reference. A replay from the Premiere graph/2 matched
+the same frame and audio references. Swapped physical selectors
+refused publication. The Save As copy also saved explicit stereo mixer
+state, which the reader retained in its Fairlight sidecar.
+
+### Linear retimes and dissolves on separate edits
+
+A Premiere Cross Dissolve can share V1 with a qualified Linear retime
+on a separate edit. Capture validates the dissolve's saved endpoint IDs
+before extending their graph ranges to include handles. An endpoint
+with sampled picture timing is refused. Resolve preparation retains
+the existing plain-endpoint and handle checks. Review still reports
+that blend sampling can differ between editors.
+
+The native control used a centered eight-frame dissolve on two 24 fps
+edits followed by trimmed 23.976 fps ProRes HQ with a Linear map on
+a 24 fps timeline. After Resolve Save Project As and reopen, all
+1,059 retimed frames and the eight unblended lead frames matched
+Premiere's numbered source selections. All 16 lead frames, including
+the blend, matched decoded frame hashes from a reopened Resolve control
+built with the previous writer and only the dissolve. The two mono WAV
+lanes kept source trims of 4,000 and 6,000 samples, and each matched
+2,150,000 sample frames from its native reference. Replays from both
+the Premiere graph/2 and the reopened Resolve graph/2 reproduced the
+result. Moving the dissolve to the retimed cut refused without writing
+a project.
+
+### Static Motion on a Linear retime
+
+A qualified Linear retime can share an HD picture edit with static
+position and scale, centered rotation through ±30°, or the qualified
+centered crop, scale, and rotation profile. The linked preparation
+checks the two clocks and the static geometry independently. Graph/2
+retains the transform and time map on the same occurrence.
+For the combined framing, Resolve saves Motion, Crop, and nearest-frame
+sampling in that order. Read-back checks the section order, keys, and
+transform.
+
+The control used 24 fps H.264 on a 25 fps timeline with a 48-pixel
+horizontal offset and 106.25% scale. After Resolve Save Project As and
+reopen, all 240 numbered frames selected the same source frames as
+Premiere. The decoded picture matched a Resolve control with Motion
+set through the native clip controls. Both independent WAV lanes
+matched their native references sample for sample. Replaying the
+Premiere graph/2 reproduced the results.
+
+The rotation control used a centered 15° Premiere rotation on trimmed
+23.976 fps ProRes HQ in a 24 fps timeline. After Save Project As and
+reopen in Resolve, all 1,059 retimed and 16 lead frames matched
+Premiere's numbered selections. All decoded frames matched the Resolve
+control with rotation set through native clip controls. The two mono
+WAVs kept their independent 4,000- and 6,000-sample trims, and each
+matched 2,150,000 sample frames from its native reference. Premiere
+graph/2 replay reproduced both checks. Adding translation to the
+rotation refused before publication.
+
+The crop control used a 6% top and 10% bottom crop on the same trimmed
+23.976 fps source. All 1,075 numbered frame selections and both mono
+WAV trims survived Save Project As and reopen, and graph/2 replay
+reproduced the result. The pictures matched the native Resolve crop
+control and both isolated WAV renders matched their native references.
+The visible rows on each retimed frame were `[65, 972)` in Premiere
+and `[64, 972)` in Resolve at the same editable percentages.
+
+Adding centered 95% scale to that crop produced an editable Resolve
+project with the same numbered frame selections. After Save Project As
+and reopen, all 1,075 decoded frames matched a Resolve control with
+scale and crop set through native clip controls. Both mono WAV lanes
+matched their independent references sample for sample. Graph/2 replay
+reproduced the result. With the same crop percentages, Resolve showed
+one extra visible top row compared with Premiere. The bottom edge
+agreed on every frame.
+
+The combined framing control kept the same crop and used 90% width,
+95% height, and centered 15° rotation on the retimed edit. Save Project
+As and reopen preserved the editable settings and all 1,075 frame
+selections. The decoded picture matched the native Resolve control
+frame for frame, and both independent mono WAV lanes matched their
+references sample for sample. Graph/2 replay reproduced both results.
+After aligning the rotated frames for edge measurement, the top crop
+still showed one extra visible row in Resolve and the bottom edge
+agreed. Adding translation to the framing refused before publication.
+
+The same combined framing passed on 25 fps and 29.97 drop-frame HD
+timelines with 24 fps ProRes HQ. On each timeline, the direct conversion
+and the saved graph/2 replay selected the same 240 numbered frames as
+Premiere and matched the decoded native Resolve picture after reopen.
+Both isolated WAV lanes matched sample for sample, at 460,800 sample
+frames per lane at 25 fps and 384,384 at 29.97. The drop-frame edit
+crossed the dropped-number minute boundary and retained its timeline
+start and separate 8,008- and 16,016-sample trims. The top crop showed
+the same one-row difference between editors on both timelines.
+Setting the rotation to 45° refused before publication at both rates.
+
+### Linear retiming with Resolve-assisted media
+
+An assisted source can carry a 1080p V1 Linear retime when
+the verified source raster matches the canvas and the saved keys
+agree with every graph/2 frame selection. The importer supplies the
+Media Pool record and the writer uses the same file-relative source
+map as standalone linking. The admitted assisted edit uses Frame
+Sampling. A picture-only original can also use the existing static
+framing profile for Linear retimes.
+
+The native 24 fps control used one ProRes LT MOV with source timecode
+`10:00:01:00` on two V1 edits. The first edit had a positive retimed
+trim and the second was a straight cut. Review counted one assisted
+original and two standalone mono WAVs, and each build imported the MOV
+once. Two source markers required explicit loss approval.
+
+After Save Project As and reopen, the 48 source frame selections
+matched Premiere and the decoded picture matched a Resolve control
+assembled with ordinary cuts. Both independent WAV lanes matched
+their references for all 96,000 sample frames per lane, including
+the 6,000- and 12,000-sample source trims. The serialized graph replay
+preserved the same clock, keys, links, and renders. A contradictory
+frame selection and an assisted frame hold each refused publication.
+
+For mixed-rate Linear edits, the assisted original must be picture-only.
+The Resolve archive reader checks the saved sampling control, source and
+record clocks, matching HD raster, and Linear map independently of the
+codec tag. Physical media verification still runs during preparation.
+
+Timecoded ProRes LT controls passed with 23.976 picture on a 24 fps
+timeline and 24 fps picture on a 23.976 timeline. Each control used
+a straight lead, a trimmed Linear retime, and two separate mono WAV
+trims. Each build counted one assisted original and three direct links.
+After Save Project As and reopen, all 1,075 frame selections per
+timeline matched Premiere. Replaying graph/2 reproduced the decoded
+picture and retained the editable time maps and source timecode. Both
+WAV lanes matched their respective references sample for sample, with
+2,150,000 sample frames per lane on the 24 fps timeline and 2,152,150
+on the 23.976 fps timeline. Removing the Linear map or changing a
+sampled frame refused publication.
+
+#### Static framing with assisted ProRes LT
+
+The same two rate pairings preserved a 6% top crop, 10% bottom crop,
+independent 90% X and 95% Y scale, and centered 15° clockwise rotation
+on the trimmed Linear edit. After Save Project As and reopen, the
+editable controls and source timecode survived alongside the timing
+keys. All 1,075 frame selections per timeline matched Premiere.
+The converted pictures and graph/2 replays matched the decoded Resolve
+controls with the framing set natively. Resolve showed one extra
+visible row at the top crop edge with the same percentages.
+
+Both mono WAV lanes matched their retained references sample for
+sample. The 24 fps timeline kept independent 4,000- and 6,000-sample
+trims, and the 23.976 fps timeline kept 4,004- and 6,006-sample trims.
+Both projects still refused a 45° rotation outside the qualified
+profile, and framing on the retained straight-cut assisted edit
+also refused before publication.
 
 ## Capture in graph/2
 

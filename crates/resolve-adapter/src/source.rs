@@ -18,6 +18,8 @@ pub(crate) mod mixer;
 mod multicam;
 pub(crate) use multicam::{native_group_default_unavailable, REFERENCE_AUDIO_SWITCH};
 pub(crate) use multicam::selection::OBSERVED_GAP as MULTICAM_OBSERVED_GAP;
+pub(crate) use multicam::PARTIAL_PICTURE as MULTICAM_PARTIAL_PICTURE;
+pub(crate) use timing::exact_frame_offset;
 mod observations;
 mod still;
 mod timing;
@@ -671,6 +673,7 @@ struct Master {
     path: String,
     size: (i64, i64),
     prores_hq: bool,
+    avc: bool,
     camera_pcm: bool,
     native_mono_movie: bool,
     saved_aac_clock: bool,
@@ -880,6 +883,7 @@ fn media(
     graph.items.push(item);
     Ok(Some(Master {
         prores_hq: codec == "apch",
+        avc: codec == "avc1",
         camera_pcm,
         native_mono_movie,
         saved_aac_clock,
@@ -1483,27 +1487,30 @@ fn sequence<'a>(
         texts: vec![],
     };
     let mut mixer = MixerControls::default();
-    let mut inherited_input_scaling = None;
+    let mut input_scaling = None;
     if let Some(container) = context.container(id, grid.length)? {
         let can_inherit_nearest = context.nearest_default && supported_marker_rate(grid.rate);
-        let can_inherit_sizing = context.input_scaling_default.is_some()
-            && !context.inspect_drt && grid.size == (1920, 1080);
-        let inherits_project = (can_inherit_nearest || can_inherit_sizing)
-            && node.maybe("FieldsBlob")?
-                .and_then(|saved| context.blobs.qt(saved).ok())
-                .is_some_and(|map| !map.keys().any(|key| key == "SequenceSetup"));
+        let settings = node.maybe("FieldsBlob")?.and_then(|saved| context.blobs.qt(saved).ok());
+        let inherits_project = settings.as_ref()
+            .is_some_and(|map| !map.keys().any(|key| key == "SequenceSetup"));
         let default_nearest = can_inherit_nearest && inherits_project;
         let default_input_fit =
             context.input_scaling_default == Some(crate::input_scaling::FIT) && default_nearest;
         let track_flags = read_tracks(context, &container, grid, &mut out, default_nearest, default_input_fit)?;
-        if inherits_project && can_inherit_sizing
+        if !context.inspect_drt
             && out.placements.iter().any(|edit| {
                 edit.video_track.is_some()
                     && context.masters.get(edit.item.as_str())
                         .is_some_and(|master| master.size != grid.size && master.rate == grid.rate)
             })
         {
-            inherited_input_scaling = context.input_scaling_default;
+            input_scaling = if inherits_project {
+                context.input_scaling_default.map(|mode| (crate::input_scaling::PROJECT_SETTING, mode))
+            } else {
+                settings.as_ref().and_then(|map| map.bytes("SequenceSetup").ok())
+                    .and_then(|raw| encoding::sequence_input_scaling(raw, grid.size))
+                    .map(|mode| (crate::input_scaling::SEQUENCE_SETTING, mode))
+            };
         }
         mixer = read_mixer_controls(context, node, &mut out, track_flags)?;
     }
@@ -1515,8 +1522,8 @@ fn sequence<'a>(
         ("record_origin", Value::Int(grid.origin)),
         ("record_length", Value::Int(grid.length)),
     ];
-    if let Some(mode) = inherited_input_scaling {
-        fields.push((crate::input_scaling::PROJECT_SETTING, text(mode)));
+    if let Some((key, mode)) = input_scaling {
+        fields.push((key, text(mode)));
     }
     let mut marks = Vec::new();
     for (tag, key) in crate::timeline_marks::TAGS {
@@ -1985,6 +1992,7 @@ fn read_tracks<'a>(
                     && !((kind == StreamKind::Video && index == 1
                         || kind == StreamKind::Audio && master.camera_pcm)
                         && crate::mixed_rate::Cadence::for_resolve_source(master.rate, grid.rate).is_some())
+                    && !(kind == StreamKind::Video && index == 1 && mixed_linear_picture(master, grid))
                 {
                     record_unqualified_timing(
                         &mut context.graph,
@@ -2286,6 +2294,20 @@ fn ordinary_item(
     Ok(true)
 }
 
+fn mixed_linear_picture(master: &Master, grid: Grid) -> bool {
+    let suffix = Path::new(&master.path).extension().and_then(|ext| ext.to_str());
+    master.rate != grid.rate && master.audio.is_empty()
+        && grid.size == master.size
+        && match master.size {
+            // The Linear map and saved sampling control are checked on the edit.
+            (1920, 1080) => suffix.is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("mov") || ext.eq_ignore_ascii_case("mp4")
+            }),
+            (3840, 2160) => master.avc && suffix.is_some_and(|ext| ext.eq_ignore_ascii_case("mp4")),
+            _ => false,
+        }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn direct(
     master: &Master,
@@ -2312,17 +2334,33 @@ fn direct(
         record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
         return Ok(None);
     };
+    let mixed_linear = mixed_linear_picture(master, grid);
+    let mut retime_motion = None;
     let timing = if kind == StreamKind::Video
         && track == 1
-        && grid.rate == Rational::integer(24)
-        && master.rate == grid.rate
-        && rate(&hex_bytes(node.get("MediaFrameRate")?)?)? == master.rate
-        && node.maybe("EffectFiltersBA")? == Some(crate::retime::NEAREST)
+        && (master.rate == grid.rate || mixed_linear)
     {
-        observations::picture_timing(node.get("MediaTimemapBA")?, master.length, blobs)?
+        let filters = node.maybe("EffectFiltersBA")?.filter(|value| !value.is_empty());
+        let saved_map = node.get("MediaTimemapBA")?;
+        if grid.size == (1920, 1080) && master.size == grid.size && saved_map.starts_with("00000001") {
+            if let Some(filters) = filters.filter(|value| *value != crate::retime::NEAREST) {
+                retime_motion = effects::retime_motion(filters, blobs)?;
+            }
+        }
+        if (filters == Some(crate::retime::NEAREST) || retime_motion.is_some())
+            && rate(&hex_bytes(node.get("MediaFrameRate")?)?)? == master.rate
+        {
+            observations::picture_timing(saved_map, master.length, master.rate, grid.rate, blobs)?
+        } else {
+            None
+        }
     } else {
         None
     };
+    if retime_motion.is_some() && !matches!(timing, Some(PictureTiming::Linear(_))) {
+        record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+        return Ok(None);
+    }
     let mixed = match crate::mixed_rate::Cadence::for_resolve_source(master.rate, grid.rate) {
         Some(cadence) if (kind == StreamKind::Video && track == 1
             && (master.camera_pcm && default_input_fit || master.prores_hq && master.start == 0 && master.audio.is_empty()
@@ -2397,27 +2435,42 @@ fn direct(
             )?;
             (edit, Some(speed), None)
         }
-        (None, Some(PictureTiming::Linear(keys))) if master.prores_hq && master.start == 0
-            && master.audio.is_empty() && master.size == (1920, 1080) && grid.size == master.size
+        (None, Some(PictureTiming::Linear(keys))) if grid.size == master.size
             && Path::new(&master.path).extension().and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mov") || ext.eq_ignore_ascii_case("mp4"))
             && node.maybe("MixedFrameRateAlignment")? == Some("0") =>
         {
-            let Some(record_in) = timing::FrameField::parse(node.get("In")?)?.integer() else {
+            let saved_in = node.get("In")?;
+            // Resolve writes an empty In for the zero-trim mixed-rate curve on save.
+            let record_in = if mixed_linear && saved_in.is_empty() {
+                Some(0)
+            } else {
+                timing::FrameField::parse(saved_in)?.integer()
+            };
+            let Some(record_in) = record_in else {
                 record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
                 return Ok(None);
             };
             let count = crate::retime::hold_count(length).ok_or("invalid Resolve Linear retime edit length")?;
             blobs.charge(count * size_of::<i64>())?;
-            let map = crate::retime::LinearMap::new(record_in, keys, master.length)?;
-            let samples = map.samples(length)?;
+            let sampled = crate::retime::LinearMap::new(record_in, keys, master.length, master.rate, grid.rate)
+                .and_then(|map| Ok((map.samples(length)?, map)));
+            let (samples, map) = match sampled {
+                Ok(sampled) => sampled,
+                Err(_) if mixed_linear => {
+                    record_unqualified_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             let source_in = samples[0];
             let source_length = samples[count - 1] - source_in + 1;
             let edit = grid.edit_at(start, length, source_in)?;
             leaf_range_matches(master, node, source_in, source_length, owner, graph)?;
             record_saved_timing(graph, node, owner, master.rate, grid.rate, blobs)?;
+            let source_time = map.source_time(source_in)?;
             linear_map = Some(map);
-            (edit, None, Some((seconds(source_in, grid.rate)?, samples)))
+            (edit, None, Some((source_time, samples)))
         }
         (None, Some(PictureTiming::Hold(frame))) if master.prores_hq && master.start == 0
             && master.audio.is_empty() && master.size == (1920, 1080) && grid.size == master.size
@@ -2536,6 +2589,7 @@ fn direct(
         placement.frame_map = Some(sampled);
         if let Some(map) = linear_map {
             graph.sidecars.push(map.receipt(&placement.id));
+            placement.transform = retime_motion;
         }
         if master.camera_pcm {
             graph.sidecars.push(Sidecar {
@@ -2582,6 +2636,14 @@ fn direct(
                 true
             }
 
+            StreamKind::Video if master.size != grid.size => {
+                if let Some(transform) = effects::fitted_static_motion(filters, blobs).ok().flatten() {
+                    placement.transform = Some(transform);
+                    true
+                } else {
+                    false
+                }
+            }
             StreamKind::Video if grid.size == (1920, 1080) && master.size == grid.size => {
                 match effects::picture_control(
                     filters, blobs, edit.source_in, edit.length, master.length,

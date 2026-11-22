@@ -1,11 +1,11 @@
 //! Prepare the linked edit's picture timing after transition trims.
-use super::{Media, MovieVideo, Profile, SidecarLookup};
+use super::{Media, MovieVideo, Profile};
 use crate::{
     Result,
     mixed_rate::Cadence,
-    retime::{self, LinearMap, PictureSpeed},
+    retime::{LinearMap, PictureSpeed, hold_count},
 };
-use graph::{Loss, Placement, Rational, source::SourceGraph};
+use graph::{Loss, Placement, Rational, Value, source::SourceGraph};
 
 pub(crate) enum Timing {
     Straight,
@@ -24,6 +24,7 @@ pub(super) struct TimingContext<'a> {
     pub raster_mismatch: bool,
     pub transition_trimmed: bool,
     pub mixed_rate: Option<Cadence>,
+    pub mixed_linear: bool,
     pub can_review_losses: bool,
 }
 
@@ -37,7 +38,7 @@ pub(super) struct PreparedTiming {
 impl TimingContext<'_> {
     pub(super) fn prepare(
         self,
-        sidecars: SidecarLookup<'_>,
+        linear: Option<&Value>,
         edit: &Placement,
         mut source_in: i64,
         length: i64,
@@ -53,36 +54,31 @@ impl TimingContext<'_> {
             && edit.transform.is_none()
             && edit.effects.is_empty();
         let mut loss = None;
-        let timing = if let Some(saved) = sidecars.get(retime::LINEAR_ADAPTER, &edit.id) {
-            let Profile::Mov {
-                video: MovieVideo::ProResHq,
-                frames,
-                aac: false,
-                pcm: None,
-                avid_source_timecode: None,
-                ..
-            } = profile
-            else {
+        let timing = if let Some(saved) = linear {
+            let Profile::Mov { rate, frames, .. } = profile else {
                 return Err(format!(
-                    "{}: Linear retime requires a linked ProRes HQ picture original",
+                    "{}: Linear retime requires a verified linked movie picture original",
                     edit.id
                 )
                 .into());
             };
-            if !plain_picture
-                || self.mixed_rate.is_some()
-                || profile.movie_timecode().is_some()
-                || self.media.native.is_some()
+            if self.lane != 0
+                || (*rate != self.rate && !self.mixed_linear)
+                || speed.is_some()
+                || edit.transform.as_ref().is_some_and(|t| self.canvas != (1920, 1080)
+                    || !crate::video::retime_motion_supported(t))
+                || !edit.effects.is_empty()
+                || self.media.proxy.is_some()
                 || self.raster_mismatch
                 || self.transition_trimmed
             {
                 return Err(format!(
-                    "{}: Linear retime requires a plain same-rate 1080p24 V1 picture edit",
+                    "{}: Linear retime requires a plain V1 picture edit with a verified source clock and matching raster",
                     edit.id
                 )
                 .into());
             }
-            let map = LinearMap::from_receipt(saved, *frames)
+            let map = LinearMap::from_receipt(saved, *frames, *rate, self.rate)
                 .map_err(|error| format!("{}: {error}", edit.id))?;
             let samples = map
                 .samples(length)
@@ -122,7 +118,7 @@ impl TimingContext<'_> {
                         ..
                     }
                 )
-                || retime::hold_count(length) != Some(map.len())
+                || hold_count(length) != Some(map.len())
                 || map.iter().any(|&sample| sample != frame)
             {
                 return Err(format!("{}: Resolve frame hold requires a constant map on linked picture-only 1080p24 ProRes HQ", edit.id).into());
@@ -180,6 +176,13 @@ impl TimingContext<'_> {
 }
 
 impl Timing {
+    pub(crate) fn trim_rate(&self, record_rate: Rational) -> Rational {
+        match self {
+            Self::Linear(map) => map.source_rate,
+            _ => record_rate,
+        }
+    }
+
     fn source_end(&self, edit: &Placement, source_in: i64, length: i64) -> Result<i64> {
         let end = match self {
             Self::Straight => source_in.checked_add(length),

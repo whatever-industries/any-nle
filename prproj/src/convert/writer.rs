@@ -636,6 +636,7 @@ struct WriterInput<'a> {
     track_states: &'a BTreeMap<usize, Vec<super::prepared::PreparedTrackState>>,
     timeline_marks: &'a BTreeMap<usize, super::prepared::PreparedTimelineMarks>,
     non_drop_sequences: &'a HashSet<usize>,
+    fit_picture: &'a HashSet<(usize, usize)>,
     picture_effects: &'a [PreparedPictureEffect],
     source_luts: &'a [super::prepared::PreparedSourceLut],
     extended_sdr_grades: &'a HashSet<(usize, usize)>,
@@ -1553,10 +1554,11 @@ impl Writer<'_> {
         let expanded_groups = || model.multicam_tracks.iter().filter(|group| group.sequence == sequence_index);
         let mut preset = preset_bound(&seq.name, seq.rate, seq.width, seq.height, &mut self.report, self.rewrapped)
             .or_else(|error| {
-                let mut picture = seq.events.iter().filter(|event| event.video_track.is_some()).peekable();
-                if self.rewrapped || (expanded_groups().next().is_none() && picture.peek().is_none()) || !picture.all(|event| {
+                let mut picture = seq.events.iter().enumerate().filter(|(_, event)| event.video_track.is_some()).peekable();
+                if self.rewrapped || (expanded_groups().next().is_none() && picture.peek().is_none()) || !picture.all(|(index, event)| {
                     model.originals.get(event.clip.as_str()).is_some_and(|clip|
                         clip.matches_explicit_linked_raster(seq))
+                        || model.fit_picture.contains(&(sequence_index, index))
                 }) {
                     return Err(error);
                 }
@@ -2083,6 +2085,13 @@ impl Writer<'_> {
                     self.report.notes.push(format!("sequence {seq_name} event {i}: AniMatte {n} not converted"));
                 }
             }
+            if model.fit_picture.contains(&(sequence_index, i)) {
+                let mut picture = placed.iter().copied().filter(|&item|
+                    self.project.doc.tree.tag(self.project.track_item(item).element) == "VideoClipTrackItem");
+                let item = picture.next().filter(|_| picture.next().is_none())
+                    .ok_or_else(|| other("input fitting did not produce one Premiere picture edit"))?;
+                fit_picture_edit(&mut self.project, item);
+            }
             if let Some(tf) = &e.transform {
                 for &t in &placed {
                     if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
@@ -2496,6 +2505,11 @@ impl Writer<'_> {
     }
 }
 
+pub(super) fn fit_picture_edit(project: &mut Project, item: TrackItemId) {
+    let clip = project.track_item(item).clip;
+    crate::xml::mutations::append_leaf(&mut project.doc.tree, clip, "ScaleToFramePolicy", "1");
+}
+
 /// `e.audio_gains[j] if e.audio_gains else None` (and the same for pans).
 fn edit_value(values: &[Option<f64>], j: usize) -> Result<Option<f64>> {
     if values.is_empty() {
@@ -2606,7 +2620,7 @@ fn prepare_project_with_effects_impl(
         })?;
     super::prepared::validate_constant_speeds(constant_speeds, &model.options, &model.sequences,
         |id, seq, event, speed| model.clips.get(id).is_some_and(|clip| speed.raw_trim(seq, event, clip).is_some()))?;
-    let view=WriterInput{options:&model.options,project_version,marker_provenance:None,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),timeline_marks:&BTreeMap::new(),non_drop_sequences:&HashSet::new(),picture_effects,source_luts:&[],extended_sdr_grades:&HashSet::new(),edit_labels:&[],frame_holds:&HashMap::new(),disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],multicam_tracks:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
+    let view=WriterInput{options:&model.options,project_version,marker_provenance:None,clips:model.clips.iter().collect(),originals:HashMap::new(),bins:&model.bins,sequences:&model.sequences,texts,video_dissolves,audio_edge_fades:&[],audio_crossfades:&[],audio_pans:&[],audio_mixers:&BTreeMap::new(),track_states:&BTreeMap::new(),timeline_marks:&BTreeMap::new(),non_drop_sequences:&HashSet::new(),fit_picture:&HashSet::new(),picture_effects,source_luts:&[],extended_sdr_grades:&HashSet::new(),edit_labels:&[],frame_holds:&HashMap::new(),disabled_edits:&HashSet::new(),direct_dnxhr_origins,direct_dnxhd_pcm24:None,constant_speeds,multicams:&[],multicam_uses:&[],multicam_tracks:&[],autosync_bins:&BTreeMap::new(),picture_subclips:&[],av_subclips:&[],av_subclip_uses:&[],picture_nests:&[],layered_submasters:&[],png_mattes:&super::prepared::PreparedPngMattes::default()};
     prepare_view(&view,model,out_path,ids,media,native_av,None,&HashSet::new(), &HashSet::new(), false, dnxhr_444_rgb_sources)
 }
 
@@ -2742,7 +2756,7 @@ fn prepare_typed_project_impl(input:&super::prepared::PreparedProjectInput,out_p
             sequence
         }).collect();
     }
-    let view=WriterInput{options:&input.options,project_version,marker_provenance,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,timeline_marks:&input.timeline_marks,non_drop_sequences:&input.non_drop_sequences,picture_effects:&input.picture_effects,source_luts:&input.source_luts,extended_sdr_grades:&input.extended_sdr_grades,edit_labels:&input.edit_labels,frame_holds:&input.frame_holds,disabled_edits:&input.disabled_edits,direct_dnxhr_origins:&input.direct_dnxhr_origins,direct_dnxhd_pcm24:Some(&input.direct_dnxhd_pcm24),constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,multicam_tracks:&input.multicam_tracks,autosync_bins:&input.autosync_bins,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,layered_submasters:&input.layered_submasters,png_mattes:&input.png_mattes};
+    let view=WriterInput{options:&input.options,project_version,marker_provenance,clips:legacy.clips.iter().collect(),originals:input.clips.iter().filter_map(|c|match c{super::prepared::PreparedClip::Original(c)=>Some((c.metadata.id.as_str(),c)),_=>None}).collect(),bins:&input.bins,sequences:&input.sequences,texts:&input.texts,video_dissolves:&input.video_dissolves,audio_edge_fades:&input.audio_edge_fades,audio_crossfades:&input.audio_crossfades,audio_pans:&input.audio_pans,audio_mixers:&input.audio_mixers,track_states:&input.track_states,timeline_marks:&input.timeline_marks,non_drop_sequences:&input.non_drop_sequences,fit_picture:&input.fit_picture,picture_effects:&input.picture_effects,source_luts:&input.source_luts,extended_sdr_grades:&input.extended_sdr_grades,edit_labels:&input.edit_labels,frame_holds:&input.frame_holds,disabled_edits:&input.disabled_edits,direct_dnxhr_origins:&input.direct_dnxhr_origins,direct_dnxhd_pcm24:Some(&input.direct_dnxhd_pcm24),constant_speeds:&input.constant_speeds,multicams:&input.multicams,multicam_uses:&input.multicam_uses,multicam_tracks:&input.multicam_tracks,autosync_bins:&input.autosync_bins,picture_subclips:&input.picture_subclips,av_subclips:&input.av_subclips,av_subclip_uses:&input.av_subclip_uses,picture_nests:&input.picture_nests,layered_submasters:&input.layered_submasters,png_mattes:&input.png_mattes};
     prepare_view(&view,&legacy,out_path,ids,media,native_av,layout,offline,linked_op1a,selective,dnxhr_444_rgb_sources)
 }
 fn dissolve_handles(model: &WriterInput<'_>) -> Result<()> {

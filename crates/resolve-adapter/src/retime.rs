@@ -8,6 +8,8 @@ use graph::{Placement, Rational, Sidecar, Speed, Value};
 
 pub(crate) const NEAREST: &str =
     "0000000200000019800a16082c38124a08085b1a040a0220014a004a004a004a00";
+pub(crate) const NEAREST_SECTION: &[u8] =
+    b"\x08\x2c\x38\x12\x4a\x08\x08\x5b\x1a\x04\x0a\x02\x20\x01\x4a\x00\x4a\x00\x4a\x00\x4a\x00";
 
 const HALF_FRAME: &str = "000000000000e03f";
 pub(crate) const HOLD_IN: &str = "86400";
@@ -18,16 +20,27 @@ pub(crate) const MAX_LINEAR_KEYS: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LinearMap {
     pub(crate) record_in: i64,
+    pub(crate) source_rate: Rational,
+    record_rate: Rational,
     keys: Vec<[i64; 2]>,
 }
 
 impl LinearMap {
-    pub(crate) fn new(record_in: i64, keys: Vec<[i64; 2]>, available: i64) -> Result<Self> {
+    pub(crate) fn new(
+        record_in: i64,
+        keys: Vec<[i64; 2]>,
+        available: i64,
+        source_rate: Rational,
+        record_rate: Rational,
+    ) -> Result<Self> {
         Self::validate_keys(&keys, available)?;
         if record_in < 0 {
             return Err("Linear retime requires a nonnegative record trim".into());
         }
-        Ok(Self { record_in, keys })
+        if source_rate <= Rational::ZERO || record_rate <= Rational::ZERO {
+            return Err("Linear retime requires positive source and timeline clocks".into());
+        }
+        Ok(Self { record_in, source_rate, record_rate, keys })
     }
 
     pub(crate) fn validate_keys(keys: &[[i64; 2]], available: i64) -> Result<()> {
@@ -64,12 +77,26 @@ impl LinearMap {
             let dx = i128::from(b[0] - a[0]);
             let dy = i128::from(b[1] - a[1]);
             let offset = i128::from(record - a[0]) * dy;
-            if record == self.record_in && offset % dx != 0 {
+            let fraction = offset % dx;
+            if record == self.record_in && fraction != 0 {
                 return Err("Linear retime source In must fall on a whole source frame".into());
+            }
+            // Mixed-rate sampling can advance a value within 0.002 frames of
+            // the next source frame. Require agreement with the exact floor
+            // even with a 1/400-frame advance, including a rounding margin.
+            if self.source_rate != self.record_rate && (dx - fraction) * 400 <= dx {
+                return Err("mixed-rate Linear retime samples too close to a source frame boundary".into());
             }
             samples.push(a[1] + i64::try_from(offset / dx)?);
         }
         Ok(samples)
+    }
+
+    pub(crate) fn source_time(&self, frame: i64) -> Result<Rational> {
+        Rational::new(
+            i128::from(frame) * i128::from(self.source_rate.den()),
+            self.source_rate.num().into(),
+        ).ok_or_else(|| "invalid Linear retime source trim".into())
     }
 
     pub(crate) fn receipt(&self, owner: &str) -> Sidecar {
@@ -85,7 +112,12 @@ impl LinearMap {
         }
     }
 
-    pub(crate) fn from_receipt(value: &Value, available: i64) -> Result<Self> {
+    pub(crate) fn from_receipt(
+        value: &Value,
+        available: i64,
+        source_rate: Rational,
+        record_rate: Rational,
+    ) -> Result<Self> {
         let invalid = || "malformed graph/2 Linear retime receipt";
         let (Some(Value::Int(record_in)), Some(Value::Arr(keys))) =
             (value.get("record_in"), value.get("keys"))
@@ -102,13 +134,15 @@ impl LinearMap {
             },
             _ => Err(invalid()),
         }).collect::<std::result::Result<_, _>>()?;
-        Self::new(*record_in, keys, available)
+        Self::new(*record_in, keys, available, source_rate, record_rate)
     }
 
     pub(crate) fn encode(&self, id: &str) -> Vec<u8> {
+        let record_fps = self.record_rate.num() as f64 / self.record_rate.den() as f64;
+        let source_fps = self.source_rate.num() as f64 / self.source_rate.den() as f64;
         encode_points(self.keys.iter().map(|&[record, source]| {
-            (record as f64 / 24.0, source as f64 / 24.0)
-        }), self.keys.last().expect("validated retime keys")[1] as f64 / 24.0, id)
+            (record as f64 / record_fps, source as f64 / source_fps)
+        }), self.keys.last().expect("validated retime keys")[1] as f64 / source_fps, id)
     }
 }
 
@@ -302,14 +336,43 @@ mod tests {
 
     #[test]
     fn linear_map_uses_record_trim_and_floor_sampling_between_keys() {
+        let rate = Rational::integer(24);
         let keys = vec![[0, 0], [8, 4], [12, 10], [21, 19]];
-        let map = LinearMap::new(6, keys.clone(), 20).unwrap();
+        let map = LinearMap::new(6, keys.clone(), 20, rate, rate).unwrap();
         assert_eq!(map.samples(8).unwrap(), [3, 3, 4, 5, 7, 8, 10, 11]);
-        assert_eq!(LinearMap::from_receipt(&map.receipt("edit").data, 20).unwrap(), map);
-        assert!(LinearMap::from_receipt(&map.receipt("edit").data, 19).is_err());
+        assert_eq!(LinearMap::from_receipt(&map.receipt("edit").data, 20, rate, rate).unwrap(), map);
+        assert!(LinearMap::from_receipt(&map.receipt("edit").data, 19, rate, rate).is_err());
         assert!(map.samples(16).is_err());
-        assert!(LinearMap::new(7, keys, 20).unwrap().samples(8).is_err());
-        assert!(LinearMap::new(0, vec![[0, 0], [8, 4], [12, 4], [21, 19]], 20).is_err());
+        assert!(LinearMap::new(7, keys, 20, rate, rate).unwrap().samples(8).is_err());
+        assert!(LinearMap::new(0, vec![[0, 0], [8, 4], [12, 4], [21, 19]], 20, rate, rate).is_err());
+    }
+
+    #[test]
+    fn mixed_linear_trim_uses_file_clock_and_requires_stable_frame_selections() {
+        let source = crate::prepare::rate();
+        let record = Rational::integer(24);
+        let keys = vec![[0, 0], [8, 4], [12, 10], [21, 19]];
+        let map = LinearMap::new(6, keys.clone(), 20, source, record).unwrap();
+        let samples = map.samples(8).unwrap();
+        assert_eq!(samples, [3, 3, 4, 5, 7, 8, 10, 11]);
+        assert_eq!(map.source_time(samples[0]).unwrap(), Rational::new(1001, 8000).unwrap());
+        let reverse_pair = LinearMap::new(6, keys.clone(), 20, record, source).unwrap();
+        assert_eq!(reverse_pair.samples(8).unwrap(), samples);
+        assert_eq!(reverse_pair.source_time(samples[0]).unwrap(), Rational::new(1, 8).unwrap());
+        for file_rate in [Rational::integer(25), Rational::new(30000, 1001).unwrap()] {
+            let map = LinearMap::new(6, keys.clone(), 20, file_rate, source).unwrap();
+            assert_eq!(map.samples(8).unwrap(), samples);
+            assert_eq!(frames_on(map.source_time(samples[0]).unwrap(), file_rate).unwrap(), 3);
+        }
+        assert!(LinearMap::new(6, keys, 20, Rational::ZERO, source).is_err());
+
+        let near_boundary = vec![[0, 0], [1001, 1000], [1003, 1004]];
+        let mixed = LinearMap::new(0, near_boundary.clone(), 1005, source, record).unwrap();
+        let reverse_pair = LinearMap::new(0, near_boundary.clone(), 1005, record, source).unwrap();
+        let same = LinearMap::new(0, near_boundary, 1005, record, record).unwrap();
+        assert!(mixed.samples(2).is_err());
+        assert!(reverse_pair.samples(2).is_err());
+        assert_eq!(same.samples(2).unwrap(), [0, 0]);
     }
 
     #[test]

@@ -14,6 +14,16 @@ pub(crate) struct PreparedVideo {
     pub(crate) readback: PictureControl,
 }
 
+pub(crate) const RETIME_MOTION_FLAGS: u64 = 20;
+pub(crate) const RETIME_CROP_FLAGS: u64 = 26;
+
+pub(crate) fn retime_motion_supported(t: &Transform) -> bool {
+    if t.crop == [0.0; 4] {
+        return validate_static_geometry(t).is_ok();
+    }
+    centered_crop_profile(t)
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum PictureControl {
     Transform(Transform),
@@ -78,10 +88,11 @@ pub(crate) fn prepare(
     source_in: i64,
     length: i64,
     available: i64,
+    linear_retime: bool,
 ) -> Result<Option<PreparedVideo>> {
     match (&placement.transform, placement.effects.as_slice()) {
         (None, []) => Ok(None),
-        (Some(transform), []) => prepare_static(transform.clone(), rate),
+        (Some(transform), []) => prepare_static(transform.clone(), rate, linear_retime),
         (Some(transform), [effect]) if motion::is_avid_linear(&effect.kind) => {
             let motion = motion::LinearMotion::from_avid(&effect.kind, &effect.params, transform, source_in, length, available)?;
             Ok(Some(PreparedVideo {
@@ -120,9 +131,12 @@ pub(crate) fn prepare(
     }
 }
 
-fn prepare_static(mut transform: Transform, rate: Rational) -> Result<Option<PreparedVideo>> {
-    check_static_rate(&transform, rate)?;
-    Ok(encode(&transform)?.map(|encoded| {
+fn prepare_static(mut transform: Transform, rate: Rational, linear_retime: bool) -> Result<Option<PreparedVideo>> {
+    // Linear retime preparation already validates the geometry and clocks.
+    if !linear_retime {
+        check_static_rate(&transform, rate)?;
+    }
+    Ok(encode_motion(&transform, Reflection::default(), linear_retime)?.map(|encoded| {
         transform.scale = (
             (transform.scale.0 / 100.0) * 100.0,
             (transform.scale.1 / 100.0) * 100.0,
@@ -239,10 +253,6 @@ fn section<const N: usize>(effect: u64, flags: u64, slots: &[Vec<u8>; N], out: &
     pb_bytes(1, &bytes, out);
 }
 
-pub(crate) fn encode(t: &Transform) -> Result<Option<String>> {
-    encode_with_reflection(t, Reflection::default())
-}
-
 pub(crate) fn validate_static_geometry(t: &Transform) -> Result<()> {
     let (x, y) = t.position;
     let (sx, sy) = t.scale;
@@ -266,7 +276,21 @@ pub(crate) fn validate_static_geometry(t: &Transform) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn fitted_motion(t: &Transform) -> bool {
+    t.scale.0 == t.scale.1 && t.scale.0 > 0.0
+        && t.rotation == 0.0 && t.anchor == (0.0, 0.0) && t.crop == [0.0; 4]
+}
+
+#[cfg(test)]
+pub(crate) fn encode(t: &Transform) -> Result<Option<String>> {
+    encode_with_reflection(t, Reflection::default())
+}
+
 pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> Result<Option<String>> {
+    encode_motion(t, reflection, false)
+}
+
+fn encode_motion(t: &Transform, reflection: Reflection, linear_retime: bool) -> Result<Option<String>> {
     let centered_crop = centered_crop_profile(t);
     let axis = rotation_axis_profile(t);
     if !centered_crop && !axis {
@@ -316,7 +340,11 @@ pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> R
         motion[ANCHOR.0] = parameter(ANCHOR.1, &point);
     }
     reflection.write_slots(&mut motion);
-    section(4, 0, &motion, &mut body);
+    // Native retimed crop-only edits save the crop section without an empty Motion section.
+    if !linear_retime || has_transform {
+        let motion_flags = if linear_retime { RETIME_MOTION_FLAGS } else { 0 };
+        section(4, motion_flags, &motion, &mut body);
+    }
     if has_crop {
         let mut crop: [Vec<u8>; 6] = Default::default();
         for ((slot, id), value) in CROP.into_iter().zip(t.crop) {
@@ -324,7 +352,11 @@ pub(crate) fn encode_with_reflection(t: &Transform, reflection: Reflection) -> R
                 crop[slot] = scalar(id, value);
             }
         }
-        section(6, 6, &crop, &mut body);
+        let crop_flags = if linear_retime { RETIME_CROP_FLAGS } else { 6 };
+        section(6, crop_flags, &crop, &mut body);
+    }
+    if linear_retime {
+        pb_bytes(1, crate::retime::NEAREST_SECTION, &mut body);
     }
     Ok(Some(pack(&body)?))
 }

@@ -1178,6 +1178,65 @@ fn saved_warp_compositing_keeps_key_modes_and_distinct_occurrences() {
 }
 
 #[test]
+fn picture_blend_proxies_survive_graph_reload_on_their_own_slots() {
+    use av::{SourceFillerProxy as Proxy, SourcePictureBlendKind as Blend};
+
+    let (mut facts, index) = fixture(1);
+    let mut seq = sequence(Vec::new());
+    let rate = Rate::new(24, 1).unwrap();
+    seq.picture_blend_inputs = [Blend::Warp, Blend::Superimpose, Blend::PictureInPicture]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| av::SourcePictureBlendInputs {
+            kind,
+            owner: format!("revision/seq/component/{index}"),
+            track: 2,
+            record_start: Some(index as i64 * 16),
+            record_length: Some(16),
+            effect_rate: Some(rate),
+            effect_length: 16,
+            swap_sources: None,
+            inputs: [av::SourceWarpInput::Filler, av::SourceWarpInput::Picture(av::SubmasterPictureInput {
+                mob: mob(2),
+                track: 1,
+                source_start: 10 + index as i64,
+                local_start: 0,
+                length: 16,
+                local_length: 16,
+                rate,
+            })],
+            filler_proxies: [
+                [Proxy::Relative { scope: 1, track: -1 }, Proxy::Absent, Proxy::Unresolved][index],
+                Proxy::Relative { scope: 0, track: -1 },
+            ],
+            controls: Vec::new(),
+        })
+        .collect();
+    facts.sequences.push(seq);
+    let graph = run(&facts, &index).graph;
+    let reopened = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+    assert_eq!(graph, reopened);
+    let seq = &reopened.sequences[0];
+    assert!(seq.placements.is_empty());
+    let receipt = reopened.sidecar("avid.source", &seq.id).unwrap();
+    let Some(Value::Arr(warp)) = receipt.get("warp_inputs") else { panic!("missing Warp observation") };
+    let Some(Value::Arr(other)) = receipt.get("picture_blend_inputs") else { panic!("missing blend observations") };
+    assert_eq!((warp.len(), other.len()), (1, 2));
+    for (index, entry) in warp.iter().chain(other).enumerate() {
+        let owner = format!("revision/seq/component/{index}");
+        assert_eq!(entry.get("owner"), Some(&s(owner)));
+        assert_eq!(entry.get("record_start"), Some(&Value::Int(index as i64 * 16)));
+        assert_eq!(entry.get("effect_id"), [None, Some(s("EFF2_BLEND_SUPER")), Some(s("EFF2_BLEND_PIP"))][index].as_ref());
+        let Some(Value::Arr(slots)) = entry.get("slots") else { panic!("missing saved slots") };
+        assert_eq!(slots[0].get("kind"), Some(&s("filler")));
+        let relative = |scope| obj(vec![("relative_scope", Value::Int(scope)), ("relative_track", Value::Int(-1))]);
+        assert_eq!(slots[0].get("filler_proxy"), [Some(relative(1)), None, Some(Value::Null)][index].as_ref());
+        assert_eq!(slots[1].get("filler_proxy"), Some(&relative(0)));
+        assert_eq!(slots[1].get("source").unwrap().get("source_start"), Some(&Value::Int(10 + index as i64)));
+    }
+}
+
+#[test]
 fn ordered_projective_warp_receipt_survives_without_linked_picture() {
     use avid_reader::color::{ColorCorrection, ParamValue};
     use avid_reader::transform::{CornerPin, Kind, PictureEffect};

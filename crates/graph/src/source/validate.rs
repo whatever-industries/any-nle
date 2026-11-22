@@ -108,8 +108,11 @@ pub(super) fn graph(graph: &SourceGraph) -> R<()> {
             if matches!(o.container.as_str(), "jpeg" | "png" | "tiff") {
                 let still_raster = match o.container.as_str() {
                     "tiff" => m.frame_size == Some((1920, 64)),
-                    "png" => matches!(m.frame_size, Some((1920, 1080) | (1536, 1024))),
-                    _ => m.frame_size == Some((1920, 1080)),
+                    "png" | "jpeg" => m.frame_size.is_some_and(|(width, height)| {
+                        (16..=8192).contains(&width) && (16..=8192).contains(&height)
+                            && width * height <= 16_777_216
+                    }),
+                    _ => false,
                 };
                 require(m.kind == StreamKind::Video && m.codec.as_deref() == Some(o.container.as_str())
                     && m.online == Some(true) && o.stream_index == 0 && o.duration_ts == 1

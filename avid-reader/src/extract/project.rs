@@ -62,16 +62,20 @@ pub fn extract_project(files: &[&AvbFile]) -> BinContents {
     project.finish()
 }
 
-/// Native effect inputs indexed by their saved slot numbers, retaining dangling slots.
-fn numbered_two_inputs<'a>(ctx: &Ctx<'a>, effect: &Node) -> Option<[Option<&'a Node>; 2]> {
+/// Native effect tracks indexed by their saved slot numbers.
+fn numbered_two_tracks(effect: &Node) -> Option<[&Node; 2]> {
     let Value::List(tracks) = effect.get("tracks")? else { return None; };
     let [Value::Node(first), Value::Node(second)] = tracks.as_slice() else { return None; };
-    let ordered = match (int(first, "index"), int(second, "index")) {
-        (Some(1), Some(2)) => [first, second],
-        (Some(2), Some(1)) => [second, first],
-        _ => return None,
-    };
-    Some(ordered.map(|track| ctx.deref(track.get("component"))))
+    match (int(first, "index"), int(second, "index")) {
+        (Some(1), Some(2)) => Some([first, second]),
+        (Some(2), Some(1)) => Some([second, first]),
+        _ => None,
+    }
+}
+
+/// Native effect inputs indexed by their saved slot numbers, retaining dangling slots.
+fn numbered_two_inputs<'a>(ctx: &Ctx<'a>, effect: &Node) -> Option<[Option<&'a Node>; 2]> {
+    Some(numbered_two_tracks(effect)?.map(|track| ctx.deref(track.get("component"))))
 }
 
 // A source route only needs the supported range-routing facts, not arbitrary attributes,
@@ -1036,6 +1040,17 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                     }
                     _ => None,
                 };
+                use crate::source::SourcePictureBlendKind as Blend;
+                if c.class == *b"TKFX" && self.kind == KIND_PICTURE {
+                    let blend = match effect.as_str() {
+                        "EFF2_BLEND_SUPER" => Some(Blend::Superimpose),
+                        "EFF2_BLEND_PIP" => Some(Blend::PictureInPicture),
+                        _ => None,
+                    };
+                    if let (Some(source), Some(blend)) = (&mut self.source, blend) {
+                        source.picture_blend_inputs(ctx, c, position, self.track, blend);
+                    }
+                }
                 if self.source.is_some() && self.kind == KIND_PICTURE {
                     if let (Some(Value::List(tracks)), [input]) =
                         (c.get("tracks"), inputs.as_slice())
@@ -1053,7 +1068,7 @@ impl<'s, 'a> CompileWalk<'s, 'a> {
                 if let (Some(kind), true) = (picture_kind, self.kind == KIND_PICTURE) {
                     if kind == PictureKind::Warp {
                         if let Some(source) = &mut self.source {
-                            if source.warp_inputs(ctx, c, position, self.track) {
+                            if source.picture_blend_inputs(ctx, c, position, self.track, Blend::Warp) {
                                 source.unresolved_effect(c, position, self.kind, self.track, "3D Warp",
                                     "Avid 3D Warp uses two picture inputs. The composite could not be converted.");
                                 return;

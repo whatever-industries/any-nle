@@ -1259,8 +1259,52 @@ AAF import to answer a specific readiness question for a common workflow.
    The internal Premiere → Resolve route also carries bounded
    forward piecewise Linear picture retiming through graph/2. The map
    retains the editable keys and the selected source frame at each
-   record frame.
+   record frame. The same rule uses the verified source clock for 24 fps
+   ProRes, 23.976 HD and UHD AVC with independent AAC lanes, and 25 fps
+   HD AVC with separate stereo PCM16. These controls passed Resolve
+   reopen and picture and audio comparisons. Timecoded ProRes HQ at
+   24 and 23.976 fps also passed full frame and independent WAV checks
+   after reopen. Bounded Linear retimes on 1080p ProRes HQ passed native
+   picture and independent mono audio checks in both 23.976 ↔ 24 fps
+   rate pairings with zero and positive retimed trims, including
+   nonzero QuickTime source timecode. The shared timing rule uses exact
+   clocks and stable frame selections. Additional 25 and 29.97 fps
+   picture controls on 23.976 timelines passed native checks with both
+   independent mono WAV trims. 24 fps picture on 25 fps and 29.97 DF
+   timelines also passed every-frame and independent WAV checks after
+   Save Project As and reopen, including graph/2 replay. The same
+   25 fps check passed with picture-only 1080p24 H.264 MP4 through
+   standalone linking. Picture-only UHD H.264 MP4 at 23.976 fps also
+   passed on a 25 fps UHD timeline, with both independent WAV lanes
+   verified after reopen and graph/2 replay. A 24 fps H.264 MP4 on a
+   25 fps HD timeline passed the same checks with a separate stereo
+   PCM24 WAV on A1. A mixed-rate Linear retime and an eight-frame
+   centered dissolve on separate V1 edits passed reopened picture and
+   independent WAV comparisons. Static position and scale on the same
+   mixed-rate HD retime passed editable read-back and native picture
+   and audio comparisons. Centered static rotation and static crop,
+   including crop with independent scale and rotation, passed the same
+   checks on a 24 fps timeline. The combined framing also passed at
+   25 fps and 29.97 drop-frame after reopen and graph/2 replay, using
+   the same geometry and clock checks. The fractional top crop showed
+   a one-row difference between editors. A same-rate 24 fps
+   [assisted ProRes LT retime](RESOLVE-TURNOVER-IMPLEMENTATION.md#linear-retiming-with-resolve-assisted-media)
+   passed reopen and graph/2 replay with its source timecode, all
+   48 picture frames, and both independently trimmed WAV lanes.
+   Both mixed-rate pairings between 23.976 and 24 fps also passed
+   with picture-only ProRes LT, nonzero source timecode, and independent
+   WAV trims. Both rate pairings preserved editable crop, independent
+   scale, and centered rotation after reopen. The decoded picture
+   matched the native Resolve framing controls, and both mono WAV
+   lanes matched their references through graph/2 replay.
+   [Assisted framing checks](RESOLVE-TURNOVER-IMPLEMENTATION.md#static-framing-with-assisted-prores-lt)
    [Piecewise Linear retiming](RESOLVE-TURNOVER-IMPLEMENTATION.md#premiere-piecewise-linear-picture-retiming)
+   · [23.976 picture at 24 fps](RESOLVE-TURNOVER-IMPLEMENTATION.md#23976-picture-retimed-on-a-24-fps-timeline)
+   · [24 fps picture at 23.976](RESOLVE-TURNOVER-IMPLEMENTATION.md#24-fps-picture-retimed-on-a-23976-fps-timeline)
+   · [Nonzero source timecode](RESOLVE-TURNOVER-IMPLEMENTATION.md#nonzero-source-timecode-on-mixed-rate-linear-edits)
+   · [Shared clock and frame-selection checks](RESOLVE-TURNOVER-IMPLEMENTATION.md#clock-and-frame-selection-validation-for-mixed-rate-linear-edits)
+   · [Dissolves on separate edits](RESOLVE-TURNOVER-IMPLEMENTATION.md#linear-retimes-and-dissolves-on-separate-edits)
+   · [Static Motion on a retime](RESOLVE-TURNOVER-IMPLEMENTATION.md#static-motion-on-a-linear-retime)
    Expand the linked writer across verified profiles already captured by
    the Premiere reader. At 23.976, 24, 25 and 29.97, the internal 1080p
    route can use the dedicated Studio worker when standalone preparation
@@ -1695,6 +1739,78 @@ and plain captions.
 [Current profiles](RESOLVE-SOURCE-READER.md#editable-conversion-profiles)
 · [Resolve AAF export](https://documents.blackmagicdesign.com/UserManuals/DaVinciResolveReferenceManual.pdf?_v=1783666810000#page=4162)
 
+- [ ] **Qualify full project conversion.** Resolve the remaining
+      Group angle references and grouped stereo and multichannel
+      audio, including subframe alignment. Verify real
+      multilayer timelines with multicam, titles, nests, and transitions
+      present together. Extend camera linking beyond the verified RED2
+      picture and camera AVC profiles where the saved timelines need it.
+      Use project Review to rank the remaining refusals, then qualify bin
+      hierarchy and sequence publication together.
+      [Current multicam scope](RESOLVE-SOURCE-READER.md#resolve-to-premiere-editable-multicam)
+- [x] **Review all timelines together and reuse original verification.**
+      The internal probe prepares each timeline independently and reports
+      whether it can be written, what it would lose, or its first blocking
+      condition. Physical verification is shared across timeline attempts
+      in the same job. [Project Review](RESOLVE-SOURCE-READER.md#review-a-project-for-premiere)
+- [ ] **Qualify scoped omissions beside editable multicam.** Graph replays
+      verify that unsupported titles, nests, and native transitions can be
+      reported by exact record range with loss approval while retaining
+      ordinary edits and editable Groups. Verify the combined Premiere 27
+      reopen and render. Qualify mixed-rate member frames inside a Group
+      against its own clock, then verify subframe audio alignment and
+      grouped channel selection independently.
+      [Combined timeline checks](RESOLVE-SOURCE-READER.md#multicam-alongside-unsupported-edits)
+- [x] **Keep verified picture selections in a partial Group.** With
+      approval, the exporter omits an unused, unqualified angle and
+      keeps the selected picture cuts. It can also report a fractional
+      audio transition at its exact range when it can safely be omitted.
+      Qualifying the unavailable angles and audio routing remains part
+      of [full project conversion](#resolve--premiere).
+      [Partial Group checks](RESOLVE-SOURCE-READER.md#preserve-the-verified-picture-angles-of-a-partial-group)
+- [x] **Qualify fitted picture on a 24 fps custom Premiere canvas.**
+      Premiere 27 saved, reopened and rendered the 3840×1920 control with
+      the expected framing, cuts and independent mono route. The reader
+      also preserves a verified timeline-specific fit setting and the
+      writer carries uniform zoom and translation across size changes.
+      [Custom canvas checks](RESOLVE-SOURCE-READER.md#custom-multicam-sequence-canvas)
+- [x] **Write editable linked PNG holds on 24 fps timelines.** Preserve
+      static fit and the saved record range, including ordinary PNG
+      occurrences alongside multicam. Premiere 27 reopened and
+      rendered a 111-frame opaque hold with the expected framing.
+      [Still profile](RESOLVE-SOURCE-READER.md#linked-stills-on-24-fps-timelines)
+- [x] **Qualify linked JPEG holds with explicit grade omissions.**
+      Premiere 27 reopened and rendered the full 167-frame hold with
+      the original raster and expected fit. Graph/2 retains the grade
+      receipt. Writing an ungraded hold requires loss approval.
+      [Still profile](RESOLVE-SOURCE-READER.md#linked-stills-on-24-fps-timelines)
+- [x] **Link 44.1 kHz mono MP3 dialogue with zero decoder delay.**
+      Premiere 27 reopened both exact trims. Both isolated lanes
+      matched a native Premiere import sample for sample.
+      [MP3 profile](RESOLVE-SOURCE-READER.md#link-441-khz-mono-mp3-in-premiere)
+- [ ] **Link standalone stereo MP3 with artwork and encoder padding.**
+      Verify the audio stream selection, independent channels and
+      presented extent against native imports.
+- [ ] **Preserve alpha on linked PNG overlays.** Qualify an overlay with
+      transparent and opaque areas, then compare the reopened composite
+      over numbered picture.
+- [x] **Link RED2 picture from single and spanned originals.**
+      The internal writer verifies the recording's parts, source timecode
+      and extent. Premiere 27 Save As and reopen kept both trims and the
+      exact source timecode. All 72 decoded frames matched the native
+      imports at 24 and 23.976 fps, including a segment boundary and a
+      1080p fit control.
+      [Linked RED2 checks](RESOLVE-SOURCE-READER.md#link-red2-picture-to-premiere)
+- [x] **Recover whole-frame Group selections beneath a fractional tail.**
+      The reader keeps the exact extent and verifies each selected
+      angle's clock, ranges, and routing. Premiere's multipart writer
+      can omit a verified empty fractional tail with approval. Picture
+      and mono audio matched the whole-frame control after Premiere 27
+      reopen. [Fractional extent checks](RESOLVE-SOURCE-READER.md#groups-with-fractional-saved-extents)
+- [x] **Link qualified MOV originals over 2 GiB.** The ordinary and
+      multipart paths use saved identity and file state with a single
+      picture packet verification pass. A large ProRes HQ control
+      reopened in Premiere 27. [Linked media checks](RESOLVE-SOURCE-READER.md#write-linked-audio-to-premiere)
 - [x] **Open generated Resolve conversions directly in Premiere 27.**
       The ordinary and multicam writer paths emit Project version 46.
       Premiere 27 opened both without an upgrade prompt. Reopened
@@ -3136,13 +3252,15 @@ User's priority tiers to scope converter tasks.
       missing slot bindings omit the affected edit and appear in Review.
       [Routing evidence](SOURCE-GRAPH-MIGRATION.md#saved-avid-3d-warp-compositing-controls).
 - [ ] **3D Warp compositing.** Qualify Full Key foreground opacity and
-      background selection on contrasting picture layers. The numbered
-      sources and measurement recipe are ready. The remaining native
-      check is to author, save, reopen, and export the control in Avid.
-      [Full Key calibration](SOURCE-GRAPH-MIGRATION.md#native-full-key-calibration).
-      Then compare a plain border, soft crop edge, shadow, and the
-      Internal and FG Only Defocus modes. Preserve separate key-mode
-      identities before admitting an editable mapping.
+      background selection on contrasting picture layers. Native 0%, 25%,
+      100%, and swapped 25% controls match the source roles and Rec.709
+      code-value blend. Graph/2 retains the saved relative background
+      reference. Qualify its resolution across lower-track cuts and gaps.
+      Compare scaled foreground with Background Color off and on, then
+      test a plain border, soft crop edge, shadow, and the Internal and
+      FG Only Defocus modes. Preserve separate key-mode identities before
+      admitting an editable mapping.
+      [Full Key calibration](SOURCE-GRAPH-MIGRATION.md#native-full-key-calibration)
 
 - [x] **Single-shape AniMatte inversion and opacity in Premiere.** Key In
       and Key Out at full and half opacity survived Save As and reopen.
@@ -3196,15 +3314,20 @@ User's priority tiers to scope converter tasks.
       foreground color and alpha separately.
 - [ ] **Opacity** (Avid opacity/levels, fade-to-black etc.) -> Premiere Opacity (and blend modes
       where Avid has an equivalent); keyframes. Superimpose is available under
-      Filters → Blend. The installed renderer reads a 0–100 foreground
-      level and sends it to the mixer as a 0–1 factor. Verify the saved
-      foreground and background roles and compare 0%, 50%, and 100% native
-      renders before choosing a destination blend model.
+      Filters → Blend. Native Rec.709 0%, 50%, and 100% renders verify the
+      saved foreground level and both source roles. Graph/2 retains the
+      relative background reference and static level. Resolve the
+      reference and compare the destination composite at 50%.
+      Keyframes remain open.
+      [Native Opacity calibration](SOURCE-GRAPH-MIGRATION.md#native-superimpose-and-picture-in-picture-calibration)
 - [ ] **Picture-in-Picture.** The installed Avid renderer shares transform
-      and crop evaluators with Resize. Picture-in-Picture registers a second
-      picture input and reads a separate Foreground Level. Qualify a saved
-      two-layer effect with nonneutral position, crop and opacity before
-      mapping its foreground controls and background ownership.
+      and crop evaluators with Resize. The native offset and left-crop
+      controls at 46% foreground level establish the layer roles and
+      measured geometry at 1920×1080. The uncropped control reopens
+      with editable values and an identical render. Graph/2 retains both
+      saved inputs and the measured controls. Qualify editable destination
+      geometry and the background reference.
+      [Native Picture-in-Picture calibration](SOURCE-GRAPH-MIGRATION.md#native-superimpose-and-picture-in-picture-calibration)
 - [ ] **Avid Pan & Zoom.** The effect references an external still and
       calculates a source viewport from its raster, aspect, zoom, and
       position. The placeholder supplies the Video background. Qualify

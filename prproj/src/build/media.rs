@@ -122,6 +122,9 @@ pub const STILL_LABEL_INDEX: i64 = 3;
 pub const STILL_LABEL_COLOR: i64 = 8851829;
 pub const STILL_COLOR_SPACE: &str = "{\"baseColorProfile\":{\"colorProfileName\":\"BT.709 RGB Full\"},\"baseProfileType\":1}";
 pub const MOVIE_COLOR_SPACE: &str = "{\"baseColorProfile\":{\"colorProfileData\":\"AQAAAP////8=\",\"colorProfileName\":\"BT.709,32f,Display-Referred\"},\"baseProfileType\":1}";
+const RED_COLOR_SPACE: &str = r#"{"baseColorProfile":{"colorProfileName":"Red Log3G10/Wide Gamut"},"baseProfileType":1}"#;
+const RED_AS_SHOT_COLOR_SPACE: &str = r#"{"baseColorProfile":{"colorProfileName":"BT.709 RGB Full,Display-Referred"},"baseProfileType":1,"colorSpaceMetadata":{"dataRangeInfoValid":1}}"#;
+pub(crate) const RED_IMPLEMENTATION_ID: &str = "1fa18bfa-255c-44b1-ad73-56bcd99fceaf";
 /// The AVI stream fourcc that means "uncompressed": no `CodecType` element.
 pub const NO_CODEC: &str = "DIB ";
 
@@ -182,6 +185,11 @@ pub fn movie_stream_profile(container: &str, codec: &str) -> Option<VideoStreamP
         ("mov", "apch") | ("mov", "AVdh") => VideoStreamProfile { orientation: true, ..PROFILE_DEFAULT },
         ("mxf", "MPEG") | ("mxf", "AVdn") => PROFILE_DEFAULT,
         ("mov", "AVdn") => VideoStreamProfile { orientation: true, ..PROFILE_DEFAULT },
+        ("r3d", "RED") => VideoStreamProfile {
+            color_space: RED_COLOR_SPACE,
+            codec_type: Some("REDC"),
+            ..PROFILE_DEFAULT
+        },
         _ => return None,
     })
 }
@@ -441,6 +449,10 @@ pub fn new_movie_video_stream(
         leaf(tree, e, "CodecType", &fourcc(stamped)?.to_string(), "\n\t\t");
     }
     leaf(tree, e, "OriginalColorSpace", profile.color_space, "\n\t\t");
+    if container == "r3d" {
+        leaf(tree, e, "IsColorSpaceSelected", "true", "\n\t\t");
+        leaf(tree, e, "SelectedColorSpace", RED_AS_SHOT_COLOR_SPACE, "\n\t\t");
+    }
     if let Some(a) = profile.alpha_type {
         leaf(tree, e, "AlphaType", a, "\n\t\t");
     }

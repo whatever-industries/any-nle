@@ -13,6 +13,7 @@ anynle-premiere-adapter = { path = "../premiere-adapter" }
 prproj = { path = "../../prproj" }
 flate2 = "1"
 hex = "0.4.3"
+png = "=0.18.1"
 quick-xml = "0.41"
 regex = "1.12"
 serde = { version = "1", features = ["derive"] }

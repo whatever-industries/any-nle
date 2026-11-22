@@ -1386,7 +1386,8 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                         let source_start = m.start.filter(|_| m.clock.as_ref().is_some_and(|clock|
                             matches!(clock.provenance.route.as_str(),
                                 graph::source::AVID_SOURCE_COLUMNS_TIMECODE | graph::source::AVID_LINKED_MOV_TIMECODE
-                                    | graph::source::VERIFIED_LINKED_MOV_TIMECODE)))
+                                    | graph::source::VERIFIED_LINKED_MOV_TIMECODE
+                                    | graph::source::VERIFIED_LINKED_R3D_TIMECODE)))
                             .map(|start| ticks(start, "original source timecode"))
                             .transpose()?.unwrap_or_default();
                         if let Some(receipt) = side(&sc, "avid.source", &m.id)
@@ -1782,6 +1783,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         track_states: Default::default(),
         timeline_marks: Default::default(),
         non_drop_sequences: Default::default(),
+        fit_picture: Default::default(),
         picture_effects: Vec::new(),
         source_luts: Vec::new(),
         extended_sdr_grades: Default::default(),

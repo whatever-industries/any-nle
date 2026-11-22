@@ -132,6 +132,13 @@ pub fn add_item(
             0,
         )
     };
+    if c.container == "r3d" {
+        let tree = &mut project.doc.tree;
+        let implementation = tree.find1(e, "ImplementationID")
+            .ok_or_else(|| Error::Value("linked RED importer field is absent".into()))?;
+        tree.set_text(implementation, Some(m::RED_IMPLEMENTATION_ID));
+        append_leaf(tree, e, "LogComment", "As Shot");
+    }
     let reel = c
         .metadata
         .tape_name

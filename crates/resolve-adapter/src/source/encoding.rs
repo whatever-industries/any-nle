@@ -385,6 +385,22 @@ pub(super) fn valid_clip_sizing_state(property: &[u8]) -> Result<bool> {
         [(1, Wire::Int(1)), (2, Wire::Int(saved))] if *saved > 0))
 }
 
+pub(super) fn sequence_input_scaling(setup: &[u8], size: (i64, i64)) -> Option<&'static str> {
+    // Native version 3 exports retain the canvas and input sizing enum in
+    // a fixed prefix. Other settings and the variable trailer stay opaque.
+    let word = |at: usize| -> Option<i64> {
+        Some(i64::from_be_bytes(setup.get(at..at + 8)?.try_into().ok()?))
+    };
+    if word(0)? != 3 || (word(40)?, word(48)?) != size {
+        return None;
+    }
+    match word(92)? {
+        -1 => Some(crate::input_scaling::FIT),
+        0 => Some(crate::input_scaling::CENTER_CROP),
+        _ => None,
+    }
+}
+
 pub(super) fn pb_bytes(data: &[u8], wanted: u64) -> Result<Option<&[u8]>> {
     let mut found = None;
     for (key, value) in fields(data)? {
@@ -627,6 +643,25 @@ mod tests {
         }
         assert!(!valid_clip_sizing_state(&[0x1a, 4, 8, 1, 16, 0]).unwrap());
         assert!(!valid_clip_sizing_state(&[0x1a, 4, 8, 2, 16, 1]).unwrap());
+    }
+
+    #[test]
+    fn sequence_sizing_is_bound_to_the_saved_version_and_canvas() {
+        let mut setup = [0; 100];
+        setup[..8].copy_from_slice(&3i64.to_be_bytes());
+        setup[40..48].copy_from_slice(&3840i64.to_be_bytes());
+        setup[48..56].copy_from_slice(&1920i64.to_be_bytes());
+        let canvas = (3840, 1920);
+        assert_eq!(sequence_input_scaling(&setup, canvas), Some(crate::input_scaling::CENTER_CROP));
+        setup[92..100].copy_from_slice(&(-1i64).to_be_bytes());
+        assert_eq!(sequence_input_scaling(&setup, canvas), Some(crate::input_scaling::FIT));
+        assert_eq!(sequence_input_scaling(&setup, (1920, 1080)), None);
+        assert_eq!(sequence_input_scaling(&setup[..99], canvas), None);
+        setup[92..100].copy_from_slice(&2i64.to_be_bytes());
+        assert_eq!(sequence_input_scaling(&setup, canvas), None);
+        setup[7] = 4;
+        setup[92..100].fill(0);
+        assert_eq!(sequence_input_scaling(&setup, canvas), None);
     }
 
     #[test]

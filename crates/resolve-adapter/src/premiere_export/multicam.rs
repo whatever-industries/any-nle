@@ -1,7 +1,6 @@
 //! Resolve's two picture angles and camera-A reference audio as a Premiere multicam.
 use crate::{
     group::{member, prepare_native_group},
-    media::{media_digest, verify_group_binding, BindingSpec},
     prepare::{frames, rate},
     source::{mixer::FAIRLIGHT_ADAPTER, ADAPTER, REFERENCE_AUDIO_SWITCH},
     Result, StreamSelector, VerifiedBinding,
@@ -27,13 +26,13 @@ use std::{collections::HashSet, path::Path, sync::Arc};
 // Complete neutral mixer model on the retained Resolve Save As/reopen control.
 const NEUTRAL_MIXER: &str = "6f9f0411d14f45daccac9b617134ef768f23bea282f33e221527797c49309874";
 
-pub(super) fn write(
+pub(super) fn prepare(
     graph: &SourceGraph,
     sequence: &SourceSequence,
-    ffprobe: &Path,
+    originals: &mut super::Originals<'_>,
     output: &Path,
     accept_losses: bool,
-) -> Result<Vec<Loss>> {
+) -> Result<(prproj::convert::writer::PreparedProject, Vec<Loss>)> {
     let fail = |reason: &str| format!("{}: {reason}", sequence.id);
     let uses: HashSet<_> = graph
         .multicam_uses
@@ -141,11 +140,9 @@ pub(super) fn write(
         )
         .into());
     }
-    let cameras = [
-        Arc::new(camera_binding(graph, items[0], ffprobe)?),
-        Arc::new(camera_binding(graph, items[1], ffprobe)?),
-    ];
-    let prepared = prepare_native_group(graph, &sequence.id, cameras)
+    let (first, first_path) = camera_binding(graph, items[0], originals)?;
+    let (second, second_path) = camera_binding(graph, items[1], originals)?;
+    let prepared = prepare_native_group(graph, &sequence.id, [first, second])
         .map_err(|error| format!("{}: {error}", group.id))?;
     let mut bindings = Vec::new();
     let clips = prepared
@@ -240,14 +237,17 @@ pub(super) fn write(
         &input, output, &mut RandomUuids::new(),
         TypedMedia::Bound { bindings: &bindings, native_av: true }, None,
     )?;
-    for camera in &prepared.cameras {
-        camera.recheck()?;
+    for locator in [first_path, second_path] {
+        originals.recheck_legacy(locator)?;
     }
-    staged.publish()?;
-    Ok(vec![default])
+    Ok((staged, vec![default]))
 }
 
-fn camera_binding(graph: &SourceGraph, item: &SourceItem, tool: &Path) -> Result<VerifiedBinding> {
+fn camera_binding<'a>(
+    graph: &'a SourceGraph,
+    item: &SourceItem,
+    originals: &mut super::Originals<'_>,
+) -> Result<(Arc<VerifiedBinding>, &'a str)> {
     let fail = |reason: &str| format!("{}: {reason}", item.id);
     if !matches!(graph.sidecar(ADAPTER, &item.id).and_then(|r| r.get("kind")),
         Some(Value::Str(kind)) if kind == "media_pool_clip")
@@ -289,18 +289,7 @@ fn camera_binding(graph: &SourceGraph, item: &SourceItem, tool: &Path) -> Result
             fail("camera picture and mono tracks must share one absolute original path").into(),
         );
     }
-    let digest = media_digest(Path::new(path))
-        .map_err(|error| fail(&format!("could not read camera original {path}: {error}")))?;
-    verify_group_binding(
-        BindingSpec {
-            item_id: item.id.clone(),
-            path: path.into(),
-            sha256: hex::encode(digest),
-            streams: [video, a1, a2],
-        },
-        tool,
-    )
-    .map_err(|error| fail(&format!("camera original verification failed: {error}")).into())
+    Ok((originals.legacy_camera(path, &item.id, [video, a1, a2])?, path))
 }
 
 fn camera_clip(

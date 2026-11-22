@@ -7,6 +7,7 @@ pub(crate) const RESOLVE: &str = "resolve.input_scaling";
 pub(crate) const CENTER_CROP: &str = "center_crop";
 pub(crate) const FIT: &str = "scale_to_fit";
 pub(crate) const PROJECT_SETTING: &str = "project_input_scaling";
+pub(crate) const SEQUENCE_SETTING: &str = "sequence_input_scaling";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Sizing {
@@ -53,7 +54,7 @@ pub(crate) fn prepare(
         return Ok((raster_mismatch || sizing == Sizing::CenterCrop).then_some(sizing));
     }
     if let Some(source) = sidecars.get(crate::source::ADAPTER, sequence).filter(|_| raster_mismatch) {
-        let sizing = observed(source.get(PROJECT_SETTING))?
+        let sizing = observed(source.get(SEQUENCE_SETTING).or_else(|| source.get(PROJECT_SETTING)))?
             .ok_or("unresolved inherited Resolve input sizing")?;
         return Ok(Some(sizing));
     }
@@ -67,7 +68,8 @@ pub(crate) fn matches_readback(
     Ok(match expected {
         Some(Sizing::Fit) if clip.is_none() => {
             let project = graph.sidecar(crate::source::ADAPTER, sequence);
-            observed(project.and_then(|source| source.get(PROJECT_SETTING)))? == expected
+            observed(project.and_then(|source| source.get(SEQUENCE_SETTING)
+                .or_else(|| source.get(PROJECT_SETTING))))? == expected
         }
         Some(_) => clip == expected,
         None => clip != Some(Sizing::CenterCrop),

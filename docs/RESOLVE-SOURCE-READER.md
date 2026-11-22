@@ -728,6 +728,117 @@ linked originals and known sizing when the raster differs. A false binding,
 overlap, missing file, or unknown geometry blocks the affected conversion.
 Unresolved uses require `--accept-losses` before they may be left out.
 
+#### Multicam alongside unsupported edits
+
+The multipart Premiere exporter can preserve editable Group cuts, a verified
+mono lane, and ordinary clips alongside an unsupported Resolve title, nest,
+or native transition. With `--accept-losses`, Review and export identify
+each omission by its occurrence ID, track, and exact record frame range.
+Surviving edits keep their original positions. If the omitted edit defines
+the output duration, or its saved track or range cannot be verified,
+preparation refuses with the affected occurrence. The saved graph retains
+the source records.
+
+A controlled 24 fps graph replay covered all three omissions in one
+timeline, with editable Group picture and audio beside an ordinary V1 clip.
+The written project and its retained-edit control agreed on the surviving
+placements. Premiere reopen and render comparison remain pending for this
+combined case.
+
+#### Preserve the verified picture angles of a partial Group
+
+With loss approval, the multipart exporter can retain a Group's saved
+picture selections when an unused angle has no verified source binding.
+It checks each selected edit's saved angle track ID against the graph
+alternative and names every omitted angle in Review. An unresolved or
+contradictory selected angle blocks this path. This preserves the linked
+edits and keeps the original angle and audio evidence in graph/2.
+
+An unsupported audio transition can be omitted at its exact fractional
+record range when the retained edits still cover the range. The omission
+report keeps the saved fraction. Picture transitions, titles and nests
+still use their whole-frame rules.
+
+#### Custom multicam sequence canvas
+
+The multipart exporter can write a custom canvas from the saved sequence
+dimensions and exact record clock. An edit whose original has a
+different raster needs a known Resolve input fit setting. The reader
+keeps the inherited project setting or the saved version-three timeline
+override in graph/2. Same-build controls distinguish Fit from Center
+Crop even when the project default differs from the timeline. Unknown
+overrides remain unresolved. Preparation uses the Premiere fit policy
+on the affected occurrence, including inside a Group. The custom
+Premiere canvas currently requires Fit for mismatched originals.
+
+Premiere 27.0.0 build 88 saved and reopened the 3840×1920, 24 fps
+control with both the outer and Group canvases intact. The 66-frame render
+showed the expected centered picture, 60 active frames at their saved
+positions, and the six-frame gap. The two output channels matched the
+retained mono control for 96,000 sample frames, followed by the expected
+silent tail.
+
+The custom-canvas route also keeps static uniform zoom and translation
+editable in Premiere Motion. Premiere's normalized position uses the
+file raster. Preparation converts Resolve's fitted-image displacement
+using the same fit factor as the clip. The 24 fps ProRes and RED
+controls were saved, reopened and rendered in Premiere 27 and compared
+with native Resolve frames. Geometry and trims agreed. Rendered
+color and resampling can differ between editors.
+
+#### Linked stills on 24 fps timelines
+
+Graph/2 keeps a single physical frame and the saved hold for each still
+occurrence. Premiere preparation extends the linked still's editable
+range to cover those occurrences. It keeps the original path, bin item,
+and record range. The same rule applies to ordinary clips beside
+multicam. A raster mismatch uses the qualified timeline or clip Fit
+setting. The physical check decodes a bounded opaque, square-pixel
+8-bit RGB or RGBA PNG. It accepts untagged images and verified sRGB
+metadata. Linked JPEGs require a bounded baseline JFIF image with one
+scan, square pixels and no rotation or alternate color profile. The
+writer reports a saved clip grade per still occurrence and requires
+`--accept-losses` before writing the ungraded hold. The grade receipt
+remains on the graph/2 edit. Transparency, animation, other profiles,
+and unresolved framing remain open.
+
+Premiere 27.0.0 build 88 saved and reopened a 3840×1920, 24 fps replay
+with the 3500×2000 PNG still online. All 111 decoded frames held the
+same image. The active picture edges matched a native Resolve render
+on the same canvas. The two renders differed slightly in color and
+resampling. A separate multipart graph replay retained its Group and
+mono routing while writing a linked PNG after the gap.
+
+A separate 2518×1416 JPEG replay kept its original path and all 167
+hold frames after Premiere 27 Save As and reopen on the same 3840×1920
+canvas. The image edges matched an ungraded Resolve control. The grade
+omission was reported, and conversion without approval refused output.
+Rotated, truncated and concatenated JPEG controls were also refused.
+
+#### Groups with fractional saved extents
+
+A Group can save a fractional duration separately from its whole-frame
+playback endpoint. Graph/2 retains the exact duration and the tail gap.
+The reader resolves a whole-frame edit when its saved outer map agrees
+with the last complete frame, its source range fits, and the selected
+angle has verified members. A known angle can retain its edit bindings
+when another angle is unresolved. The incomplete definition stays
+unqualified for editable export.
+
+Audio selection still requires a verified physical route and member
+clock. A stereo Group output with unresolved source routing and a
+member with subframe timing stay explicit in the archive receipt. A
+fractional-tail variant of the retained two-mono control kept all six
+audio bindings and all three picture edits.
+
+The multipart Premiere writer can use the complete-frame extent with
+loss approval when every angle proves the fractional tail is empty.
+It refuses a tail containing media or a selected use beyond the
+complete-frame extent. The fractional-tail control retained its
+editable cuts and mono lane after Premiere 27 Save As and reopen.
+All 48 decoded picture frames and 96,000 PCM sample frames matched the
+whole-frame control.
+
 The internal `--premiere` probe also accepts one linked 1080p23.976 Group
 timeline with neutral V1/A1/A2 and two full unretimed DNxHR LB OP1a camera
 sources. Each original has two independently verified 48 kHz PCM24 mono
@@ -800,6 +911,87 @@ channel, including independent trims when both lanes reference one
 stereo file. Premiere gets discrete mono source views for fresh
 insertion. The 24 fps picture-only speed and caption profile remains
 available through the same command.
+
+The ordinary and multipart multicam writers read MOV stream metadata
+before verifying the packet clock. The packet verifier checks the count
+and cadence in one pass. These paths verify the saved locator, source
+clock, extent, and channel layout, then recheck file identity and state
+before publication. A linked original can exceed 2 GiB. A synthetic
+ProRes HQ MOV with a large QuickTime free-space atom exercised this path
+in Premiere 27 after Save As and reopen. A missing packet or a file
+changed during verification refused publication.
+
+#### Link 44.1 kHz mono MP3 in Premiere
+
+The same internal route can link a standalone, single-stream mono MP3
+at 44.1 kHz with zero decoder delay and padding. It checks the saved
+locator, exact sample clock, channel zero and decoded extent. The
+qualified saved cache can be up to three samples short of that extent.
+Premiere uses the verified playable extent for the master and keeps
+each original source trim in exact ticks, including half-sample
+positions on the 44.1 kHz clock. No resampling offset is added to the
+edit. Truncated files, contradictory selectors or extents, and MP3s
+that require decoder delay or padding adjustments remain refused.
+
+Premiere 27.0.0 build 88 saved and reopened a 24 fps control with two
+trimmed MP3 edits and an independent WAV lane. Both isolated 94,000-frame
+PCM renders matched a separate native Premiere import and exact-trim
+control byte for byte. The MP3 waveform led the Resolve reference by two
+48 kHz samples in both Premiere renders. The WAV control aligned at
+zero. Stereo MP3, attached artwork, and nonzero decoder delay remain
+open.
+
+### Link RED2 picture to Premiere
+
+The internal Premiere writer links same-rate 5120×2700 RED2 picture at
+24 or 24000/1001. A 1920×1080 timeline can use the saved Resolve input
+fit to map the source raster at its correct aspect ratio. The reader
+verifies the first R3D part's time-of-day timecode and
+checks the part number, clip identity, rate, raster, and accumulated
+picture extent through the recording's closing footer. The saved
+Resolve clock and extent must agree with the recording. Graph/2 carries
+the verified source clock separately from each file-relative edit trim.
+Premiere opens the original at part `_001`. Any NLE checks the state of
+every part before publishing the project.
+
+Premiere 27.0.0 build 88 preserved online links, both trim endpoints,
+and the exact alternate source timecode after Save As, close, and
+reopen. All 54 decoded frames matched native Premiere controls across
+one single-part and two spanned originals. One edit crosses from the
+first part into the second. All 18 frames also matched in the separate
+1080p fit control. The comparison uses Premiere's default RED decode.
+Embedded RED audio, mixed-rate RED conform, and transferring custom
+RAW settings remain separate work.
+
+### Review a project for Premiere
+
+```text
+resolve-source-probe --premiere-review INPUT.drp FFPROBE REPORT.json
+resolve-source-probe --premiere-review INPUT.graph.json FFPROBE REPORT.json
+```
+
+Review uses the internal Premiere writer to prepare one timeline at a
+time in saved order. It lists timelines that can be written, timelines
+that carry reported losses, and each blocked timeline's first refusal.
+Original verification failures include the saved locator and the media
+or camera owner. The report includes each attempted original, its
+verification result, and the number of times other preparations reused it.
+
+The job shares physical evidence for the same original, including
+failed inspections. Ordinary files use their resolved paths. A spanned
+RED original also depends on the saved recording directory and sibling
+names. Each timeline still checks its own saved source clock, range,
+and channel claims, and the writer rechecks the file state. Overlapping
+requests for incompatible verification profiles are reported as
+conflicts. Originals behind an earlier timeline refusal are left
+uninspected. Packet inspection of long files can still take time on its
+first pass. Review publishes only the JSON report to a new path.
+
+Use `--premiere` with the reported sequence ID to write a new Premiere
+project. That separate job rechecks the originals. See the loss approval
+rules below.
+
+### Linked Premiere review and omissions
 
 The probe reports unqualified timeline In/Out selections and unrecognized
 clip label codes before creating a project. Use `--accept-losses` to

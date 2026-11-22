@@ -66,10 +66,43 @@ pub struct OriginalClip {
     pub groups: Vec<Vec<i64>>,
 }
 impl OriginalClip {
+    fn is_linked_red_picture(&self) -> bool {
+        self.container == "r3d"
+            && self.audio.is_none()
+            && self.proxy_path.is_none()
+            && std::path::Path::new(&self.path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("r3d"))
+            && self.video.as_ref().is_some_and(|video| {
+                video.codec == "RED" && (video.width, video.height) == (5120, 2700)
+                    && matches!((video.rate.num, video.rate.den), (24, 1) | (24000, 1001))
+            })
+    }
+
     pub(super) fn matches_explicit_linked_raster(&self, sequence: &Sequence) -> bool {
-        self.supports_explicit_linked_raster()
+        (self.supports_explicit_linked_raster() || self.is_linked_red_picture() || self.is_linked_still())
             && self.video.as_ref().is_some_and(|v| v.rate == sequence.rate
                 && (v.width, v.height) == (sequence.width, sequence.height))
+    }
+
+    fn supports_linked_input_fit(&self, sequence: &Sequence) -> bool {
+        (self.supports_explicit_linked_raster() || self.is_linked_red_picture() || self.is_linked_still())
+            && self.video.as_ref().is_some_and(|video| {
+                video.rate == sequence.rate
+                    && (video.width, video.height) != (sequence.width, sequence.height)
+            })
+    }
+
+    fn is_linked_still(&self) -> bool {
+        self.audio.is_none() && self.proxy_path.is_none()
+            && std::path::Path::new(&self.path).extension().is_some_and(|ext| match self.container.as_str() {
+                "png" => ext.eq_ignore_ascii_case("png"),
+                "jpeg" => ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"),
+                _ => false,
+            })
+            && self.video.as_ref().is_some_and(|video| {
+                video.codec == self.container && video.rate == Fraction::new(24, 1)
+                    && (16..=8192).contains(&video.width) && (16..=8192).contains(&video.height)
+                    && video.width * video.height <= 16_777_216
+            })
     }
 
     pub fn supports_explicit_linked_raster(&self) -> bool {
@@ -324,6 +357,8 @@ pub struct PreparedProjectInput {
     pub timeline_marks: BTreeMap<usize, PreparedTimelineMarks>,
     /// Same-rate linked 29.97 sequences with an exact non-drop source TC1.
     pub non_drop_sequences: HashSet<usize>,
+    /// Picture occurrences with verified input fitting to the sequence raster.
+    pub fit_picture: HashSet<(usize, usize)>,
     pub picture_effects: Vec<PreparedPictureEffect>,
     pub source_luts: Vec<PreparedSourceLut>,
     /// Occurrences whose linked picture was verified as Rec.709 video range.
@@ -1344,6 +1379,7 @@ impl PreparedProjectInput {
             track_states: BTreeMap::new(),
             timeline_marks: BTreeMap::new(),
             non_drop_sequences: HashSet::new(),
+            fit_picture: HashSet::new(),
             picture_effects: Vec::new(),
             source_luts: Vec::new(),
             extended_sdr_grades: HashSet::new(),
@@ -1415,6 +1451,11 @@ impl PreparedProjectInput {
             .is_none_or(|s| s.rate != Fraction::new(30_000, 1001)))
         {
             return Err(ModelError("29.97 non-drop display has an incompatible sequence".into()));
+        }
+        if self.fit_picture.iter().any(|&(sequence, event)| {
+            self.sequences.get(sequence).and_then(|s| s.events.get(event)).is_none()
+        }) {
+            return Err(ModelError("prepared input fitting references a missing edit".into()));
         }
         for (&index, marks) in &self.timeline_marks {
             let invalid = || ModelError("prepared timeline marks need an ordered frame-aligned range".into());
@@ -1833,6 +1874,22 @@ impl PreparedProjectInput {
                 let c = clips
                     .get(e.clip.as_str())
                     .ok_or_else(|| fail("prepared event references unknown clip"))?;
+                if self.fit_picture.contains(&(i, event_index))
+                    && (!matches!(c, PreparedClip::Original(clip) if clip.supports_linked_input_fit(s))
+                        || e.video_track.is_none()
+                        || e.transform.as_ref().is_some_and(|motion| {
+                            motion.scale.0 != motion.scale.1 || motion.scale.0 <= 0.0
+                                || motion.rotation != 0.0 || motion.anchor != (0.0, 0.0)
+                                || motion.crop != [0.0; 4]
+                        })
+                        || e.speed_ratio.is_some()
+                        || e.time_remap.is_some()
+                        || e.matte.is_some()
+                        || picture_effects.contains(&(i, event_index))
+                        || self.frame_holds.contains_key(&(i, event_index)))
+                {
+                    return Err(fail("prepared input fitting needs same-rate linked picture with supported static controls"));
+                }
                 let (video, labels, duration, audio_count) = match c {
                     PreparedClip::Legacy(c) => (
                         c.video.is_some(),
@@ -2022,7 +2079,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
     }
     require(
         matches!(c.container.as_str(), "mov" | "wav" | "mp3" | "jpeg" | "png" | "tiff")
-            || c.container == "mxf" && c.is_same_rate_linked_pcm(),
+            || c.container == "mxf" && c.is_same_rate_linked_pcm() || c.is_linked_red_picture(),
         "unqualified original container",
     )?;
     let suffix = std::path::Path::new(&c.path).extension().and_then(|ext|ext.to_str());
@@ -2040,17 +2097,15 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         let qualified_still = v.codec == c.container && c.audio.is_none()
             && c.proxy_path.is_none() && v.rate == Fraction::new(24, 1)
             && suffix.is_some_and(|s| match c.container.as_str() {
-                "jpeg" => raster == (1920, 1080)
-                    && (s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("jpeg")),
-                "png" => matches!(raster, (1920, 1080) | (1536, 1024))
-                    && s.eq_ignore_ascii_case("png"),
+                "jpeg" | "png" => c.is_linked_still(),
                 "tiff" => raster == (1920, 64)
                     && (s.eq_ignore_ascii_case("tif") || s.eq_ignore_ascii_case("tiff")),
                 _ => false,
             });
         require(
             v.stream_index == 0 && (c.container == "mov" && (qualified_codec || c.premiere_assisted)
-                || c.container == "mxf" && c.is_same_rate_linked_pcm() || qualified_still),
+                || c.container == "mxf" && c.is_same_rate_linked_pcm() || qualified_still
+                || c.is_linked_red_picture()),
             "unqualified original picture stream/profile",
         )?;
         super::model::check_dimensions(v.width, v.height, "original video")?;
@@ -2060,7 +2115,8 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
         require(
             v.source_start >= 0
                 && v.source_start % frame == 0
-                && (v.source_start == 0 || v.codec == "apch" || c.is_timecoded_avc_pcm() || c.premiere_assisted),
+                && (v.source_start == 0 || v.codec == "apch" || c.is_timecoded_avc_pcm()
+                    || c.premiere_assisted || c.is_linked_red_picture()),
             "unqualified original picture source timecode",
         )?;
         super::model::check_ticks(

@@ -14,6 +14,7 @@ fn input() -> PreparedProjectInput {
         track_states: Default::default(),
         timeline_marks: Default::default(),
         non_drop_sequences: Default::default(),
+        fit_picture: Default::default(),
         picture_effects: Vec::new(),
         source_luts: Vec::new(),
         extended_sdr_grades: Default::default(),

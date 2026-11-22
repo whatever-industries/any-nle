@@ -13,6 +13,7 @@ pub const MAX_SOURCE_GRAPH_BYTES: usize = 256 << 20;
 pub const AVID_SOURCE_COLUMNS_TIMECODE: &str = "avid_source_columns_verified_mov_timecode";
 pub const AVID_LINKED_MOV_TIMECODE: &str = "avid_linked_mov_timecode";
 pub const VERIFIED_LINKED_MOV_TIMECODE: &str = "verified_linked_mov_timecode";
+pub const VERIFIED_LINKED_R3D_TIMECODE: &str = "verified_linked_r3d_timecode";
 
 /// Exact source timecode facts. Display base and physical counting rate are distinct.
 #[derive(Clone, Debug, PartialEq)]

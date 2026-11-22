@@ -469,28 +469,44 @@ fn warp_control_receipt(control: &av::SourceWarpControl) -> Value {
     obj(fields)
 }
 
-fn warp_input_receipt(warp: &av::SourceWarpInputs) -> Value {
+fn picture_blend_input_receipt(blend: &av::SourcePictureBlendInputs) -> Value {
     let integer = |value: Option<i64>| value.map_or(Value::Null, Value::Int);
-    let slot = |input| match input {
-        av::SourceWarpInput::Filler => obj(vec![("kind", s("filler"))]),
-        av::SourceWarpInput::Unresolved => obj(vec![("kind", s("unresolved"))]),
-        av::SourceWarpInput::Picture(picture) => obj(vec![
-            ("kind", s("picture")),
-            ("source", obj(picture_input_fields(picture))),
-        ]),
+    let slot = |index: usize| {
+        let mut fields = match blend.inputs[index] {
+            av::SourceWarpInput::Filler => vec![("kind", s("filler"))],
+            av::SourceWarpInput::Unresolved => vec![("kind", s("unresolved"))],
+            av::SourceWarpInput::Picture(picture) => vec![
+                ("kind", s("picture")),
+                ("source", obj(picture_input_fields(picture))),
+            ],
+        };
+        match blend.filler_proxies[index] {
+            av::SourceFillerProxy::Absent => {}
+            av::SourceFillerProxy::Unresolved => fields.push(("filler_proxy", Value::Null)),
+            av::SourceFillerProxy::Relative { scope, track } => fields.push((
+                "filler_proxy", obj(vec![
+                    ("relative_scope", Value::Int(scope)),
+                    ("relative_track", Value::Int(track)),
+                ]),
+            )),
+        }
+        obj(fields)
     };
     let mut fields = vec![
-        ("owner", s(&warp.owner)),
-        ("track", Value::Int(warp.track)),
-        ("record_start", integer(warp.record_start)),
-        ("record_length", integer(warp.record_length)),
-        ("effect_rate", warp.effect_rate.map_or(Value::Null, |rate| s(rational(rate)))),
-        ("effect_length", Value::Int(warp.effect_length)),
-        ("swap_sources", warp.swap_sources.map_or(Value::Null, Value::Bool)),
-        ("slots", Value::Arr(warp.inputs.map(slot).into())),
+        ("owner", s(&blend.owner)),
+        ("track", Value::Int(blend.track)),
+        ("record_start", integer(blend.record_start)),
+        ("record_length", integer(blend.record_length)),
+        ("effect_rate", blend.effect_rate.map_or(Value::Null, |rate| s(rational(rate)))),
+        ("effect_length", Value::Int(blend.effect_length)),
+        ("swap_sources", blend.swap_sources.map_or(Value::Null, Value::Bool)),
+        ("slots", Value::Arr([slot(0), slot(1)].into())),
     ];
-    if !warp.controls.is_empty() {
-        fields.push(("controls", Value::Arr(warp.controls.iter().map(warp_control_receipt).collect())));
+    if blend.kind != av::SourcePictureBlendKind::Warp {
+        fields.push(("effect_id", s(blend.kind.effect_id())));
+    }
+    if !blend.controls.is_empty() {
+        fields.push(("controls", Value::Arr(blend.controls.iter().map(warp_control_receipt).collect())));
     }
     obj(fields)
 }
@@ -2098,6 +2114,16 @@ pub(super) fn append(
             obj(fields)
         })
         .collect();
+    let mut warp_inputs = Vec::new();
+    let mut picture_blend_inputs = Vec::new();
+    for input in &source.picture_blend_inputs {
+        let receipts = if input.kind == av::SourcePictureBlendKind::Warp {
+            &mut warp_inputs
+        } else {
+            &mut picture_blend_inputs
+        };
+        receipts.push(picture_blend_input_receipt(input));
+    }
     sidecar(
         out,
         budget,
@@ -2148,8 +2174,11 @@ pub(super) fn append(
             .chain((!source.group_uses.is_empty()).then(|| (
                 "native_group_uses", Value::Arr(source.group_uses.iter().map(group_use_native).collect()),
             )))
-            .chain((!source.warp_inputs.is_empty()).then(|| (
-                "warp_inputs", Value::Arr(source.warp_inputs.iter().map(warp_input_receipt).collect()),
+            .chain((!warp_inputs.is_empty()).then(|| (
+                "warp_inputs", Value::Arr(warp_inputs),
+            )))
+            .chain((!picture_blend_inputs.is_empty()).then(|| (
+                "picture_blend_inputs", Value::Arr(picture_blend_inputs),
             )))
             .collect()),
     )?;
@@ -2254,6 +2283,17 @@ fn reserve_controls(source: &av::SourceSequence, budget: &Budget) -> Result<(), 
         reservation.charge(4096+u.id.len()+u.reason.as_ref().map_or(0,String::len)+u.binding.reason.as_ref().map_or(0,String::len))?;
         reservation.charge(u.alternatives.len().checked_mul(4096).ok_or("group endpoint receipt overflow")?)?;
         for id in &u.binding.placements{reservation.charge(256+id.len())?;}
+    }
+    for blend in &source.picture_blend_inputs {
+        reservation.charge(4096 + blend.owner.len())?;
+        for control in &blend.controls {
+            reservation.charge(1536)?;
+            if let av::SourceWarpControlCurve::Keyframed(curve) = &control.curve {
+                if let Some(keys) = &curve.keys {
+                    reservation.charge(keys.len().checked_mul(1024).ok_or("picture blend key receipt overflow")?)?;
+                }
+            }
+        }
     }
     Ok(())
 }
