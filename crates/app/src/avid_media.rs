@@ -14,6 +14,8 @@ use std::{
 mod avb;
 mod linked;
 mod master;
+mod roundtrip;
+pub use roundtrip::roundtrip_avb;
 pub use linked::write_linked_bin;
 #[cfg(target_os = "macos")]
 pub use linked::write_linked_project;

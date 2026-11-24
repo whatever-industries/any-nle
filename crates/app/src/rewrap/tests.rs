@@ -17,6 +17,85 @@ static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 struct Scratch(PathBuf);
 
 #[test]
+fn rewrap_preview_splits_distinct_wide_bundles_and_includes_mono_gain() {
+    use super::preview_native_recipes;
+    use std::collections::HashMap;
+
+    let mut model = parse_model_str(include_str!("../../../../examples/opatom_clip.model.json")).unwrap();
+    let mut wide = model.clips["clip-1"].clone();
+    wide.video.as_mut().unwrap().path = "picture1.mxf".into();
+    let audio = wide.audio[0].clone();
+    wide.stereo_pairs.clear();
+    wide.multichannel_groups.clear();
+    wide.audio = (1..=33).map(|lane| {
+        let mut stream = audio.clone();
+        stream.path = format!("lane-{lane}.mxf");
+        stream.avid_track = Some(lane);
+        stream
+    }).collect();
+    let mut duplicate = wide.clone();
+    duplicate.id = "duplicate".into();
+    duplicate.audio.reverse();
+    let mut second = wide.clone();
+    second.id = "second".into();
+    second.video.as_mut().unwrap().path = "picture2.mxf".into();
+    let mut gain = wide.clone();
+    gain.id = "gain".into();
+    gain.video = None;
+    gain.audio.truncate(1);
+    gain.audio[0].path = "gain.mxf".into();
+    gain.audio[0].bits = 24;
+    gain.audio[0].sample_rate = 48_000;
+    let mut unused = gain.clone();
+    unused.id = "unused".into();
+    unused.audio[0].path = "unused.mxf".into();
+    model.bins[0].clips = vec![wide.id.clone(), duplicate.id.clone(), second.id.clone(), gain.id.clone()];
+    model.clips = [wide, duplicate, second, gain, unused].into_iter().collect();
+    model.sequences.clear();
+
+    let recipes = preview_native_recipes(&model, &HashMap::from([("gain.mxf", ("file", "origin"))]));
+    let expected: Vec<_> = ["picture1.mxf", "picture2.mxf"].into_iter()
+        .flat_map(|picture| {
+            std::iter::once(PathBuf::from(picture))
+                .chain((1..=33).map(|lane| PathBuf::from(format!("lane-{lane}.mxf"))))
+        })
+        .chain(std::iter::once(PathBuf::from("gain.mxf")))
+        .map(|path| vec![path])
+        .collect();
+    assert_eq!(recipes, expected);
+}
+
+#[test]
+fn mono_rewrap_reports_exact_file_failure_separately_from_recipe_error() {
+    use super::{mono::MonoPcm, PrepareIssue};
+
+    let scratch = Scratch::new();
+    let path = scratch.0.join("Missing Gain.mxf");
+    let model = parse_model_str(include_str!("../../../../examples/opatom_clip.model.json")).unwrap();
+    let mut clip = model.clips.get("clip-1").unwrap().clone();
+    clip.video = None;
+    clip.audio.truncate(1);
+    clip.stereo_pairs.clear();
+    clip.multichannel_groups.clear();
+    let audio = &mut clip.audio[0];
+    audio.path = path.to_str().unwrap().into();
+    audio.avid_track = Some(1);
+    audio.bits = 24;
+    audio.sample_rate = 48_000;
+    audio.duration = TPS;
+    assert!(matches!(
+        MonoPcm::plan(&clip, Some(("render", "origin")), Path::new("unused-probe")),
+        Err(PrepareIssue::SourceFile { path: reported, .. }) if reported == path
+    ));
+
+    clip.audio[0].sample_rate = 44_100;
+    assert!(matches!(
+        MonoPcm::plan(&clip, Some(("render", "origin")), Path::new("unused-probe")),
+        Err(PrepareIssue::Source(_))
+    ));
+}
+
+#[test]
 fn avid_dnx_clip_wrapped_picture_element_is_recognized() {
     let scratch = Scratch::new();
     let path = scratch.0.join("picture-elements.mxf");
@@ -873,6 +952,7 @@ fn bin_grouping_refuses_unrepresented_or_ambiguous_layouts() {
         color: None,
         start: None,
         aux_timecodes: vec![],
+        saved_clock_segments: vec![],
         source_file: None,
         source_path: None,
         bin: 0,

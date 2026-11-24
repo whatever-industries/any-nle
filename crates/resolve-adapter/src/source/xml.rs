@@ -100,13 +100,18 @@ fn open_with_limit(path: &Path, limit: u64) -> Result<File> {
         return Err("expected a regular Resolve archive".into());
     }
     let file = File::open(path)?;
+    check_open_file(&file, limit)?;
+    Ok(file)
+}
+
+fn check_open_file(file: &File, limit: u64) -> Result<()> {
     let meta = file.metadata()?;
     if !meta.is_file() || meta.len() > limit {
         return Err(format!(
             "expected a regular Resolve archive no larger than {} MiB", limit >> 20
         ).into());
     }
-    Ok(file)
+    Ok(())
 }
 
 pub(super) fn checked_zip<R: Read + Seek>(input: R) -> Result<ZipArchive<R>> {
@@ -135,7 +140,15 @@ fn zip_with_limit<R: Read + Seek>(mut input: R, member_limit: usize) -> Result<Z
 /// The first pass checks the entire archive even if semantic validation later
 /// fails. Each sequence tree is dropped before reading the next one.
 pub(super) fn read_project(path: &Path) -> Result<(BTreeMap<String, Node>, ProjectContainers)> {
-    let mut zip = project_zip(path)?;
+    read_project_zip(project_zip(path)?)
+}
+
+pub(super) fn read_staged_project(file: File) -> Result<(BTreeMap<String, Node>, ProjectContainers)> {
+    check_open_file(&file, PROJECT_MAX_ARCHIVE)?;
+    read_project_zip(zip_with_limit(file, PROJECT_MAX_MEMBERS)?)
+}
+
+fn read_project_zip(mut zip: ZipArchive<File>) -> Result<(BTreeMap<String, Node>, ProjectContainers)> {
     let mut seen = HashSet::new();
     let mut pool = BTreeMap::new();
     let mut index = HashMap::new();

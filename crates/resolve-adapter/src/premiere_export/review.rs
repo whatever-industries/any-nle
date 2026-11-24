@@ -59,7 +59,7 @@ pub fn write(graph: &SourceGraph, ffprobe: &Path, mut report: impl Write) -> Res
     )?;
     for (index, sequence) in graph.sequences.iter().enumerate() {
         let (status, losses, blocker) =
-            match prepare_timeline(graph.clone(), index, &mut originals, &destination, true) {
+            match prepare_timeline(graph, sequence, &mut originals, &destination, true) {
                 Ok((_, losses)) if losses.is_empty() => {
                     totals.ready += 1;
                     (Status::Ready, losses, None)

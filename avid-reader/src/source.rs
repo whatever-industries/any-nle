@@ -646,6 +646,15 @@ pub struct SourceTimewarpControls {
     pub curves: Vec<SourceTimewarpCurve>,
 }
 
+#[derive(Debug)]
+pub struct SourceSavedTimewarp {
+    pub owner: String,
+    pub record: i64,
+    pub track: i64,
+    pub length: i64,
+    pub controls: Box<SourceTimewarpControls>,
+}
+
 impl SourceTimewarpControls {
     /// Names read back in Media Composer for explicit interpolation overrides.
     pub fn explicit_fluid_motion(&self) -> Option<&'static str> {
@@ -1161,6 +1170,7 @@ pub struct SourceSequence {
     pub unresolved: Vec<SourceIssue>,
     pub texts: Vec<SourceText>,
     pub group_uses: Vec<SourceGroupUse>,
+    pub saved_timewarps: Vec<SourceSavedTimewarp>,
     pub picture_blend_inputs: Vec<SourcePictureBlendInputs>,
 }
 
@@ -1213,6 +1223,7 @@ pub struct SourceGroupLane {
     pub length: Option<i64>,
     pub selected: Option<i64>,
     pub alternatives: Vec<SourceGroupAlternative>,
+    pub markers: Vec<(AvidMarker, Observed<i64>)>,
     pub reason: Option<String>,
 }
 #[derive(Debug)]
@@ -1297,6 +1308,7 @@ impl SourceSequence {
             unresolved: Vec::new(),
             texts: Vec::new(),
             group_uses: Vec::new(),
+            saved_timewarps: Vec::new(),
             picture_blend_inputs: Vec::new(),
         }
     }

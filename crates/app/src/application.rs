@@ -429,7 +429,8 @@ fn source_notes(a: &Args, read: &mut AvidRead, matte: &crate::png_mattes::Plan) 
         ));
     }
     if a.link_originals || a.allow_offline_media {
-        let issues = result.scan_issues.iter().chain(&result.audio_group_issues);
+        let issues = result.scan_issues.iter()
+            .chain(result.audio_group_issues.iter().map(|issue| &issue.message));
         let unresolved = result.graph.losses.iter().filter(|loss| loss.aspect == "source_master" && matte.keeps_loss(loss));
         let mut blockers: Vec<_> = issues.cloned().chain(unresolved.map(|loss| {
             format!("{}: {}", loss.object, loss.reason)
@@ -447,7 +448,7 @@ fn source_notes(a: &Args, read: &mut AvidRead, matte: &crate::png_mattes::Plan) 
     let mut problems = std::mem::take(&mut result.diagnostics);
     problems.retain(|note| matte.keeps_reader_note(note));
     problems.append(&mut result.scan_issues);
-    problems.append(&mut result.audio_group_issues);
+    problems.extend(result.audio_group_issues.drain(..).map(|issue| issue.message));
     if a.wants_rewrap() {
         problems.extend(result.missing_managed_audio.iter().cloned());
         // Retain the existing strict rewrap policy: an omitted source route or
@@ -623,7 +624,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     let mut matte = crate::png_mattes::prepare(
         &read.result, &a.original_mappings, !a.wants_rewrap() && policy.bin_mode == BinMode::Separate,
         &mut || Ok(()),
-    )?;
+    ).map_err(|issue| issue.message)?;
     let has_matte = !matte.picture.edits.is_empty();
     let problems = source_notes(a, &mut read, &matte)?;
     let AvidRead { result, inputs, .. } = read;
@@ -701,7 +702,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
         };
         let (p, mut luts) = premiere_preparation::prepare_typed(
             &graph, &policy.to_options(), clock, a.rewrap_media, &mut matte, &inputs, &ffprobe, false, false, None, &mut || Ok(()),
-        )?;
+        ).map_err(|issue| issue.message)?;
         source_losses.retain(|loss| luts.keeps_loss(loss));
         original_inputs.append(&mut luts.inputs);
         lut_pictures = luts.pictures;

@@ -567,6 +567,200 @@ linked AAF on all 120 picture frames. This replay checked audio
 assignments in the saved project.
 [Independent A1 switch](EDITABLE-GROUPS-2026-11-08.md#native-independent-a1-switch)
 
+## Source markers, LUTs, and Matte Key evidence
+
+These controls record the Avid → Premiere comparisons through the verified
+profiles. Current follow-ups are in the [route roadmap](ROADMAP.md#edit-fidelity-and-metadata).
+
+### Source and edit marker range controls
+
+The native 23.976 point-marker comparison verifies both source/edit
+preferences. Linked AAF holds all three events. Premiere 27 reopens
+two sequence markers with the edit comments and drops the source
+event. Any NLE retains all three names and colors, the source bin
+marker and the selected edit/sequence ownership. The retained native
+24 fps sequence span survived Premiere 27 reopen in a marker-only
+project. Its linked AAF, exported with media offline, omitted the
+span. In the paired 24 fps source-copy control, the reopened AAF
+carried the copied point onto the sequence. Any NLE kept both source
+ranges and both point occurrences on the edits. Direct native
+authoring of coincident source/edit ranges remains open.
+[Native point-marker comparison](SPLIT-EDIT-AUDIO-2026-11-06.md#native-coincident-point-markers-and-linked-aaf)
+[Sequence span comparison](SPLIT-EDIT-AUDIO-2026-11-06.md#retained-native-sequence-span-and-linked-aaf)
+[Source copy comparison](SPLIT-EDIT-AUDIO-2026-11-06.md#native-source-range-and-point-copy)
+A derived AVB now preserves both coincident ranges after Premiere 27
+reopen when **Keep the other marker as a sequence marker** is enabled.
+[Marker ownership check](SPLIT-EDIT-AUDIO-2026-11-06.md#coincident-source-and-edit-markers)
+Grouped now retains the winning V1 range for the verified direct
+DNxHD profile. The 29.97 DF edit-preferred case survived Premiere
+27 Save As and reopen. Both preferences passed direct CLI and
+saved-job read-back. Merged keeps the winning range on a dedicated
+V1 component for the tested same-rate direct DNxHD edit. The 29.97
+DF edit-preferred project also survived Save As and reopen with its
+other range on the sequence and both original mono siblings linked.
+The reusable Merged item displays its source range at
+`02:00:00;12` with a two-frame duration. In the verified 29.97 DF
+profile, a mono edit with a unique sibling binding now keeps the
+preferred marker on its dedicated Merged audio component. Premiere
+27 Save As and reopen kept the winning A1 range and the other range
+on the sequence. Both preferences passed writing checks. Direct
+Media Composer authoring of coincident audio ranges remains open.
+Merged also preserves lane-specific clip markers for the verified
+23.976 DNxHD LB/PCM16 profile with a nonzero source origin. The
+preferred A1 range stays on its own mono component and the other
+retains its full range on the sequence. The independent A2 and V1
+ranges stay on their own components. Both preferences passed the
+direct CLI, saved job, and Premiere 27 Save As and reopen. All 48
+picture frames match the retained linked AAF, and all 96,096 stereo
+PCM16 sample frames match the unmarked Merged control.
+On the reusable Merged item, Premiere 27 shows both two-frame
+source ranges at `02:00:00:07` and lists each twice. Premiere
+recreates the extra entries on save even with only the component
+marks in the input project. The fresh edit keeps one range per
+mono lane. Its 24 picture frames match the linked AAF, and each
+isolated 48,048-sample lane matches its original under the
+center-pan mix policy to within one PCM16 count. (CONV-0132)
+
+### Source Color Adapter and LUT controls
+
+Any NLE retains the saved source color transformation text and source
+owner in graph/2. Premiere preparation flags the affected clip for
+manual review. For an Avid-authored full-range to video-level transform,
+linked AAF preserved the source record and exported a ColorAdapter
+operation on the sequence. Premiere 27 reopened with an Unknown Effect
+marker at the edit, and all 72 decoded frames matched a direct import.
+Any NLE reports the affected sequence track and record position.
+Any NLE now applies the exact 10-bit full-range to video-level
+transform as an editable ASC CDL on a plain same-rate 1080p24
+Rec.709 picture-only ProRes HQ MOV edit in Separate files. The saved
+source and edit transforms must agree. After Premiere 27.0.0 build 88
+Save As, close, and reopen, the 48 neutral chart frames matched Avid
+exactly. On each of the 24 adjusted frames, 25 sampled luma and
+chroma patch centers agreed within one 10-bit code value. The plain
+occurrence of the same file and trim stayed neutral. Both range
+directions now share the graph/2 interpretation for 1080p same-rate
+picture-only Rec.709 AVC MOV. Premiere 27 and Resolve Studio 21.2.0
+build 00006 reopened the synthetic controls at 23.976, 25, and
+29.97 DF with editable clip controls. All 24 adjusted frames in
+each of the six Resolve outputs matched the separately authored
+native Resolve controls with equivalent Deliver settings. In the
+24 fps reference test, Resolve's legal-to-full render agreed with
+Avid within two 10-bit code values at sampled points with Video
+data levels and Retain sub-black and super-white data enabled.
+Resolve Review reports this Deliver setting. Native Resolve saves
+now have the same graph/2 range representation as writer-produced
+saves. A graph replay of both shifts at all four rates matched
+288 decoded frames after reopening. Equal-channel CDL slopes
+share the native decoder and passed two new 24 fps controls.
+Unqualified stacks and media retain their occurrence diagnostics.
+[Native Resolve CDL round trip](PREMIERE-27-COLOR-MODE.md#native-resolve-cdl-round-trip)
+[Graph and mapping scope](SOURCE-GRAPH-MIGRATION.md#avid-source-coloradapter-ownership)
+(CONV-0144)
+The external .cube control preserves its filename in the source and
+sequence AAF records. On reopen, Premiere's AAF import renders the
+neutral look and reports the unknown ColorAdapter. Both Any NLE
+entry points now name the saved cube in the clip's review message and
+retain the affected edit report. Avid's neutral and LUT-applied
+exports differ on all 87 frames. A generated Premiere source Input
+LUT asset survived Save As and reopen with no matching installed
+filename. All 87 decoded frames match Premiere's manually assigned
+Input LUT. The prototype measures 48.85 dB RGB PSNR against Avid's
+LUT-applied render, compared with 16.78 dB for the linked AAF import.
+Both saved Avid bins can carry the same picture source LUT
+metadata while their sequence renders differ. Only the LUT-applied
+sequence has the matching timeline ColorAdapter. Graph/2 now
+binds the saved 24 fps ColorAdapter payload to the exact picture
+placement when its source package, saved transform and edit
+ranges agree. A contradictory payload stays available for review
+with the placement unresolved.
+Premiere 27 coalesced duplicate same-file source references on
+Save As and dropped their distinct LUT state. The initial writer
+embedded a clip-level Lumetri Look when the saved adapter was neutral
+apart from the LUT, the Avid project descriptor matches, and the
+direct managed picture verifies as the tested 1080p24 Rec.709 DNxHD
+profile. The current mapping checks the entire affine LUT grid at
+edge sizes 2–65 in an explicit unit RGB domain and embeds its
+eight corner samples on a plain V1 edit in Separate files.
+A derived 33-point grid rendered all 174 frames identically to
+the original size-two control after Premiere 27 reopen. The
+65-point grid produced the same seeded Premiere project.
+The adjacent neutral and processed uses share the original file and
+source trim after Save As and reopen. All 87 neutral frames match
+the linked AAF. The processed render measures 48.34 dB RGB PSNR
+against Avid, compared with 16.78 dB for that AAF import.
+The qualified affine route now writes a
+[Premiere 27 clip LUT](PREMIERE-27-COLOR-MODE.md#clip-lut).
+Avid 25.12 also saved video-to-full scaling and the same nonlinear
+cube in two orders on two edits of the same picture source. All 36
+decoded frames differed between orders. The earlier edit still
+rendered identically after the saved source order changed. Graph/2
+records both orders and can identify the earlier edit's picture
+placement even when the file's saved order differs. Private
+Premiere 27 Color Mode prototypes each used a single composed clip
+LUT. Across all 36 frames per order after Save As and reopen, the
+renders measured 59.30 and 58.29 dB YUV PSNR against their
+respective Avid renders. Swapping the references dropped both
+comparisons to about 30.2 dB. Normal conversion now composes both
+saved orders into editable Premiere 27 clip Color Mode LUTs for
+verified 1080p24 Rec.709 picture-only Avid ProRes LT rewraps. The
+two production results match all 72 prototype frames after Save
+As and reopen. A missing or invalid cube leaves each cut in place
+and reports the omitted stack. Other media and Resolve composition
+remain open. [Ordered adapter verification](PREMIERE-27-COLOR-MODE.md#ordered-avid-color-adapters)
+Other color transforms and unqualified cube profiles remain
+occurrence-specific omissions.
+[Premiere Input LUT controls](https://helpx.adobe.com/premiere/desktop/correct-color/set-up-color-management/color-management-using-clip-modify.html)
+(CONV-0175)
+
+### PNG Matte Key controls
+
+The retained Avid alpha bin produces four Matte Key losses on V2 at
+relative frames 0, 1, 4 and 5. Graph/2 retains each range, its saved
+fill and matte references, and the shared master's original image
+locator and alpha import flags. The linked AAF carries all
+four composites with separate inputs. Premiere 27 rejected that AAF.
+With known-good linked picture and the saved Avid Matte Key operation,
+Premiere accepted both flat and nested controls, saved the fill and
+matte on separate tracks inside a nest, and added an unsupported-effect
+marker. After Save As and reopen, all 24 frames in each control
+matched the raw matte input. Linking the original straight-alpha PNG in
+a Premiere control reproduced both Avid polarities within 0.94 mean
+absolute 8-bit RGB codes after reopen with **Composite in Linear
+Color** disabled. A child sequence can keep that blend local when it
+contains both the keyed foreground and the matching background. A
+foreground-only child uses the parent's blend at its boundary.
+The retained background edits use an unsupported picture compression.
+Graph/2 also retains four imported PNG masters independently of
+managed media admission, with exact saved locator, master identity,
+track, source range and import settings. The eight background edits
+resolve to the two master identities. Graph/2 now also keeps the four
+markers on the matte input, with qualified record times and distinct
+owners. A local graph/2 prototype generated all four editable nests
+and linked the originals. After Premiere 27 reopened the project, all
+eight frames were within one mean absolute 8-bit RGB code of the
+Avid TIFFs, and all eight comments and marker positions survived.
+The reader now identifies the tested saved-control profile on
+each of the four Matte Key occurrences and distinguishes twelve
+empty Color Adapters from changed payloads. A separate bounded
+verifier resolves the original PNG by exact path, decodes it, and
+pins the verified bytes. Separate files conversion now uses this
+path for the verified 1080p24 still-only sequence with one-frame
+Matte Keys and exact V1 background coverage. Direct CLI and saved
+jobs build four editable children and keep both alpha polarities
+and all eight marker times, comments and colors after Premiere 27
+Save As and reopen. The markers use sequence ownership. The
+standalone Avid Matte Key bin compositions remain unsupported.
+(CONV-0143)
+
+The direct CLI, selected-bin job and whole-project job now recover
+provisional managed-media gaps for these PNGs. Preparation requires
+the exact saved edit, still master and range before it verifies the
+original. The Premiere output keeps the eight authored markers and
+removes the gap markers for the recovered edits. Structural replay
+matched the four editable nests and both alpha polarities. A missing
+or damaged original blocks Review with the triggering edit's track,
+record timecode, bin and saved PNG locator.
+
 ## Native checks and linked AAF benchmarks
 
 - **Coincident ranges on linked original clips.** Premiere 27

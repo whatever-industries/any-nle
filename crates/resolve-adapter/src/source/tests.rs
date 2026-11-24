@@ -261,6 +261,82 @@ fn saved_still_and_stereo_mp3_round_trip_without_physical_media_claims() {
     assert_eq!(SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap(), graph);
 }
 
+#[test]
+fn standalone_pcm_wav_captures_physical_channels_without_opening_original() {
+    const CACHE: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+    const SAMPLES: i64 = 144_017;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wav-source.drp");
+    build(&path, HANDLE, ROOT);
+    let mut cache = Vec::new();
+    crate::binary::pb_bytes(1, b"/unavailable-fixture", &mut cache);
+    crate::binary::pb_bytes(2, b"stereo.wav", &mut cache);
+    crate::binary::pb_bytes(5, b"Linear PCM", &mut cache);
+    let cache = crate::binary::pack(&cache).unwrap();
+
+    for (depth, bits, representation) in [(1, 16, "pcm16"), (2, 24, "pcm24")] {
+        let track = encode_qt(&[
+            ("SampleRate", Qt::Int(48000)), ("NumChannels", Qt::Int(2)),
+            ("BitDepth", Qt::Int(depth)), ("Duration", Qt::Long(SAMPLES)),
+            ("StartTime", Qt::Double(0.0)), ("CodecName", Qt::Text("Linear PCM")),
+            ("IdxTrack", Qt::Int(0)),
+        ]);
+        let tracks = hex::encode(encode_qt(&[("0", Qt::Bytes(&track))]));
+        let capture = |right| {
+            let channel = |index| encode_qt(&[
+                ("MediaRef", Qt::Text(CACHE)), ("TrackIdx", Qt::Int(0)),
+                ("ChannelIdx", Qt::Int(index)),
+            ]);
+            let left = channel(0);
+            let right = channel(right);
+            let mapping = encode_qt(&[("0", Qt::Bytes(&left)), ("1", Qt::Bytes(&right))]);
+            let mut extent = vec![0; 8];
+            extent.extend_from_slice(&(SAMPLES as f64 / 48000.0).to_le_bytes());
+            let route = encode_qt(&[
+                ("Type", Qt::Int(0)), ("CodecName", Qt::Text("Linear PCM")),
+                ("BitDepth", Qt::Int(depth)), ("MediaExtents", Qt::Bytes(&extent)),
+                ("ChannelVecBA", Qt::Bytes(&mapping)),
+            ]);
+            let routes = encode_qt(&[("0", Qt::Bytes(&route))]);
+            let mut pool = Vec::new();
+            crate::binary::pb_bytes(5, &routes, &mut pool);
+            let mut fields = Vec::new();
+            crate::binary::pb_bytes(1, &pool, &mut fields);
+            let mut clock = vec![9];
+            clock.extend_from_slice(&24.0f64.to_le_bytes());
+            crate::binary::pb_bytes(2, &clock, &mut fields);
+            let fields = crate::binary::pack(&fields)?;
+            let clip = xml::parse(&format!(
+                r#"<Sm2MpAudioClip DbId="{CLIP}"><Name>Stereo</Name><FieldsBlob>{fields}</FieldsBlob><EmbeddedAudioVec><Element><BtAudioInfo DbId="{CACHE}"><Clip>{cache}</Clip><TracksBA>{tracks}</TracksBA></BtAudioInfo></Element></EmbeddedAudioVec></Sm2MpAudioClip>"#,
+            ), &mut 0)?;
+            let mut graph = read(&path)?;
+            assert!(wav::read(&clip, &mut Blobs::default(), &mut graph)?.is_some());
+            Ok::<_, Box<dyn std::error::Error>>(graph)
+        };
+        assert!(capture(0).unwrap_err().to_string().contains("ambiguous standalone PCM physical channel"));
+        let graph = capture(1).unwrap();
+        let reloaded = SourceGraph::from_json_text(&graph.to_json_text().unwrap()).unwrap();
+        assert_eq!(graph, reloaded);
+        assert_eq!(reloaded.media.len(), 2);
+        for (channel, media) in reloaded.media.iter().enumerate() {
+            let original = media.original.as_ref().unwrap();
+            assert_eq!(media.online, None);
+            assert_eq!(media.bits, Some(bits));
+            assert_eq!(original.saved_locators, ["/unavailable-fixture/stereo.wav"]);
+            assert_eq!(original.container, "wav");
+            assert_eq!(original.stream_index, 0);
+            assert_eq!(original.channel_index, Some(channel as i64));
+            assert_eq!(original.channels, Some(2));
+            assert_eq!(original.time_base, Rational::new(1, 48000).unwrap());
+            assert_eq!(original.duration_ts, SAMPLES);
+            assert_eq!(original.start_pts, 0);
+            assert_eq!(original.sample_representation.as_deref(), Some(representation));
+            assert_eq!(reloaded.sidecar(ADAPTER, &media.id).unwrap().get("saved_channel"),
+                Some(&Value::Int(channel as i64)));
+        }
+    }
+}
+
 fn build_with_child_registration(path: &Path, handle: &str, child_parent: &str, registered: &str) {
     let fields = hex::encode(encode_qt(&[("RootFolderRef", Qt::Text(ROOT))]));
     let mut child_list = Vec::new();
@@ -417,6 +493,25 @@ fn broken_registration_and_bin_parent_are_rejected() {
         .unwrap_err()
         .to_string()
         .contains("child bin registration contradicts"));
+}
+
+#[test]
+fn temporary_archive_keeps_project_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("review.drp");
+    let read_temporary = || {
+        let mut scratch = tempfile::tempfile().unwrap();
+        std::io::copy(&mut File::open(&path).unwrap(), &mut scratch).unwrap();
+        read_staged(scratch)
+    };
+
+    build(&path, HANDLE, ROOT);
+    assert_eq!(read_temporary().unwrap(), read(&path).unwrap());
+
+    build_with_child_registration(&path, HANDLE, ROOT, HANDLE);
+    let error = read_temporary().unwrap_err().to_string();
+    assert!(error.contains("child bin registration contradicts"));
+    assert_eq!(error, read(&path).unwrap_err().to_string());
 }
 
 #[test]

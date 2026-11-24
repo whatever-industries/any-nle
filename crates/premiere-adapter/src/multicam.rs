@@ -26,8 +26,8 @@ fn real_piece<'a>(alt: &'a MulticamAlternative, group: &str) -> R<&'a MulticamPi
     Ok(p)
 }
 
-pub(super) fn prepare(
-    g: &SourceGraph,
+pub(super) fn prepare<'a>(
+    g: &'a SourceGraph,
     input: &mut PreparedProjectInput,
     ownership: &HashMap<String, (usize, usize)>,
     clock: ClockProfile,
@@ -35,6 +35,7 @@ pub(super) fn prepare(
     losses: &mut Vec<Loss>,
     best_effort: bool,
     omitted_offline_items: &HashSet<&str>,
+    context: &mut PreparationContext<'a>,
 ) -> R<()> {
     if g.multicams.is_empty() && g.multicam_uses.is_empty() {
         return Ok(());
@@ -81,6 +82,7 @@ pub(super) fn prepare(
     for (i, b) in g.bins.iter().enumerate() {
         for id in &b.items {
             if known.contains(id.as_str()) && bin_indices.insert(id.as_str(), i).is_some() {
+                context.occurrence = Some(PreparationOccurrence::Group(id));
                 return Err(refusal(id, "group belongs to more than one selected bin"));
             }
         }
@@ -91,6 +93,7 @@ pub(super) fn prepare(
         if omitted.contains(m.id.as_str()) {
             continue;
         }
+        context.occurrence = Some(PreparationOccurrence::Group(&m.id));
         if m.reason.is_some() || m.rate.map(fraction) != Some(RATE) {
             return Err(refusal(
                 &m.id,
@@ -231,6 +234,7 @@ pub(super) fn prepare(
                 .map_err(|_| refusal(&m.id, "wrong camera count"))?,
         });
     }
+    context.occurrence = None;
     let sequences: HashMap<_, _> = g
         .sequences
         .iter()
@@ -265,6 +269,8 @@ pub(super) fn prepare(
                     g.sequences[sequences[u.sequence.as_str()]].name, u.track));
             continue;
         }
+        context.sequence = Some(&u.sequence);
+        context.occurrence = Some(PreparationOccurrence::GroupUse(&u.id));
         let [id] = u.candidates.as_slice() else {
             return Err(refusal(
                 &u.id,
@@ -372,6 +378,7 @@ pub(super) fn prepare(
             }
         }
     }
+    *context = PreparationContext::default();
     for (si, (sequence, source)) in input.sequences.iter_mut().zip(&g.sequences).enumerate() {
         for marker in &mut sequence.markers {
             let Some(event) = marker.event.and_then(|index| usize::try_from(index).ok()) else {

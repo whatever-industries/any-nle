@@ -8,9 +8,11 @@ qualification target.
 
 ## Avid to Resolve in the macOS wizard
 
-For local qualification, set `ANYNLE_RESOLVE_TEMPLATES` to a JSON file
-containing the pinned `templates` object from an Avid turnover job.
-Launch the wizard and choose **Resolve** as the destination. Read the
+The macOS app discovers the reviewed, hash-pinned templates in its bundle
+for 1920×1080, 23.976 fps projects. Launch the wizard and choose
+**Resolve** as the destination. For a development build, set
+`ANYNLE_RESOLVE_TEMPLATES` to a JSON file containing a pinned `templates`
+object from an Avid turnover job. Read the
 selected Avid bins or project folder, select and order timelines, and
 choose a new `.drp` destination.
 
@@ -31,13 +33,50 @@ macOS arm64 package. **Calculate rewrap size** reported the combined
 source byte count before a media folder was chosen and cleared its
 result when the folder changed.
 
-The current donor archives stay private. Blackmagic documents sharing
-exported Resolve projects, and the installed license assigns user
-content to its applicable owner. The current archives contain private
-locators and saved previews, and generated projects inherit a donor
-preview. Public rollout requires a new, self-authored template set with
-reviewed contents, fresh pins, and a packaged native replay.
-[Blackmagic reference manual](https://documents.blackmagicdesign.com/UserManuals/DaVinciResolveReferenceManual.pdf)
+The original research donors stay private. They contain local paths
+and saved previews. The local release-template trial used fresh native
+exports from generated media. [Release-template checks](#local-avid-release-template-checks)
+
+### Local Avid release-template checks
+
+Resolve Studio 21.2.0 build 00006 authored a new layout and rate
+profile, split-MXF donor, and two-camera Group donor from generated
+picture and PCM. A deterministic preparation pass cleared the donor
+working directories from the saved project configuration, substituted
+a synthetic placeholder for template media paths, and removed project,
+timeline, and nested sequence previews. The writer sets the outer Group
+edits' media start to the generated Group's clock. A fresh native Group
+with a zero source origin exposed the previous dependency on the
+donor's clock.
+
+An isolated macOS arm64 package used fresh SHA-256 pins and an external
+template manifest. Both media choices completed in the packaged wizard
+with the first candidate. Calculate rewrap size reported 727.27 MiB for
+two files without creating media or a project. After the audit found a
+second thumbnail layer in sequence metadata, the final package repeated
+Review, CLI conversion, saved-job replay, and native Resolve reopen with
+the cleaned templates. The link and OP1a outputs preserved both timelines
+in each job, exact trims and clocks, and both independent mono lanes.
+The rendered comparison matched all 325 picture frames and both isolated
+PCM lanes against the retained controls.
+
+The final archive audit checked the three donors and five converter
+outputs for embedded preview payloads and inherited paths in XML,
+compressed project settings, and media caches. Changing a pinned donor
+blocked Review and conversion before publication. The packaging review
+approved those exact self-authored archives. The macOS packager and the
+extracted-package verifier both match their hashes against the reviewed
+pins. [Template provenance](../packaging/resolve-templates/PROVENANCE.md)
+
+The signed macOS arm64 package exposed the Avid → Resolve route with
+its default bundle lookup. Both media choices completed using the
+bundled archives. The two-file rewrap estimate was 727.27 MiB and left
+the destination empty. File → Save Project As, close, and reopen in
+Resolve Studio 21.2 retained all 30 edits, ten physical links across the
+two test projects, the managed reels, and both mono lanes. All 325
+decoded picture frames and each isolated PCM lane matched the retained
+controls. The packaged CLI accepted the saved direct-link job, its
+replay matched the wizard output, and Review rejected a wrong donor.
 
 ## Automatic native media import fallback
 
@@ -214,8 +253,10 @@ components by occurrence.
 Both jobs supply `ffprobe`, `templates`, and `output`. The templates are
 the existing hash-pinned layout and rate profile, plus the applicable Atom
 and Group donors. Use `--review` to check preparation, template assembly
-and the output path without staging an archive, or `--graph` to inspect
-the source document. Reviewable omissions require
+and the output path. Review reads back a disposable archive using the
+same destination checks as publication, with no project or media
+written to the output location. Use `--graph` to inspect the source
+document. Reviewable omissions require
 `--accept-losses` on the publication run. Timing, media, routing and topology
 failures still block publication. Each input project and media binding is
 checked again before exclusive publication.

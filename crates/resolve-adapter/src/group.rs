@@ -115,6 +115,7 @@ fn prepare_group_profile(
     native_resolve: bool,
 ) -> Result<PreparedGroup> {
     graph.validate()?;
+    anynle_media_verification::linked_original::qualify(&graph.media)?;
     let sequence = graph
         .sequences
         .iter()

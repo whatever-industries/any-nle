@@ -76,15 +76,43 @@ fn uncertainty(s: &str, b: &mut Budget) -> Result<Option<String>, String> {
     b.charge(size_of::<String>() + s.len())?;
     Ok(Some(s.into()))
 }
+pub(super) type MissingAudioTracks<'a> = HashMap<(usize, i64), (&'a str, MobId)>;
+
+pub(super) fn index_missing_audio<'a>(
+    tracks: &mut MissingAudioTracks<'a>,
+    item: usize,
+    master: &'a extract::MasterClip,
+    missing_ordinals: &[usize],
+) {
+    for &ordinal in missing_ordinals {
+        let track = &master.tracks[ordinal];
+        if track.kind == KIND_SOUND
+            && matches!(track.essence, Some(Essence::Sound { channels: 1, .. }))
+            && master.tracks.iter()
+                .filter(|m| m.kind == KIND_SOUND && m.index == track.index)
+                .nth(1).is_none()
+        {
+            tracks.insert((item, track.index), (&master.name, track.file_mob));
+        }
+    }
+}
+
 pub(super) fn append<'a>(
     groups: &'a [av::SourceGroup],
     copies: &HashMap<MobId, Vec<(usize, usize)>>,
+    missing_audio: &MissingAudioTracks<'_>,
     out: &mut ReadResult,
     budget: &mut Budget,
 ) -> Result<Index<'a>, String> {
     let mut index = Index {
         lanes: HashMap::new(),
     };
+    if groups.is_empty() {
+        return Ok(index);
+    }
+    // The same master can still be portable when one of its streams is missing.
+    let media: HashMap<_, _> = out.graph.media.iter().map(|m| (m.id.as_str(), m)).collect();
+    let mut review_bytes = 0;
     for g in groups {
         reserve(budget, &mut out.graph.multicams, 1)?;
         budget.charge(g.id.len() + g.name.len() + g.reason.as_ref().map_or(0, String::len))?;
@@ -148,10 +176,45 @@ pub(super) fn append<'a>(
                             source_in,
                             rate: source_rate,
                         } => {
-                            let Some(item) = source_master_copy(*master, g.bin, copies, &out.graph.items) else {
+                            let Some(item_index) = source_master_index(*master, g.bin, copies) else {
                                 alt.reason=uncertainty("group member is missing, unsupported or ambiguous in its source bin",budget)?;
                                 break;
                             };
+                            let item = &out.graph.items[item_index];
+                            let has_stream = item.media.iter()
+                                .filter_map(|link| media.get(link.media.as_str()))
+                                .any(|m| m.kind == kind && (m.stream == Some(*track)
+                                    || (kind == StreamKind::Video && m.stream.is_none() && *track == 1)));
+                            if !has_stream {
+                                if let (StreamKind::Audio, None, Some(&(source, package))) =
+                                    (kind, layout_reason, missing_audio.get(&(item_index, *track)))
+                                {
+                                    let span = start.checked_add(*length)
+                                        .filter(|end| *start >= 0 && end > start)
+                                        .and_then(|end| time(*start, rate).ok().zip(time(end, rate).ok()));
+                                    if let Some((start, end)) = span {
+                                        let bytes = size_of::<MissingGroupAudio>() + source.len() + g.id.len() + 128;
+                                        if review_bytes + bytes > super::index::REVIEW_DETAIL_BUDGET {
+                                            out.missing_group_audio_truncated = true;
+                                        } else {
+                                            review_bytes += bytes;
+                                            out.missing_group_audio.entry(g.id.clone()).or_default().push(MissingGroupAudio {
+                                                lane: label,
+                                                alternative: i as i64,
+                                                start,
+                                                end,
+                                                source: source.into(),
+                                                source_track: *track,
+                                                package: package.umid_hex(),
+                                            });
+                                        }
+                                    }
+                                }
+                                // Keep the native member and its range in the receipt.
+                                // An unavailable stream cannot become a portable source or blank space.
+                                alt.reason = uncertainty("group member source stream is unavailable", budget)?;
+                                break;
+                            }
                             budget.charge(item.id.len())?;
                             (
                                 *start,
@@ -209,6 +272,13 @@ pub(super) fn append<'a>(
         reservation.charge(8192 + g.id.len() * 3 + g.reason.as_ref().map_or(0, String::len))?;
         for l in &g.lanes {
             reservation.charge(4096 + l.reason.as_ref().map_or(0, String::len))?;
+            for (marker, offset) in &l.markers {
+                reserve_marker(marker, &mut reservation)?;
+                reservation.charge(512)?;
+                if let av::Observed::Unresolved(reason) = offset {
+                    reservation.charge(reason.len())?;
+                }
+            }
             for a in &l.alternatives {
                 reservation.charge(
                     4096 + a
@@ -229,7 +299,7 @@ pub(super) fn append<'a>(
         for marker in &g.markers {
             reserve_marker(marker, &mut reservation)?;
         }
-        sidecar(out, budget, "avid.group", &g.id, native(g))?;
+        push_sidecar(&mut out.graph.sidecars, budget, "avid.group", &g.id, native(g))?;
     }
     Ok(index)
 }
@@ -294,6 +364,22 @@ fn native(g: &av::SourceGroup) -> Value {
                             ("native", marker_native(m)),
                         ])
                     })
+                    .chain(g.lanes.iter().flat_map(|lane| {
+                        lane.markers.iter().map(move |(m, offset)| {
+                            obj(vec![
+                                ("name", s(&m.name)),
+                                ("comment", s(&m.comment)),
+                                ("user", s(&m.user)),
+                                ("color", s(&m.color)),
+                                ("owner", s("output_selector")),
+                                ("kind", lane.kind.map_or(Value::Null, Value::Int)),
+                                ("track", lane.label.map_or(Value::Null, Value::Int)),
+                                ("local_offset", observed(offset)),
+                                ("local_rate", lane.rate.map(|r| s(rational(r))).unwrap_or(Value::Null)),
+                                ("native", marker_native(m)),
+                            ])
+                        })
+                    }))
                     .collect(),
             ),
         ),

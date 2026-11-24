@@ -1,8 +1,24 @@
 import gzip,io,json,pathlib,sys,tempfile,unittest,zipfile,zlib
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
 from audit import Scanner
-from package import verify_backend
+from package import RESOLVE_TEMPLATES, verify_backend, verify_resolve_templates
 from publish import validate_existing
+
+class ResolveTemplateTests(unittest.TestCase):
+    def test_bundle_requires_exact_reviewed_template_bytes(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=pathlib.Path(tmp)/'resolve-templates'
+            shutil.copytree(RESOLVE_TEMPLATES,directory)
+            verify_resolve_templates(directory)
+            donor=directory/'Group.drp'
+            donor.write_bytes(donor.read_bytes()+b'\0')
+            with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+                verify_resolve_templates(directory)
+            donor.unlink()
+            with self.assertRaisesRegex(ValueError, 'inventory mismatch'):
+                verify_resolve_templates(directory)
+
 class AuditTests(unittest.TestCase):
     def test_generic_private_sentinel_in_nested_compressed_utf16_is_found(self):
         nested=zlib.compress('SyntheticPrivateSentinel'.encode('utf-16-le'))

@@ -42,6 +42,56 @@ pub struct AuxTimecode {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SavedClockSegment {
+    pub source: MobId,
+    pub kind: i64,
+    pub track: i64,
+    pub position: i64,
+    pub length: i64,
+    pub rate: Option<crate::source::Rate>,
+    pub source_offset: i64,
+    pub payload: SavedClockPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedClockPayload {
+    Timecode { count: i64, base: i64, flags: i64 },
+    Edgecode { header: [u8; 8], film_kind: i64, format: i64, base_perf: i64, count: i64 },
+}
+
+fn saved_clock_segment(source: MobId, source_offset: i64, track: i64, position: i64, segment: &Node) -> Option<SavedClockSegment> {
+    let kind = int(segment, "media_kind_id")?;
+    let payload = match (&segment.class, kind, track) {
+        (b"TCCP", KIND_TIMECODE, 2..) => SavedClockPayload::Timecode {
+            count: int(segment, "start")?,
+            base: int(segment, "fps")?,
+            flags: int(segment, "flags")?,
+        },
+        (b"ECCP", 4, 1..) => {
+            let Value::Bytes(header) = segment.get("header")? else { return None };
+            let header: [u8; 8] = header.as_slice().try_into().ok()?;
+            let count = int(segment, "start_ec")?;
+            // Ignore the blank edgecode tracks created by ordinary video bins.
+            if header == [0; 8] && count == 0 { return None }
+            SavedClockPayload::Edgecode {
+                header,
+                film_kind: int(segment, "film_kind")?,
+                format: int(segment, "code_format")?,
+                base_perf: int(segment, "base_perf")?,
+                count,
+            }
+        }
+        _ => return None,
+    };
+    Some(SavedClockSegment {
+        source, source_offset, kind, track, position,
+        length: int(segment, "length")?,
+        rate: float(segment, "edit_rate").and_then(crate::source::Rate::from_avid),
+        payload,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Essence {
     Picture { compression: String, resolution_id: i64, width: i64, height: i64, display_aspect: Option<(i64, i64)> },
     Sound { sample_rate: f64, bits: i64, channels: i64 },
@@ -154,6 +204,7 @@ pub struct MasterClip {
     pub color: Option<[i64; 3]>,
     pub start: Option<Timecode>,
     pub aux_timecodes: Vec<AuxTimecode>,
+    pub saved_clock_segments: Vec<SavedClockSegment>,
     pub source_file: Option<String>,
     pub source_path: Option<String>,
     /// Index of the bin (in the order given) the master was read from.
@@ -661,6 +712,7 @@ fn master<'a>(ctx: &Ctx<'a>, mob: &'a Node, prefix: Option<&project::pcm_prefix:
     // All file mobs of an OP-Atom master clip normally share one import mob and offset.
     let mut start = None;
     let mut aux_timecodes = Vec::new();
+    let mut saved_clock_segments = Vec::new();
     let mut source_file = None;
     let mut source_path = None;
     import_refs.dedup();
@@ -672,6 +724,15 @@ fn master<'a>(ctx: &Ctx<'a>, mob: &'a Node, prefix: Option<&project::pcm_prefix:
                     Some(c) => c,
                     None => continue,
                 };
+                let track_kind = int(component, "media_kind_id");
+                if matches!(track_kind, Some(3 | 4)) {
+                    let label = int(track, "index").unwrap_or(0);
+                    for (position, segment) in ctx.segments(component) {
+                        if let Some(clock) = saved_clock_segment(*import_id, *offset, label, position, segment) {
+                            saved_clock_segments.push(clock);
+                        }
+                    }
+                }
                 if int(component, "media_kind_id") != Some(KIND_TIMECODE) {
                     continue;
                 }
@@ -721,6 +782,7 @@ fn master<'a>(ctx: &Ctx<'a>, mob: &'a Node, prefix: Option<&project::pcm_prefix:
         color,
         start,
         aux_timecodes,
+        saved_clock_segments,
         source_file,
         source_path,
         bin: 0,

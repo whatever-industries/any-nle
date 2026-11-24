@@ -386,6 +386,19 @@ pub struct PreparedProjectInput {
     pub png_mattes: PreparedPngMattes,
 }
 
+/// The timeline and optional event slot in the prepared input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedValidationLocation {
+    pub sequence: usize,
+    pub event: Option<usize>,
+}
+
+#[derive(Debug)]
+pub struct PreparedValidationIssue {
+    pub error: ModelError,
+    pub location: Option<PreparedValidationLocation>,
+}
+
 /// Timeline-relative frame-aligned ticks. Out is the first excluded frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PreparedTimelineMarks {
@@ -1436,16 +1449,28 @@ impl PreparedProjectInput {
         Ok(model)
     }
     pub fn validate(&self) -> Result<(), ModelError> {
-        self.validate_with_budget(64)
+        self.validate_with_budget(64, &mut None)
     }
 
     /// A linked whole-project input comes from the bounded disk-backed graph
     /// path and may retain more edits than a standalone prepared document.
     pub fn validate_whole_project(&self) -> Result<(), ModelError> {
-        self.validate_with_budget(512)
+        self.validate_with_budget(512, &mut None)
     }
 
-    fn validate_with_budget(&self, limit_mib: usize) -> Result<(), ModelError> {
+    /// Run the normal validation and retain a typed location for sequence and event checks.
+    pub fn validate_with_location(&self, whole_project: bool) -> Result<(), PreparedValidationIssue> {
+        let mut location = None;
+        let budget = if whole_project { 512 } else { 64 };
+        self.validate_with_budget(budget, &mut location)
+            .map_err(|error| PreparedValidationIssue { error, location })
+    }
+
+    fn validate_with_budget(
+        &self,
+        limit_mib: usize,
+        location: &mut Option<PreparedValidationLocation>,
+    ) -> Result<(), ModelError> {
         let limit = limit_mib << 20;
         if self.non_drop_sequences.iter().any(|&i| self.sequences.get(i)
             .is_none_or(|s| s.rate != Fraction::new(30_000, 1001)))
@@ -1866,11 +1891,16 @@ impl PreparedProjectInput {
         let constant_speed_edits: HashSet<_> = self.constant_speeds.iter()
             .map(|speed| (speed.sequence, speed.event)).collect();
         for (i, s) in self.sequences.iter().enumerate() {
-            super::model::validate_sequence(s, &format!("prepared sequences[{i}]"))?;
+            let mut failing_event = None;
+            super::model::validate_sequence(s, &format!("prepared sequences[{i}]"), &mut failing_event)
+                .inspect_err(|_| {
+                    *location = Some(PreparedValidationLocation { sequence: i, event: failing_event });
+                })?;
             let mapped_picture_spans: HashSet<_> = s.events.iter().filter(|e| {
                 e.video_track.is_some() && e.time_remap.is_some()
             }).map(|e| (e.clip.as_str(), e.record_start, e.duration, e.source_in)).collect();
             for (event_index, e) in s.events.iter().enumerate() {
+                *location = Some(PreparedValidationLocation { sequence: i, event: Some(event_index) });
                 let c = clips
                     .get(e.clip.as_str())
                     .ok_or_else(|| fail("prepared event references unknown clip"))?;
@@ -1991,6 +2021,7 @@ impl PreparedProjectInput {
                 }
             }
         }
+        *location = None;
         super::multicam::validate(self, &clips)?;
         super::multicam_tracks::validate(self, &clips)
     }

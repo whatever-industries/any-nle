@@ -250,6 +250,15 @@ independent walk of the archive's handle and sequence records confirmed
 that UUID. The [linked writer checks](RESOLVE-PROJECT-CORE.md#saved-active-timeline)
 verify selection remapping, including duplicate names and subset exports.
 
+## Saved embedded reel names
+
+The reader retains the cached file reel in the clip-owned
+`resolve.media_metadata` receipt. When the project uses the verified
+embedded-reel conform mode and contains a cached reel, the Media Pool
+root also owns a `resolve.reel_names` receipt with value `"embedded"`.
+The cached file tag and the project setting are separate saved facts.
+[Avid → Resolve Reel Name evidence](RESOLVE-PROJECT-CORE.md#visible-media-pool-reel-name)
+
 ## Compare saved timelines and blobs
 
 ```text
@@ -590,6 +599,12 @@ each other. It keeps an unresolved PCM depth code as a saved fact. Same-rate
 whole-frame occurrences with an identity time map carry their independent
 source trims and saved channel selections. Unsupported edit maps and
 selectors receive occurrence-level losses.
+
+Qualified zero-origin 48 kHz PCM16 and PCM24 WAV caches also populate
+graph/2's `OriginalStream` with the saved physical stream and channel,
+sample clock, and extent. The Resolve receipt retains the virtual
+selector. Archive capture leaves file availability unknown. Destination
+preparation verifies the actual file before publication.
 
 Embedded 44.1 kHz stereo AAC retains the saved sample origin and sample
 count independently of the picture clock. The stereo pool route must
@@ -976,6 +991,13 @@ that carry reported losses, and each blocked timeline's first refusal.
 Original verification failures include the saved locator and the media
 or camera owner. The report includes each attempted original, its
 verification result, and the number of times other preparations reused it.
+
+Review and publication use the same preparation. They read the shared
+project and copy the selected writer inputs, including media used only
+inside multicam angles. For linked PCM WAVs, a saved graph can supply
+the physical channel through its typed original or the older Resolve
+selector receipt. Present fields must agree with each other and with
+the verified file. The destination track number does not select a channel.
 
 The job shares physical evidence for the same original, including
 failed inspections. Ordinary files use their resolved paths. A spanned

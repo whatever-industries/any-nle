@@ -328,9 +328,9 @@ Resolve Studio 21.2.0.6 imported the generated DRP as a named test
 project, saved, closed, reopened and re-exported it. The returned archive
 kept all eighteen edits, both starts, physical paths and source clocks,
 and one shared pool item per managed master. The saved reel metadata
-on each managed source matches the picture MXF's reel tag. Media Pool reel
-display remains a UI check. The missing exact-file mapping, missing PCM
-sibling, and occupied output controls refused publication.
+on each managed source matches the picture MXF's reel tag. The missing
+exact-file mapping, missing PCM sibling, and occupied output controls
+refused publication.
 
 The 24 MOV frames matched a fresh native Resolve import and trim at
 full decoded resolution. Frame comparisons also covered the managed
@@ -342,7 +342,58 @@ The straight-cut timeline retained 144,144 samples per channel and
 matched its direct mono siblings within one PCM24 code outside
 Resolve's measured 72-sample edit-edge windows. The Group matched
 the direct samples within one code away from its known startup and
-edge envelopes. File menu Save Project As for this cohort remains pending.
+edge envelopes.
+
+A current converter replay exposed a clock check that rejected the
+retained managed source starting at `16:47:02:14`. The archived decimal
+`60483.00591666666` is the saved binary64 division of 1,450,142 frames by
+`24000/1001`. The reader now compares that encoding against the exact
+cached frame count and checks it can distinguish neighboring ticks. The
+original staged and native-reopened DRPs both read again. A new export
+preserves the 18 edits, seven linked paths, and both starts. Changing the
+saved clock by one frame or to an unrelated nearby decimal still refuses.
+Review now checks a disposable archive against the prepared project,
+using the same read-back as publication. The combined fixture passes
+Review without creating a destination project. Reinstating the earlier
+clock check in a test build makes Review report the rejection before
+conversion.
+
+The automatic cohort also passed **File → Save Project As**, close, and
+reopen. Archive read-back preserved both starts, all 18 edits, the Group
+selections, seven original paths, and the saved reel and source timecode
+values. All 72 straight-cut and 145 Group picture frames matched the
+previous reopened Resolve renders. Both straight-cut PCM lanes matched
+exactly. One isolated Group lane varied within its previously observed
+startup window and matched from sample frame 10,000 onward.
+
+A separate native Avid split-edit bin linked directly to its managed
+DNxHR LB picture and two PCM24 OP-Atom siblings. After File menu Save
+Project As and reopen, all nine edits and the source paths survived.
+All 72 rendered picture frames selected the expected source frames.
+Each mono lane rendered 144,144 sample frames and matched its source
+within one PCM24 count after Resolve's center-pan gain outside the
+72-sample edit-edge windows. Review reported five omitted marker
+occurrences and required explicit approval before writing.
+
+#### Visible Media Pool Reel Name
+
+The linked writer enables **Assist using reel names** with **Embedding in
+source clip file** when an exported managed picture MXF has a verified
+embedded reel. This is a setting in the generated project. The original
+file reel is carried in the picture cache's `ActualReelNumber`. Before
+publication the writer checks the project setting and each expected
+cache value by Media Pool item ID. The Avid Tape logging field remains
+independent. A custom per-clip override and rewrapped files have separate
+qualification.
+
+Resolve Studio 21.2.0 build 00006 showed three distinct managed reels
+after File → Save Project As, close, and reopen across the combined
+managed/UME project and the managed split-edit project. Their nonzero
+source timecodes, ten physical file links, all 27 edit ranges, and both
+mono assignments agreed with the staged archives. The untagged MOV's
+reel remained empty. A direct native import confirmed that turning off
+reel assist leaves the visible name empty even when the file carries a
+reel tag.
 
 ### Static picture controls
 

@@ -175,6 +175,62 @@ fn premiere_27_writers_change_only_the_seeded_project_version() {
 }
 
 #[test]
+fn mixed_managed_media_preserves_the_verified_op1a_guards() {
+    use prproj::convert::rewrap::MediaRelink;
+    use std::collections::HashSet;
+
+    let scratch = Scratch::new();
+    let path = scratch.0.join("mixed.prproj");
+    let mut model = parse_model_str(include_str!("../../examples/opatom_clip.model.json")).unwrap();
+    let original = model.clips["clip-1"].clone();
+    let mut clips = Vec::new();
+    let mut bindings = Vec::new();
+    for id in ["verified", "rewrapped"] {
+        let mut clip = original.clone();
+        clip.id = id.into();
+        let target = scratch.0.join(format!("{id}.mxf")).to_string_lossy().into_owned();
+        let picture = clip.video.as_mut().unwrap();
+        picture.path = scratch.0.join(format!("{id}-V.mxf")).to_string_lossy().into_owned();
+        bindings.push(MediaRelink {
+            source_path: picture.path.clone(), target_path: target.clone(),
+            audio_stream: None, separate_mono: false, pixel_aspect: None,
+        });
+        for (i, audio) in clip.audio.iter_mut().enumerate() {
+            audio.path = scratch.0.join(format!("{id}-A{i}.mxf")).to_string_lossy().into_owned();
+            audio.avid_track = Some(i as i64 + 1);
+            bindings.push(MediaRelink {
+                source_path: audio.path.clone(), target_path: target.clone(),
+                audio_stream: Some(i as u32), separate_mono: false, pixel_aspect: None,
+            });
+        }
+        clips.push(clip);
+    }
+    model.bins[0].clips = clips.iter().map(|clip| clip.id.clone()).collect();
+    model.clips = clips.into_iter().collect();
+    model.sequences[0].events[0].clip = "verified".into();
+    let mut second = model.sequences[0].events[0].clone();
+    second.clip = "rewrapped".into();
+    second.record_start += second.duration;
+    model.sequences[0].events.push(second);
+    let mut input = PreparedProjectInput::from_model(&model).unwrap();
+    let verified = HashSet::from(["verified".into()]);
+    let rewrapped = HashSet::from(["rewrapped".into()]);
+    let offline = HashSet::new();
+    let prepare = |input: &PreparedProjectInput, rewrapped: &HashSet<String>| {
+        prepare_typed_project_for_premiere_27(
+            input, &path, &mut SeededUuids::new("mixed-managed"),
+            TypedMedia::MixedManaged { bindings: &bindings, verified: &verified, rewrapped, offline: &offline },
+            None,
+        )
+    };
+    assert!(prepare(&input, &rewrapped).is_ok());
+    assert!(prepare(&input, &verified).err().unwrap().to_string().contains("distinct verified and rewrapped clips"));
+    input.sequences[0].rate = Fraction::new(25, 1);
+    assert!(prepare(&input, &rewrapped).err().unwrap().to_string().contains("same-rate unretimed placement"));
+    assert!(!path.exists());
+}
+
+#[test]
 fn linked_dual_mono_mov_writes_two_physical_audio_media_nodes() {
     let mut clip = original("dualmono");
     clip.separate_mono_streams = true;

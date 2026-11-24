@@ -2,8 +2,8 @@
 use super::{encoding, Blobs, Node, Result, Sidecar, SourceGraph, Value};
 use sha2::{Digest, Sha256};
 
-pub(super) const ADAPTER: &str = "resolve.media_metadata";
-pub(super) const REEL: &str = "BtVideoInfo.VideoMetadata.ActualReelNumber";
+pub(crate) const ADAPTER: &str = "resolve.media_metadata";
+pub(crate) const REEL: &str = "BtVideoInfo.VideoMetadata.ActualReelNumber";
 pub(super) const TIMECODE: &str = "BtVideoTime.Timecode";
 
 pub(super) fn capture_pixel_aspect(

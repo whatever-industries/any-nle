@@ -70,58 +70,98 @@ pub fn write_with_options(
     accept_losses: bool,
 ) -> Result<Vec<graph::Loss>> {
     graph.validate()?;
-    let index = graph
+    let sequence = graph
         .sequences
         .iter()
-        .position(|seq| seq.id == sequence_id)
+        .find(|seq| seq.id == sequence_id)
         .ok_or("selected Resolve sequence is absent")?;
     let mut originals = Originals::new(ffprobe, false);
-    let (project, losses) = prepare_timeline(graph, index, &mut originals, output, accept_losses)?;
+    let (project, losses) = prepare_timeline(&graph, sequence, &mut originals, output, accept_losses)?;
     project.publish()?;
     Ok(losses)
 }
 
+/// Materialize the selected writer inputs in source order. Empty bins also
+/// participate in destination hierarchy and its loss reporting.
+fn timeline_graph(
+    source: &SourceGraph,
+    sequence: SourceSequence,
+    used: &HashSet<String>,
+    owners: &mut HashSet<String>,
+) -> SourceGraph {
+    let items: Vec<_> = source.items.iter()
+        .filter(|item| used.contains(&item.id))
+        .cloned()
+        .collect();
+    let media_ids: HashSet<_> = items.iter()
+        .flat_map(|item| item.media.iter().map(|link| link.media.as_str()))
+        .collect();
+    let media = source.media.iter()
+        .filter(|media| media_ids.contains(media.id.as_str()))
+        .cloned()
+        .collect();
+    owners.extend(media_ids.into_iter().map(str::to_owned));
+    owners.extend(used.iter().cloned());
+    SourceGraph {
+        project: source.project.clone(),
+        bins: source.bins.iter().map(|bin| graph::Bin {
+            id: bin.id.clone(),
+            name: bin.name.clone(),
+            parent: bin.parent.clone(),
+            items: bin.items.iter().filter(|id| used.contains(*id)).cloned().collect(),
+        }).collect(),
+        sidecars: source.sidecars.iter()
+            .filter(|row| owners.contains(&row.object))
+            .cloned()
+            .collect(),
+        sequences: vec![sequence],
+        items,
+        media,
+        multicams: Vec::new(),
+        multicam_uses: Vec::new(),
+        losses: Vec::new(),
+    }
+}
+
 fn prepare_timeline(
-    mut graph: SourceGraph,
-    index: usize,
+    graph: &SourceGraph,
+    sequence: &SourceSequence,
     originals: &mut Originals<'_>,
     output: &Path,
     accept_losses: bool,
 ) -> Result<(PreparedProject, Vec<Loss>)> {
-    let sequence = &graph.sequences[index];
-    let sequence_id = sequence.id.clone();
-    let sequence_id = sequence_id.as_str();
+    let sequence_id = sequence.id.as_str();
     if let Some(edit) = sequence.disabled_placements.first() {
         return Err(format!("{}: disabled source edit has no qualified Resolve export mapping", edit.id).into());
     }
     if graph.multicam_uses.iter().any(|usage| usage.sequence == sequence_id) {
-        if multicam_tracks::legacy_profile(&graph, sequence) {
-            return multicam::prepare(&graph, sequence, originals, output, accept_losses);
+        if multicam_tracks::legacy_profile(graph, sequence) {
+            return multicam::prepare(graph, sequence, originals, output, accept_losses);
         }
-        return multicam_tracks::prepare(graph, index, originals, output, accept_losses);
+        return multicam_tracks::prepare(graph, sequence, originals, output, accept_losses);
     }
-    let track_state = crate::track_state::TrackState::prepare(&graph, sequence)?;
-    let still_grades = still::grade_omissions(&graph, sequence, &HashSet::new());
+    let track_state = crate::track_state::TrackState::prepare(graph, sequence)?;
+    let still_grades = still::grade_omissions(graph, sequence, &HashSet::new());
     let still_grade_owners: HashSet<_> = still_grades.iter().map(|loss| loss.object.as_str()).collect();
-    let (mut mixer, mapped_direct_mixer) = validate_sequence(&graph, sequence, track_state.is_some(), &still_grade_owners)?;
+    let (mut mixer, mapped_direct_mixer) = validate_sequence(graph, sequence, track_state.is_some(), &still_grade_owners)?;
     let empty_stereo = if track_state.is_none()
         && sequence.tracks.iter().map(|track| (track.kind, track.index, track.level_db))
             .eq([(StreamKind::Video, 1, None), (StreamKind::Audio, 1, None)])
         && sequence.placements.iter().all(|edit| edit.audio_tracks.is_empty() && edit.grouped_audio.is_empty())
         && graph.sidecar(FAIRLIGHT_ADAPTER, sequence_id).is_some_and(neutral_empty_stereo)
     {
-        crate::source::default_empty_stereo(&graph, sequence_id).map(str::to_owned)
+        crate::source::default_empty_stereo(graph, sequence_id).map(str::to_owned)
     } else {
         None
     };
-    let (timeline_marks, mut metadata_losses) = prepare_timeline_marks(&graph, sequence)?;
+    let (timeline_marks, mut metadata_losses) = prepare_timeline_marks(graph, sequence)?;
     let accounted_marks = timeline_marks.is_some() || !metadata_losses.is_empty();
-    let labels = prepare_edit_labels(&graph, sequence, &mut metadata_losses)?;
+    let labels = prepare_edit_labels(graph, sequence, &mut metadata_losses)?;
     let handled_labels: HashSet<_> = labels.iter().map(|label| label.owner.as_str())
         .chain(metadata_losses.iter().filter(|loss| loss.aspect == "clip_label")
             .map(|loss| loss.object.as_str())).collect();
     let mut transitions = Vec::new();
-    let native_transitions = dissolve::prepare_all_native(&graph, sequence)?;
+    let native_transitions = dissolve::prepare_all_native(graph, sequence)?;
     for transition in native_transitions {
         let d = transition.prepared;
         if d.style == dissolve::Style::Power {
@@ -136,18 +176,16 @@ fn prepare_timeline(
         transitions.push((d, transition.outgoing.to_owned(), transition.incoming.to_owned(), frame));
     }
     let used: HashSet<_> = sequence.placements.iter().map(|p| p.item.clone()).collect();
-    let mut owned = used.clone();
+    let mut owned = HashSet::new();
     owned.insert(sequence_id.into());
     owned.extend(sequence.placements.iter().map(|p| p.id.clone()));
     owned.extend(sequence.texts.iter().map(|text| text.id.clone()));
-    graph.items.retain(|item| used.contains(&item.id));
-    let used_media: HashSet<_> = graph
-        .items
-        .iter()
-        .flat_map(|item| item.media.iter().map(|link| link.media.clone()))
+    let mut selected = timeline_graph(graph, sequence.clone(), &used, &mut owned);
+    selected.losses = graph.losses.iter()
+        .filter(|loss| loss.object == "project" || owned.contains(&loss.object))
+        .cloned()
         .collect();
-    owned.extend(used_media.iter().cloned());
-    graph.sequences = vec![graph.sequences.swap_remove(index)];
+    let mut graph = selected;
     let (fades, mut destination_losses) = prepare_clip_controls(&mut graph)?;
     let selected_edit_marker = |loss: &Loss| {
         owned.contains(&loss.object) && graph.sidecar(EDIT_MARKER_ADAPTER, &loss.object).is_some()
@@ -213,17 +251,8 @@ fn prepare_timeline(
     }
     destination_losses.extend(graph.losses.iter().filter(|loss| selected_marker_color(loss)).cloned());
     prepare_track_pan(&mut graph.sequences[0], &mut mixer, &mut destination_losses);
-    graph.media.retain(|media| used_media.contains(&media.id));
-    graph
-        .bins
-        .iter_mut()
-        .for_each(|bin| bin.items.retain(|item| used.contains(item)));
-    graph.multicams.clear();
-    graph.multicam_uses.clear();
     graph.losses.clear();
-    graph
-        .sidecars
-        .retain(|receipt| owned.contains(&receipt.object));
+    anynle_media_verification::linked_original::qualify(&graph.media)?;
     let fitted_stills = still::prepare(&mut graph)?;
     let verified = bind_originals(&mut graph, originals, true)?;
     let mut trim_losses = Vec::new();

@@ -50,13 +50,12 @@ pub(super) fn legacy_profile(graph: &SourceGraph, sequence: &SourceSequence) -> 
 }
 
 pub(super) fn prepare(
-    mut graph: SourceGraph,
-    sequence_index: usize,
+    graph: &SourceGraph,
+    sequence: &SourceSequence,
     originals: &mut Originals<'_>,
     output: &Path,
     accept_losses: bool,
 ) -> Result<(PreparedProject, Vec<Loss>)> {
-    let sequence = &graph.sequences[sequence_index];
     let fail = |reason: &str| format!("{}: {reason}", sequence.id);
     let size = sequence
         .frame_size
@@ -179,7 +178,7 @@ pub(super) fn prepare(
             .iter()
             .find(|lane| lane.kind == StreamKind::Audio && lane.index == 1);
         if partial {
-            losses.extend(picture_subset::omitted_angles(&graph, group, source, picture, &edits)?);
+            losses.extend(picture_subset::omitted_angles(graph, group, source, picture, &edits)?);
         }
         if group.lanes.len() != usize::from(picture.is_some()) + usize::from(audio.is_some()) {
             return Err(invalid("expected picture and at most one independent mono lane").into());
@@ -283,7 +282,7 @@ pub(super) fn prepare(
         groups.push(out);
     }
 
-    let omissions = omissions::collect(&graph, sequence, &groups, &claimed, origin)?;
+    let omissions = omissions::collect(graph, sequence, &groups, &claimed, origin)?;
     let mut used: HashSet<String> = groups
         .iter()
         .flat_map(|group| group.picture.iter().flatten().chain(&group.mono))
@@ -309,7 +308,7 @@ pub(super) fn prepare(
         .chain(used_media.iter().map(String::as_str))
         .chain(sequence.placements.iter().map(|p| p.id.as_str()))
         .collect();
-    let still_grades = still::grade_omissions(&graph, sequence, &claimed);
+    let still_grades = still::grade_omissions(graph, sequence, &claimed);
     let still_grade_owners: HashSet<_> = still_grades.iter().map(|loss| loss.object.as_str()).collect();
     losses.extend(
         graph
@@ -344,33 +343,15 @@ pub(super) fn prepare(
         )
         .into());
     }
-    let claimed: HashSet<String> = claimed.into_iter().map(str::to_owned).collect();
-    graph.sequences = vec![graph.sequences.swap_remove(sequence_index)];
-    graph.sequences[0]
-        .placements
-        .retain(|edit| !claimed.contains(&edit.id));
-    graph.sequences[0].texts.clear();
-    graph.multicams.clear();
-    graph.multicam_uses.clear();
-    graph.losses.clear();
-    graph.items.retain(|item| used.contains(&item.id));
-    graph.media.retain(|media| used_media.contains(&media.id));
-    graph
-        .bins
-        .iter_mut()
-        .for_each(|bin| bin.items.retain(|id| used.contains(id)));
-    let mut scoped = used;
-    scoped.extend(used_media);
-    scoped.insert(graph.sequences[0].id.clone());
-    scoped.extend(graph.bins.iter().map(|bin| bin.id.clone()));
-    scoped.extend(
-        graph.sequences[0]
-            .placements
-            .iter()
-            .map(|edit| edit.id.clone()),
-    );
-    graph.sidecars.retain(|row| scoped.contains(&row.object));
+    let mut selected = sequence.clone();
+    selected.placements.retain(|edit| !claimed.contains(edit.id.as_str()));
+    selected.texts.clear();
+    let mut scoped: HashSet<_> = graph.bins.iter().map(|bin| bin.id.clone()).collect();
+    scoped.insert(selected.id.clone());
+    scoped.extend(selected.placements.iter().map(|edit| edit.id.clone()));
+    let mut graph = timeline_graph(graph, selected, &used, &mut scoped);
     let fit = fit_custom_canvas(&graph, size)?;
+    anynle_media_verification::linked_original::qualify(&graph.media)?;
     let fitted_stills = still::prepare(&mut graph)?;
     let verified = bind_originals(&mut graph, originals, true)?;
     let mut prepared = premiere_adapter::prepare_resolve_originals(&graph, &Options::default())?;

@@ -5,7 +5,7 @@ use avid_adapter::{
     ReadResult,
 };
 use avid_reader::source::SourceInput;
-use graph::{Loss, Rational, StreamKind, Value};
+use graph::{Loss, MarkerOwner, Rational, StreamKind, Value};
 use prproj::convert::{
     model::TICKS_PER_SECOND,
     prepared::{PngAlpha, PreparedPngEdit, PreparedPngMattes, PreparedPngStill},
@@ -19,12 +19,38 @@ const MATTE: &str = "EFF2_2DMATTE";
 const ADAPTER: &str = "EFF2_LUTSFX";
 const FRAME: i64 = TICKS_PER_SECOND / 24;
 
+pub(crate) struct PrepareIssue {
+    pub message: String,
+    pub edit: Option<FailedPngEdit>,
+}
+
+pub(crate) struct FailedPngEdit {
+    pub sequence: String,
+    pub id: String,
+    pub track: i64,
+    pub record_frame: i64,
+    pub saved_locators: Vec<String>,
+}
+
+impl From<String> for PrepareIssue {
+    fn from(message: String) -> Self {
+        Self { message, edit: None }
+    }
+}
+
+impl From<&str> for PrepareIssue {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Plan {
     pub picture: PreparedPngMattes,
     pub inputs: Vec<SourceInput>,
     replaced: HashMap<String, HashMap<&'static str, HashSet<String>>>,
     recovered_reader_notes: HashSet<String>,
+    recovered_gap_markers: HashMap<String, HashSet<usize>>,
 }
 
 impl Plan {
@@ -46,11 +72,15 @@ impl Plan {
             if seq.markers.len() != source.markers.len() {
                 return Err("one or more PNG Matte Key markers have unresolved timing".into());
             }
-            for (marker, saved) in seq.markers.iter_mut().zip(&source.markers) {
-                if marker.owner == "sequence" && saved.owner == graph::MarkerOwner::Edit {
+            let recovered = self.recovered_gap_markers.get(&source.id);
+            let mut saved = source.markers.iter().enumerate();
+            seq.markers.retain_mut(|marker| {
+                let (index, saved) = saved.next().expect("marker counts already checked");
+                if marker.owner == "sequence" && saved.owner == MarkerOwner::Edit {
                     marker.track = None;
                 }
-            }
+                recovered.is_none_or(|indices| !indices.contains(&index))
+            });
         }
         input.png_mattes = std::mem::take(&mut self.picture);
         Ok(())
@@ -139,6 +169,7 @@ struct Still<'a> {
     id: &'a str,
     master: &'a Value,
     import: &'a Value,
+    omitted: bool,
 }
 
 impl<'a> Still<'a> {
@@ -276,7 +307,7 @@ pub(crate) fn prepare(
     mappings: &[RootMapping],
     separate: bool,
     check: &mut dyn FnMut() -> Result<(), String>,
-) -> Result<Plan, String> {
+) -> Result<Plan, PrepareIssue> {
     if !separate {
         return Ok(Plan::default());
     }
@@ -314,15 +345,16 @@ pub(crate) fn prepare(
         let Some(&receipt) = receipts.get(record.id.as_str()) else {
             continue;
         };
-        let masters: HashMap<_, _> = list(receipt, "unresolved_masters")
-            .iter()
-            .filter_map(|m| Some((text(m, "occurrence")?, m)))
+        let masters: HashMap<_, _> = [("unresolved_masters", false), ("omitted_media_masters", true)]
+            .into_iter()
+            .flat_map(|(key, omitted)| list(receipt, key).iter().map(move |master| (master, omitted)))
+            .filter_map(|(master, omitted)| Some((text(master, "occurrence")?, (master, omitted))))
             .collect();
         for import in list(receipt, "imported_stills") {
             let (Some(id), Some(mob)) = (text(import, "id"), text(import, "mob")) else {
                 continue;
             };
-            let Some(&master) = masters.get(id) else {
+            let Some(&(master, omitted)) = masters.get(id) else {
                 continue;
             };
             if text(master, "mob_id") != Some(mob) {
@@ -337,6 +369,7 @@ pub(crate) fn prepare(
                         id,
                         master,
                         import,
+                        omitted,
                     },
                 )
                 .is_some()
@@ -347,7 +380,10 @@ pub(crate) fn prepare(
     }
     for (index, seq, receipt) in candidates {
         prepare_sequence(&mut builder, read, index, seq, receipt, check)
-            .map_err(|e| format!("PNG Matte Key · {}: {e}", seq.name))?;
+            .map_err(|mut issue| {
+                issue.message = format!("PNG Matte Key · {}: {}", seq.name, issue.message);
+                issue
+            })?;
     }
     builder.plan.inputs = builder
         .inputs
@@ -365,7 +401,7 @@ fn prepare_sequence<'a>(
     seq: &'a graph::source::SourceSequence,
     receipt: &'a Value,
     check: &mut dyn FnMut() -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<(), PrepareIssue> {
     let rate = Rational::integer(24);
     let valid_clock = seq.clock.as_ref().is_some_and(|clock| {
         clock.rate == rate
@@ -421,7 +457,24 @@ fn prepare_sequence<'a>(
     let mut frames = BTreeMap::<i64, [Option<usize>; 2]>::new();
     let mut consumed = HashSet::new();
     let mut effects = HashSet::new();
-    for issue in list(receipt, "unresolved") {
+    let issues = list(receipt, "unresolved");
+    let mut gaps = HashMap::new();
+    for gap in issues.iter().filter(|issue| issue.get("omitted_master").is_some()) {
+        let id = text(gap, "occurrence").ok_or("missing PNG gap identity")?;
+        if gaps.insert(id, gap).is_some() {
+            return Err("duplicate PNG gap identity".into());
+        }
+    }
+    let mut gap_markers = HashMap::new();
+    for (index, marker) in seq.markers.iter().enumerate().filter(|(_, marker)|
+        marker.owner == MarkerOwner::Sequence && marker.name.starts_with("Media omitted · V"))
+    {
+        if gap_markers.insert(marker.owner_occurrence.as_str(), (index, marker)).is_some() {
+            return Err("duplicate PNG gap marker ownership".into());
+        }
+    }
+    let gap_losses: HashSet<_> = read.graph.losses_for(&seq.id, "media_gap").collect();
+    for issue in issues.iter().filter(|issue| issue.get("omitted_master").is_none()) {
         let lane = number(issue, "track")
             .filter(|n| (1..=2).contains(n))
             .ok_or("unsupported native track")?;
@@ -441,12 +494,22 @@ fn prepare_sequence<'a>(
         {
             return Err(format!(
                 "V{lane} frame {frame} is outside the verified one-frame profile"
-            ));
+            ).into());
         }
         let owner = text(issue, "owner").ok_or("missing effect occurrence")?;
         if !effects.insert(owner) {
             return Err("duplicate PNG effect occurrence".into());
         }
+        let source_issue = |message, import| PrepareIssue {
+            message,
+            edit: Some(FailedPngEdit {
+                sequence: seq.id.clone(),
+                id: owner.into(),
+                track: lane,
+                record_frame: frame,
+                saved_locators: locators(import).unwrap_or_default(),
+            }),
+        };
         let profile = (text(issue, "effect_id"), text(issue, "picture_profile"));
         let (index, aspect) = match profile {
             (Some(MATTE), Some("imported_png_matte_controls")) if lane == 2 => {
@@ -463,7 +526,7 @@ fn prepare_sequence<'a>(
                     import,
                     PngAlpha::Straight { invert: !invert },
                     check,
-                )?;
+                ).map_err(|message| source_issue(message, import))?;
                 builder.plan.recovered_reader_notes.insert(format!(
                     "{:?}: V{lane} at frame {frame}: Matte Key (EFF2_2DMATTE) not converted",
                     seq.name
@@ -500,13 +563,35 @@ fn prepare_sequence<'a>(
                 let reason = still
                     .unresolved_reason()
                     .ok_or("missing recovered PNG master diagnosis")?;
-                let index = builder.add(still_bin, mob, &name, import, PngAlpha::Ignore, check)?;
+                let gap = if still.omitted {
+                    let gap = gaps.remove(id).ok_or("omitted PNG master has no exact saved gap")?;
+                    let (marker_index, marker) = gap_markers.remove(id)
+                        .ok_or("omitted PNG master has no exact gap marker")?;
+                    let expected_start = Rational::new(frame.into(), 24);
+                    if !matches_omitted_event(gap, event, occurrence, reason)
+                        || marker.name != format!("Media omitted · V{lane}")
+                        || marker.start != expected_start
+                        || marker.duration != Rational::new(1, 24).unwrap()
+                        || !gap_losses.contains(marker.comment.as_str())
+                    {
+                        return Err("omitted PNG gap does not match its verified edit and source".into());
+                    }
+                    Some((marker_index, marker.comment.as_str()))
+                } else {
+                    None
+                };
+                let index = builder.add(still_bin, mob, &name, import, PngAlpha::Ignore, check)
+                    .map_err(|message| source_issue(message, import))?;
                 let bin_id = &read.graph.bins[still_bin].id;
-                builder.plan.replace_loss(
-                    bin_id,
-                    "source_master",
-                    unresolved_master_reason(&occurrence, reason),
-                );
+                if let Some((marker_index, comment)) = gap {
+                    builder.plan.recovered_gap_markers.entry(seq.id.clone()).or_default().insert(marker_index);
+                    builder.plan.replace_loss(&seq.id, "media_gap", comment.into());
+                    builder.plan.replace_loss(bin_id, "media_bin_omission",
+                        format!("Omitted {name:?}, bin item {occurrence}. {reason}"));
+                } else {
+                    builder.plan.replace_loss(bin_id, "source_master",
+                        unresolved_master_reason(occurrence, reason));
+                }
                 builder
                     .plan
                     .recovered_reader_notes
@@ -521,7 +606,7 @@ fn prepare_sequence<'a>(
             _ => {
                 return Err(format!(
                     "V{lane} frame {frame} has an unverified picture effect or Color Adapter"
-                ))
+                ).into())
             }
         };
         let reason = text(issue, "reason").ok_or("missing effect receipt reason")?;
@@ -536,13 +621,13 @@ fn prepare_sequence<'a>(
         {
             return Err(format!(
                 "overlapping native PNG edits on V{lane} at frame {frame}"
-            ));
+            ).into());
         }
         if builder.plan.picture.edits.len() + frames.len() > 10_000 {
             return Err("too many PNG picture edits".into());
         }
     }
-    if consumed.len() != native.len() {
+    if consumed.len() != native.len() || !gaps.is_empty() {
         return Err("some native picture inputs have no verified edit placement".into());
     }
     for (frame, [background, foreground]) in frames {
@@ -593,6 +678,17 @@ fn matte_sources(issue: &Value) -> Option<(&str, &Value, bool)> {
     ))
 }
 
+fn matches_omitted_event(gap: &Value, event: &Value, master: &str, reason: &str) -> bool {
+    text(gap, "omitted_master") == Some(master)
+        && text(gap, "reason") == Some(reason)
+        && text(event, "id").is_some_and(|id| text(gap, "occurrence") == Some(id))
+        && ["owner", "track", "master_track"].iter().all(|key| {
+            event.get(key).is_some_and(|value| gap.get(key) == Some(value))
+        })
+        && number(gap, "track_kind") == Some(1)
+        && event.get("range").is_some_and(|range| gap.get("saved_range") == Some(range))
+}
+
 fn plain_source(event: &Value, lane: i64, frame: i64) -> Option<(&str, &str)> {
     let range = event.get("range")?;
     let master = text(event, "master")?;
@@ -622,4 +718,22 @@ fn plain_source(event: &Value, lane: i64, frame: i64) -> Option<(&str, &str)> {
         && source.get("source_offset").and_then(|v| number(v, "value")) == Some(0)
         && source.get("length").and_then(|v| number(v, "value")) == Some(1))
     .then_some((text(event, "id")?, master))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn png_gap_recovery_requires_exact_occurrence_master_and_range() {
+        let event = graph::json::parse(r#"{"id":"edit","owner":"owner","track":2,"master_track":1,"range":{"record_start":4,"record_length":1}}"#).unwrap();
+        let saved = r#"{"occurrence":"edit","owner":"owner","omitted_master":"import","reason":"missing managed file","track_kind":1,"track":2,"master_track":1,"saved_range":{"record_start":4,"record_length":1}}"#;
+        let gap = graph::json::parse(saved).unwrap();
+        assert!(matches_omitted_event(&gap, &event, "import", "missing managed file"));
+        assert!(!matches_omitted_event(&gap, &event, "another import", "missing managed file"));
+        for (old, changed) in [(r#""edit""#, r#""other edit""#), ("record_start\":4", "record_start\":5")] {
+            let difference = graph::json::parse(&saved.replace(old, changed)).unwrap();
+            assert!(!matches_omitted_event(&difference, &event, "import", "missing managed file"));
+        }
+    }
 }

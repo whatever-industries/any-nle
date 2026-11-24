@@ -574,7 +574,7 @@ fn param_key_receipts(keys: &[av::SourceParamKey]) -> Value {
     }).collect())
 }
 
-fn timewarp_controls(controls: &av::SourceTimewarpControls) -> Value {
+pub fn timewarp_controls(controls: &av::SourceTimewarpControls) -> Value {
     let integer = |v: Option<i64>| v.map_or(Value::Null, Value::Int);
     let float = |v: Option<f64>| v.map_or(Value::Null, Value::Float);
     let flag = |v: Option<bool>| v.map_or(Value::Null, Value::Bool);
@@ -2171,6 +2171,9 @@ pub(super) fn append(
             ("native_transitions", Value::Arr(native_transitions)),
             ("marker_native", Value::Arr(marker_receipts)),
         ].into_iter()
+            .chain(source.info.mob_id.filter(|_| !source.group_uses.is_empty()).map(|mob| (
+                "mob_id", s(mob.urn()),
+            )))
             .chain((!source.group_uses.is_empty()).then(|| (
                 "native_group_uses", Value::Arr(source.group_uses.iter().map(group_use_native).collect()),
             )))
@@ -2219,6 +2222,22 @@ pub(super) fn append(
             + seq.tracks.len() * size_of::<SourceTrack>(),
     )?;
     out.graph.sequences.push(seq);
+    if !source.saved_timewarps.is_empty() {
+        let mut reservation = *budget;
+        for saved in &source.saved_timewarps {
+            reserve_saved_timewarp(&saved.controls, &mut reservation)?;
+            reservation.charge(saved.owner.len() + 1024)?;
+        }
+        let effects = source.saved_timewarps.iter().map(|saved| obj(vec![
+            ("owner", s(&saved.owner)), ("record", Value::Int(saved.record)),
+            ("track", Value::Int(saved.track)), ("length", Value::Int(saved.length)),
+            ("controls", timewarp_controls(&saved.controls)),
+        ])).collect();
+        sidecar(out, budget, "avid.timewarp", id, obj(vec![
+            ("mob", source.info.mob_id.map(|mob| s(mob.urn())).unwrap_or(Value::Null)),
+            ("effects", Value::Arr(effects)),
+        ]))?;
+    }
     multicams.append_uses(source, &map, out, budget)?;
     Ok(())
 }
@@ -2263,16 +2282,7 @@ fn reserve_controls(source: &av::SourceSequence, budget: &Budget) -> Result<(), 
         for p in &t.native_properties {reservation.charge(1024+p.scope.len()+p.name.len()+p.value.len())?;}
     }
     for controls in source.unresolved.iter().filter_map(|issue| issue.timewarp.as_deref()) {
-        reservation.charge(4096 + controls.resize_render_owner.as_ref().map_or(0, String::len))?;
-        for curve in &controls.curves {
-            reservation.charge(2048)?;
-            let cost = match &curve.points {
-                Some(av::SourceTimewarpPoints::HalfFrameSamples { values, .. }) => values.len() * 32,
-                Some(av::SourceTimewarpPoints::Keys(keys)) => keys.len() * 1024,
-                None => 0,
-            };
-            reservation.charge(cost)?;
-        }
+        reserve_saved_timewarp(controls, &mut reservation)?;
     }
     for adapter in source.unresolved.iter().filter_map(|issue| issue.color_adapter.as_ref()) {
         if av::SourceColorRange::from_saved_xml(&adapter.transform).is_some() {
@@ -2294,6 +2304,18 @@ fn reserve_controls(source: &av::SourceSequence, budget: &Budget) -> Result<(), 
                 }
             }
         }
+    }
+    Ok(())
+}
+fn reserve_saved_timewarp(controls: &av::SourceTimewarpControls, budget: &mut Budget) -> Result<(), String> {
+    budget.charge(4096 + controls.resize_render_owner.as_ref().map_or(0, String::len))?;
+    for curve in &controls.curves {
+        let cost = match &curve.points {
+            Some(av::SourceTimewarpPoints::HalfFrameSamples { values, .. }) => values.len() * 32,
+            Some(av::SourceTimewarpPoints::Keys(keys)) => keys.len() * 1024,
+            None => 0,
+        };
+        budget.charge(2048 + cost)?;
     }
     Ok(())
 }

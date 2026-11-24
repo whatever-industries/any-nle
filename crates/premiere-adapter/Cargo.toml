@@ -8,6 +8,8 @@ publish = false
 name = "premiere_adapter"
 
 [dependencies]
+anynle-mapping = { path = "../mapping" }
+anynle-media-verification = { path = "../media-verification" }
 anynle-graph = { path = "../graph" }
 anynle-bridge = { path = "../bridge" }
 prproj = { path = "../../prproj" }

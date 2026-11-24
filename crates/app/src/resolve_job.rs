@@ -79,10 +79,10 @@ fn rec(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Local development uses a private manifest. Packaging has no implicit donor.
+/// A development manifest overrides the reviewed templates in a macOS bundle.
 pub fn local_templates() -> Result<Option<Templates>> {
     let Some(path) = std::env::var_os("ANYNLE_RESOLVE_TEMPLATES").map(PathBuf::from) else {
-        return Ok(None);
+        return bundle_templates(&std::env::current_exe().map_err(message)?);
     };
     let path = fs::canonicalize(path).map_err(message)?;
     let mut templates: Templates = serde_json::from_slice(&rec(&path)?).map_err(message)?;
@@ -99,6 +99,19 @@ pub fn local_templates() -> Result<Option<Templates>> {
         *donor = fs::canonicalize(base.join(&*donor)).map_err(message)?;
     }
     Ok(Some(templates))
+}
+
+fn bundle_templates(executable: &Path) -> Result<Option<Templates>> {
+    let Some(macos) = executable.parent().filter(|path| path.ends_with("Contents/MacOS")) else {
+        return Ok(None);
+    };
+    let directory = macos.with_file_name("Resources").join("resolve-templates");
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => Templates::bundled_avid(&directory).map(Some).map_err(message),
+        Ok(_) => Err("Bundled Resolve templates must be a resource directory.".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(message(error)),
+    }
 }
 
 pub fn load_if_avid_resolve(path: &Path) -> Result<Option<TurnoverJob>> {

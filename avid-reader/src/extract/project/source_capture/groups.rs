@@ -31,12 +31,18 @@ fn lane(ctx: &Ctx<'_>, node: &Node, label: Option<i64>, b: &SharedBudget) -> Sou
         length: int(node, "length"),
         selected: int(node, "selected"),
         alternatives: Vec::new(),
+        markers: Vec::new(),
         reason: None,
     };
     if node.class != *b"SLCT" {
         out.reason = reason(b, "group lane is not an immediate selector");
         return out;
     }
+    each_marker(ctx, node, |marker| {
+        if reserve(b, &mut out.markers, 1) {
+            out.markers.push(read_marker(ctx, marker, b));
+        }
+    });
     let tracks = ctx.tracks(node);
     if tracks.is_empty() {
         out.reason = reason(b, "group selector has no alternatives");

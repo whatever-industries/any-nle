@@ -60,27 +60,35 @@ pub fn pin_checked(
     paths: &[PathBuf],
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<Vec<SourceInput>, String> {
-    paths
-        .iter()
-        .map(|path| {
-            Ok(SourceInput {
-                path: path.clone(),
-                revision: checked_revision(path, check)?,
-            })
-        })
-        .collect()
+    paths.iter().map(|path| pin_file_checked(path, check)).collect()
 }
+
+pub(crate) fn pin_file_checked(
+    path: &Path,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<SourceInput, String> {
+    Ok(SourceInput {
+        path: path.to_owned(),
+        revision: checked_revision(path, check)?,
+    })
+}
+
 pub fn recheck_checked(
     inputs: &[SourceInput],
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
-    for i in inputs {
-        if checked_revision(&i.path, check)? != i.revision {
-            return Err(format!(
-                "Source media changed since qualification: {}; retained outputs are preserved",
-                i.path.display()
-            ));
-        }
+    inputs.iter().try_for_each(|input| recheck_file_checked(input, check))
+}
+
+pub(crate) fn recheck_file_checked(
+    input: &SourceInput,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    if checked_revision(&input.path, check)? != input.revision {
+        return Err(format!(
+            "Source media changed since qualification: {}; retained outputs are preserved",
+            input.path.display()
+        ));
     }
     Ok(())
 }

@@ -7,7 +7,8 @@ use crate::{
     Result,
 };
 use graph::{picture_motion, Effect, Placement, Rational, Transform};
-use graph::picture_chain::{Chain, Reflection as Axes};
+use graph::picture_chain::Reflection as Axes;
+use mapping::picture_chain::{is_reflection_kind, Chain};
 
 pub(crate) struct PreparedVideo {
     pub(crate) encoded: String,
@@ -41,7 +42,7 @@ pub(crate) struct Reflection {
 
 impl Reflection {
     fn from_effect(effect: &Effect) -> Result<Self> {
-        if !Axes::is_effect_kind(&effect.kind) {
+        if !is_reflection_kind(&effect.kind) {
             return Err("unsupported Resolve picture effect".into());
         }
         Axes::from_params(&effect.params)

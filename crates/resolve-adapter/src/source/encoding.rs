@@ -346,24 +346,67 @@ pub(super) fn visit_fields<'a>(
     Ok(())
 }
 
-pub(super) fn default_picture_settings(
+pub(super) fn project_setup(
     project: &super::Node,
     blobs: &mut Blobs,
-) -> Result<(bool, Option<&'static str>)> {
-    let Some(config) = project.optional("CommonConfig")? else { return Ok((false, None)); };
+) -> Result<Option<Vec<u8>>> {
+    let Some(config) = project.optional("CommonConfig")? else { return Ok(None); };
     let encoded = blobs.qt(config.entry()?.get("FieldsBlob")?)?;
+    let Some(decoded) = decode_project_setup(&encoded)? else { return Ok(None); };
+    blobs.charge(decoded.len())?;
+    Ok(Some(decoded))
+}
+
+fn decode_project_setup(encoded: &Map) -> Result<Option<Vec<u8>>> {
     let setup = encoded.bytes("SetupBA")?;
     if setup.len() < 9 || setup[..4] != 1u32.to_be_bytes()
         || u32::from_be_bytes(setup[4..8].try_into()?) as usize != setup.len() - 8
         || setup[8] != 0x81
     {
-        return Ok((false, None));
+        return Ok(None);
     }
-    let decoded = zstd::bulk::decompress(&setup[9..], MAX_BLOB)?;
-    blobs.charge(decoded.len())?;
+    Ok(Some(zstd::bulk::decompress(&setup[9..], MAX_BLOB)?))
+}
+
+// Studio 21.2 stores the "Assist using reel names" checkbox and its
+// "Embedding in source clip file" choice in a version-one submessage.
+const REEL_MODE_FIELD: u64 = 164;
+const EMBEDDED_REELS: &[u8] = &[0, 0, 0, 1, 0, 0, 0, 4, 8, 2, 16, 4];
+
+pub(super) fn uses_embedded_reels(setup: &[(u64, Wire<'_>)]) -> bool {
+    let mut modes = setup.iter().filter(|(field, _)| *field == REEL_MODE_FIELD);
+    matches!(modes.next(), Some((_, Wire::Bytes(saved))) if *saved == EMBEDDED_REELS)
+        && modes.next().is_none()
+}
+
+pub(crate) fn enable_embedded_reels(encoded: &str) -> Result<String> {
+    let map = qt(&hex_bytes(encoded)?)?;
+    if map.0.len() != 1 {
+        return Err("expected only SetupBA in the pinned Resolve common configuration".into());
+    }
+    let mut body = decode_project_setup(&map)?.ok_or("unsupported Resolve project setup")?;
+    let config = fields(&body)?;
+    if uses_embedded_reels(&config) {
+        return Ok(encoded.into());
+    }
+    if config.iter().any(|(field, _)| *field == REEL_MODE_FIELD) {
+        return Err("pinned Resolve project has an unexpected reel-name mode".into());
+    }
+    crate::binary::pb_bytes(REEL_MODE_FIELD, EMBEDDED_REELS, &mut body);
+    if body.len() > MAX_BLOB {
+        return Err("Resolve project setup exceeds its decoded limit".into());
+    }
+    let payload = zstd::bulk::compress(&body, 3)?;
+    let mut setup = 1u32.to_be_bytes().to_vec();
+    setup.extend_from_slice(&u32::try_from(payload.len() + 1)?.to_be_bytes());
+    setup.push(0x81);
+    setup.extend_from_slice(&payload);
+    Ok(hex::encode(crate::binary::qt(&[("SetupBA", crate::binary::Qt::Bytes(&setup))])))
+}
+
+pub(super) fn default_picture_settings(config: &[(u64, Wire<'_>)]) -> (bool, Option<&'static str>) {
     // Resolve Studio 21.2 omits field 180 for the measured Nearest
     // default. The same setting changed to Frame Blend stores value 2.
-    let config = fields(&decoded)?;
     let nearest = !config.iter().any(|(field, _)| *field == 180);
     // The default Scale entire image to fit omits field 98. Choosing
     // Center crop with no resizing in the same project saved zero there.
@@ -373,7 +416,7 @@ pub(super) fn default_picture_settings(
         (Some((_, Wire::Int(0))), None) => Some(crate::input_scaling::CENTER_CROP),
         _ => None,
     };
-    Ok((nearest, sizing))
+    (nearest, sizing)
 }
 
 pub(super) fn valid_clip_sizing_state(property: &[u8]) -> Result<bool> {
@@ -627,13 +670,38 @@ mod tests {
                 "<SM_Project><CommonConfig><SM_Config><FieldsBlob>{}</FieldsBlob></SM_Config></CommonConfig></SM_Project>",
                 hex::encode(qt),
             ), &mut 0).unwrap();
-            default_picture_settings(&project, &mut Blobs::default()).unwrap()
+            let body = project_setup(&project, &mut Blobs::default()).unwrap().unwrap();
+            default_picture_settings(&fields(&body).unwrap())
         };
         assert_eq!(settings(&[]), (true, Some(FIT)));
         assert_eq!(settings(&[0x90, 0x06, 0]), (true, Some(CENTER_CROP)));
         assert_eq!(settings(&[0x90, 0x06, 1]), (true, None));
         assert_eq!(settings(&[0x90, 0x06, 0, 0x90, 0x06, 0]), (true, None));
         assert_eq!(settings(&[0xa0, 0x0b, 2]), (false, Some(FIT)));
+    }
+
+    #[test]
+    fn embedded_reel_mode_preserves_other_setup_fields() {
+        let pack_setup = |body: &[u8]| {
+            let mut setup = hex_bytes(&crate::binary::pack(body).unwrap()).unwrap();
+            setup[3] = 1;
+            hex::encode(crate::binary::qt(&[("SetupBA", crate::binary::Qt::Bytes(&setup))]))
+        };
+        // One existing sizing field and the native assist-off, embedded-source choice.
+        let original = [0x90, 0x06, 0];
+        let mut off = original.to_vec();
+        crate::binary::pb_bytes(REEL_MODE_FIELD, &[0, 0, 0, 1, 0, 0, 0, 2, 16, 4], &mut off);
+        assert!(!uses_embedded_reels(&fields(&off).unwrap()));
+        assert!(enable_embedded_reels(&pack_setup(&off)).is_err());
+
+        let enabled = enable_embedded_reels(&pack_setup(&original)).unwrap();
+        let decoded = decode_project_setup(&qt(&hex_bytes(&enabled).unwrap()).unwrap()).unwrap().unwrap();
+        assert!(decoded.starts_with(&original));
+        let config = fields(&decoded).unwrap();
+        assert_eq!(config.len(), 2);
+        assert!(uses_embedded_reels(&config));
+        assert_eq!(enable_embedded_reels(&enabled).unwrap(), enabled);
+        assert!(!uses_embedded_reels(&[config[1], config[1]]));
     }
 
     #[test]

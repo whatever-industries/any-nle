@@ -246,7 +246,7 @@ pub(super) fn apply_picture_chain(
     for reason in losses {
         loss(out, budget, &p.id, "transform", reason)?;
     }
-    let kind = "avid.picture_chain";
+    let kind = graph::picture_chain::KIND;
     budget.charge(size_of::<Effect>() + kind.len() + size_of::<Value>() + "stages".len())?;
     p.effects.push(Effect { kind: kind.into(), params: obj(vec![("stages", Value::Arr(stages))]) });
     Ok(())

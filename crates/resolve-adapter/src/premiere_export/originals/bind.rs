@@ -89,7 +89,7 @@ pub(in crate::premiere_export) fn bind_originals(
             )
         })?;
         let receipt = receipts.get(source.id.as_str()).copied();
-        bind_ordinary(source, binding, receipt)?;
+        bind_ordinary(source, binding, receipt, premiere_destination)?;
     }
     Ok(verified)
 }
@@ -98,6 +98,7 @@ fn bind_ordinary(
     source: &mut SourceMedia,
     binding: &Ordinary,
     receipt: Option<&Value>,
+    premiere_destination: bool,
 ) -> Result<()> {
     let locator = &source.locations[0];
     let file_error =
@@ -128,7 +129,12 @@ fn bind_ordinary(
         (Profile::Wav { bits, channels, .. }, StreamKind::Audio)
             if source.codec.as_deref() == Some("pcm") =>
         {
-            let channel = saved_channel(receipt)
+            let channel = if premiere_destination {
+                wav_channel(source.original.as_ref().and_then(|file| file.channel_index), receipt)
+                    .map_err(|reason| format!("{} ({locator}): {reason}", source.id))?
+            } else {
+                saved_channel(receipt)
+            }
                 .filter(|channel| (0..*channels).contains(channel))
                 .ok_or_else(|| format!("{}: unresolved WAV physical selector", source.id))?;
             let representation = if *bits == 16 { "pcm16" } else { "pcm24" };
@@ -219,6 +225,32 @@ fn saved_channel(receipt: Option<&Value>) -> Option<i64> {
     }
 }
 
+/// A typed physical channel can complete an older Resolve receipt. Every
+/// supplied native field must still describe a channel on WAV stream zero.
+fn wav_channel(
+    typed: Option<i64>,
+    receipt: Option<&Value>,
+) -> std::result::Result<Option<i64>, &'static str> {
+    let Some(receipt) = receipt else { return Ok(typed) };
+    if !matches!(receipt, Value::Obj(_)) {
+        return Err("malformed Resolve WAV selector receipt");
+    }
+    let track = receipt.get("saved_cache_track");
+    if !matches!(track, None | Some(Value::Int(0))) {
+        return Err("invalid Resolve WAV cache track");
+    }
+    match receipt.get("saved_channel") {
+        None => Ok(typed),
+        Some(Value::Int(channel)) if *channel >= 0 => {
+            if typed.is_some_and(|physical| physical != *channel) {
+                return Err("saved original selector or clock disagrees with verified linked file");
+            }
+            Ok(if track.is_some() { Some(*channel) } else { typed })
+        }
+        Some(_) => Err("invalid Resolve WAV physical channel"),
+    }
+}
+
 fn retain<'a, T>(
     files: &'a mut HashMap<String, Arc<T>>,
     locator: &str,
@@ -228,4 +260,31 @@ fn retain<'a, T>(
         files.insert(locator.to_owned(), inspect()?);
     }
     Ok(files[locator].as_ref())
+}
+
+#[cfg(test)]
+mod wav_tests {
+    use super::*;
+
+    #[test]
+    fn physical_channel_reconciles_partial_and_legacy_wav_receipts() {
+        let channel = ("saved_channel".into(), Value::Int(1));
+        let track = ("saved_cache_track".into(), Value::Int(0));
+        let legacy = Value::Obj(vec![track.clone(), channel.clone()]);
+        assert_eq!(wav_channel(None, Some(&legacy)), Ok(Some(1)));
+        assert_eq!(wav_channel(Some(1), Some(&legacy)), Ok(Some(1)));
+        assert!(wav_channel(Some(0), Some(&legacy)).is_err());
+        assert_eq!(wav_channel(Some(1), None), Ok(Some(1)));
+        for partial in [Value::Obj(vec![track]), Value::Obj(vec![channel])] {
+            assert_eq!(wav_channel(Some(1), Some(&partial)), Ok(Some(1)));
+            assert_eq!(wav_channel(None, Some(&partial)), Ok(None));
+        }
+        for malformed in [
+            Value::Null,
+            Value::Obj(vec![("saved_cache_track".into(), Value::Int(1))]),
+            Value::Obj(vec![("saved_channel".into(), Value::Null)]),
+        ] {
+            assert!(wav_channel(Some(1), Some(&malformed)).is_err());
+        }
+    }
 }

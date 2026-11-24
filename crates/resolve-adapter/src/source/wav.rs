@@ -1,6 +1,7 @@
 //! Standalone audio caches and their saved physical channel routing.
 use super::*;
 use crate::linked::{is_2997, samples_per_frame, wav_timemap_endpoint};
+use graph::source::OriginalStream;
 
 #[derive(Debug)]
 pub(super) struct Standalone {
@@ -320,6 +321,12 @@ pub(super) fn read(
     if physical.len() != channels as usize {
         return Ok(None);
     }
+    // These are saved cache facts. The reader has not opened the WAV.
+    let representation = match (qualified_wav, bits) {
+        (true, Some(16)) => Some("pcm16"),
+        (true, Some(24)) => Some("pcm24"),
+        _ => None,
+    };
     for (channel, selector) in physical {
         let label = channel + 1;
         let stream_id = format!("{id}/audio/{label}");
@@ -349,7 +356,17 @@ pub(super) fn read(
                 clock: None,
                 stream: Some(label),
                 online: None,
-                original: None,
+                original: representation.map(|representation| OriginalStream {
+                    saved_locators: vec![path.clone()],
+                    container: "wav".into(),
+                    stream_index: 0,
+                    channel_index: Some(channel),
+                    channels: Some(channels),
+                    time_base: Rational::new(1, sample_rate.into()).unwrap(),
+                    start_pts: 0,
+                    duration_ts: samples,
+                    sample_representation: Some(representation.into()),
+                }),
             },
         );
     }

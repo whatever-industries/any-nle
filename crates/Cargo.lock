@@ -225,7 +225,7 @@ version = "0.1.0"
 
 [[package]]
 name = "anynle-gui"
-version = "0.1.0-alpha.10"
+version = "0.1.0-alpha.11"
 dependencies = [
  "anynle-app",
  "anynle-mapping",
@@ -266,6 +266,8 @@ version = "0.1.0"
 dependencies = [
  "anynle-bridge",
  "anynle-graph",
+ "anynle-mapping",
+ "anynle-media-verification",
  "prproj",
 ]
 
@@ -275,6 +277,7 @@ version = "0.1.0"
 dependencies = [
  "anynle-avid-adapter",
  "anynle-graph",
+ "anynle-mapping",
  "anynle-media-verification",
  "anynle-premiere-adapter",
  "avid-reader",

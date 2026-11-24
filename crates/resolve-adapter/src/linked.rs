@@ -1224,6 +1224,7 @@ pub(crate) fn prepare_project(
         MediaPreparation::StandaloneOnly => (None, false),
     };
     graph.validate()?;
+    anynle_media_verification::linked_original::qualify(&graph.media)?;
     if !(1..=64).contains(&spec.timelines.len())
         || !(1..=256).contains(&spec.media.len().saturating_add(spec.atom_media.len()))
         || graph.bins.len() > 256

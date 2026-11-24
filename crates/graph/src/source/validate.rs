@@ -1,6 +1,15 @@
 // Source identities, timing, routing and occurrence validation.
 use super::*;
 
+pub(super) fn on_lane(p: &Placement, kind: StreamKind, track: i64) -> bool {
+    match kind {
+        StreamKind::Video => p.video_track == Some(track),
+        StreamKind::Audio => {
+            p.audio_tracks.contains(&track) || p.grouped_audio.iter().any(|g| g.track == track)
+        }
+    }
+}
+
 pub(super) fn graph(graph: &SourceGraph) -> R<()> {
     use crate::validation::{
         distinct, finite, list, positive_labels, rate, require, text, value, ItemRoutes,
@@ -99,60 +108,7 @@ pub(super) fn graph(graph: &SourceGraph) -> R<()> {
             "stream label must be positive",
         )?;
         if let Some(o) = &m.original {
-            list(o.saved_locators.len(), &w)?;
-            require(!o.saved_locators.is_empty(), &w, "original stream needs saved locators")?;
-            for p in &o.saved_locators { text(p, &w)?; }
-            text(&o.container, &w)?;
-            rate(o.time_base, &w)?;
-            require(o.stream_index >= 0 && o.start_pts == 0 && o.duration_ts > 0, &w, "unsupported original stream origin or extent")?;
-            if matches!(o.container.as_str(), "jpeg" | "png" | "tiff") {
-                let still_raster = match o.container.as_str() {
-                    "tiff" => m.frame_size == Some((1920, 64)),
-                    "png" | "jpeg" => m.frame_size.is_some_and(|(width, height)| {
-                        (16..=8192).contains(&width) && (16..=8192).contains(&height)
-                            && width * height <= 16_777_216
-                    }),
-                    _ => false,
-                };
-                require(m.kind == StreamKind::Video && m.codec.as_deref() == Some(o.container.as_str())
-                    && m.online == Some(true) && o.stream_index == 0 && o.duration_ts == 1
-                    && o.time_base == Rational::new(1, 24).unwrap() && m.rate == Some(Rational::integer(24))
-                    && still_raster
-                    && m.duration.to_units(24).is_some_and(|n| n > 0),
-                    &w, "invalid original still or editorial hold")?;
-            } else {
-                require(Rational::new(o.duration_ts as i128 * o.time_base.num() as i128, o.time_base.den() as i128) == Some(m.duration), &w, "original physical duration contradicts stream clock")?;
-            }
-            match m.kind {
-                StreamKind::Video => require(o.channels.is_none() && o.channel_index.is_none() && o.sample_representation.is_none(), &w, "picture cannot have audio channel facts")?,
-                StreamKind::Audio => {
-                    require(matches!((o.channels,o.channel_index),(Some(n),Some(c))
-                        if (0..n).contains(&c)
-                            && ((1..=2).contains(&n) || n == 8 && o.container == "wav"
-                                && m.sample_rate == Some(48000)
-                                && o.sample_representation.as_deref() == Some("pcm16"))),
-                        &w, "invalid physical audio channel")?;
-                    require(match o.sample_representation.as_deref() {
-                        Some("aac") => m.bits.is_none(),
-                        Some("mp3") => m.bits.is_none()
-                            && o.container == "mp3"
-                            && m.codec.as_deref() == Some("mp3")
-                            && m.online == Some(true)
-                            && o.stream_index == 0
-                            && m.sample_rate.is_some_and(|rate| {
-                                matches!(rate, 44_100 | 48_000)
-                                    && Some(o.time_base) == Rational::new(1, rate.into())
-                            }),
-                        Some("pcm16") => m.bits == Some(16),
-                        Some("pcm16be") => m.bits == Some(16) && o.container == "mov"
-                            && o.stream_index == 1 && o.channels == Some(2)
-                            && m.sample_rate == Some(48_000)
-                            && o.time_base == Rational::new(1, 48_000).unwrap(),
-                        Some("pcm24") => m.bits == Some(24),
-                        _ => false,
-                    }, &w, "audio sample representation contradicts bit depth or media profile")?;
-                }
-            }
+            validate_original(m, o, &w)?;
         }
         if let Some(r) = m.rate {
             rate(r, &w)?;
@@ -399,14 +355,7 @@ pub(super) fn graph(graph: &SourceGraph) -> R<()> {
                 if endpoint.reason.is_none() {
                     for id in &endpoint.placements {
                         let p = placements[id.as_str()];
-                        let on_lane = match t.kind {
-                            StreamKind::Video => p.video_track == Some(t.track),
-                            StreamKind::Audio => {
-                                p.audio_tracks.contains(&t.track)
-                                    || p.grouped_audio.iter().any(|g| g.track == t.track)
-                            }
-                        };
-                        require(on_lane, &tw, "resolved endpoint is on a different track")?;
+                        require(on_lane(p, t.kind, t.track), &tw, "resolved endpoint is on a different track")?;
                     }
                 }
             }
@@ -603,4 +552,46 @@ fn check_marker(m: &SourceMarker, placements: &HashMap<&str, &Placement>, w: &st
         text(&c.name, w)?;
     }
     check_binding(&m.binding, placements, m.owner == MarkerOwner::Edit, w)
+}
+
+/// Validate saved physical facts independently of a destination's import profile.
+fn validate_original(media: &SourceMedia, original: &OriginalStream, owner: &str) -> R<()> {
+    use crate::validation::{list, rate, require, text};
+
+    list(original.saved_locators.len(), owner)?;
+    require(!original.saved_locators.is_empty(), owner, "original stream needs saved locators")?;
+    for locator in &original.saved_locators {
+        text(locator, owner)?;
+    }
+    text(&original.container, owner)?;
+    rate(original.time_base, owner)?;
+    require(original.stream_index >= 0 && original.duration_ts > 0, owner,
+        "unsupported original stream origin or extent")?;
+    if matches!(original.container.as_str(), "jpeg" | "png" | "tiff") {
+        // One physical image can be held for an independent editorial duration.
+        require(media.kind == StreamKind::Video && media.codec.as_deref() == Some(&original.container)
+            && original.duration_ts == 1 && media.duration > Rational::ZERO,
+            owner, "invalid original still or editorial hold")?;
+    } else {
+        let duration = Rational::new(i128::from(original.duration_ts) * i128::from(original.time_base.num()),
+            i128::from(original.time_base.den()));
+        require(duration == Some(media.duration), owner, "original physical duration contradicts stream clock")?;
+    }
+    if media.kind == StreamKind::Video {
+        return require(original.channels.is_none() && original.channel_index.is_none()
+            && original.sample_representation.is_none(), owner, "picture cannot have audio channel facts");
+    }
+    require(matches!((original.channels, original.channel_index), (Some(count), Some(index))
+        if (0..count).contains(&index)), owner, "invalid physical audio channel")?;
+    if let Some(representation) = &original.sample_representation {
+        text(representation, owner)?;
+        let consistent = match representation.as_str() {
+            "aac" | "mp3" => media.bits.is_none(),
+            "pcm16" | "pcm16be" => media.bits == Some(16),
+            "pcm24" => media.bits == Some(24),
+            other => !other.is_empty(),
+        };
+        require(consistent, owner, "audio sample representation contradicts bit depth or media profile")?;
+    }
+    Ok(())
 }

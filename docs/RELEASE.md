@@ -50,6 +50,11 @@ The package records its observed host SONAMEs in `linux-runtime.json`.
    For local replays, pass `--receipt PATH` to keep the verification receipt with
    the replay outputs.
 
+The macOS package includes the reviewed synthetic Resolve templates for the
+1920×1080, 23.976 fps Avid route. Packaging and extracted-package verification
+check the complete resource set and its SHA-256 pins. The wizard discovers the
+templates inside the app bundle. [Template provenance](../packaging/resolve-templates/PROVENANCE.md)
+
 Scripts use Python 3.13 in CI. Native packaging uses macOS ditto/codesign, NSIS 3.11
 on Windows, using the zlib compressor and retained NSIS notices, and
 checksum-pinned AppImage appimagetool 1.9.1 on Linux. AppImage composition

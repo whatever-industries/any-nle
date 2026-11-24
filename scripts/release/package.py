@@ -7,6 +7,8 @@ from windows_pe import verify as verify_windows_pe
 from release_version import release_version
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 ICONS=ROOT/'packaging/icons'
+RESOLVE_TEMPLATES=ROOT/'packaging/resolve-templates'
+RESOLVE_DONORS=('Layout.drp', 'Atom.drp', 'Group.drp')
 TARGETS={
 'aarch64-apple-darwin':('macOS_ARM','.zip'), 'x86_64-apple-darwin':('macOS_x64','.zip'),
 'x86_64-pc-windows-msvc':('Windows_x64','.exe'), 'aarch64-pc-windows-msvc':('Windows_ARM','.exe'),
@@ -34,6 +36,19 @@ def assert_native_dependencies(binary,target):
             if not dep.startswith(('/usr/lib/','/System/Library/')): raise ValueError('non-system macOS runtime dependency: '+dep)
     elif 'windows' in target:
         return verify_windows_pe(binary)
+
+def verify_resolve_templates(directory):
+    names={*RESOLVE_DONORS, *(name+'.sha256' for name in RESOLVE_DONORS), 'PROVENANCE.md'}
+    if directory.is_symlink() or not directory.is_dir() or {p.name for p in directory.iterdir()} != names:
+        raise ValueError('macOS Resolve template resource inventory mismatch')
+    if any(p.is_symlink() or not p.is_file() for p in directory.iterdir()):
+        raise ValueError('macOS Resolve templates must be regular files')
+    for name in RESOLVE_DONORS:
+        pin=RESOLVE_TEMPLATES/(name+'.sha256')
+        if (directory/pin.name).read_bytes()!=pin.read_bytes() or sha(directory/name)!=pin.read_text().strip():
+            raise ValueError(f'macOS Resolve template checksum mismatch: {name}')
+    if (directory/'PROVENANCE.md').read_bytes()!=(RESOLVE_TEMPLATES/'PROVENANCE.md').read_bytes():
+        raise ValueError('macOS Resolve template provenance mismatch')
 
 def linux_dependencies(stage):
     # Distro libraries are host prerequisites. Copying them would require their
@@ -101,6 +116,10 @@ def package(target,binaries,backend,notices,output,version):
             else: shutil.copy2(p,dest)
     shutil.copy2(ROOT/'LICENSE',resources/'LICENSE'); shutil.copy2(ROOT/'THIRD_PARTY_NOTICES.md',resources/'THIRD_PARTY_NOTICES.md')
     if 'apple' in target:
+        verify_resolve_templates(RESOLVE_TEMPLATES)
+        bundled_templates=resources/'resolve-templates'
+        shutil.copytree(RESOLVE_TEMPLATES,bundled_templates)
+        verify_resolve_templates(bundled_templates)
         numeric_version = version.split('-', 1)[0]
         contents=stage/'Any NLE.app/Contents'
         info={'CFBundleName':'Any NLE','CFBundleDisplayName':'Any NLE','CFBundleIdentifier':'industries.whatever.any-nle','CFBundleExecutable':'any-nle-gui','CFBundlePackageType':'APPL','CFBundleShortVersionString':numeric_version,'CFBundleVersion':numeric_version,'LSMinimumSystemVersion':'12.0','NSHighResolutionCapable':True}

@@ -63,7 +63,7 @@ pub fn convert_avid_ume(
     )?;
     let mut notices = read.diagnostics;
     notices.extend(read.scan_issues);
-    notices.extend(read.audio_group_issues);
+    notices.extend(read.audio_group_issues.into_iter().map(|issue| issue.message));
     Ok(AvidAtomConversion {
         notices,
         omitted_markers: prepared.omitted_markers().to_vec(),
@@ -104,7 +104,7 @@ pub fn convert_avid_atom(
     })?;
     let mut notices = read.diagnostics;
     notices.extend(read.scan_issues);
-    notices.extend(read.audio_group_issues);
+    notices.extend(read.audio_group_issues.into_iter().map(|issue| issue.message));
     Ok(AvidAtomConversion {
         notices,
         omitted_markers: prepared.omitted_markers().to_vec(),
@@ -509,7 +509,7 @@ pub(crate) fn plan_avid_turnover(
     }
     let mut notices = read.diagnostics;
     notices.extend(read.scan_issues);
-    notices.extend(read.audio_group_issues);
+    notices.extend(read.audio_group_issues.into_iter().map(|issue| issue.message));
     let problem = notices.iter().find(|note|
         note.contains(avid_adapter::original::SOURCE_MEDIA_UNAVAILABLE)).cloned();
     let used: HashSet<_> = spec.media.iter().filter_map(|m|

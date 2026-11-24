@@ -7,7 +7,7 @@ const CAMERA_BIN: &str = "MediaPool/Master/000_Camera sources/MpFolder.xml";
 const GROUP_ORIGIN: i64 = 86400;
 
 pub(super) fn camera_donor(skeleton: &Path) -> Result<String> {
-    let members = load_skeleton(skeleton, GROUP_SKELETON, 7)?;
+    let members = load_pinned_skeleton(skeleton, &[(GROUP_SKELETON, 7), BUNDLED_GROUP])?;
     let [first, _] = camera_items(members.get(CAMERA_BIN).ok_or("missing camera bin")?)?;
     Ok(first.to_owned())
 }
@@ -198,6 +198,7 @@ fn write_outer(p: &PreparedGroup, mut sequence: String, group_id: &str) -> Resul
                 &format!("<FieldsBlob>{}</FieldsBlob>", pack(&changed)?),
             )?;
             set(&mut item, "Name", &xml(&p.group_name))?;
+            set(&mut item, "MediaStartTime", &seconds(GROUP_ORIGIN).to_string())?;
             set(&mut item, "Start", &(p.origin + g.edit.start).to_string())?;
             set(&mut item, "In", &g.edit.source_in.to_string())?;
             set(&mut item, "Duration", &g.edit.length.to_string())?;
@@ -325,7 +326,7 @@ pub(super) fn build_turnover_group(
     timeline_bin: &str,
     media_ids: [&str; 2],
 ) -> Result<TurnoverGroup> {
-    let mut m = load_skeleton(skeleton, GROUP_SKELETON, 7)?;
+    let mut m = load_pinned_skeleton(skeleton, &[(GROUP_SKELETON, 7), BUNDLED_GROUP])?;
     let pool = m.remove(POOL).ok_or("missing Group pool")?;
     let cameras = m.remove(CAMERA_BIN).ok_or("missing camera bin")?;
     let mut group = block(&pool, "Sm2MpMulticamClip")?;

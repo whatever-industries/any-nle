@@ -1,5 +1,6 @@
 //! Byte-preserving mono WAV preparation for saved Gain renders and wide rewraps.
 use super::backend::probe;
+use super::planning::PrepareIssue;
 use super::receipts::{obj, text};
 use super::source::{essence_spans, stamp, Stamp};
 use super::R;
@@ -76,7 +77,7 @@ fn hash(reader: impl Read) -> R<[u8; 32]> {
     prproj::hash::sha256_reader(reader).map_err(|e| e.to_string())
 }
 
-fn audio_clip(clip: &Clip) -> R<&prproj::convert::model::AudioFile> {
+pub(super) fn audio_clip(clip: &Clip) -> R<&prproj::convert::model::AudioFile> {
     match clip.audio.as_slice() {
         [a] if clip.video.is_none()
             && clip.stereo_pairs.is_empty()
@@ -94,7 +95,15 @@ fn audio_clip(clip: &Clip) -> R<&prproj::convert::model::AudioFile> {
 }
 
 impl MonoPcm {
-    pub(super) fn plan(clip: &Clip, render: Option<(&str, &str)>, ffprobe: &Path) -> R<Self> {
+    pub(super) fn input_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn plan(
+        clip: &Clip,
+        render: Option<(&str, &str)>,
+        ffprobe: &Path,
+    ) -> Result<Self, PrepareIssue> {
         let a = audio_clip(clip)?;
         let gain = render.is_some();
         let sample_unit = TICKS_PER_SECOND / RATE;
@@ -113,12 +122,13 @@ impl MonoPcm {
         .ok()
         .filter(|n| *n <= u32::MAX - 37)
         .ok_or("PCM length exceeds RIFF WAV limits")?;
-        let path = fs::canonicalize(&a.path).map_err(|e| e.to_string())?;
-        let before = stamp(&path)?;
-        let id = avid_reader::mxf::read_identity(&path).map_err(|e| e.to_string())?;
+        let file_issue = PrepareIssue::source_file(&a.path);
+        let path = fs::canonicalize(&a.path).map_err(|e| file_issue(e.to_string()))?;
+        let before = stamp(&path).map_err(&file_issue)?;
+        let id = avid_reader::mxf::read_identity(&path).map_err(|e| file_issue(e.to_string()))?;
         let (Some(material), [file]) = (clip.material_umid.as_ref(), id.file_packages.as_slice())
         else {
-            return Err("mono PCM requires exact MXF package identity".into());
+            return Err(file_issue("mono PCM requires exact MXF package identity".into()));
         };
         if id.material_packages.len() != 1
             || id.material_packages.first() != Some(material)
@@ -130,14 +140,13 @@ impl MonoPcm {
                     || !id.source_packages.iter().any(|p| p == origin)
             })
         {
-            return Err(
-                "mono PCM MXF package identity or playable sample clock disagrees with the model"
-                    .into(),
-            );
+            return Err(file_issue(
+                "mono PCM MXF package identity or playable sample clock disagrees with the model".into(),
+            ));
         }
-        let p = probe(ffprobe, &path)?;
+        let p = probe(ffprobe, &path).map_err(&file_issue)?;
         let [stream] = p.streams.as_slice() else {
-            return Err("mono PCM MXF needs one essence stream".into());
+            return Err(file_issue("mono PCM MXF needs one essence stream".into()));
         };
         if p.op != GAIN_OP
             || !p.references.is_empty()
@@ -148,16 +157,16 @@ impl MonoPcm {
             || stream.bits != 24
             || stream.ticks != a.duration
         {
-            return Err("mono PCM MXF stream is outside the qualified Avid profile".into());
+            return Err(file_issue("mono PCM MXF stream is outside the qualified Avid profile".into()));
         }
-        let spans = essence_spans(&path)?;
+        let spans = essence_spans(&path).map_err(&file_issue)?;
         let [span] = spans.as_slice() else {
-            return Err("mono PCM MXF needs one sound KLV".into());
+            return Err(file_issue("mono PCM MXF needs one sound KLV".into()));
         };
         if span.key != PCM_KEY || span.bytes != u64::from(bytes) + if gain { 6 } else { 0 } {
-            return Err(
+            return Err(file_issue(
                 "mono PCM MXF physical span disagrees with the playable sample count".into(),
-            );
+            ));
         }
         let mut pcm = Self {
             source: a.path.clone(),
@@ -172,11 +181,16 @@ impl MonoPcm {
             material: material.clone(),
             file: file.clone(),
         };
-        pcm.hash = pcm.source_hash()?;
+        pcm.hash = pcm.source_hash().map_err(file_issue)?;
         Ok(pcm)
     }
 
-    pub(super) fn plan_wide_sibling(input: &super::Input, start: i64) -> R<Self> {
+    pub(super) fn plan_wide_sibling(
+        input: &super::Input,
+        start: i64,
+        saved_path: &str,
+    ) -> Result<Self, PrepareIssue> {
+        let file_issue = PrepareIssue::source_file(saved_path);
         let stream = &input.probe.streams[0];
         let unit = TICKS_PER_SECOND / RATE;
         let samples = stream.ticks / unit;
@@ -184,14 +198,18 @@ impl MonoPcm {
             ("pcm_s16le", 16) => (16, 2),
             ("pcm_s24le", 24) => (24, 3),
             _ => {
-                return Err("wide rewrap requires independent mono 48 kHz PCM16 or PCM24 MXFs".into());
+                return Err(file_issue(
+                    "wide rewrap requires independent mono 48 kHz PCM16 or PCM24 MXFs".into(),
+                ));
             }
         };
         if stream.kind != "audio"
             || stream.samples != RATE || stream.channels != 1 || !input.probe.references.is_empty()
             || samples <= 0 || stream.ticks % unit != 0
         {
-            return Err("wide rewrap requires independent mono 48 kHz PCM16 or PCM24 MXFs".into());
+            return Err(file_issue(
+                "wide rewrap requires independent mono 48 kHz PCM16 or PCM24 MXFs".into(),
+            ));
         }
         let time_reference = bwf_time_reference(start)?;
         let overhead = u32::from(time_reference != 0) * BEXT_CHUNK_BYTES;
@@ -200,11 +218,11 @@ impl MonoPcm {
             .ok()
             .filter(|n| *n <= u32::MAX - 37 - overhead)
             .ok_or("PCM length exceeds RIFF WAV limits")?;
-        let id = avid_reader::mxf::read_identity(&input.path).map_err(|e| e.to_string())?;
+        let id = avid_reader::mxf::read_identity(&input.path).map_err(|e| file_issue(e.to_string()))?;
         let ([material], [file]) = (id.material_packages.as_slice(), id.file_packages.as_slice())
-        else { return Err("wide audio needs one material and file package per sibling".into()); };
-        let spans = essence_spans(&input.path)?;
-        let [span] = spans.as_slice() else { return Err("wide audio needs one sound KLV".into()); };
+        else { return Err(file_issue("wide audio needs one material and file package per sibling".into())); };
+        let spans = essence_spans(&input.path).map_err(&file_issue)?;
+        let [span] = spans.as_slice() else { return Err(file_issue("wide audio needs one sound KLV".into())); };
         if !id.file_tracks.contains(&(RATE, 1, samples))
             || id.file_tracks.iter().any(|&(num, den, length)| {
                 num <= 0 || den <= 0 || length <= 0
@@ -213,7 +231,7 @@ impl MonoPcm {
             })
             || span.kind != 0x16 || span.bytes != u64::from(bytes)
         {
-            return Err("wide audio sample extent disagrees with its physical PCM payload".into());
+            return Err(file_issue("wide audio sample extent disagrees with its physical PCM payload".into()));
         }
         let mut pcm = Self {
             source: input.aliases[0].clone(),
@@ -228,7 +246,7 @@ impl MonoPcm {
             material: material.clone(),
             file: file.clone(),
         };
-        pcm.hash = pcm.source_hash()?;
+        pcm.hash = pcm.source_hash().map_err(file_issue)?;
         Ok(pcm)
     }
 
@@ -382,6 +400,77 @@ mod tests {
         let ordinary = wave_header(4, 16, bwf_time_reference(0).unwrap());
         assert_eq!(ordinary.len(), 44);
         assert_eq!(&ordinary[36..], b"data\x04\0\0\0");
+    }
+
+    #[test]
+    fn size_review_lists_each_published_media_recipe() {
+        use super::super::{backend::Probe, Input, Job, Plan};
+        use prproj::convert::model::Fraction;
+
+        let stamp = Stamp {
+            len: 4,
+            modified: std::time::UNIX_EPOCH,
+        };
+        let path = |name: &str| PathBuf::from(name);
+        let input = |name: &str| Input {
+            path: path(name),
+            aliases: vec![],
+            stamp: stamp.clone(),
+            probe: Probe {
+                raw: Value::Null,
+                streams: vec![],
+                op: String::new(),
+                tc: None,
+                stream_indices: vec![],
+                references: vec![],
+            },
+            identity: Value::Null,
+            terminal: None,
+        };
+        let pcm = |name: &str, gain| MonoPcm {
+            source: name.into(),
+            path: path(name),
+            stamp: stamp.clone(),
+            offset: 0,
+            bytes: 0,
+            bits: 24,
+            time_reference: 0,
+            gain,
+            hash: [0; 32],
+            material: String::new(),
+            file: String::new(),
+        };
+        let job = |inputs, wide_audio: Vec<MonoPcm>| Job {
+            inputs,
+            clips: vec![],
+            tc: None,
+            rate: Fraction::new(24, 1),
+            mov: false,
+            pixel_aspect: None,
+            separate_mono: !wide_audio.is_empty(),
+            wide_audio,
+        };
+        let plan = Plan {
+            destination: path("Generated"),
+            inputs: vec![input("picture.mxf"), input("A1.mxf"), input("A2.mxf")],
+            jobs: vec![
+                job(vec![0, 1], vec![]),
+                job(vec![0, 1, 2], vec![pcm("A1.mxf", false), pcm("A2.mxf", false)]),
+            ],
+            mono: vec![pcm("gain.mxf", true)],
+            ffmpeg: PathBuf::new(),
+            ffprobe: PathBuf::new(),
+            versions: vec![],
+            estimate: 0,
+            free: 0,
+        };
+        assert_eq!(plan.estimate_sources(), [
+            vec![path("picture.mxf"), path("A1.mxf")],
+            vec![path("picture.mxf")],
+            vec![path("A1.mxf")],
+            vec![path("A2.mxf")],
+            vec![path("gain.mxf")],
+        ]);
     }
 }
 

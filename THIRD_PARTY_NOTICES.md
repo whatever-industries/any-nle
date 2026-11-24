@@ -3,6 +3,10 @@
 First-party Any NLE code is MIT licensed; see LICENSE. Third-party notices and
 copyrights remain applicable to their respective code and assets.
 
+The macOS bundle includes three Any NLE-authored Resolve project archives.
+Their hashes and authoring record are in
+[Resolve template provenance](packaging/resolve-templates/PROVENANCE.md).
+
 - The Avid reader includes MIT code derived from Mark Reid's pyavb and the bounded
   AniMatte reader from FilmCraft. Preserve `avid-reader/NOTICE`,
   `avid-reader/LICENSE-pyavb` and `avid-reader/LICENSE-filmcraft`.

@@ -10,7 +10,7 @@ use prproj::convert::{
     writer::{self, DestinationBinLayout, PreparedProject, Report, TypedMedia},
 };
 use prproj::UuidSource;
-use std::{collections::{HashMap, HashSet}, path::Path};
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}};
 
 pub(crate) fn clock_profile(rewrap: bool) -> ClockProfile {
     if rewrap {
@@ -29,6 +29,44 @@ pub(crate) struct ManagedRewrapCandidate<'a> {
     pub item: &'a str,
     pub detail: String,
     pub pending: bool,
+}
+
+pub(crate) fn selective_rewrap_preview(
+    graph: &SourceGraph,
+    candidates: &[ManagedRewrapCandidate<'_>],
+) -> Vec<Vec<PathBuf>> {
+    let eligible: HashSet<_> = candidates.iter()
+        .filter(|row| !row.pending)
+        .map(|row| row.item)
+        .collect();
+    let media: HashMap<_, _> = graph.media.iter()
+        .map(|stream| (stream.id.as_str(), stream))
+        .collect();
+    let bundles = graph.items.iter()
+        .filter(|item| eligible.contains(item.id.as_str()))
+        .filter_map(|item| {
+            let mut inputs = item.media.iter()
+                .map(|binding| {
+                    let stream = *media.get(binding.media.as_str())?;
+                    let [path] = stream.locations.as_slice() else { return None };
+                    (stream.online == Some(true) && stream.original.is_none())
+                        .then_some((stream, path))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            inputs.sort_by_key(|(stream, _)| (stream.kind == StreamKind::Audio, stream.stream));
+            let ((picture, _), audio) = inputs.split_first()?;
+            if picture.kind != StreamKind::Video
+                || audio.iter().any(|(stream, _)| stream.kind != StreamKind::Audio)
+            {
+                return None;
+            }
+            let prores = picture.codec.as_deref()
+                .and_then(avid_reader::mxf::ProResProfile::from_fourcc)
+                .is_some();
+            let paths = inputs.into_iter().map(|(_, path)| PathBuf::from(path)).collect();
+            Some((paths, prores))
+        });
+    crate::rewrap::preview_picture_recipes(bundles)
 }
 
 pub(crate) fn managed_rewrap_candidates(graph: &SourceGraph, op1a_requested: bool) -> Vec<ManagedRewrapCandidate<'_>> {
@@ -114,16 +152,12 @@ pub(crate) fn prepare_typed(
     assisted: bool,
     managed: Option<(&HashSet<&str>, &HashSet<&str>)>,
     check: &mut dyn FnMut() -> Result<(), String>,
-) -> Result<(PreparedPremiereInput, crate::source_luts::Applied), String> {
-    let mut prepared = if let Some((selected, omitted)) = managed {
-        premiere_adapter::prepare_managed_rewrap(graph, options, spooled, assisted, selected, omitted)
-    } else if assisted {
-        premiere_adapter::prepare_assisted_originals(graph, options, clock, spooled)
-    } else if clock == ClockProfile::LegacyImport {
-        premiere_adapter::prepare_linked_originals(graph, options, clock, spooled)
-    } else {
-        premiere_adapter::prepare_originals(graph, options, clock)
-    }.map_err(|e| format!("Premiere preparation failed: {e}"))?;
+) -> Result<(PreparedPremiereInput, crate::source_luts::Applied), premiere_adapter::PreparationIssue> {
+    let mut prepared = premiere_adapter::prepare_avid_job(graph, options, clock, spooled, assisted, managed)
+        .map_err(|mut issue| {
+            issue.message = format!("Premiere preparation failed: {}", issue.message);
+            issue
+        })?;
     matte.apply(&mut prepared.input, graph)?;
     prepared.losses.retain(|loss| matte.keeps_loss(loss));
     let mut luts = if clock == ClockProfile::LegacyImport || native_rewrap {
@@ -170,12 +204,29 @@ pub(crate) fn timeline_subject(
     track: i64,
     record_start: Option<graph::Rational>,
 ) -> String {
-    let clock = sequence.clock.as_ref().and_then(|clock| {
-        let start = sequence.start?;
-        (clock.rate == sequence.rate && clock.exact_start() == Some(start))
-            .then_some((start, clock.display_base, clock.drop))
+    timeline_subject_at(
+        &sequence.name, kind, track, Some(sequence.rate), record_start, review_clock(sequence),
+    )
+}
+
+pub(crate) fn timeline_subject_with_exact_offset(
+    sequence: &graph::source::SourceSequence,
+    kind: StreamKind,
+    track: i64,
+    offset: Option<graph::Rational>,
+) -> String {
+    let position = offset.map(|offset| {
+        timeline_position(sequence.rate, offset, review_clock(sequence))
+            .unwrap_or_else(|| format!("{offset} seconds from sequence start"))
     });
-    timeline_subject_at(&sequence.name, kind, track, Some(sequence.rate), record_start, clock)
+    format_timeline_subject(&sequence.name, kind, track, position)
+}
+
+fn review_clock(sequence: &graph::source::SourceSequence) -> Option<(graph::Rational, u16, bool)> {
+    let clock = sequence.clock.as_ref()?;
+    let start = sequence.start?;
+    (clock.rate == sequence.rate && clock.exact_start() == Some(start))
+        .then_some((start, clock.display_base, clock.drop))
 }
 
 pub(crate) fn timeline_subject_at(
@@ -186,39 +237,47 @@ pub(crate) fn timeline_subject_at(
     record_start: Option<graph::Rational>,
     clock: Option<(graph::Rational, u16, bool)>,
 ) -> String {
-    use prproj::build::time::{Time, TICKS_PER_SECOND};
+    let position = rate.zip(record_start).and_then(|(rate, offset)| timeline_position(rate, offset, clock));
+    format_timeline_subject(name, kind, track, position)
+}
 
+fn format_timeline_subject(name: &str, kind: StreamKind, track: i64, position: Option<String>) -> String {
     let lane = match kind {
         graph::StreamKind::Audio => "A",
         graph::StreamKind::Video => "V",
     };
     let subject = format!("{name} · {lane}{track}");
-    let position = (|| {
-        let offset = record_start?;
-        let rate = rate?;
-        let frame = graph::Rational::new(rate.den().into(), rate.num().into())?;
-        let timebase = frame.to_units(TICKS_PER_SECOND)?;
-        let offset_ticks = offset.to_units(TICKS_PER_SECOND)?;
-        if timebase <= 0 || offset_ticks < 0 || offset_ticks % timebase != 0 {
-            return None;
-        }
-        if let Some((start, display_base, drop)) = clock {
-            let nominal = (TICKS_PER_SECOND as f64 / timebase as f64).round_ties_even();
-            let valid_drop = !drop || matches!((rate.num(), rate.den()), (30_000, 1001) | (60_000, 1001));
-            if f64::from(display_base) == nominal && valid_drop {
-                if let Some(ticks) = start.to_units(TICKS_PER_SECOND)
-                    .and_then(|start| start.checked_add(offset_ticks))
-                {
-                    return Time::new(ticks).to_timecode(timebase, drop).ok();
-                }
-            }
-        }
-        Some(format!("frame {} from sequence start", offset_ticks / timebase))
-    })();
     match position {
         Some(position) => format!("{subject} · {position}"),
         None => subject,
     }
+}
+
+fn timeline_position(
+    rate: graph::Rational,
+    offset: graph::Rational,
+    clock: Option<(graph::Rational, u16, bool)>,
+) -> Option<String> {
+    use prproj::build::time::{Time, TICKS_PER_SECOND};
+
+    let frame = graph::Rational::new(rate.den().into(), rate.num().into())?;
+    let timebase = frame.to_units(TICKS_PER_SECOND)?;
+    let offset_ticks = offset.to_units(TICKS_PER_SECOND)?;
+    if timebase <= 0 || offset_ticks < 0 || offset_ticks % timebase != 0 {
+        return None;
+    }
+    if let Some((start, display_base, drop)) = clock {
+        let nominal = (TICKS_PER_SECOND as f64 / timebase as f64).round_ties_even();
+        let valid_drop = !drop || matches!((rate.num(), rate.den()), (30_000, 1001) | (60_000, 1001));
+        if f64::from(display_base) == nominal && valid_drop {
+            if let Some(ticks) = start.to_units(TICKS_PER_SECOND)
+                .and_then(|start| start.checked_add(offset_ticks))
+            {
+                return Time::new(ticks).to_timecode(timebase, drop).ok();
+            }
+        }
+    }
+    Some(format!("frame {} from sequence start", offset_ticks / timebase))
 }
 
 pub(crate) fn grouped_picture_marker_losses(source: &SourceGraph, report: &Report) -> Vec<graph::Loss> {

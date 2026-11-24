@@ -118,9 +118,27 @@ pub(super) fn clock_matches(saved: &str, expected: Rational, tick_rate: Rational
     if error <= expected.den() as u128 / 2 {
         return Ok(true);
     }
-    // A shortest string can represent the native double rather than the
-    // mathematical fraction. Require the same double as the known clock.
-    Ok(saved.parse::<f64>()? == expected.num() as f64 / expected.den() as f64)
+    // A shortest string can represent the saved double rather than the
+    // mathematical fraction.
+    let saved = saved.parse::<f64>()?;
+    if saved == expected.num() as f64 / expected.den() as f64 {
+        return Ok(true);
+    }
+    // Resolve also saves whole-frame clocks computed by dividing the frame
+    // count by the binary64 frame rate. Require that exact calculation and
+    // verify that neither neighboring frame would produce the same value.
+    let Some(count) = Rational::new(
+        i128::from(expected.num()) * i128::from(tick_rate.num()),
+        i128::from(expected.den()) * i128::from(tick_rate.den()),
+    )
+    .filter(|count| count.den() == 1)
+    else {
+        return Ok(false);
+    };
+    let tick = i128::from(count.num());
+    let fps = tick_rate.num() as f64 / tick_rate.den() as f64;
+    let seconds = |frame: i128| frame as f64 / fps;
+    Ok(saved == seconds(tick) && saved != seconds(tick - 1) && saved != seconds(tick + 1))
 }
 
 fn decimal(saved: &str) -> Option<(i128, i128)> {
@@ -171,6 +189,16 @@ mod tests {
         assert!(clock_matches("0.001896", sample_start, samples).unwrap());
         assert!(!clock_matches("0.001917", sample_start, samples).unwrap());
         assert!(clock_matches("NaN", expected, rate).is_err());
+    }
+
+    #[test]
+    fn saved_frame_clock_divides_by_the_binary64_rate() {
+        let rate = Rational::new(24000, 1001).unwrap();
+        let expected = Rational::new(725_796_071, 12_000).unwrap();
+        assert!(clock_matches("60483.00591666666", expected, rate).unwrap());
+        assert!(clock_matches("60483.00591666667", expected, rate).unwrap());
+        assert!(!clock_matches("60483.00591666665", expected, rate).unwrap());
+        assert!(!clock_matches("60483.047625", expected, rate).unwrap());
     }
 
     #[test]

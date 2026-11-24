@@ -2059,7 +2059,7 @@ pub fn validate_model(model: &Model) -> R<()> {
     }
     require(model.sequences.len() <= 10_000, || "model.sequences: expected a list".to_string())?;
     for (i, sequence) in model.sequences.iter().enumerate() {
-        validate_sequence(sequence, &format!("model.sequences[{i}]"))?;
+        validate_sequence(sequence, &format!("model.sequences[{i}]"), &mut None)?;
     }
     validate_sequence_links(&model.clips, &model.sequences)?;
     check_text(&model.project_name, "model.project.name", 4096, false)
@@ -2422,7 +2422,7 @@ pub(crate) fn validate_marker(m: &Marker, w: &str, in_sequence: bool) -> R<()> {
     check_text(&m.color, &format!("{w}.color"), 64, true)
 }
 
-pub(crate) fn validate_sequence(s: &Sequence, w: &str) -> R<()> {
+pub(crate) fn validate_sequence(s: &Sequence, w: &str, failing_event: &mut Option<usize>) -> R<()> {
     check_rate(s.rate, &format!("{w}.rate"))?;
     require(s.events.len() <= MAX_ITEMS, || format!("{w}.events: expected a list"))?;
     require(s.markers.len() <= MAX_ITEMS, || format!("{w}.markers: expected a list"))?;
@@ -2454,7 +2454,8 @@ pub(crate) fn validate_sequence(s: &Sequence, w: &str) -> R<()> {
     }
     check_text(&s.name, &format!("{w}.name"), 4096, false)?;
     for (i, e) in s.events.iter().enumerate() {
-        validate_event(e, &format!("{w}.events[{i}]"))?;
+        validate_event(e, &format!("{w}.events[{i}]"))
+            .inspect_err(|_| *failing_event = Some(i))?;
     }
     check_ticks(s.start as i128, &format!("{w}.start_ticks"), false)
 }

@@ -1,14 +1,18 @@
 # Any NLE
 
-Any NLE translates editing projects between native project formats. Its current
-desktop wizard and CLI convert selected Avid Media Composer bins (`.avb`) to
-Adobe Premiere Pro projects (`.prproj`). Conversion can run without Premiere
-installed. You need Premiere to review the result in the editor.
+Any NLE is an alpha-stage converter for native video-editing projects. Source
+readers capture edits and media relationships in a shared graph (graph/2).
+Editor-specific writers use those facts to rebuild editable controls where
+verified and report changes or omissions in Review.
 
-DaVinci Resolve conversion is in development. Premiere → Avid and Resolve → Avid
-are planned, with Pro Tools and After Effects as longer-term targets. The
-[roadmap](docs/ROADMAP.md#linked-media-conversion-parity) tracks each direction
-and the [experimental FCPXML export](docs/ROADMAP.md#further-fcpxml-work).
+| Route | Status |
+| --- | --- |
+| **Avid → Premiere 27** | Available in the published wizard and CLI. Convert selected Media Composer bins (`.avb`) to an editable Premiere project (`.prproj`). [Workflow and coverage](#convert-an-avid-project) |
+| **Avid → Resolve** | macOS preview for qualified 1080p23.976 projects. Link supported managed and original media, or rewrap managed media to OP1a. [Avid → Resolve qualification](docs/ROADMAP.md#avid--resolve) |
+| **Premiere ↔ Resolve** | Internal previews in both directions. Verified cases include editable multicam, mixed-rate timing, and independent audio trims. [Coverage by direction](docs/ROADMAP.md#premiere--resolve-conversion) |
+| **Premiere → Avid and Resolve → Avid** | Planned product routes with early native output prototypes. [Route roadmap](docs/ROADMAP.md#linked-media-conversion-readiness) |
+
+The roadmap also tracks the [experimental FCPXML export](docs/ROADMAP.md#further-fcpxml-work).
 
 ## Download
 
@@ -31,6 +35,11 @@ originals for picture and attach matching Avid media as proxies. Check the
 [wizard guide](docs/GUI-WIZARD.md) and release notes for
 the supported options in your build.
 
+Standalone conversion works without Premiere installed for supported media.
+On macOS, verified originals that need a Premiere media record can use an
+optional installed helper with Premiere 27 running at Home.
+[Premiere-assisted linking](tools/premiere-import-uxp/README.md#avid-to-premiere-wizard)
+
 Supported transfers include bin organization and logging metadata, trims and
 sequence timecode, markers and clip colors, and selected editable picture,
 audio, and text controls. Support depends on the saved controls, media
@@ -44,7 +53,7 @@ for what Any NLE preserves and where equivalent transfer still needs work.
 | Editable groups and text | [Avid Groups](docs/EDITABLE-GROUPS-2026-11-08.md) and [caption and text translation](docs/CAPTION-TEXT-TRANSLATION-2026-11-08.md) |
 | Reusable AutoSync, track names, and disabled edits | [AutoSync source sequences](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#reusable-autosync-source-sequences), [timeline track names](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#timeline-track-names), and [disabled edits](docs/SPLIT-EDIT-AUDIO-2026-11-06.md#disabled-clip-occurrences) |
 | Moved files and relinking | [Verified relink](docs/VERIFIED-RELINK.md) |
-| Conversion behavior and coverage by direction | [Decisions explained](docs/DECISIONS-EXPLAINED.md) and [roadmap](docs/ROADMAP.md#linked-media-conversion-parity) |
+| Conversion behavior and coverage by direction | [Decisions explained](docs/DECISIONS-EXPLAINED.md) and [roadmap](docs/ROADMAP.md#linked-media-conversion-readiness) |
 | Current implementation and qualification priorities | [Next work](docs/ROADMAP.md#next-work) |
 
 ## Command line

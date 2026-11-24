@@ -7,7 +7,27 @@ APP_TESTS=['rewrap::source::space_tests::available_space_queries_existing_volume
 APP_TESTS += ['rewrap::mov::tests::prores_alpha_rewrite_changes_only_qualified_sample_depth']
 APP_TESTS += ['rewrap::mov::tests::anamorphic_picture_requires_matching_saved_and_physical_geometry']
 APP_TESTS += ['rewrap::mono::tests::wide_wav_stores_only_exact_source_sample_references']
+APP_TESTS += ['rewrap::mono::tests::size_review_lists_each_published_media_recipe']
+APP_TESTS += ['rewrap::tests::rewrap_preview_splits_distinct_wide_bundles_and_includes_mono_gain']
+APP_TESTS += ['rewrap::tests::mono_rewrap_reports_exact_file_failure_separately_from_recipe_error']
 APP_TESTS += ['avid_media::master::tests::managed_master_places_referenced_objects_before_the_bin_root']
+APP_TESTS += ['avid_media::linked::markers::tests::point_marker_requires_dependencies_before_its_owner']
+APP_TESTS += ['png_mattes::tests::png_gap_recovery_requires_exact_occurrence_master_and_range']
+RESOLVE_SOURCE_TESTS = [
+    'archive::tests::bundled_resolve_templates_bind_the_reviewed_role_bytes',
+    'source::multicam::tests::multipart_picture_angle_keeps_both_trims_and_the_gap',
+    'source::multicam::tests::single_group_audio_slot_preserves_each_virtual_channel',
+    'source::tests::imported_movie_split_selectors_follow_physical_channel_order',
+    'source::tests::embedded_movie_overrides_physical_audio_channel_without_changing_track',
+    'source::tests::embedded_aac_keeps_44100_sample_clock_and_saved_channel_route',
+    'source::tests::temporary_archive_keeps_project_validation',
+    'source::tests::standalone_pcm_wav_captures_physical_channels_without_opening_original',
+    'source::encoding::tests::embedded_reel_mode_preserves_other_setup_fields',
+    'source::timing::tests::clock_precision_checks_the_known_tick',
+    'source::timing::tests::saved_frame_clock_divides_by_the_binary64_rate',
+    'source::timing::tests::frame_fraction_retains_signed_binary64_and_rejects_bad_payloads',
+    'source::timing::tests::fractional_group_duration_has_an_exact_source_extent',
+]
 def run(output):
     output=pathlib.Path(output); output.mkdir(parents=True,exist_ok=True)
     results=[]; failures=[]
@@ -18,6 +38,7 @@ def run(output):
         ('gui_report', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'report'], 3, workspace),
         ('gui_svg_arrow', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'icons::tests'], 1, workspace),
         ('media_verification', ['-p', 'anynle-media-verification', '--lib'], 4, workspace),
+        ('resolve_source', ['-p', 'anynle-resolve-adapter', '--lib'], len(RESOLVE_SOURCE_TESTS), workspace),
         ('premiere_preparation', ['-p', 'anynle-premiere-adapter', '--test', 'preparation'], 54, workspace),
         ('premiere_import_worker', ['-p', 'anynle-app', '--lib', 'premiere_import::worker'], 2, workspace),
         ('graph_output', ['-p', 'anynle-app', '--test', 'graph_output'], 11 if os.name == 'nt' else 13, workspace),
@@ -30,6 +51,7 @@ def run(output):
     for name,args,minimum,manifest in selected:
         cmd=['cargo','test','--locked','--manifest-path',str(manifest),*args,'--','--nocapture']
         if name in APP_TESTS or name == 'source_open_cancellation': cmd.append('--exact')
+        if name == 'resolve_source': cmd.extend(['--exact', *RESOLVE_SOURCE_TESTS])
         proc=subprocess.run(cmd,cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
         log=proc.stdout; (output/(name.replace(':','_')+'.log')).write_text(log)
         counts=re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;',log)

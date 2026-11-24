@@ -123,17 +123,118 @@ fn raw_json(g: &SourceGraph) -> String {
     encode::write_graph(g, &mut bytes).unwrap();
     String::from_utf8(bytes).unwrap()
 }
+
+#[test]
+fn multicam_checks_every_resolved_leaf_on_the_destination_track() {
+    let mut g = multicam_example();
+    let use_ = &mut g.multicam_uses[0];
+    use_.selected = Some(1);
+    use_.duration = Some(Rational::integer(2));
+    use_.track = 2; // Source V1 is cut onto timeline V2.
+    use_.binding.placements = vec!["picture".into(), "second".into()];
+    let seq = &mut g.sequences[0];
+    let first = &mut seq.placements[0];
+    first.video_track = Some(2);
+    first.duration = Rational::integer(1);
+    let mut second = first.clone();
+    second.id = "second".into();
+    second.record_start = Rational::integer(1);
+    second.source_in = Rational::integer(1);
+    seq.placements.push(second);
+    assert_eq!(SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap(), g);
+
+    g.sequences[0].placements.last_mut().unwrap().video_track = Some(1);
+    refuses_all(&g, "bound placement \"second\" is not on destination video track 2");
+    g.multicam_uses[0].binding.placements = vec!["out".into()];
+    g.multicam_uses[0].track = 1;
+    refuses_all(&g, "bound placement \"out\" is not on destination video track 1");
+
+    // Unresolved bindings may keep candidate IDs. Their sequence ownership still matters.
+    g.multicam_uses[0].binding.reason = Some("native descendants are ambiguous".into());
+    g.validate().unwrap();
+    g.multicam_uses[0].binding.placements.push("missing".into());
+    refuses_all(&g, "invalid multicam occurrence placement binding");
+}
+
+#[test]
+fn multicam_audio_selection_is_independent_of_the_timeline_lane() {
+    let mut g = multicam_example();
+    let lane = &mut g.multicams[0].lanes[1];
+    let mut switched = lane.alternatives[0].clone();
+    switched.id = "independent-audio".into();
+    switched.pieces[1].stream = Some(1);
+    lane.alternatives.push(switched);
+
+    let mut use_ = g.multicam_uses[0].clone();
+    use_.id = "audio-use".into();
+    use_.kind = StreamKind::Audio;
+    use_.lane = Some(3);
+    use_.track = 2;
+    use_.selected = Some(1);
+    use_.source_in = Some(Rational::integer(1));
+    use_.binding.placements = vec!["mic".into()];
+    g.multicam_uses.push(use_);
+    let mut mic = g.sequences[0].placements[0].clone();
+    mic.id = "mic".into();
+    mic.video_track = None;
+    mic.audio_tracks = vec![2];
+    mic.audio_streams = vec![1];
+    mic.duration = Rational::integer(1);
+    g.sequences[0].placements.push(mic);
+    assert_eq!(SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap(), g);
+
+    let use_ = &mut g.multicam_uses[1];
+    use_.track = 3;
+    use_.binding.placements = vec!["out".into()];
+    g.validate().unwrap(); // The grouped-audio placement occupies A3.
+    g.multicam_uses[1].track = 2;
+    refuses_all(&g, "bound placement \"out\" is not on destination audio track 2");
+}
+
+#[test]
+fn multicam_bounds_use_the_unique_members_physical_offset() {
+    let mut g = multicam_example();
+    // Angle A ends at the four-second file boundary after adding the item offset.
+    g.items[0].media[0].source_offset = Some(Rational::integer(1));
+    g.multicams[0].lanes[0].alternatives.truncate(1);
+    g.validate().unwrap();
+    g.multicams[0].lanes[0].alternatives[0].pieces[1].source_in = Some(Rational::new(1, 24).unwrap());
+    refuses_all(&g, "alternative \"angle-a\", member \"i\" stream 1: source range exceeds selected media");
+    g.items[0].media[0].source_offset = None;
+    assert_eq!(SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap(), g);
+
+    g.items[0].media[0].source_offset = Some(Rational::integer(-1));
+    refuses_all(&g, "source range exceeds selected media");
+    g.items[0].media[0].source_offset = Some(Rational::ZERO);
+    g.multicams[0].lanes[0].alternatives[0].pieces[1].source_in = Some(Rational::integer(100));
+    refuses_all(&g, "source range exceeds selected media");
+
+    // Two picture links share the same logical selector. Neither one alone proves the limit.
+    let mut other = g.media[0].clone();
+    other.id = "long-picture".into();
+    other.duration = Rational::integer(110);
+    let mut link = g.items[0].media[0].clone();
+    link.media = other.id.clone();
+    g.media.push(other);
+    g.items[0].media.push(link);
+    g.sequences[0].placements.retain(|p| p.video_track.is_none());
+    assert_eq!(SourceGraph::from_json_text(&g.to_json_text().unwrap()).unwrap(), g);
+}
+
 fn refuses_all(g: &SourceGraph, expected: &str) {
     let text = raw_json(g);
+    let mut output = Vec::new();
     for e in [
         g.validate(),
         SourceGraph::from_json(&json::parse(&text).unwrap()).map(|_| ()),
         SourceGraph::from_json_text(&text).map(|_| ()),
         g.to_json_text().map(|_| ()),
+        g.write_json(&mut output),
     ] {
         let e = e.unwrap_err().to_string();
         assert!(e.contains(expected), "{e}, expected {expected}");
     }
+    assert!(output.is_empty());
 }
 #[test]
 fn original_stream_clocks_channels_and_compressed_representation_round_trip(){

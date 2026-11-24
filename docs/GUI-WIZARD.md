@@ -47,15 +47,36 @@ its cause and a way to fix it, such as opening media locations, opening
 saved-path mappings, or choosing a new output. Preflight stops at the first
 blocking stage. Run it again after making a correction.
 If conversion can proceed with changes, Review shows the affected clips or
-sequences where known. Warnings and the **Full preflight report** can be expanded
-separately. **Save preflight report** writes a new JSON file. After a successful
-preflight, it includes inventory notes and all findings, including those hidden
-by the current search or filters. You can convert from the same Review after
-saving. If preflight stops at a blocker, the report includes the blocker
-category, reason, and the details collected for that stage. If a saved path
-is missing, malformed, or ambiguous in **Rewrap to native clips**, Review
-checks the remaining saved original paths with the current mappings. It reports
-other locator problems without probing those files or preparing a project.
+sequences where known. Caption and title findings show the saved Avid video
+track and record position when available. Disabled edits left as gaps and
+omitted source edits with a unique saved occurrence show their tracks and
+any verified positions. Source media gaps use the start of the marked
+span, including adjustments made when a transition is omitted.
+Expand warnings and the **Full
+preflight report** separately. **Save preflight report** writes a new JSON
+file. After a successful preflight, it includes inventory notes and all
+findings, including those hidden by the current search or filters. You can
+convert from the same Review after saving. If preflight stops at a blocker,
+the report includes the blocker
+category, reason, and the details collected for that stage. When Premiere
+preparation stops on a specific edit, Review shows its bin, timeline, track,
+and saved start. A subframe start appears as an exact offset from sequence
+start. If preparation stops while building a source clip, Review lists its
+bin when uniquely known and the timeline edits that reference the saved clip
+directly, including disabled edits. Review also lists Group edits whose
+saved selection uses the clip within that edit's source range.
+For checks after Premiere events are assembled, Review shows the saved edit
+when the event maps to one edit. If it represents several edits, Review
+lists the contributing edits under their timeline and bin.
+This includes a retime that Premiere preparation cannot represent.
+If a saved Group is refused, Review lists timeline edits that
+unambiguously reference it. If a specific Group edit is refused, Review
+shows its saved track and position when available.
+
+If a saved path is missing, malformed, or ambiguous in **Rewrap to native
+clips**, Review checks the remaining saved original paths with the current
+mappings. It reports other locator problems without probing those files or
+preparing a project.
 When legacy MXF verification blocks Rewrap, Review uses the existing media
 index to report other absent or ambiguous package IDs on the affected clip
 and later clips. For duplicates, it shows up to eight conflicting file paths
@@ -107,6 +128,11 @@ record position when available.
 When native rewrap requires a missing managed picture or audio package,
 Review identifies the edits that use the missing source track. Missing and
 duplicate package findings share the same timeline filter.
+When a saved audio group blocks conversion, **Affected details** identifies
+the source bin and clip. The timeline filter shows each saved edit of a
+known group member with its timeline lane and record time where available.
+Ambiguous source identities and declarations with unknown members stay at
+bin level. Saved-job Review shows the same details.
 In **Separate files**, a verified 23.976 DNxHR LB clip can keep its picture
 and any available PCM24 mono source linked when one or both mono siblings
 are missing. Review lists the unavailable edits and the Premiere timeline

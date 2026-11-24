@@ -23,6 +23,22 @@ pub struct Templates {
     pub nested: Option<PathBuf>,
 }
 
+impl Templates {
+    /// Verify the exact native donors shipped for the 1080p23.976 Avid route.
+    pub fn bundled_avid(directory: &Path) -> Result<Self> {
+        crate::archive::check_bundled_avid_templates(directory)?;
+        let layout = directory.join("Layout.drp");
+        Ok(Self {
+            profile: layout.clone(),
+            layout,
+            atom: Some(directory.join("Atom.drp")),
+            group: Some(directory.join("Group.drp")),
+            fairlight: None,
+            nested: None,
+        })
+    }
+}
+
 /// Internal saved-job contract for the two experimental Resolve routes.
 /// The public application still reads and writes its existing job/1 format.
 #[derive(Clone, Deserialize, Serialize)]
@@ -278,7 +294,7 @@ impl Turnover {
             .chain(&self.prepared.destination_losses)
     }
 
-    /// Check the destination plan without staging or publishing any output.
+    /// Check the destination plan and read back a disposable archive.
     pub fn review(&self, templates: &Templates, output: &Path) -> Result<TurnoverReview> {
         let estimated_proxy_bytes = avid_adapter::proxy::review(&self.proxies)?;
         review_turnover(&self.prepared, templates, output)?;
@@ -307,7 +323,8 @@ impl Turnover {
             );
         }
         if self.proxies.iter().any(|p| p.audio.is_some()) {
-            self.review(templates, output)?;
+            // The writer checks its own staged archive before the proxy callback.
+            avid_adapter::proxy::review(&self.proxies)?;
         }
         publish_turnover_checked(&self.prepared, templates, output, || {
             let verify = || self.recheck_projects();

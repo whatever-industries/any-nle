@@ -1,10 +1,12 @@
 //! Pair policies: the choices that depend on the source *and* target program, kept out of the
-//! graph (docs/GRAPH-MODEL.md). Today one pair, Avid -> Premiere, holding what model/1 carries
+//! graph (docs/GRAPH-MODEL.md). The Avid -> Premiere job policy holds what model/1 carries
 //! as `options`: bin mode, Avid's default pan, marker conflicts and Avid info, and the colour
 //! mapper's tables (ROADMAP "Import options UI").
 //!
 //! The policy decides; the Premiere writer applies it. Default tables are the writer's own
 //! (`prproj::convert::colors`), so the colour preview shows exactly what will be written.
+
+pub mod picture_chain;
 
 use graph::json::{self, Value};
 use graph::{Graph, GraphError, Loss};

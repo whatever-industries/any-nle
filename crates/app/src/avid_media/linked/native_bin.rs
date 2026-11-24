@@ -1,5 +1,5 @@
 //! Write timelines over native source objects and verify the saved bin links.
-use super::{Plan, Result, Route, Span, RATE};
+use super::{markers, Plan, Result, Route, Span, RATE};
 use avid_reader::{
     document::{AvbDocument, MobKind},
     document_attributes_extra::{AttributeValue, DocumentAttributesExt},
@@ -345,11 +345,10 @@ impl Donor<'_> {
     }
 
     pub(super) fn check(&self, doc: &AvbDocument, plan: &Plan<'_>) -> Result<()> {
-        let sequence = node(
-            doc,
-            self.sequence
-                .ok_or("generated sequence was not registered")?,
-        )?;
+        let sequence_id = self
+            .sequence
+            .ok_or("generated sequence was not registered")?;
+        let sequence = node(doc, sequence_id)?;
         let timecode = track(doc, sequence, 3, 1)?;
         if sequence.get("name").and_then(Value::as_str) != Some(plan.name)
             || sequence.get("edit_rate") != Some(&EDIT_RATE)
@@ -362,6 +361,18 @@ impl Donor<'_> {
             || number(timecode, "flags")? != 0
         {
             return Err("generated timeline identity, extent or clock disagrees".into());
+        }
+        markers::check(doc, sequence_id, &plan.sequence_markers)?;
+        if !plan.picture_markers.is_empty() {
+            let picture_id = self
+                .items
+                .iter()
+                .filter_map(|item| embedded(item).ok()?.get("mob")?.as_index())
+                .find(|id| {
+                    doc.node(*id).and_then(|node| mob_id(node).ok()) == Some(self.links[0].master)
+                })
+                .ok_or("generated picture master was not registered")?;
+            markers::check(doc, picture_id, &plan.picture_markers)?;
         }
         for (i, (kind, lane)) in [(1, 1), (2, 1), (2, 2)].into_iter().enumerate() {
             let parts = parts(doc, track(doc, sequence, kind, lane)?)?;
@@ -432,6 +443,7 @@ pub(super) fn write_timeline(
         tracks.push((lane, segment));
     }
     let timecode = doc.create_timecode(RATE as f64, plan.length, RATE as u16, plan.start)?;
+    let marker_list = markers::write(doc, &plan.sequence_markers)?;
     let mob = doc.create_composition(
         plan.name,
         MobKind::Composition,
@@ -441,6 +453,7 @@ pub(super) fn write_timeline(
     )?;
     doc.set_field(mob, "edit_rate", EDIT_RATE)?;
     let attrs = index(node(doc, mob)?, "attributes")?;
+    markers::attach(doc, attrs, marker_list)?;
     doc.set_attribute(attrs, "_VERSION", AttributeValue::Integer(2))?;
     doc.set_attribute(attrs, "SEQUERNCE_FORMAT_TYPE", AttributeValue::Integer(10))?;
     doc.set_attribute(

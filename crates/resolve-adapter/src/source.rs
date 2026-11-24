@@ -6,6 +6,7 @@ pub mod drt;
 mod embedded_audio;
 mod effects;
 mod encoding;
+pub(crate) use encoding::enable_embedded_reels;
 mod fairlight;
 pub mod inventory;
 mod markers;
@@ -14,6 +15,7 @@ pub(crate) use markers::{
     POOL_ADAPTER as POOL_MARKER_ADAPTER,
 };
 mod metadata;
+pub(crate) use metadata::{ADAPTER as MEDIA_METADATA_ADAPTER, REEL as CACHED_REEL};
 pub(crate) mod mixer;
 mod multicam;
 pub(crate) use multicam::{native_group_default_unavailable, REFERENCE_AUDIO_SWITCH};
@@ -54,6 +56,7 @@ const ROOT_FOLDER: &str = "MediaPool/Master/MpFolder.xml";
 pub(crate) const ADAPTER: &str = "resolve.source";
 pub(crate) const BIN_ORDER_ADAPTER: &str = "resolve.bin_order";
 pub(crate) const ACTIVE_TIMELINE_ADAPTER: &str = "resolve.active_timeline";
+pub(crate) const REEL_NAMES_ADAPTER: &str = "resolve.reel_names";
 const OMITTED_TRACKS_ADAPTER: &str = "resolve.omitted_tracks";
 const EMPTY_STEREO: &str = "unqualified Resolve track state or layout";
 use crate::nests::{self, ADAPTER as NESTS_ADAPTER};
@@ -81,7 +84,16 @@ pub(crate) fn is_empty_stereo_loss(loss: &Loss, owner: &str, track: &str) -> boo
 
 /// Read an exported .drp without opening media or making application calls.
 pub fn read(path: &Path) -> Result<SourceGraph> {
-    let (members, containers) = xml::read_project(path)?;
+    read_project_archive(xml::read_project(path)?)
+}
+
+pub(crate) fn read_staged(file: std::fs::File) -> Result<SourceGraph> {
+    read_project_archive(xml::read_staged_project(file)?)
+}
+
+fn read_project_archive(
+    (members, containers): (BTreeMap<String, Node>, xml::ProjectContainers),
+) -> Result<SourceGraph> {
     read_project(&members, Some(containers), false, Blobs::new(384 << 20))
 }
 
@@ -246,13 +258,28 @@ fn read_project<'a>(
             && (supported_marker_rate(master.rate)
                 || crate::mixed_rate::Cadence::for_resolve_source(master.rate, crate::prepare::rate()).is_some())
     });
-    let (nearest_default, input_scaling_default) = if cadence_profile
-        || masters.values().any(|master| master.size.0 > 0 && master.size != (1920, 1080))
-    {
-        encoding::default_picture_settings(project, &mut blobs).unwrap_or_default()
-    } else {
-        (false, None)
-    };
+    let needs_picture_settings = cadence_profile
+        || masters.values().any(|master| master.size.0 > 0 && master.size != (1920, 1080));
+    let has_cached_reel = graph.sidecars.iter().any(|row|
+        row.adapter == MEDIA_METADATA_ADAPTER && row.data.get(CACHED_REEL).is_some());
+    let mut picture_settings = (false, None);
+    if needs_picture_settings || has_cached_reel {
+        if let Ok(Some(body)) = encoding::project_setup(project, &mut blobs) {
+            if let Ok(setup) = encoding::fields(&body) {
+                if needs_picture_settings {
+                    picture_settings = encoding::default_picture_settings(&setup);
+                }
+                if encoding::uses_embedded_reels(&setup) {
+                    graph.sidecars.push(Sidecar {
+                        adapter: REEL_NAMES_ADAPTER.into(),
+                        object: graph.bins[0].id.clone(),
+                        data: Value::Str("embedded".into()),
+                    });
+                }
+            }
+        }
+    }
+    let (nearest_default, input_scaling_default) = picture_settings;
     let mut context = Context {
         masters,
         groups: HashMap::new(),

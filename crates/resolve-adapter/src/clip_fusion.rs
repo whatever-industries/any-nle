@@ -4,7 +4,8 @@ use crate::{
     Result,
 };
 use flate2::{write::ZlibEncoder, Compression};
-use graph::picture_chain::{self, CORNER_PIN_KIND};
+use graph::picture_chain::{corner_pin_geometry, CORNER_PIN_KIND, KIND};
+use mapping::picture_chain::{is_corner_pin_stage, read_ordered_corner_pin};
 use prproj::convert::prepared::CornerPin;
 use std::{fmt::Write as _, io::Write as _, path::Path};
 
@@ -35,19 +36,19 @@ pub(crate) fn prepare_pin(effect: &graph::Effect) -> Result<Option<Operation>> {
     if effect.kind == CORNER_PIN_KIND {
         return Ok(Some(Operation::CornerPin(read_pin(&effect.params)?, None)));
     }
-    if effect.kind != picture_chain::KIND {
+    if effect.kind != KIND {
         return Ok(None);
     }
     let Some(graph::Value::Arr(stages)) = effect.params.get("stages") else {
         return Ok(None);
     };
-    if !stages.iter().any(picture_chain::is_corner_pin_stage) {
+    if !stages.iter().any(is_corner_pin_stage) {
         return Ok(None);
     }
     let unsupported =
         "Resolve ordered Corner Pin requires one static pin and one horizontal reflection";
     let chain =
-        picture_chain::read_ordered_corner_pin(stages, &effect.params)?.ok_or(unsupported)?;
+        read_ordered_corner_pin(stages, &effect.params)?.ok_or(unsupported)?;
     let pin = read_pin(chain.pin_params)?;
     if !chain
         .reflection
@@ -65,7 +66,7 @@ pub(crate) fn prepare_pin(effect: &graph::Effect) -> Result<Option<Operation>> {
 
 fn read_pin(params: &graph::Value) -> Result<CornerPin> {
     let (corners, source_crop) =
-        picture_chain::corner_pin_geometry(params).ok_or("malformed Corner Pin coordinates")?;
+        corner_pin_geometry(params).ok_or("malformed Corner Pin coordinates")?;
     let pin = CornerPin {
         corners,
         source_crop,

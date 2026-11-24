@@ -8,6 +8,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         [mode, volume] if mode == "--plan-drive" => {
             println!("{}", serde_json::to_string_pretty(&avid_media::plan_drive(Path::new(volume))?)?);
         }
+        [mode, request, options @ ..] if mode == "--roundtrip-avb"
+            && (options.is_empty() || matches!(options, [flag] if flag == "--review")) =>
+        {
+            let report = avid_media::roundtrip_avb(Path::new(request), !options.is_empty())?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         [mode, request, stage, tools @ ..] if mode == "--stage" && matches!(tools.len(), 0 | 2) => {
             let mut bytes = Vec::new();
             File::open(request)?.take(65_537).read_to_end(&mut bytes)?;
@@ -37,7 +43,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let sequence = sequence.to_str().ok_or("sequence ID must be UTF-8")?;
             avid_media::write_linked_project(Path::new(project), sequence, Path::new(output), &backend)?;
         }
-        _ => return Err("usage: avid-media-probe --plan-drive VOLUME\n       avid-media-probe --stage REQUEST.json NEW_STAGING_FOLDER [FFMPEG FFPROBE]\n       avid-media-probe --master-bin STAGE.json INDEXED_MXF_FOLDER NEW.avb [FFMPEG FFPROBE]\n       avid-media-probe --linked-bin GRAPH.json SEQUENCE_ID DONOR.avb NEW.avb [FFMPEG FFPROBE]\n       avid-media-probe --linked-originals GRAPH.json SEQUENCE_ID NEW.avb [FFMPEG FFPROBE]\n       avid-media-probe --linked-project INPUT SEQUENCE_ID NEW.avb [FFMPEG FFPROBE] (macOS)".into()),
+        _ => return Err("usage: avid-media-probe --plan-drive VOLUME\n       avid-media-probe --roundtrip-avb REQUEST.json [--review]\n       avid-media-probe --stage REQUEST.json NEW_STAGING_FOLDER [FFMPEG FFPROBE]\n       avid-media-probe --master-bin STAGE.json INDEXED_MXF_FOLDER NEW.avb [FFMPEG FFPROBE]\n       avid-media-probe --linked-bin GRAPH.json SEQUENCE_ID DONOR.avb NEW.avb [FFMPEG FFPROBE]\n       avid-media-probe --linked-originals GRAPH.json SEQUENCE_ID NEW.avb [FFMPEG FFPROBE]\n       avid-media-probe --linked-project INPUT SEQUENCE_ID NEW.avb [FFMPEG FFPROBE] (macOS)".into()),
     }
     Ok(())
 }

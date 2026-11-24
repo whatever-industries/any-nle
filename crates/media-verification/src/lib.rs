@@ -2,6 +2,7 @@
 
 use graph::Rational;
 
+pub mod linked_original;
 pub mod rewrap_size;
 
 pub fn stream_duration(count: i64, time_base: Rational) -> Option<Rational> {

@@ -184,12 +184,105 @@ pub struct PreparedPremiere {
 pub struct PreparedPremiereInput {
     pub input:PreparedProjectInput, pub losses:Vec<Loss>,pub diagnostics:Vec<String>,pub ownership:HashMap<String,(usize,usize)>,
 }
-pub fn prepare_originals(g:&SourceGraph,options:&Options,clock:ClockProfile)->R<PreparedPremiereInput>{prepare_input(g,options,clock,true,false,true,false,false,None)}
+
+pub struct PreparationIssue {
+    pub message: String,
+    pub sequence: Option<String>,
+    pub occurrence: Option<PreparationOccurrence<String>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PreparationOccurrence<Id> {
+    Item(Id),
+    Transition(Id),
+    Placement(Id),
+    CombinedPlacements { ids: Vec<Id>, truncated: bool },
+    Group(Id),
+    GroupUse(Id),
+}
+
+impl From<String> for PreparationIssue {
+    fn from(message: String) -> Self {
+        Self { message, sequence: None, occurrence: None }
+    }
+}
+
+#[derive(Default)]
+struct PreparationContext<'a> {
+    sequence: Option<&'a str>,
+    occurrence: Option<PreparationOccurrence<&'a str>>,
+}
+
+impl<'a> PreparationContext<'a> {
+    fn at_placement(&mut self, sequence: &'a SourceSequence, placement: &'a Placement) {
+        self.sequence = Some(&sequence.id);
+        self.occurrence = Some(PreparationOccurrence::Placement(&placement.id));
+    }
+
+    fn at_prepared_event(
+        &mut self,
+        graph: &'a SourceGraph,
+        sequence: usize,
+        event: Option<usize>,
+        ownership: &HashMap<String, (usize, usize)>,
+    ) {
+        let Some(source) = graph.sequences.get(sequence) else { return };
+        self.sequence = Some(&source.id);
+        let Some(event) = event else { return };
+        const MAX_EVENT_DETAILS: usize = 1024;
+        let slot = (sequence, event);
+        let mut owners = source.placements.iter()
+            .filter(|edit| ownership.get(&edit.id) == Some(&slot))
+            .map(|edit| edit.id.as_str());
+        let ids: Vec<_> = owners.by_ref().take(MAX_EVENT_DETAILS).collect();
+        self.occurrence = match ids.as_slice() {
+            [] => None,
+            [id] => Some(PreparationOccurrence::Placement(id)),
+            _ => Some(PreparationOccurrence::CombinedPlacements {
+                ids,
+                truncated: owners.next().is_some(),
+            }),
+        };
+    }
+}
+
+/// Prepare an Avid job and retain the saved clip or timeline owner of a preparation failure.
+pub fn prepare_avid_job(
+    graph: &SourceGraph,
+    options: &Options,
+    clock: ClockProfile,
+    spooled: bool,
+    assisted: bool,
+    managed: Option<(&HashSet<&str>, &HashSet<&str>)>,
+) -> Result<PreparedPremiereInput, PreparationIssue> {
+    let clock = if managed.is_some() { ClockProfile::LegacyImport } else { clock };
+    let linked = assisted || clock == ClockProfile::LegacyImport;
+    let mut context = PreparationContext::default();
+    prepare_input(graph, options, clock, true, false, !linked || !spooled, linked,
+        assisted, managed, &mut context).map_err(|error| PreparationIssue {
+            message: error.to_string(),
+            sequence: context.sequence.map(str::to_owned),
+            occurrence: context.occurrence.map(|occurrence| match occurrence {
+                PreparationOccurrence::Item(id) => PreparationOccurrence::Item(id.into()),
+                PreparationOccurrence::Transition(id) => PreparationOccurrence::Transition(id.into()),
+                PreparationOccurrence::Placement(id) => PreparationOccurrence::Placement(id.into()),
+                PreparationOccurrence::Group(id) => PreparationOccurrence::Group(id.into()),
+                PreparationOccurrence::GroupUse(id) => PreparationOccurrence::GroupUse(id.into()),
+                PreparationOccurrence::CombinedPlacements { ids, truncated } =>
+                    PreparationOccurrence::CombinedPlacements {
+                        ids: ids.into_iter().map(str::to_owned).collect(),
+                        truncated,
+                    },
+            }),
+        })
+}
+
+pub fn prepare_originals(g:&SourceGraph,options:&Options,clock:ClockProfile)->R<PreparedPremiereInput>{prepare_input(g,options,clock,true,false,true,false,false,None,&mut PreparationContext::default())}
 
 /// A validated working graph for native publication only. It is not an
 /// exportable graph/2 document and has no aggregate wire-encoding bound.
 pub fn prepare_linked_originals(g: &SourceGraph, options: &Options, clock: ClockProfile, spooled: bool) -> R<PreparedPremiereInput> {
-    prepare_input(g, options, clock, true, false, !spooled, true, false, None)
+    prepare_input(g, options, clock, true, false, !spooled, true, false, None, &mut PreparationContext::default())
 }
 
 /// Use a verified Premiere donor when standalone media construction does not
@@ -198,7 +291,7 @@ pub fn prepare_linked_originals(g: &SourceGraph, options: &Options, clock: Clock
 pub fn prepare_assisted_originals(
     g: &SourceGraph, options: &Options, clock: ClockProfile, spooled: bool,
 ) -> R<PreparedPremiereInput> {
-    prepare_input(g, options, clock, true, false, !spooled, true, true, None)
+    prepare_input(g, options, clock, true, false, !spooled, true, true, None, &mut PreparationContext::default())
 }
 
 pub fn prepare_managed_rewrap(
@@ -206,11 +299,12 @@ pub fn prepare_managed_rewrap(
     selected: &HashSet<&str>, omitted: &HashSet<&str>,
 ) -> R<PreparedPremiereInput> {
     prepare_input(graph, options, ClockProfile::LegacyImport, true, false, !spooled, true,
-        assisted, Some((selected, omitted)))
+        assisted, Some((selected, omitted)), &mut PreparationContext::default())
 }
 
 pub fn prepare_resolve_originals(g: &SourceGraph, options: &Options) -> R<PreparedPremiereInput> {
-    prepare_input(g, options, ClockProfile::VerifiedRewrap, true, true, true, false, false, None)
+    prepare_input(g, options, ClockProfile::VerifiedRewrap, true, true, true, false, false,
+        None, &mut PreparationContext::default())
 }
 fn loss(out: &mut Vec<Loss>, object: &str, aspect: &str, reason: impl Into<String>) {
     out.push(Loss {
@@ -1131,13 +1225,18 @@ pub fn prepare(g: &SourceGraph, options: &Options, clock: ClockProfile) -> R<Pre
     if !g.multicams.is_empty() || !g.multicam_uses.is_empty() {
         return Err(error("multicam_native_route_required: editable Groups require typed native rewrap preparation"));
     }
-    let p=prepare_input(g,options,clock,false,false,true,false,false,None)?;
+    let p=prepare_input(g,options,clock,false,false,true,false,false,None,&mut PreparationContext::default())?;
     let model=Model{project_name:p.input.project_name,options:p.input.options,clips:p.input.clips.into_iter().map(|c|match c{PreparedClip::Legacy(c)=>c,_=>unreachable!()}).collect(),bins:p.input.bins,sequences:p.input.sequences};
     model::validate_model(&model).map_err(|e|error(e.to_string()))?;
     Ok(PreparedPremiere{model,losses:p.losses,diagnostics:p.diagnostics,ownership:p.ownership,texts:p.input.texts,video_dissolves:p.input.video_dissolves,picture_effects:p.input.picture_effects,direct_dnxhr_origins:p.input.direct_dnxhr_origins,constant_speeds:p.input.constant_speeds})
 }
-fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_originals:bool,allow_original_speed:bool,check_encoding:bool,best_effort:bool,assisted:bool,managed_rewrap:Option<(&HashSet<&str>,&HashSet<&str>)>)->R<PreparedPremiereInput> {
+fn prepare_input<'a>(
+    g: &'a SourceGraph, options: &Options, clock: ClockProfile, allow_originals: bool,
+    allow_original_speed: bool, check_encoding: bool, best_effort: bool, assisted: bool,
+    managed_rewrap: Option<(&HashSet<&str>, &HashSet<&str>)>, context: &mut PreparationContext<'a>,
+) -> R<PreparedPremiereInput> {
     g.validate()?;
+    anynle_media_verification::linked_original::qualify(&g.media)?;
     if check_encoding {
         g.encoded_len()?;
     }
@@ -1239,6 +1338,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         HashSet::new()
     };
     for item in &g.items {
+        context.occurrence = Some(PreparationOccurrence::Item(&item.id));
         let id = clip_id(&item.id);
         if !ids.insert(id.clone()) {
             return Err(error("prepared clip identity collision"));
@@ -1714,6 +1814,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         }));
         }
     }
+    context.occurrence = None;
     let media: HashMap<_, _> = g.media.iter().map(|m| (m.id.as_str(), m)).collect();
     let mut routes = HashMap::new();
     for item in &g.items {
@@ -1952,6 +2053,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         let exact_start = ndf_start.or_else(|| qualified_sequence_start(s));
         if needs_drop && (s.rate != Rational::new(30_000, 1001).unwrap() || exact_start.is_none())
         {
+            context.sequence = Some(&s.id);
             return Err(error(format!(
                 "direct_dnxhd_sequence_clock {}: direct 29.97 DNxHD OP-Atom needs a qualified same-rate drop-frame TC1",
                 s.id
@@ -1986,7 +2088,8 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             &mut animatte_points_remaining,
             &mut record_only_markers,
             best_effort,
-        )?;
+            &mut context.occurrence,
+        ).inspect_err(|_| context.sequence = Some(&s.id))?;
         pan::prepare(&facts, s, &sequence, si, &ownership, &pan_clips,
             &mut model.audio_pans, &mut written_pan, &mut losses);
         let names = track_names::prepare(&facts, s, &sequence,
@@ -1997,7 +2100,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         model.sequences.push(sequence);
     }
     multicam::prepare(g, &mut model, &ownership, clock, &mut diagnostics, &mut losses,
-        best_effort, &facts.omitted_offline_items)?;
+        best_effort, &facts.omitted_offline_items, context)?;
     let autosyncs = subclips::prepare(
         g, &media, &facts.sidecars, &mut model, &ownership, allow_originals, clock, &mut losses,
     )?;
@@ -2016,10 +2119,12 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 let nested = facts.editable_nested_motion.contains(placement.id.as_str());
                 let (num, den) = if nested {
                     let Some(speed) = &placement.speed else {
+                        context.at_placement(source_sequence, placement);
                         return Err(error("missing saved Avid nested constant-speed witness"));
                     };
                     let (den, num) = speed.ratio;
                     if num <= 0 || den <= 0 {
+                        context.at_placement(source_sequence, placement);
                         return Err(error("invalid saved Avid nested constant-speed witness"));
                     }
                     (num, den)
@@ -2030,6 +2135,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                     let Some(Value::Arr(ratio)) = side(&facts.sidecars, "avid.source", &placement.id)
                         .and_then(|receipt| key(receipt, "constant_speed")) else { continue };
                     let [Value::Int(num), Value::Int(den)] = ratio.as_slice() else {
+                        context.at_placement(source_sequence, placement);
                         return Err(error("invalid saved Avid constant-speed witness"));
                     };
                     (*num, *den)
@@ -2037,6 +2143,7 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
                 let Some(&(sequence, event)) = ownership.get(&placement.id) else { continue };
                 let seq = &model.sequences[sequence];
                 let Some(item) = facts.items_by_clip.get(seq.events[event].clip.as_str()) else {
+                    context.at_placement(source_sequence, placement);
                     return Err(error("saved Avid constant speed has no prepared source item"));
                 };
                 let eligible = nested || *qualified_items.entry(item.id.as_str()).or_insert_with(|| {
@@ -2086,9 +2193,14 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
             PreparedClip::Original(clip) => Some(clip.metadata.id.as_str()),
             _ => None,
         }).collect();
-        if model.sequences.iter().enumerate().any(|(si, s)| s.events.iter().enumerate().any(|(ei, event)|
-            event.speed_ratio.is_some() && originals.contains(event.clip.as_str())
-                && !verified_speeds.contains(&(si, ei)))) {
+        let unsupported = model.sequences.iter().enumerate().find_map(|(si, sequence)| {
+            sequence.events.iter().enumerate().find(|(ei, event)| {
+                event.speed_ratio.is_some() && originals.contains(event.clip.as_str())
+                    && !verified_speeds.contains(&(si, *ei))
+            }).map(|(ei, _)| (si, ei))
+        });
+        if let Some((sequence, event)) = unsupported {
+            context.at_prepared_event(g, sequence, Some(event), &ownership);
             return Err(error("original-file retiming is not qualified"));
         }
     }
@@ -2103,11 +2215,12 @@ fn prepare_input(g:&SourceGraph,options:&Options,clock:ClockProfile,allow_origin
         model.autosync_bins.insert(model.sequences.len(), bin);
         model.sequences.push(sequence);
     }
-    if check_encoding {
-        model.validate()
-    } else {
-        model.validate_whole_project()
-    }.map_err(|e| error(e.to_string()))?;
+    model.validate_with_location(!check_encoding).map_err(|issue| {
+        if let Some(location) = issue.location {
+            context.at_prepared_event(g, location.sequence, location.event, &ownership);
+        }
+        error(issue.error.to_string())
+    })?;
     let native_disabled_losses: HashSet<_> = g.losses.iter()
         .filter(|loss| loss.aspect == "disabled_clip")
         .filter_map(|loss| loss.reason.split_once(": ")
@@ -2278,9 +2391,9 @@ fn isolated_filler_cut(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_sequence(
-    facts: &PreparationFacts,
-    s: &SourceSequence,
+fn prepare_sequence<'a>(
+    facts: &PreparationFacts<'a>,
+    s: &'a SourceSequence,
     si: usize,
     exact_start: Option<Rational>,
     linear_fade_clips: &HashSet<&str>,
@@ -2294,6 +2407,7 @@ fn prepare_sequence(
     animatte_points_remaining: &mut usize,
     record_only_markers: &mut HashSet<(usize, usize)>,
     best_effort: bool,
+    active_occurrence: &mut Option<PreparationOccurrence<&'a str>>,
 ) -> R<Sequence> {
     // Avid's actual sequence canvas is currently unqualified. Keep the exact
     // old first-picture/default raster only in the destination compatibility profile.
@@ -2328,10 +2442,12 @@ fn prepare_sequence(
                     s.id
                 ))
             })?;
-            if !qualified.contains(id) {
+            let Some(&saved_id) = qualified.get(id) else {
+                *active_occurrence = Some(PreparationOccurrence::Transition(id));
                 return Err(error(format!("unresolved_transition_topology {id}: native transition has no qualified timing/relationship; source retained unchanged")));
-            }
+            };
             if !receipt_ids.insert(id) {
+                *active_occurrence = Some(PreparationOccurrence::Transition(saved_id));
                 return Err(error(format!("unresolved_transition_topology {id}: duplicate native transition receipt")));
             }
             if let Some(edges) = key(transition, "gain_gap_edges") {
@@ -2377,7 +2493,9 @@ fn prepare_sequence(
     let mut stereo_tail_fades = Vec::new();
     let mut seen = HashSet::new();
     // Resolve against original spans before making any edit, including chains.
+    // Keep the current ID on early return, and clear it before unrelated checks.
     for t in &s.transitions {
+        *active_occurrence = Some(PreparationOccurrence::Transition(&t.id));
         let all_endpoints_omitted = t.outgoing.placements.iter().chain(&t.incoming.placements)
             .all(|id| facts.omitted_offline_items.contains(placements[id.as_str()].item.as_str()));
         if best_effort && t.style.starts_with("avid.")
@@ -2557,6 +2675,7 @@ fn prepare_sequence(
             format!("native transition {:?} prepared as a video cut", t.style),
         );
     }
+    *active_occurrence = None;
     let edit_marker_owners: HashSet<_> = if facts.same_rate_aac_views.is_empty() {
         HashSet::new()
     } else {
@@ -2569,6 +2688,7 @@ fn prepare_sequence(
         if facts.omits_placement(p) {
             continue;
         }
+        *active_occurrence = Some(PreparationOccurrence::Placement(&p.id));
         if side(&facts.sidecars, "avid.nested_motion", &p.id).is_some()
             && !facts.editable_nested_motion.contains(p.id.as_str())
         {
@@ -2809,7 +2929,7 @@ fn prepare_sequence(
                     }
                     matte = Some(parsed);
                 }
-                kind if graph::picture_chain::Reflection::is_effect_kind(kind) && picture.is_none() => {
+                kind if mapping::picture_chain::is_reflection_kind(kind) && picture.is_none() => {
                     let axes = graph::picture_chain::Reflection::from_params(&e.params)
                         .filter(|_| p.video_track.is_some())
                         .ok_or_else(|| error(format!("invalid reflection effect for {}", p.id)))?;
@@ -2930,6 +3050,7 @@ fn prepare_sequence(
             },
         ));
     }
+    *active_occurrence = None;
     // Assemble only compatible spans after all lane-specific trims. Preserve two
     // simultaneous picture lanes as separate events and genuine combiners atomically.
     let mut events: Vec<Event> = Vec::new();
@@ -2997,6 +3118,7 @@ fn prepare_sequence(
         sorted.push(event);
     }
     for (t, outgoing, incoming) in dissolve_endpoints {
+        *active_occurrence = Some(PreparationOccurrence::Transition(&t.id));
         video_dissolves.push(PreparedVideoDissolve {
             sequence: si,
             outgoing: ownership[outgoing].1,
@@ -3006,11 +3128,13 @@ fn prepare_sequence(
         });
     }
     for (t, outgoing) in stereo_tail_fades {
+        *active_occurrence = Some(PreparationOccurrence::Transition(&t.id));
         audio_edge_fades.push(prproj::convert::prepared::PreparedAudioEdgeFade {
             sequence: si, event: ownership[outgoing].1, track: t.track, head: 0,
             tail: ticks(t.duration, "stereo fade duration")?,
         });
     }
+    *active_occurrence = None;
     for (id, effect, reflection_before_motion) in picture_edits {
         picture_effects.push(prproj::convert::prepared::PreparedPictureEffect {
             sequence: si, event: ownership[id].1, effect, reflection_before_motion,

@@ -95,6 +95,7 @@ pub(crate) fn prepare_bindings(
     bindings: Vec<VerifiedBinding>,
 ) -> Result<PreparedResolve> {
     graph.validate()?;
+    anynle_media_verification::linked_original::qualify(&graph.media)?;
     if bindings.is_empty() || bindings.len() > MAX_CORE_MEDIA_ITEMS {
         return Err("Resolve media item count outside supported range".into());
     }

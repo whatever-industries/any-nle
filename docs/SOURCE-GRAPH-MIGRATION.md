@@ -29,6 +29,22 @@ owner clocks and omitted portable objects retain bounded native receipts and los
 Malformed references and contradictions refuse. Occurrence IDs are scoped to the
 input revision; they are not native identity claims or object addresses.
 
+For an original stream, graph/2 checks the exact duration against its tick clock,
+the physical channel index against the saved channel count, and the bit depth of
+known sample representations. A single still has a separate editorial hold.
+Signed packet origins, larger channel layouts, still rasters and additional
+representation names can round-trip as source facts. Linked destination
+preparation invokes the shared original-stream profile before it uses those
+facts. Each route also checks its own supported edits, file identity and routing.
+Graph capture alone therefore establishes no new playback or export support.
+
+For ordered Avid picture effects, graph/2 preserves the saved stage list.
+The shared picture-chain policy in `anynle-mapping` checks which stages can
+share one destination Motion control and how a Corner Pin adjoins a reflection.
+Premiere preparation reports an unsupported stack on its edit. Resolve
+preparation refuses an unsupported stack. Each writer applies its own geometry
+and stage ordering after the shared check.
+
 The separate [Resolve source reader](RESOLVE-SOURCE-READER.md) feeds graph/2
 from a bounded native archive profile. Its saved Resolve clocks and channel
 selectors retain their own provenance. Product route qualification remains
@@ -1469,6 +1485,12 @@ source layouts, independent lane alternatives and structural selector occurrence
 They are omitted from group-free encodings. Known filler intervals are distinct from
 unresolved layouts; ambiguous full-ID/offset matches are retained without selecting a
 candidate. Native marks, selector flags and endpoint receipts remain sidecars.
+
+For a resolved occurrence, each bound leaf edit must occupy the occurrence's
+destination track and media kind. The source lane and selected alternative may
+have different indices from the destination track. A member piece with one
+matching physical stream and a known item-to-file offset must fit that stream
+after applying the offset. An exact end at the stream boundary is valid.
 
 The typed native rewrap path prepares a bounded editable Premiere multicam from these
 facts. Model/1 projection and non-native Premiere routes refuse Groups explicitly;

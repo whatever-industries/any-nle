@@ -22,7 +22,11 @@ Use **Calculate rewrap size** in Review to see the total size of the
 source files for the planned rewrap outputs. A shared output counts once
 across edits. A source used in multiple distinct outputs contributes to
 each. The button reads file metadata without starting an editor or
-running FFmpeg. The converter checks actual available space before writing.
+running FFmpeg. Before you choose a media folder, Review estimates the
+output count from the saved picture and audio recipes. After you choose
+the folder, it uses the verified plan. Picture rewraps, split-mono WAVs,
+and standalone WAVs count separately. The converter checks actual
+available space before writing.
 
 ## Current CLI
 
@@ -34,6 +38,11 @@ spans it can safely leave vacant and retains independently routed mono audio
 in the qualified Separate files case. The saved job carries the selected
 folder in optional `rewrap_needed`. Existing full-rewrap jobs keep their
 media choice.
+
+In Separate files mode, a saved job can keep a verified Avid-managed
+OP1a Direct Out master linked while selectively rewrapping other clips.
+Review counts the existing MXF once. With a rewrap folder, only approved
+clips create media. Without a folder, the usual marked gaps still apply.
 
 ### Managed picture and mono streams
 
@@ -226,6 +235,8 @@ mono sibling on qualified 33–64 lane DNx masters. The plan checks a shared
 source clock, a common bit depth, and full physical sample extents.
 The WAVs retain the original PCM bytes. Review counts the new WAVs
 and the receipt records each saved lane, WAV path, and sample hash.
+If the final PCM check fails, Review shows the affected MXF and its
+saved timeline edits.
 Each WAV has its own complete Premiere media-state record. At 32 mono
 lanes the DNx rewrap continues to use a single OP1a.
 

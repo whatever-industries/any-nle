@@ -397,6 +397,7 @@ fn master_cost(m: &MasterClip) -> usize {
             .iter()
             .map(|(k, v)| sum([k.capacity(), v.capacity()]))),
         array::<AuxTimecode>(m.aux_timecodes.capacity()),
+        array::<crate::extract::SavedClockSegment>(m.saved_clock_segments.capacity()),
         m.source_file.as_ref().map_or(0, String::capacity),
         m.source_path.as_ref().map_or(0, String::capacity),
         array::<(i64, i64)>(m.stereo_pairs.capacity()),
@@ -993,6 +994,7 @@ pub(super) struct Capture {
     adapter_issues: Vec<SourceIssue>,
     texts: Vec<TextFact>,
     group_uses: Vec<groups::UseFact>,
+    saved_timewarps: Vec<SourceSavedTimewarp>,
     picture_blend_inputs: Vec<SourcePictureBlendInputs>,
     charged_ops: usize,
     problem_ops: usize,
@@ -1082,6 +1084,7 @@ impl Capture {
             adapter_issues: Vec::new(),
             texts: Vec::new(),
             group_uses: Vec::new(),
+            saved_timewarps: Vec::new(),
             picture_blend_inputs: Vec::new(),
             charged_ops: 0,
             problem_ops: 0,
@@ -2221,6 +2224,20 @@ impl Capture {
             };
             self.unresolved_timewarp(ctx, effect, record, kind, track, reason, ambiguous);
             return false;
+        }
+        if !owned.is_empty() {
+            if let Some(scope) = self.stack.last().map(|index| &self.scopes[*index]) {
+                if let Some(length) = scope.record_length.filter(|_| scope.position_known) {
+                    if let Some(controls) = timewarp::observe(ctx, effect, &self.budget) {
+                        if reserve(&self.budget, &mut self.saved_timewarps, 1) {
+                            self.saved_timewarps.push(SourceSavedTimewarp {
+                                owner: copy_text(&self.budget, &scope.id),
+                                record, track, length, controls,
+                            });
+                        }
+                    }
+                }
+            }
         }
         let map = (!owned.is_empty()).then_some(owned);
         self.query_with_timewarp(op, input, Some(ratio), None, map, false);
@@ -3712,6 +3729,7 @@ fn finish_source(
         unresolved,
         texts,
         group_uses,
+        saved_timewarps: capture.saved_timewarps,
         picture_blend_inputs: capture.picture_blend_inputs,
     }
 }

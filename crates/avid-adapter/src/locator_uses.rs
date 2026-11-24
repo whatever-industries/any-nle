@@ -57,6 +57,15 @@ pub(super) fn collect_tracks(
     findings: impl IntoIterator<Item = (usize, usize)>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<MediaEditDetails, String> {
+    collect_sequence_tracks(facts, &facts.sequences, findings, check)
+}
+
+pub(super) fn collect_sequence_tracks(
+    facts: &av::SourceProject,
+    sequences: &[av::SourceSequence],
+    findings: impl IntoIterator<Item = (usize, usize)>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<MediaEditDetails, String> {
     let mut affected = HashMap::<usize, HashSet<usize>>::new();
     for (master, track) in findings {
         affected.entry(master).or_default().insert(track);
@@ -94,7 +103,7 @@ pub(super) fn collect_tracks(
     if tracks.is_empty() { return Ok(details); }
 
     let mut bytes = 0;
-    for sequence in &facts.sequences {
+    for sequence in sequences {
         check()?;
         let mut edits = Vec::new();
         for edit in &sequence.events {

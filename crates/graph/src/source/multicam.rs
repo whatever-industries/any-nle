@@ -230,20 +230,28 @@ pub(super) fn validate(g: &SourceGraph, media: &HashMap<&str, &SourceMedia>) -> 
                             let item = items.get(id.as_str()).ok_or_else(|| {
                                 GraphError(format!("{w}: unknown multicam member {id:?}"))
                             })?;
-                            require(
-                                item.media
-                                    .iter()
-                                    .filter_map(|im| media.get(im.media.as_str()))
-                                    .any(|m| {
-                                        m.kind == lane.kind
-                                            && (m.stream == Some(stream)
-                                                || (m.kind == StreamKind::Video
-                                                    && m.stream.is_none()
-                                                    && stream == 1))
-                                    }),
-                                &w,
-                                "multicam member has no matching source stream",
-                            )?;
+                            let mut matches = item.media.iter().filter_map(|link| {
+                                let m = media.get(link.media.as_str())?;
+                                let selected = m.kind == lane.kind && (m.stream == Some(stream)
+                                    || (m.kind == StreamKind::Video && m.stream.is_none() && stream == 1));
+                                selected.then_some((link, m))
+                            });
+                            let Some((link, m)) = matches.next() else {
+                                return fail(format!("{w}: multicam member has no matching source stream"));
+                            };
+                            // A physical range is established only for a unique member stream
+                            // with a known item-to-file offset.
+                            if let (Some(offset), None) = (link.source_offset, matches.next()) {
+                                let start = offset.checked_add(source_in);
+                                if !start.is_some_and(|start| !start.is_negative()
+                                    && start.checked_add(p.duration).is_some_and(|end| end <= m.duration))
+                                {
+                                    return fail(format!(
+                                        "{w} alternative {:?}, member {id:?} stream {stream}: source range exceeds selected media {:?} (offset {offset}, in {source_in}, duration {}, media duration {})",
+                                        a.id, m.id, p.duration, m.duration
+                                    ));
+                                }
+                            }
                         }
                         _ => {
                             return fail(format!(
@@ -267,7 +275,7 @@ pub(super) fn validate(g: &SourceGraph, media: &HashMap<&str, &SourceMedia>) -> 
         .flat_map(|s| {
             s.placements
                 .iter()
-                .map(move |p| (p.id.as_str(), s.id.as_str()))
+                .map(move |p| (p.id.as_str(), (s.id.as_str(), p)))
         })
         .collect();
     for u in &g.multicam_uses {
@@ -294,11 +302,16 @@ pub(super) fn validate(g: &SourceGraph, media: &HashMap<&str, &SourceMedia>) -> 
         }
         let mut refs = HashSet::new();
         for id in &u.binding.placements {
-            require(
-                placements.get(id.as_str()) == Some(&sequence.id.as_str()) && refs.insert(id),
-                &w,
-                "invalid multicam occurrence placement binding",
-            )?;
+            let Some(&(owner, placement)) = placements.get(id.as_str()) else {
+                return fail(format!("{w}: invalid multicam occurrence placement binding"));
+            };
+            require(owner == sequence.id && refs.insert(id), &w, "invalid multicam occurrence placement binding")?;
+            if u.reason.is_none() && u.binding.reason.is_none()
+                && !validate::on_lane(placement, u.kind, u.track)
+            {
+                return fail(format!("{w}: bound placement {id:?} is not on destination {} track {}",
+                    u.kind.as_str(), u.track));
+            }
         }
         require(
             u.record_start.is_none_or(|n| !n.is_negative())

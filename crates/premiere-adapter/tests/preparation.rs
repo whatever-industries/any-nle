@@ -3687,6 +3687,51 @@ fn original_fixture() -> SourceGraph {
 }
 
 #[test]
+fn retime_refusals_keep_the_saved_edit_and_original_diagnostic() {
+    use premiere_adapter::{prepare_avid_job, prepare_linked_originals, PreparationOccurrence};
+
+    let mut g = original_fixture();
+    g.sequences[0].markers.clear();
+    g.sequences[0].placements.retain(|edit| edit.video_track.is_some());
+    let mut second = g.sequences[0].clone();
+    second.id = "second".into();
+    second.placements[0].id = "second/retime".into();
+    second.placements[0].record_start = q(2);
+    second.placements[0].source_in = q(0);
+    second.placements[0].duration = q(1);
+    g.sequences.push(second);
+    g.sidecars.push(Sidecar {
+        adapter: "avid.source".into(),
+        object: "second".into(),
+        data: v(vec![("compatibility_start", Value::Str("3600".into()))]),
+    });
+    let options = options();
+    let profile = ClockProfile::LegacyImport;
+    let prepare = |g: &SourceGraph| prepare_avid_job(g, &options, profile, false, false, None);
+    if let Err(issue) = prepare(&g) {
+        panic!("the straight-cut control must prepare: {}", issue.message);
+    }
+
+    g.sequences[1].placements[0].speed = Some(graph::Speed { ratio: (1, 2), source_duration: q(2) });
+    let check = |g: &SourceGraph, message| {
+        let issue = prepare(g).err().expect("retime must refuse preparation");
+        let legacy = prepare_linked_originals(g, &options, profile, false).err().unwrap();
+        assert_eq!(issue.message, message);
+        assert_eq!(issue.message, legacy.to_string());
+        assert_eq!(issue.sequence.as_deref(), Some("second"));
+        assert_eq!(issue.occurrence, Some(PreparationOccurrence::Placement("second/retime".into())));
+    };
+    check(&g, "original-file retiming is not qualified");
+
+    g.sidecars.push(Sidecar {
+        adapter: "avid.source".into(),
+        object: "second/retime".into(),
+        data: v(vec![("constant_speed", Value::Arr(vec![Value::Int(2)]))]),
+    });
+    check(&g, "invalid saved Avid constant-speed witness");
+}
+
+#[test]
 fn linked_aac_origin_preserves_stereo_source_and_independent_audio_edits() {
     use prproj::convert::prepared::PreparedClip;
 
@@ -3844,6 +3889,54 @@ fn partial_animatte_key_out_keeps_its_mask_and_reports_the_compositing_differenc
             assert_eq!(notice.object, owner);
         }
     }
+}
+
+#[test]
+fn graph_media_round_trips_beyond_linked_destination_profiles() {
+    fn check(graph: SourceGraph, owner: usize, reason: &str) {
+        let saved = graph.to_json_text().unwrap();
+        let reloaded = SourceGraph::from_json_text(&saved).unwrap();
+        assert_eq!(reloaded, graph);
+        let err = premiere_adapter::prepare_originals(&reloaded, &options(), ClockProfile::LegacyImport)
+            .err().unwrap();
+        assert_eq!(err.to_string(), format!("source media {:?}: {reason}", graph.media[owner].id));
+    }
+
+    let mut graph = original_fixture();
+    graph.media[0].original.as_mut().unwrap().start_pts = -1024;
+    check(graph, 0, "unsupported original stream origin or extent");
+
+    let mut graph = original_fixture();
+    let media = &mut graph.media[1];
+    media.bits = Some(24);
+    media.codec = Some("pcm_s24le".into());
+    let original = media.original.as_mut().unwrap();
+    original.sample_representation = Some("pcm24".into());
+    original.container = "wav".into();
+    original.stream_index = 0;
+    original.channels = Some(8);
+    original.channel_index = Some(7);
+    check(graph, 1, "invalid physical audio channel");
+
+    for representation in [None, Some("pcm32")] {
+        let mut graph = original_fixture();
+        let media = &mut graph.media[1];
+        media.bits = Some(32);
+        media.codec = Some("pcm_s32le".into());
+        media.original.as_mut().unwrap().sample_representation = representation.map(str::to_owned);
+        check(graph, 1, "audio sample representation contradicts bit depth or media profile");
+    }
+
+    let mut graph = original_fixture();
+    let media = &mut graph.media[0];
+    media.codec = Some("tiff".into());
+    media.frame_size = Some((2048, 1556));
+    media.rate = Some(q(25));
+    let original = media.original.as_mut().unwrap();
+    original.container = "tiff".into();
+    original.time_base = Q::new(1, 25).unwrap();
+    original.duration_ts = 1;
+    check(graph, 0, "invalid original still or editorial hold");
 }
 
 #[test]
@@ -4783,6 +4876,7 @@ fn linked_group_selects_picture_templates_independently_of_pcm_depth() {
 
 #[test]
 fn linked_editable_multicam_uses_the_six_original_streams() {
+    use premiere_adapter::{prepare_avid_job, PreparationOccurrence};
     use prproj::convert::{multicam::FRAME, writer::prepare_typed_project};
 
     let g = linked_group_camera_fixture();
@@ -4796,7 +4890,25 @@ fn linked_editable_multicam_uses_the_six_original_streams() {
     assert!(prepare_linked(&g, &merged).err().unwrap().0.contains("Separate files"));
     let mut missing = g.clone();
     missing.media[5].bits = Some(16);
-    assert!(prepare_linked(&missing, &options()).err().unwrap().0.contains("two original mono PCM24 siblings"));
+    let group_error = prepare_linked(&missing, &options()).err().unwrap();
+    assert!(group_error.0.contains("two original mono PCM24 siblings"));
+    let scoped = |g: &SourceGraph| prepare_avid_job(
+        g, &options(), ClockProfile::LegacyImport, false, false, None,
+    );
+    let failure = scoped(&missing).err().unwrap();
+    assert_eq!(failure.message, group_error.to_string());
+    assert!(failure.sequence.is_none());
+    assert_eq!(failure.occurrence, Some(PreparationOccurrence::Group(g.multicams[0].id.clone())));
+
+    let mut invalid_use = g.clone();
+    let usage = invalid_use.multicam_uses.iter_mut().find(|u| u.kind == StreamKind::Audio).unwrap();
+    usage.binding.reason = Some("unresolved synthetic leaf".into());
+    let (sequence_id, use_id) = (usage.sequence.clone(), usage.id.clone());
+    let failure = scoped(&invalid_use).err().unwrap();
+    assert_eq!(failure.message, prepare_linked(&invalid_use, &options()).err().unwrap().to_string());
+    assert!(failure.message.contains("group use or leaf binding has an unresolved witness"));
+    assert_eq!(failure.sequence, Some(sequence_id));
+    assert_eq!(failure.occurrence, Some(PreparationOccurrence::GroupUse(use_id)));
 
     let dir = std::env::temp_dir().join(format!("anynle-linked-group-{}-{}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));

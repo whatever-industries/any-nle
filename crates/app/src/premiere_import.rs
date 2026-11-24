@@ -465,6 +465,7 @@ pub fn run(path: &Path, mode: Mode) -> Result<Report> {
     )?)
     .map_err(|err| err.to_string())?;
     select(&mut graph, &request.sequence)?;
+    anynle_media_verification::linked_original::qualify(&graph.media).map_err(|e| e.to_string())?;
     if graph.media.len() > 64 {
         return Err("import trial is limited to 64 original streams".into());
     }

@@ -1,5 +1,6 @@
 use super::*;
-use graph::picture_chain::{is_corner_pin_stage, read_ordered_corner_pin, Chain, Reflection};
+use graph::picture_chain::Reflection;
+use mapping::picture_chain::{is_corner_pin_stage, read_ordered_corner_pin, Chain};
 use prproj::convert::prepared::{supports_picture_motion_clock, CornerPin, MotionKey, PictureEffect, TrimmedMotion, TrimmedMotionKey, WarpRollInterpolation};
 
 fn number(value: &Value) -> Option<f64> {
@@ -117,7 +118,7 @@ pub(super) fn prepare_chain(
     }
     let chain = match Chain::read(effect) {
         Ok(chain) => chain,
-        Err(graph::picture_chain::Error::Unsupported(reason)) => {
+        Err(mapping::picture_chain::Error::Unsupported(reason)) => {
             loss(losses, &placement.id, "picture_effect", reason);
             return Ok(refused);
         }
@@ -184,7 +185,7 @@ fn spectramatte_motion(stages: &[Value]) -> Option<([u8; 3], graph::Transform)> 
     let Value::Arr(channels) = params.get("key_rgb8")? else { return None };
     let [Value::Int(r), Value::Int(g), Value::Int(b)] = channels.as_slice() else { return None };
     let rgb = [u8::try_from(*r).ok()?, u8::try_from(*g).ok()?, u8::try_from(*b).ok()?];
-    let motion = graph::picture_chain::read_transform(warp.get("transform")?).ok()?;
+    let motion = mapping::picture_chain::read_transform(warp.get("transform")?).ok()?;
     (g > r && g > b && motion.rotation == 0.0 && motion.anchor == (0.0, 0.0)
         && motion.crop == [0.0; 4] && motion.scale.0 == motion.scale.1 && motion.scale.0 > 0.0)
         .then_some((rgb, motion))

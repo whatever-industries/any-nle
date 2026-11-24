@@ -115,6 +115,123 @@ fn missing_managed_review_uses_the_saved_source_track() {
 }
 
 #[test]
+fn blocked_picture_review_keeps_exact_edits_with_spooled_receipts() {
+    let (mut facts, mut index) = fixture(2);
+    let picture = mob(100);
+    let duplicate = facts.masters[0].master.tracks[1].file_mob.umid_hex();
+    index.files.remove(&duplicate);
+    index.ambiguous.push(duplicate);
+    let source = &mut facts.masters[0];
+    source.master.tracks.push(MediaTrack {
+        kind: KIND_PICTURE, index: 1, file_mob: picture, edit_rate: 24.0, length: 48,
+        essence: Some(Essence::Picture {
+            compression: "RI00".into(), resolution_id: 0, width: 1920, height: 1080,
+            display_aspect: Some((16, 9)),
+        }),
+        offset: 0, clip_length: 48, gain_db: None, pan_raw: None,
+    });
+    source.offsets.push(Observed::Known(0));
+    source.originals.push(None);
+    let mut video = event("picture", 3, 1, 12, 12, None);
+    video.event.kind = KIND_PICTURE;
+    video.event.edit_gain_db = None;
+    // Match whole-project capture, which moves sequences out of the project facts.
+    let sequences = vec![sequence(vec![video, event("audio", 3, 1, 12, 12, None)])];
+    let originals = original::OriginalIndex { allow_media_gaps: true, ..Default::default() };
+    let selected = SelectedMediaIndex::new(&facts, &originals, &index, &mut || Ok(())).unwrap();
+    let build = |review| build_working_graph(
+        &facts, &sequences, &selected, "Synthetic", &["Bin".into()], &originals,
+        &MotionMxf::default(), Some(spool::ReceiptSpool::new().unwrap()), review,
+        &mut |_| Ok(()), &mut || Ok(()),
+    ).unwrap();
+    let normal = build(false);
+    let reviewed = build(true);
+    assert_eq!(normal.graph, reviewed.graph);
+    assert!(normal.missing_managed_edits.timelines.is_empty());
+    let [timeline] = reviewed.missing_managed_edits.timelines.as_slice() else {
+        panic!("expected one timeline with a missing picture package");
+    };
+    let [edit] = timeline.edits.as_slice() else {
+        panic!("only the picture edit should be attributed to the missing picture package");
+    };
+    assert_eq!((edit.id.as_str(), edit.kind, edit.track), ("picture", StreamKind::Video, 3));
+    assert_eq!(edit.offset, Rational::new(12, 24));
+    assert_eq!(edit.file_package, picture.umid_hex());
+}
+
+#[test]
+fn audio_group_review_uses_only_uniquely_resolved_saved_members() {
+    let (mut facts, mut index) = fixture(3);
+    let mut clean = fixture(1).0.masters.pop().unwrap();
+    clean.id = "revision/clean/master".into();
+    clean.master.mob_id = mob(2);
+    clean.master.bin = 1;
+    facts.masters.push(clean);
+    let missing = facts.masters[0].master.tracks[1].file_mob.umid_hex();
+    index.files.remove(&missing);
+
+    let mut blocked = sequence(vec![
+        event("present_member", 3, 1, 0, 4, None),
+        event("missing_member", 5, 2, 7, 4, None),
+        event("independent", 7, 3, 11, 4, None),
+    ]);
+    blocked.clock = Some(av::SequenceClock {
+        count: 86_400,
+        rate: Rate::new(24, 1).unwrap(),
+        display_base: 24,
+        drop: false,
+        track_ordinal: 0,
+    });
+    let mut unaffected = sequence(vec![event("clean", 5, 1, 0, 4, None)]);
+    unaffected.events[0].event.master = facts.masters[1].master.mob_id;
+    unaffected.info.bin = 1;
+    unaffected.id = "revision/clean/sequence".into();
+    facts.sequences.extend([blocked, unaffected]);
+
+    let build = |facts: &av::SourceProject, review| {
+        let originals = original::OriginalIndex::default();
+        let selected = SelectedMediaIndex::new(facts, &originals, &index, &mut || Ok(())).unwrap();
+        build_working_graph(facts, &facts.sequences, &selected, "Synthetic",
+            &["Blocked".into(), "Clean".into()], &originals, &MotionMxf::default(),
+            None, review, &mut |_| Ok(()), &mut || Ok(())).unwrap()
+    };
+    facts.masters[0].master.stereo_pairs = vec![(1, 2)];
+    let normal = build(&facts, false);
+    let review = build(&facts, true);
+    assert_eq!(normal.graph, review.graph);
+    assert!(normal.audio_group_edits.timelines.is_empty());
+    let [issue] = review.audio_group_issues.as_slice() else { panic!("expected one audio group issue") };
+    assert_eq!((issue.source_id.as_str(), issue.bin), ("revision/master", 0));
+    assert_eq!(issue.message, normal.audio_group_issues[0].message);
+    let [timeline] = review.audio_group_edits.timelines.as_slice() else {
+        panic!("expected only one affected timeline");
+    };
+    assert_eq!((timeline.id.as_str(), timeline.bin), ("revision/seq", 0));
+    assert_eq!(timeline.clock, Some((Rational::integer(3600), 24, false)));
+    let [present, absent] = timeline.edits.as_slice() else {
+        panic!("expected both saved group members only");
+    };
+    assert_eq!((present.id.as_str(), present.track, present.master_track), ("present_member", 3, 1));
+    assert_eq!((absent.id.as_str(), absent.track, absent.master_track), ("missing_member", 5, 2));
+    assert_eq!(absent.offset, Rational::new(7, 24));
+
+    facts.masters[0].master.stereo_pairs.clear();
+    facts.masters[0].master.other_groups = vec!["51:A1A2A4A5A6A7".into()];
+    assert_eq!(build(&facts, true).audio_group_edits.timelines[0].edits.len(), 2);
+
+    facts.masters[1].master.mob_id = facts.masters[0].master.mob_id;
+    facts.sequences[1].events[0].event.master = facts.masters[0].master.mob_id;
+    assert!(build(&facts, true).audio_group_edits.timelines.is_empty());
+
+    facts.masters[1].master.mob_id = mob(2);
+    facts.sequences[1].events[0].event.master = mob(2);
+    facts.masters[0].master.other_groups = vec!["unknown:A1A2".into()];
+    let unknown = build(&facts, true);
+    assert_eq!(unknown.audio_group_issues.len(), 1);
+    assert!(unknown.audio_group_edits.timelines.is_empty());
+}
+
+#[test]
 fn unused_managed_picture_with_unsupported_rate_gets_reported_omission() {
     let (mut facts, index) = fixture(2);
     let source = &mut facts.masters[0];
@@ -511,6 +628,7 @@ fn fixture(channels: i64) -> (av::SourceProject, index::MediaIndex) {
         color: None,
         start: None,
         aux_timecodes: vec![],
+        saved_clock_segments: vec![],
         source_file: None,
         source_path: None,
         bin: 0,
@@ -2236,20 +2354,71 @@ fn source_group(id:&str)->av::SourceGroup{
         endpoint:av::GroupEndpoint{class:*b"SCLP",kind:Some(KIND_SOUND),rate:Some(r),mob:Some(mob(10+i)),track:Some(1),start:Some(0),length:Some(48)},
         pieces:if i==0{vec![av::SourceGroupPiece::Gap{start:0,length:24},av::SourceGroupPiece::Media{start:24,length:24,master:mob(1),track:1,source_in:0,rate:r}]}else{vec![av::SourceGroupPiece::Media{start:0,length:48,master:mob(1),track:1,source_in:0,rate:r}]},reason:None,
     }).collect();
-    av::SourceGroup{id:id.into(),bin:0,mob:Some(mob(20)),name:"Group A".into(),rate:Some(r),stored_rate:Some(24.0),length:Some(48),lanes:vec![av::SourceGroupLane{is_ganged:Some(true),kind:Some(KIND_SOUND),label:Some(1),rate:Some(r),length:Some(48),selected:Some(0),alternatives,reason:None}],marks:vec![],markers:vec![],reason:None}
+    av::SourceGroup{id:id.into(),bin:0,mob:Some(mob(20)),name:"Group A".into(),rate:Some(r),stored_rate:Some(24.0),length:Some(48),lanes:vec![av::SourceGroupLane{is_ganged:Some(true),kind:Some(KIND_SOUND),label:Some(1),rate:Some(r),length:Some(48),selected:Some(0),alternatives,markers:vec![],reason:None}],marks:vec![],markers:vec![],reason:None}
 }
 fn group_use(g:&av::SourceGroup,selected:i64,bindings:&[&str])->av::SourceGroupUse{
     av::SourceGroupUse{is_ganged:Some(true),warp_picture_input:false,id:"group-use".into(),kind:KIND_SOUND,track:1,position:Some(0),length:Some(12),rate:g.rate,selected:Some(selected),alternatives:g.lanes[0].alternatives.iter().map(|a|av::GroupEndpoint{length:Some(12),..a.endpoint}).collect(),binding:av::Binding{placements:bindings.iter().map(|s|s.to_string()).collect(),reason:None},reason:None}
 }
 #[test]
 fn group_layouts_keep_gaps_and_bind_exact_occurrences_instead_of_first_timestamp(){
-    let (mut f,i)=fixture(1);let g=source_group("group");let u=group_use(&g,1,&["second"]);
+    let (mut f,i)=fixture(1);let g=source_group("group");let mut u=group_use(&g,1,&["second"]);
+    u.track = 2; // The second simultaneous edit is on A2 and selects Group source lane 1.
     let mut seq=sequence(vec![event("first",1,1,0,12,None),event("second",2,1,0,12,None)]);seq.group_uses.push(u);f.groups.push(g);f.sequences.push(seq);
     let out=run(&f,&i);assert_eq!(out.graph.multicams.len(),1);assert!(out.graph.bins[0].items.iter().any(|s|s=="group"));
     assert!(out.graph.multicams[0].lanes[0].alternatives[0].pieces[0].item.is_none());
     let u=&out.graph.multicam_uses[0];assert_eq!(u.candidates,vec!["group"]);assert_eq!(u.selected,Some(1));assert_eq!(u.binding.placements,vec!["second"]);assert_eq!(u.source_in,Some(Rational::ZERO));assert!(u.reason.is_none());
+    assert_eq!((u.lane, u.track), (Some(1), 2));
     assert_eq!(SourceGraph::from_json_text(&out.graph.to_json_text().unwrap()).unwrap(),out.graph);
 }
+#[test]
+fn group_member_with_missing_stream_keeps_the_native_reference() {
+    let (mut facts, mut index) = fixture(2);
+    let mut group = source_group("group");
+    let av::SourceGroupPiece::Media { track, .. } =
+        &mut group.lanes[0].alternatives[1].pieces[0]
+    else {
+        panic!("expected an audio member");
+    };
+    *track = 2;
+    facts.groups.push(group);
+
+    let complete = run(&facts, &index);
+    assert_eq!(complete.graph.multicams[0].lanes[0].alternatives[1].pieces[0].stream, Some(2));
+    let package = facts.masters[0].master.tracks[1].file_mob.umid_hex();
+    index.files.remove(&package);
+
+    let missing = run(&facts, &index);
+    let graph = SourceGraph::from_json_text(&missing.graph.to_json_text().unwrap()).unwrap();
+    let alternatives = &graph.multicams[0].lanes[0].alternatives;
+    assert_eq!(alternatives[0], complete.graph.multicams[0].lanes[0].alternatives[0]);
+    assert_eq!(alternatives[1].reason.as_deref(), Some("group member source stream is unavailable"));
+    assert!(alternatives[1].pieces.is_empty());
+    assert_eq!(graph.sidecar("avid.group", "group"), complete.graph.sidecar("avid.group", "group"));
+    assert!(missing.missing_managed_audio.iter().any(|reason| reason.contains(&package)));
+
+    let originals = original::OriginalIndex {
+        allow_media_gaps: true,
+        ..Default::default()
+    };
+    let review = |index: &index::MediaIndex, collect| {
+        let selected = SelectedMediaIndex::new(&facts, &originals, index, &mut || Ok(())).unwrap();
+        build_working_graph(
+            &facts, &facts.sequences, &selected, "Synthetic", &["Bin".into()],
+            &originals, &MotionMxf::default(), None, collect, &mut |_| Ok(()), &mut || Ok(()),
+        ).unwrap()
+    };
+    let reviewed = review(&index, true);
+    assert_eq!(reviewed.graph, review(&index, false).graph);
+    let [finding] = reviewed.missing_group_audio["group"].as_slice() else {
+        panic!("expected exactly one Group member with an absent package");
+    };
+    assert_eq!((finding.lane, finding.alternative, finding.source_track), (1, 1, 2));
+    assert_eq!((finding.start, finding.end), (Rational::ZERO, Rational::integer(2)));
+    assert_eq!(finding.package, package);
+    index.ambiguous.push(package);
+    assert!(review(&index, true).missing_group_audio.is_empty());
+}
+
 #[test]
 fn selected_group_gap_ambiguity_missing_member_and_bad_clock_are_explicit(){
     let (mut f,i)=fixture(1);let g=source_group("group");let u=group_use(&g,0,&[]);let mut seq=sequence(vec![]);seq.group_uses.push(u);f.groups.push(g);f.sequences.push(seq);

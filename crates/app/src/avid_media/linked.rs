@@ -1,4 +1,5 @@
 //! Internal graph/2 replay to one native Avid bin.
+mod markers;
 mod native_bin;
 mod original;
 mod prepare;
@@ -45,6 +46,8 @@ struct Plan<'a> {
     length: u32,
     routes: [Route<'a>; 3],
     spans: [Span; 3],
+    picture_markers: Vec<markers::Marker<'a>>,
+    sequence_markers: Vec<markers::Marker<'a>>,
 }
 
 pub fn write_linked_bin(
@@ -120,7 +123,13 @@ fn write_graph(
     tools: &BackendTools,
     recheck_source: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    anynle_media_verification::linked_original::qualify(&graph.media)?;
     let plan = prepare::plan(graph, sequence_id, captured)?;
+    if donor_path.is_some() && !plan.picture_markers.is_empty() {
+        return Err(
+            "picture markers require a newly created Avid master; use --linked-originals".into(),
+        );
+    }
     let donor_bytes = donor_path
         .map(|path| read_small(path, MAX_DONOR_BYTES))
         .transpose()?;

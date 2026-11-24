@@ -1,5 +1,5 @@
 //! Validate the graph and resolve each edit to its saved physical stream.
-use super::{Plan, Result, Route, Span, RASTER, RATE};
+use super::{markers, Plan, Result, Route, Span, RASTER, RATE};
 use graph::{source::SourceGraph, Rational, StreamKind};
 use std::path::Path;
 
@@ -76,7 +76,6 @@ pub(super) fn plan<'a>(
         || sequence.name.trim().is_empty()
         || !matches_clock(sequence.clock.as_ref(), start)
         || !sequence.transitions.is_empty()
-        || !sequence.markers.is_empty()
         || !sequence.texts.is_empty()
         || !sequence.disabled_placements.is_empty()
         || !graph.losses.is_empty()
@@ -98,6 +97,7 @@ pub(super) fn plan<'a>(
     }
     let mut lanes = Vec::with_capacity(3);
     let mut item_ids = Vec::with_capacity(3);
+    let mut picture_markers = Vec::new();
     for (kind, lane, label) in [
         (StreamKind::Video, 1, "V1"),
         (StreamKind::Audio, 1, "A1"),
@@ -169,7 +169,7 @@ pub(super) fn plan<'a>(
         };
         let (binding, media) =
             selected.ok_or_else(|| format!("{}: unresolved stream selector", edit.id))?;
-        if !item.markers.is_empty()
+        if (!picture && !item.markers.is_empty())
             || item.color_rgb16.is_some()
             || !(item.stream_groups.is_empty()
                 || captured && !picture && item.stream_groups == [vec![1, 2]])
@@ -239,6 +239,9 @@ pub(super) fn plan<'a>(
         let extent = frames(duration)
             .filter(|n| *n > 0)
             .ok_or("original extent needs whole edit frames")?;
+        if picture {
+            picture_markers = markers::prepare(&item.markers, binding.source_offset, extent)?;
+        }
         // Premiere's WAV capture leaves display timecode absent. The
         // separate physical check still requires a zero embedded origin.
         let clock = if captured && !picture && media.start.is_none() {
@@ -309,11 +312,14 @@ pub(super) fn plan<'a>(
         .map(|span| span.record.checked_add(span.length))
         .try_fold(0, |length, end| Some(length.max(end?)))
         .ok_or("sequence end overflow")?;
+    let sequence_markers = markers::prepare(&sequence.markers, Some(Rational::ZERO), length)?;
     Ok(Plan {
         name: &sequence.name,
         start,
         length,
         routes: [video, left, right],
         spans: [v, a, b],
+        picture_markers,
+        sequence_markers,
     })
 }

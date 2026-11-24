@@ -32,6 +32,16 @@ pub(crate) fn prepare(
     layout: Option<&DestinationBinLayout>,
     offline: &HashSet<&str>,
 ) -> Result<PreparedProject> {
+    let (clips, bindings) = bind(graph, input, offline)?;
+    let media = TypedMedia::VerifiedOp1a { bindings: &bindings, clips: &clips, offline };
+    prepare_typed_project_for_premiere_27(input, output, ids, media, layout)
+}
+
+pub(crate) fn bind(
+    graph: &SourceGraph,
+    input: &mut PreparedProjectInput,
+    offline: &HashSet<&str>,
+) -> Result<(HashSet<String>, Vec<MediaRelink>)> {
     let invalid =
         |reason: &str| WriteError::Other(prproj::Error::Value(format!("managed OP1a: {reason}")));
     let facts: HashMap<_, _> = graph
@@ -154,6 +164,5 @@ pub(crate) fn prepare(
             "verified graph stream does not belong to a prepared clip",
         ));
     }
-    let media = TypedMedia::VerifiedOp1a { bindings: &bindings, clips: &clips, offline };
-    prepare_typed_project_for_premiere_27(input, output, ids, media, layout)
+    Ok((clips, bindings))
 }

@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+anynle-mapping = { path = "../mapping" }
 avid-reader = { path = "../../avid-reader" }
 anynle-avid-adapter = { path = "../avid-adapter" }
 anynle-graph = { path = "../graph" }

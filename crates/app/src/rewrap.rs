@@ -58,7 +58,10 @@ pub(crate) struct AtomEssence {
 mod tests;
 
 pub use validation::{normalize_source_clocks, validate_bin_audio};
-pub(crate) use planning::{NativeMediaPreparation, PrepareIssue};
+pub(crate) use planning::{
+    preview_native_recipes, preview_picture_recipes, referenced_input_paths, NativeMediaPreparation,
+    PrepareIssue,
+};
 pub(crate) use mono::gain_paths;
 pub(crate) use source::{essence_spans, pcm_essence_bytes};
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify actual extracted packages, target architectures and six-job gate receipts."""
 import argparse,hashlib,json,os,pathlib,plistlib,shutil,struct,subprocess,tempfile,zipfile
-from package import ICONS,TARGETS
+from package import ICONS,TARGETS,verify_resolve_templates
 from build_ffmpeg import sha
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 from release_version import gate_binding, release_version
@@ -83,6 +83,7 @@ def verify_package(target,directory,version,*,receipt_path=pathlib.Path('candida
                 if not counterpart.is_file() or sha(p)!=sha(counterpart):raise ValueError('extracted package differs from audited stage')
         verify_launcher_icon(target,extracted,package)
         if 'apple' in target:
+            verify_resolve_templates(bindir.parent/'Resources'/'resolve-templates')
             info = plistlib.loads((bindir.parent/'Info.plist').read_bytes())
             numeric_version = version.split('-', 1)[0]
             if any(info.get(key) != numeric_version for key in ('CFBundleShortVersionString', 'CFBundleVersion')):

@@ -10,7 +10,7 @@ use graph::source::SourceGraph;
 use prproj::convert::model::{ticks_per_unit, Fraction, Model, TICKS_PER_SECOND as TPS};
 use prproj::convert::prepared::PreparedProjectInput;
 use prproj::convert::rewrap::supported_rate;
-use std::{cell::LazyCell, collections::{HashMap, HashSet}};
+use std::{cell::LazyCell, collections::{BTreeSet, HashMap, HashSet}};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,12 +18,20 @@ pub(crate) enum PrepareIssue {
     Destination(String),
     Tools(String),
     Source(String),
+    SourceFile { path: PathBuf, message: String },
 }
 impl PrepareIssue {
     pub(crate) fn into_message(self) -> String {
         match self {
-            Self::Destination(message) | Self::Tools(message) | Self::Source(message) => message,
+            Self::Destination(message)
+            | Self::Tools(message)
+            | Self::Source(message)
+            | Self::SourceFile { message, .. } => message,
         }
+    }
+
+    pub(super) fn source_file(path: &str) -> impl Fn(String) -> Self + '_ {
+        move |message| Self::SourceFile { path: PathBuf::from(path), message }
     }
 }
 impl From<String> for PrepareIssue {
@@ -135,17 +143,94 @@ fn validate_destination(
     Ok((parent, destination))
 }
 
+fn referenced_clip_ids(model: &Model) -> HashSet<&str> {
+    model.bins.iter().flat_map(|bin| bin.clips.iter().map(String::as_str))
+        .chain(model.sequences.iter().flat_map(|seq| seq.events.iter().map(|event| event.clip.as_str())))
+        .collect()
+}
+
+/// Exact model locators for a read-only follow-up after a file-specific refusal.
+pub(crate) fn referenced_input_paths(model: &Model) -> impl Iterator<Item = &Path> {
+    let used = referenced_clip_ids(model);
+    let mut seen = HashSet::new();
+    model.clips.values()
+        .filter(move |clip| used.contains(clip.id.as_str()))
+        .flat_map(|clip| clip.video.iter().map(|video| video.path.as_str())
+            .chain(clip.audio.iter().map(|audio| audio.path.as_str())))
+        .filter(move |path| seen.insert(*path))
+        .map(Path::new)
+}
+
+fn splits_mono_wavs(prores: bool, audio_lanes: usize) -> bool {
+    !prores && audio_lanes > 32
+}
+
+/// Preview picture rewraps before a media folder is chosen. Deduplicate the
+/// whole bundle first, since distinct bundles can each emit a WAV from one input.
+pub(crate) fn preview_picture_recipes(
+    bundles: impl Iterator<Item = (Vec<PathBuf>, bool)>,
+) -> Vec<Vec<PathBuf>> {
+    let mut recipes = Vec::new();
+    for (paths, prores) in bundles.collect::<BTreeSet<_>>() {
+        if splits_mono_wavs(prores, paths.len().saturating_sub(1)) {
+            recipes.extend(paths.into_iter().map(|path| vec![path]));
+        } else {
+            recipes.push(paths);
+        }
+    }
+    recipes
+}
+
+/// Saved source recipes for a full rewrap's missing-folder Review.
+pub(crate) fn preview_native_recipes(model: &Model, gain: &GainPaths<'_>) -> Vec<Vec<PathBuf>> {
+    let used = referenced_clip_ids(model);
+    let clips = model.clips.values().filter(|clip| used.contains(clip.id.as_str()));
+    let mut recipes = preview_picture_recipes(clips.clone().filter_map(|clip| {
+        let picture = clip.video.as_ref()?;
+        let mut audio: Vec<_> = clip.audio.iter().collect();
+        audio.sort_by_key(|stream| stream.avid_track);
+        let paths = std::iter::once(PathBuf::from(&picture.path))
+            .chain(audio.iter().map(|stream| PathBuf::from(&stream.path)))
+            .collect();
+        let prores = avid_reader::mxf::ProResProfile::from_fourcc(&picture.codec).is_some();
+        Some((paths, prores))
+    }));
+    if !gain.is_empty() {
+        let mono: BTreeSet<_> = clips
+            .filter_map(|clip| super::mono::audio_clip(clip).ok())
+            .map(|audio| PathBuf::from(&audio.path))
+            .collect();
+        recipes.extend(mono.into_iter().map(|path| vec![path]));
+    }
+    recipes
+}
+
 impl Plan {
+    fn input_paths(&self, indices: &[usize]) -> Vec<PathBuf> {
+        indices
+            .iter()
+            .map(|&index| self.inputs[index].path.clone())
+            .collect()
+    }
+
     pub(crate) fn estimate_sources(&self) -> Vec<Vec<PathBuf>> {
-        self.jobs.iter().map(|job| {
-            job.inputs.iter().map(|&index| self.inputs[index].path.clone()).collect()
-        }).collect()
+        let mono_recipe = |pcm: &super::mono::MonoPcm| vec![pcm.input_path().to_owned()];
+        let mut recipes = Vec::new();
+        for job in &self.jobs {
+            recipes.push(self.input_paths(job.packaged_inputs()));
+            recipes.extend(job.wide_audio.iter().map(mono_recipe));
+        }
+        recipes.extend(self.mono.iter().map(mono_recipe));
+        recipes
     }
 
     #[cfg(target_os = "macos")]
     pub(crate) fn op1a_targets(&self) -> impl Iterator<Item = (Vec<PathBuf>, PathBuf)> + '_ {
-        self.estimate_sources().into_iter().enumerate().map(|(index, inputs)| {
-            (inputs, self.destination.join(format!("media-{:04}.mxf", index + 1)))
+        self.jobs.iter().enumerate().map(|(index, job)| {
+            (
+                self.input_paths(&job.inputs),
+                self.destination.join(format!("media-{:04}.mxf", index + 1)),
+            )
         })
     }
 
@@ -300,17 +385,7 @@ impl Plan {
         }
         // Destination track capacity is validated by the staged project writer before execution.
         prproj::convert::model::validate_model(model).map_err(|e| e.to_string())?;
-        let used: HashSet<&str> = model
-            .bins
-            .iter()
-            .flat_map(|b| b.clips.iter().map(String::as_str))
-            .chain(
-                model
-                    .sequences
-                    .iter()
-                    .flat_map(|s| s.events.iter().map(|e| e.clip.as_str())),
-            )
-            .collect();
+        let used = referenced_clip_ids(model);
         if allow_mov && !prefer_separate_mono && model.clips.values().any(|clip| {
             used.contains(clip.id.as_str())
                 && clip.audio.len() > 8
@@ -370,7 +445,7 @@ impl Plan {
             })?;
             let mov = avid_reader::mxf::ProResProfile::from_fourcc(&video.codec).is_some();
             let separate_mono = clip.audio.len() > 32 || (mov && prefer_separate_mono);
-            let wide_dnx = !mov && clip.audio.len() > 32;
+            let wide_dnx = splits_mono_wavs(mov, clip.audio.len());
             if wide_dnx && (clip.audio.len() > 64
                 || !clip.stereo_pairs.is_empty() || !clip.multichannel_groups.is_empty()
                 || clip.audio.iter().any(|audio| !matches!(audio.bits, 16 | 24)))
@@ -384,8 +459,9 @@ impl Plan {
             {
                 return Err(format!("clip {}: rewrap requires a qualified DNx or ProRes profile and rate",clip.id).into());
             }
+            let picture_issue = PrepareIssue::source_file(&video.path);
             let source_id = avid_reader::mxf::read_identity(Path::new(&video.path))
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| picture_issue(e.to_string()))?;
             let native_clock = source_id.file_start_timecode();
             let freeze = video.codec == "apch" && native_clock.is_none();
             let tc = if freeze {
@@ -401,14 +477,17 @@ impl Plan {
                 }
                 None
             } else {
-                let (frames, base, drop) = native_clock.ok_or("missing/ambiguous source timecode")?;
+                let (frames, base, drop) = native_clock
+                    .ok_or_else(|| picture_issue("missing/ambiguous source timecode".into()))?;
                 if base as i64 != (video.rate.num + video.rate.den / 2) / video.rate.den
                     || i128::from(frames) * i128::from(ticks_per_unit(video.rate))
                         != i128::from(video.start)
                 {
-                    return Err("native source timecode disagrees with exact model start".into());
+                    return Err(picture_issue(
+                        "native source timecode disagrees with exact model start".into(),
+                    ));
                 }
-                Some(timecode(video.start, video.rate, drop)?)
+                Some(timecode(video.start, video.rate, drop).map_err(&picture_issue)?)
             };
             let expected_op = if freeze { "060e2b34040101020d01020110000000" } else { OP_ATOM };
             let avid_prores_picture = !freeze && mov
@@ -436,15 +515,19 @@ impl Plan {
                 .chain(audio.iter().map(|a| a.path.as_str()))
                 .enumerate()
             {
+                // Keep the graph's locator for attribution, including when the probe
+                // has to use its canonical path to deduplicate physical files.
+                let input_issue = PrepareIssue::source_file(original);
                 let accepts_op = |op: &str| op == expected_op
                     || (at == 0 && (avid_lt_picture || avid_prores_picture) && op == super::backend::AVID_PRORES_LT_ATOM);
-                let path = fs::canonicalize(original).map_err(|e| format!("{original}: {e}"))?;
+                let path = fs::canonicalize(original)
+                    .map_err(|e| input_issue(format!("{original}: {e}")))?;
                 if path.to_str().is_none()
                     || original
                         .chars()
                         .any(|c| c.is_control() || matches!(c, '\u{fffe}' | '\u{ffff}'))
                 {
-                    return Err("rewrap input path cannot be represented safely".into());
+                    return Err(input_issue("rewrap input path cannot be represented safely".into()));
                 }
                 let index = if let Some(&i) = paths.get(&path) {
                     if !plan.inputs[i].aliases.contains(&original.to_string()) {
@@ -452,17 +535,17 @@ impl Plan {
                     }
                     i
                 } else {
-                    let before = stamp(&path)?;
-                    let p = probe(ffprobe, &path)?;
+                    let before = stamp(&path).map_err(&input_issue)?;
+                    let p = probe(ffprobe, &path).map_err(&input_issue)?;
                     if !accepts_op(&p.op) || p.streams.len() != 1 {
-                        return Err(format!(
+                        return Err(input_issue(format!(
                             "{}: unqualified OP-Atom operational-pattern variant or stream layout",
                             path.display()
-                        ).into());
+                        )));
                     }
-                    let identity = id_value(&path)?;
-                    if before != stamp(&path)? {
-                        return Err("input changed during probe".into());
+                    let identity = id_value(&path).map_err(&input_issue)?;
+                    if before != stamp(&path).map_err(&input_issue)? {
+                        return Err(input_issue("input changed during probe".into()));
                     }
                     let i = plan.inputs.len();
                     plan.inputs.push(Input {
@@ -478,38 +561,43 @@ impl Plan {
                 };
                 let input = &plan.inputs[index];
                 if !accepts_op(&input.probe.op) || (freeze && !input.probe.references.is_empty()) {
-                    return Err("conflicting or unqualified source operational pattern".into());
+                    return Err(input_issue(
+                        "conflicting or unqualified source operational pattern".into(),
+                    ));
                 }
                 if input.probe.op == super::backend::AVID_PRORES_LT_ATOM {
-                    super::backend::verify_stream_package(&input.probe, &source_id.file_packages)?;
+                    super::backend::verify_stream_package(&input.probe, &source_id.file_packages)
+                        .map_err(&input_issue)?;
                 }
                 let stream = &input.probe.streams[0];
                 if stream.ticks != video.duration {
-                    return Err(format!(
+                    return Err(input_issue(format!(
                         "clip {}: unequal source spans cannot be silently padded or trimmed",
                         clip.id
-                    ).into());
+                    )));
                 }
-                let input_clock =
-                    avid_reader::mxf::read_identity(&input.path).map_err(|e| e.to_string())?;
+                let input_clock = avid_reader::mxf::read_identity(&input.path)
+                    .map_err(|e| input_issue(e.to_string()))?;
                 if input_clock.file_start_timecode() != native_clock {
-                    return Err(
+                    return Err(input_issue(
                         "source native timecode components do not share the picture clock".into(),
-                    );
+                    ));
                 }
                 if input.probe.tc != tc {
-                    return Err(format!(
+                    return Err(input_issue(format!(
                         "clip {}: source timecode does not match the exact model clock",
                         clip.id
-                    ).into());
+                    )));
                 }
                 if at == 0 {
                     if mov {
-                        pixel_aspect = super::mov::validate_source(stream, &input.probe.raw, video)?;
+                        pixel_aspect = super::mov::validate_source(stream, &input.probe.raw, video)
+                            .map_err(&input_issue)?;
                         if let Some(aspect) = pixel_aspect {
                             let saved = saved_descriptors.get(video.path.as_str())
                                 .map(Vec::as_slice).unwrap_or_default();
-                            super::mov::verify_pixel_aspect(video, aspect, &input_clock, saved)?;
+                            super::mov::verify_pixel_aspect(video, aspect, &input_clock, saved)
+                                .map_err(&input_issue)?;
                         }
                     } else if stream.kind != "video"
                         || stream.codec != "dnxhd"
@@ -521,28 +609,30 @@ impl Plan {
                         || stream.width != video.width
                         || stream.height != video.height
                     {
-                        return Err(
-                            "DNx stream descriptor/frame count disagrees with supported model"
-                                .into(),
-                        );
+                        return Err(input_issue(
+                            "DNx stream descriptor/frame count disagrees with supported model".into(),
+                        ));
                     }
                     if let Some(profile) = source_id.picture_essence_coding.and_then(avid_reader::mxf::PictureProfile::from_label) {
                         if stream.profile != profile.probe_name() {
-                            return Err(format!("{} coding label disagrees with the coded picture profile", profile.probe_name()).into());
+                            return Err(input_issue(format!(
+                                "{} coding label disagrees with the coded picture profile",
+                                profile.probe_name()
+                            )));
                         }
                         if let avid_reader::mxf::PictureProfile::Dnx(cid) = profile {
-                            verify_dnx_cid(&input.path, cid)?;
+                            verify_dnx_cid(&input.path, cid).map_err(&input_issue)?;
                         }
                     }
                 } else {
                     let a = audio[at - 1];
                     if a.sample_rate != 48000 || !matches!(a.bits, 16 | 24) {
-                        return Err("rewrap supports signed 16/24-bit little-endian mono PCM at 48 kHz only; no resampling or encoding".into());
+                        return Err(input_issue("rewrap supports signed 16/24-bit little-endian mono PCM at 48 kHz only; no resampling or encoding".into()));
                     }
-                    let bytes = pcm_essence_bytes(&input.path)?;
+                    let bytes = pcm_essence_bytes(&input.path).map_err(&input_issue)?;
                     let expected = (video.duration as i128) * 48000 * (a.bits as i128) / 8;
                     if bytes as i128 * TPS as i128 != expected {
-                        return Err("PCM physical sample span disagrees with the model; padded/truncated inputs are not qualified".into());
+                        return Err(input_issue("PCM physical sample span disagrees with the model; padded/truncated inputs are not qualified".into()));
                     }
                     if stream.kind != "audio"
                         || stream.channels != 1
@@ -554,10 +644,9 @@ impl Plan {
                         || a.duration != video.duration
                         || a.start != video.start
                     {
-                        return Err(
-                            "PCM descriptor/span/start disagrees with supported mono48k model"
-                                .into(),
-                        );
+                        return Err(input_issue(
+                            "PCM descriptor/span/start disagrees with supported mono48k model".into(),
+                        ));
                     }
                 }
                 if recipe.contains(&index) {
@@ -601,20 +690,24 @@ impl Plan {
                                 || picture.ticks != verified.terminal.frames * ticks_per_unit(Fraction::new(24, 1))
                                 || picture.packets != verified.terminal.frames + i64::from(verified.terminal.bytes > 0)
                             {
-                                return Err("input changed since Color Adapter picture verification".into());
+                                return Err(picture_issue(
+                                    "input changed since Color Adapter picture verification".into(),
+                                ));
                             }
                             Ok(verified.terminal)
                         }
                         None => super::terminal::Terminal::qualify_lt(&input.path, &input.probe, ffprobe),
                     }
                 } else if mov {
-                    return Err("ProRes packet/span mismatch: no DNx terminal-packet exception applies".into());
+                    return Err(picture_issue(
+                        "ProRes packet/span mismatch: no DNx terminal-packet exception applies".into(),
+                    ));
                 } else {
                     super::terminal::Terminal::qualify(&input.path, &input.probe, ffprobe, video.rate)
                         .map_err(|e| format!("DNx packet count does not match the declared picture span; terminal/extra packets are not qualified for automatic removal: {e}"))
-                }?;
-                if input.stamp != stamp(&input.path)? {
-                    return Err("input changed during terminal packet validation".into());
+                }.map_err(&picture_issue)?;
+                if input.stamp != stamp(&input.path).map_err(&picture_issue)? {
+                    return Err(picture_issue("input changed during terminal packet validation".into()));
                 }
                 if terminal.bytes > 0 {
                     plan.inputs[i].terminal = Some(terminal);
@@ -740,8 +833,13 @@ impl Plan {
                 }
                 let wide_audio = if wide_dnx {
                     recipe[1..].iter()
-                        .map(|&i| super::mono::MonoPcm::plan_wide_sibling(&plan.inputs[i], video.start))
-                        .collect::<R<Vec<_>>>()?
+                        .enumerate()
+                        .map(|(lane, &index)| {
+                            super::mono::MonoPcm::plan_wide_sibling(
+                                &plan.inputs[index], video.start, &audio[lane].path,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
                 } else { Vec::new() };
                 plan.jobs.push(Job {
                     inputs: recipe,

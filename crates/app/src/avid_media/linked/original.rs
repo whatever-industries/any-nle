@@ -1,5 +1,5 @@
 //! Generate the verified macOS UME MOV and WaveAiff source-record layouts.
-use super::{native_bin, Plan, Result, Route, RASTER, RATE};
+use super::{markers, native_bin, Plan, Result, Route, RASTER, RATE};
 use crate::avid_media::avb::canonical_descriptor;
 use avid_reader::{
     document::{AvbDocument, MobKind},
@@ -49,8 +49,14 @@ pub(super) fn build(plan: &Plan<'_>) -> Result<AvbDocument> {
     );
     let uid = u64::from_be_bytes(new_unique_mob_id()?.material.data4);
     let mut doc = AvbDocument::new_empty_bin(uid, saved_at, timestamp, false);
-    let video = source_chain(&mut doc, &plan.routes[0], timestamp, true)?;
-    let audio = source_chain(&mut doc, &plan.routes[1], timestamp, false)?;
+    let video = source_chain(
+        &mut doc,
+        &plan.routes[0],
+        timestamp,
+        true,
+        &plan.picture_markers,
+    )?;
+    let audio = source_chain(&mut doc, &plan.routes[1], timestamp, false, &[])?;
     native_bin::write_timeline(&mut doc, plan, [video, audio, audio], timestamp)?;
     Ok(doc)
 }
@@ -64,6 +70,7 @@ fn source_chain(
     route: &Route<'_>,
     timestamp: u32,
     picture: bool,
+    marker_plan: &[markers::Marker<'_>],
 ) -> Result<MobId> {
     let path = Path::new(route.path);
     let volume = path
@@ -211,6 +218,7 @@ fn source_chain(
     }
     doc.add_bin_source(file)?;
 
+    let marker_list = markers::write(doc, marker_plan)?;
     let master = composition(
         doc,
         route.name,
@@ -244,6 +252,12 @@ fn source_chain(
             ("_SAVED_AAF_AUDIO_LENGTH", Value::Int(samples)),
         ]),
     )?;
+    let master_attrs = doc
+        .node(master)
+        .and_then(|node| node.get("attributes"))
+        .and_then(Value::as_index)
+        .ok_or("new master lacks attributes")?;
+    markers::attach(doc, master_attrs, marker_list)?;
     for lane in 1..=lanes {
         let clip = doc.create_source_clip(EDIT_RATE, kind, route.extent, file_id, lane, 0)?;
         let component = bracket(doc, kind, clip)?;

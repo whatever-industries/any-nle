@@ -28,6 +28,28 @@ pub(crate) use linked::{publish_turnover_checked, review_turnover};
 const MAX_ARCHIVE: u64 = 1 << 20;
 const MAX_XML: u64 = 8 << 20;
 const SKELETON_SHA256: &str = "957171ef74e1b1b36cb8824983f0f73c9185785a8b424f0d8f5dfd135a1725de";
+const BUNDLED_LAYOUT_SHA256: &str = include_str!("../../../packaging/resolve-templates/Layout.drp.sha256");
+const BUNDLED_ATOM_SHA256: &str = include_str!("../../../packaging/resolve-templates/Atom.drp.sha256");
+const BUNDLED_GROUP_SHA256: &str = include_str!("../../../packaging/resolve-templates/Group.drp.sha256");
+const BUNDLED_LAYOUT: (&str, usize) = (BUNDLED_LAYOUT_SHA256, 8);
+const BUNDLED_ATOM: (&str, usize) = (BUNDLED_ATOM_SHA256, 6);
+const BUNDLED_GROUP: (&str, usize) = (BUNDLED_GROUP_SHA256, 7);
+
+pub(crate) fn check_bundled_avid_templates(root: &Path) -> Result<()> {
+    for (name, (digest, count)) in [
+        ("Layout.drp", BUNDLED_LAYOUT),
+        ("Atom.drp", BUNDLED_ATOM),
+        ("Group.drp", BUNDLED_GROUP),
+    ] {
+        let path = root.join(name);
+        if !std::fs::symlink_metadata(&path)?.is_file() {
+            return Err(format!("bundled Resolve template {name} must be a regular file").into());
+        }
+        load_skeleton(&path, digest, count)
+            .map_err(|error| format!("bundled Resolve template {name}: {error}"))?;
+    }
+    Ok(())
+}
 
 pub(crate) fn review_op1a_template(templates: &crate::turnover::Templates) -> Result<()> {
     let path = templates.group.as_deref().ok_or("OP1a rewrap requires the pinned Resolve Group template")?;
@@ -101,6 +123,17 @@ fn write_archive(
     })
 }
 
+fn encode_archive(members: Members, file: &mut File) -> Result<()> {
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for (name, xml) in members {
+        zip.start_file(name, options)?;
+        zip.write_all(xml.as_bytes())?;
+    }
+    zip.finish()?;
+    Ok(())
+}
+
 fn write_checked_archive(
     members: Members,
     output: &Path,
@@ -108,15 +141,7 @@ fn write_checked_archive(
 ) -> Result<Published> {
     let parent = output_parent(output);
     let mut stage = NamedTempFile::new_in(parent)?;
-    {
-        let mut zip = ZipWriter::new(stage.as_file_mut());
-        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        for (name, xml) in members {
-            zip.start_file(name, options)?;
-            zip.write_all(xml.as_bytes())?;
-        }
-        zip.finish()?;
-    }
+    encode_archive(members, stage.as_file_mut())?;
     stage.as_file().sync_all()?;
     check(stage.path())?;
     // Same-directory hard links publish a finished project and refuse a late incumbent.
@@ -132,6 +157,10 @@ fn write_checked_archive(
 }
 
 fn load_skeleton(path: &Path, digest: &str, members: usize) -> Result<Members> {
+    load_pinned_skeleton(path, &[(digest, members)])
+}
+
+fn load_pinned_skeleton(path: &Path, pins: &[(&str, usize)]) -> Result<Members> {
     if !std::fs::metadata(path)?.is_file() {
         return Err("skeleton must be a regular file".into());
     }
@@ -139,9 +168,12 @@ fn load_skeleton(path: &Path, digest: &str, members: usize) -> Result<Members> {
     File::open(path)?
         .take(MAX_ARCHIVE + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_ARCHIVE || hex::encode(Sha256::digest(&bytes)) != digest {
+    let digest = hex::encode(Sha256::digest(&bytes));
+    let Some(&(_, members)) = pins.iter().find(|(pin, _)| {
+        bytes.len() as u64 <= MAX_ARCHIVE && pin.trim_end() == digest
+    }) else {
         return Err("expected the pinned Resolve Studio 21.2.0.0006 synthetic skeleton".into());
-    }
+    };
     read_members(&bytes, members)
 }
 
@@ -667,6 +699,20 @@ fn build(p: &PreparedResolve, mut m: Members) -> Result<Members> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_resolve_templates_bind_the_reviewed_role_bytes() {
+        let reviewed = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/resolve-templates");
+        check_bundled_avid_templates(&reviewed).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["Layout.drp", "Atom.drp", "Group.drp"] {
+            std::fs::copy(reviewed.join(name), temp.path().join(name)).unwrap();
+        }
+        check_bundled_avid_templates(temp.path()).unwrap();
+        std::fs::copy(reviewed.join("Atom.drp"), temp.path().join("Group.drp")).unwrap();
+        assert!(check_bundled_avid_templates(temp.path()).unwrap_err()
+            .to_string().contains("bundled Resolve template Group.drp"));
+    }
 
     #[test]
     fn output_preflight_checks_path_and_keeps_existing_entries() {

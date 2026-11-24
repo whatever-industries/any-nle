@@ -43,6 +43,7 @@ const STEREO_NEST_TEMPLATE: &str = "42cd49d9f9984c0f6961edb145ba6922ae44f39565dc
 const STEREO_NEST_PARENT: &str = "SeqContainer/30f61c21-7bda-4ed6-8d56-c5c0000c5934.xml";
 const MEDIA_DONOR: &str = "MediaPool/Master/002_Linked/000_Audio/MpFolder.xml";
 const TIMELINE_DONOR: &str = "SeqContainer/93a83077-933a-4ed8-9595-e12534b57e18.xml";
+const BUNDLED_TIMELINE_DONOR: &str = "SeqContainer/c6b253e8-d861-4ce0-bdcb-c782393990d6.xml";
 const PRORES_REC709: &str = "80087810027002789e01800166880132980100d80100";
 const AVC_UNTAGGED: &str = "80089403100228108801329001d080a006980100d80100";
 const AVC_REC709: &str = "80089403100228107002789e018001668801329001d080a006980100d80100";
@@ -104,7 +105,7 @@ pub(crate) fn publish_turnover_checked(
     check_output(output)?;
     let (members, identities) = assemble_turnover(prepared, templates)?;
     write_checked_archive(members, output, |stage| {
-        verify_stage(prepared, &identities, stage)?;
+        verify_stage(prepared, &identities, crate::source::read(stage)?)?;
         for media in &prepared.media {
             media.recheck()?;
         }
@@ -120,7 +121,9 @@ fn assemble_turnover(
         load_skeleton(path, hash, count)
             .map_err(|error| format!("Resolve {role} template {}: {error}", path.display()).into())
     };
-    let layout = template("layout", &templates.layout, TEMPLATE_23976, 13)?;
+    let layout = load_pinned_skeleton(&templates.layout, &[(TEMPLATE_23976, 13), BUNDLED_LAYOUT])
+        .map_err(|error| format!("Resolve layout template {}: {error}", templates.layout.display()))?;
+    let bundled_layout = layout.contains_key(BUNDLED_TIMELINE_DONOR);
     let stereo = prepared.timelines.iter().any(|row| row.stereo);
     let (hash, count, timeline) = match (prepared.canvas, prepared.rate.num(), prepared.rate.den()) {
         ((1920, 1080), 24, 1) if stereo =>
@@ -138,7 +141,18 @@ fn assemble_turnover(
         ((3840, 2160), 30000, 1001) => (TEMPLATE_UHD_DF, 4, Some(("Linked UHD", TIMELINE_UHD_DF_DONOR))),
         _ => return Err("missing pinned template for Resolve project rate and canvas".into()),
     };
-    let profile = template("profile", &templates.profile, hash, count)?;
+    let profile = if bundled_layout && templates.profile == templates.layout {
+        if hash != TEMPLATE_23976 {
+            return Err("bundled Avid to Resolve templates require a 1920×1080, 23.976 fps project".into());
+        }
+        None
+    } else if hash == TEMPLATE_23976 {
+        Some(load_pinned_skeleton(&templates.profile, &[(hash, count), BUNDLED_LAYOUT])
+            .map_err(|error| format!("Resolve profile template {}: {error}", templates.profile.display()))?)
+    } else {
+        Some(template("profile", &templates.profile, hash, count)?)
+    };
+    let profile = profile.as_ref().unwrap_or(&layout);
     let atom_donor = if prepared
         .media
         .iter()
@@ -148,7 +162,8 @@ fn assemble_turnover(
             .atom
             .as_deref()
             .ok_or("split MXF project requires its pinned media template")?;
-        let members = template("split MXF", path, SKELETON_SHA256, 6)?;
+        let members = load_pinned_skeleton(path, &[(SKELETON_SHA256, 6), BUNDLED_ATOM])
+            .map_err(|error| format!("Resolve split MXF template {}: {error}", path.display()))?;
         Some(block(member(&members, SOURCE)?, "Sm2MpVideoClip")?)
     } else {
         None
@@ -198,7 +213,8 @@ fn assemble_turnover(
         }
     } else { None };
     let (timeline_profile, name, path) = match timeline {
-        Some((name, path)) => (&profile, name, path),
+        Some((name, path)) => (profile, name, path),
+        None if bundled_layout => (&layout, "Linked A", BUNDLED_TIMELINE_DONOR),
         None => (&layout, "Linked A", TIMELINE_DONOR),
     };
     let pool = named(member(timeline_profile, POOL)?, "Sm2MpTimelineClip", name)?;
@@ -210,7 +226,7 @@ fn assemble_turnover(
     build(
         prepared,
         &layout,
-        &profile,
+        profile,
         [atom_donor.as_deref(), op1a_donor.as_deref()],
         templates.group.as_deref(),
         &donors,
@@ -225,8 +241,10 @@ pub(crate) fn review_turnover(
     output: &Path,
 ) -> Result<()> {
     check_output(output)?;
-    assemble_turnover(prepared, templates)?;
-    Ok(())
+    let (members, identities) = assemble_turnover(prepared, templates)?;
+    let mut stage = tempfile::tempfile()?;
+    encode_archive(members, &mut stage)?;
+    verify_stage(prepared, &identities, crate::source::read_staged(stage)?)
 }
 
 fn member<'a>(members: &'a Members, path: &str) -> Result<&'a str> {
@@ -1280,6 +1298,11 @@ struct Identities {
     group: Option<String>,
 }
 
+fn managed_reel(media: &Media) -> Option<&str> {
+    let Profile::BoundMxf(binding) = &media.profile else { return None; };
+    binding.atom.as_ref().map(|atom| atom.reel.as_str()).filter(|reel| !reel.is_empty())
+}
+
 fn build(
     p: &PreparedProject,
     layout: &Members,
@@ -1357,6 +1380,16 @@ fn build(
     let mut edit_metadata = Vec::new();
     let mut project = member(profile, PROJECT)?.to_owned();
     set(&mut project, "ProjectName", &xml(&p.name))?;
+    if p.media.iter().any(|media| managed_reel(media).is_some()) {
+        let saved = block(&project, "CommonConfig")?;
+        let mut updated = saved.clone();
+        let fields = Regex::new(r"^<CommonConfig>\s*<SM_Config [^>]+>\s*<FieldsBlob>([a-f0-9]+)</FieldsBlob>")?;
+        let payload = fields.captures(&saved).and_then(|row| row.get(1))
+            .ok_or("missing Resolve common configuration fields")?;
+        let config = crate::source::enable_embedded_reels(payload.as_str())?;
+        updated.replace_range(payload.range(), &config);
+        replace_once(&mut project, &saved, &updated)?;
+    }
     set(
         &mut project,
         "CurrentTimelineIndex",
@@ -1500,13 +1533,20 @@ fn build(
     ))
 }
 
-fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()> {
-    let graph = crate::source::read(path)?;
+fn verify_stage(p: &PreparedProject, ids: &Identities, graph: graph::source::SourceGraph) -> Result<()> {
     if graph.sequences.len() != p.timelines.len()
         || graph.items.len() != p.media.len()
         || graph.bins.len() != p.bins.len()
     {
         return Err("generated Resolve reference counts differ from preparation".into());
+    }
+    if p.media.iter().any(|media| managed_reel(media).is_some())
+        && !matches!(
+            graph.sidecar(crate::source::REEL_NAMES_ADAPTER, &ids.bins[0]),
+            Some(Value::Str(mode)) if mode == "embedded"
+        )
+    {
+        return Err("generated Resolve project lacks embedded reel-name conform".into());
     }
     let active = graph
         .sidecar(crate::source::ACTIVE_TIMELINE_ADAPTER, &ids.bins[0])
@@ -1619,6 +1659,13 @@ fn verify_stage(p: &PreparedProject, ids: &Identities, path: &Path) -> Result<()
     for (index, (media, id)) in p.media.iter().zip(&ids.media).enumerate() {
         let item = graph.items.iter().find(|item| item.id == *id)
             .ok_or("generated Resolve media item absent")?;
+        if let Some(expected) = managed_reel(media) {
+            let cached = graph.sidecar(crate::source::MEDIA_METADATA_ADAPTER, id)
+                .and_then(|row| row.get(crate::source::CACHED_REEL));
+            if !matches!(cached, Some(Value::Str(reel)) if reel == expected) {
+                return Err(format!("generated Resolve reel differs for {}", media.name).into());
+            }
+        }
         if let Some(expected) = p.pool_markers.get(&index) {
             let (rate, frames) = media.profile.pool_marker_grid(p.rate)?
                 .ok_or("generated Resolve source markers require qualified linked media")?;

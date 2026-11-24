@@ -46,6 +46,25 @@ work without the media backend. Source builds use external `ffmpeg` and
 `ffprobe` for media preparation. See the [release guide](docs/RELEASE.md)
 for development and packaged backend requirements.
 
+### Linked-media fixture for a new adapter
+
+Generate the PCM16 and PCM24 controls in a fresh scratch directory with
+`python3 tests/linked_media_fixture.py generate DIRECTORY`. The generator
+uses FFmpeg and writes the expected edits to `expected.json`. The control
+uses two same-named pictures, a nonzero sequence start, and independent
+audio trims on the two channels of a stereo WAV.
+
+Author a timeline from those expectations in the editor under test. Save
+and reopen it, capture graph/2, then run
+`python3 tests/linked_media_fixture.py check-graph DIRECTORY GRAPH SEQUENCE_ID BITS`.
+Use `--resolve-cache` to assert unknown WAV availability on Resolve source
+captures. For a destination adapter, start from the saved graph and
+check the written project's links, clocks, trims, and channel assignments
+after reopen. Use `check-picture RENDER` to verify every counter frame.
+Compare isolated PCM lanes against the destination editor's own control
+with the same mix and export settings. The public suite exercises the
+saved WAV cache and graph reload without an editor.
+
 ## Find the code
 
 | Concern | Entry point |

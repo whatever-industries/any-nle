@@ -929,7 +929,7 @@ mod reliability_tests {
                 edit_rate: 48000.0, length: 48000, essence: Some(Essence::Sound {
                     sample_rate: 48000.0, bits: 24, channels: 1 }), offset: 0, clip_length: 24,
                 gain_db: None, pan_raw: None }] } else { vec![] },
-            columns: vec![], color: None, start: None, aux_timecodes: vec![], source_file: None,
+            columns: vec![], color: None, start: None, aux_timecodes: vec![], saved_clock_segments: vec![], source_file: None,
             source_path: None, bin: 0, stereo_pairs: vec![], other_groups: vec![], output_mix: Default::default(), markers: vec![] }
     }
 
