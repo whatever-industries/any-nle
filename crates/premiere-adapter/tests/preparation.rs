@@ -3796,6 +3796,9 @@ fn named_aac_and_smpte_ds_prepare_only_with_matching_witnesses() {
     }
 }
 
+// An absolute fixture path must include a drive letter on Windows.
+const LINKED_FIXTURE_ROOT: &str = if cfg!(windows) { "C:/Synthetic" } else { "/Synthetic" };
+
 fn original_fixture() -> SourceGraph {
     let mut g=fixture();
     for m in &mut g.media {
@@ -3813,7 +3816,7 @@ fn linked_av_subclip_applies_the_common_backing_offset_once() {
     let mut graph = original_fixture();
     let rate = Q::new(24_000, 1001).unwrap();
     let frame = |count: i128| Q::new(count * 1001, 24_000).unwrap();
-    let path = "/Synthetic/camera.mov";
+    let path = format!("{LINKED_FIXTURE_ROOT}/camera.mov");
     let parent = &mut graph.items[0];
     parent.rate = Some(rate);
     parent.stream_groups = vec![vec![1, 2]];
@@ -3821,7 +3824,7 @@ fn linked_av_subclip_applies_the_common_backing_offset_once() {
     parent.umid = Some(mob.clone());
     for media in &mut graph.media {
         let audio = media.kind == StreamKind::Audio;
-        media.locations = vec![path.into()];
+        media.locations = vec![path.clone()];
         media.online = Some(true);
         media.duration = frame(192);
         media.codec = Some(if audio { "pcm_s24le" } else { "apch" }.into());
@@ -3839,7 +3842,7 @@ fn linked_av_subclip_applies_the_common_backing_offset_once() {
             });
         }
         let original = media.original.as_mut().unwrap();
-        original.saved_locators = vec![path.into()];
+        original.saved_locators = vec![path.clone()];
         original.time_base = Q::new(1, if audio { 48_000 } else { 24_000 }).unwrap();
         original.duration_ts = media.duration.to_units(original.time_base.den()).unwrap();
         original.sample_representation = audio.then(|| "pcm24".into());
@@ -5297,7 +5300,7 @@ fn linked_mov_group_preserves_independently_selected_mono_channels() {
     }
     for (index, media) in graph.media.iter_mut().enumerate() {
         let audio = media.kind == StreamKind::Audio;
-        let path = format!("/Synthetic/Camera-{}.mov", index / 3);
+        let path = format!("{LINKED_FIXTURE_ROOT}/Camera-{}.mov", index / 3);
         media.locations = vec![path.clone()];
         media.codec = Some(if audio { "pcm_s24le" } else { "apch" }.into());
         media.online = Some(true);
@@ -5338,8 +5341,9 @@ fn linked_mov_group_preserves_independently_selected_mono_channels() {
     let out = dir.join("Group.prproj");
     let mut ids = prproj::SeededUuids::new("synthetic-linked-mov-group");
     let ready = prepare_typed_project(&input, &out, &mut ids, &[], false).unwrap();
+    let expected = [0, 1].map(|index| format!("{LINKED_FIXTURE_ROOT}/Camera-{index}.mov"));
     assert_eq!(ready.assisted_originals().map(String::as_str).collect::<Vec<_>>(),
-        ["/Synthetic/Camera-0.mov", "/Synthetic/Camera-1.mov"]);
+        expected.each_ref().map(String::as_str));
     assert!(ready.publish().err().unwrap().to_string().contains("not been verified"));
     assert!(!out.exists());
 
