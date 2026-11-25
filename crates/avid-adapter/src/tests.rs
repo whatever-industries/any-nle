@@ -2075,6 +2075,68 @@ fn original_probe_review_groups_only_edits_for_the_failed_file() {
 }
 
 #[test]
+fn original_aac_review_names_the_profile_and_groups_all_edits_of_the_failed_file() {
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("Original.mp4");
+    let other = scratch.path().join("Other.wav");
+    std::fs::write(&path, b"synthetic original").unwrap();
+    let (mut facts, _) = fixture(3);
+    let master = &mut facts.masters[0];
+    master.rate = av::Rate::new(24_000, 1001);
+    master.master.start = None;
+    master.master.tracks[0].kind = KIND_PICTURE;
+    master.master.tracks[1].index = 1;
+    master.master.tracks[2].index = 2;
+    master.originals = (0..3).map(|track| Some(av::OriginalTrack {
+        locators: vec![path.to_str().unwrap().to_owned()],
+        descriptor_class: if track == 0 { "CDCI" } else { "MPGA" }.into(),
+        descriptor_rate: if track == 0 { 23.976 } else { 46.875 },
+        descriptor_length: if track == 0 { 48 } else { 97120 },
+        channels: (track != 0).then_some(2),
+        sample_rate: (track != 0).then_some(48000.0),
+        stored_quantization_bits: None,
+        display_raster: (track == 0).then_some((1920, 1080)),
+        file_track: Some(if track == 0 { 1 } else { track }),
+        motion_audio_track_start: (track != 0).then_some(1),
+    })).collect();
+    let mut unrelated = fixture(1).0.masters.remove(0);
+    unrelated.id = "revision/other".into();
+    unrelated.master.mob_id = mob(2);
+    unrelated.originals = vec![master.originals[1].clone()];
+    unrelated.originals[0].as_mut().unwrap().locators = vec![other.to_str().unwrap().to_owned()];
+    facts.masters.push(unrelated);
+    let mut picture = event("picture", 1, 1, 12, 24, None);
+    picture.event.kind = KIND_PICTURE;
+    let mut other_edit = event("other file", 4, 1, 12, 24, None);
+    other_edit.event.master = mob(2);
+    facts.sequences = vec![sequence(vec![picture,
+        event("left", 1, 1, 12, 24, None), event("right", 2, 2, 12, 24, None), other_edit])];
+    let probe = graph::json::parse(r#"{
+      "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"},
+      "streams":[
+        {"index":0,"codec_type":"video","codec_name":"h264","codec_tag_string":"avc1",
+         "profile":"High","level":40,"pix_fmt":"yuv420p","width":1920,"height":1080,
+         "avg_frame_rate":"24000/1001","r_frame_rate":"24000/1001","field_order":"progressive",
+         "sample_aspect_ratio":"1:1","nb_frames":"48","start_pts":0,"duration_ts":48048,"time_base":"1/24000"},
+        {"index":1,"codec_type":"audio","codec_name":"aac","codec_tag_string":"mp4a"},
+        {"index":2,"codec_type":"data","codec_tag_string":"tmcd"}
+      ]
+    }"#).unwrap();
+    let inspect = |_: &Path| Ok(probe.clone());
+    let options = original::OriginalOptions { verify_linked_imports: true, ..Default::default() };
+    let direct = original::OriginalIndex::scan_with(&facts, &options, inspect).err().unwrap();
+    let review = original::OriginalOptions { collect_blocked_locators: true, ..options };
+    let SourceReadIssue::OriginalMediaTracks(issue) =
+        original::OriginalIndex::scan_with_review_details(&facts, &review, inspect).err().unwrap()
+    else { panic!("expected qualified file failure with affected edits") };
+    assert_eq!(issue.message, direct);
+    assert!(issue.message.contains("assisted linking does not verify AAC sample placement"), "{direct}");
+    assert!(issue.message.contains("Original.mp4"));
+    let [timeline] = issue.edits.timelines.as_slice() else { panic!("expected one affected timeline") };
+    assert_eq!(timeline.edits.iter().map(|edit| edit.id.as_str()).collect::<Vec<_>>(), ["picture", "left", "right"]);
+}
+
+#[test]
 fn blocked_original_review_checks_remaining_paths_without_probing_media() {
     let scratch = tempfile::tempdir().unwrap();
     let saved = scratch.path().join("saved");

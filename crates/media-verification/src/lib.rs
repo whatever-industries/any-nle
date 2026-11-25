@@ -1,9 +1,10 @@
-//! Exact physical media checks over parsed values.
+//! Physical media checks and guarded access to source files.
 
 use graph::Rational;
 
 pub mod linked_original;
 pub mod rewrap_size;
+pub mod source_file;
 
 pub fn stream_duration(count: i64, time_base: Rational) -> Option<Rational> {
     Rational::new(

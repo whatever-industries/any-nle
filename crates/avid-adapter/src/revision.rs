@@ -1,4 +1,5 @@
 //! Streaming SHA-256 revisions for linked media and verified stills.
+use anynle_media_verification::source_file::open_regular;
 use sha2::{Digest, Sha256};
 use std::io::{self, Read};
 
@@ -37,7 +38,7 @@ pub fn file_revision_checked(
         }
     }
     check().map_err(std::io::Error::other)?;
-    let file = std::fs::File::open(path)?;
+    let file = open_regular(path)?;
     let digest = sha256_reader(Checked {
         file: std::io::BufReader::with_capacity(64 * 1024, file),
         check,

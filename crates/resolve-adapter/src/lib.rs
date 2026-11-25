@@ -42,6 +42,7 @@ pub use media::{
 };
 pub use prepare::{prepare, PreparedResolve};
 pub use premiere::{MediaLinkReview, list_premiere_sequences, prepare_premiere_project, prepare_premiere_turnover, read_premiere_avid_graph, read_premiere_media_graph};
+pub use premiere::{verify_avid_avc_aac, VerifiedAvcAac, verify_avid_managed_atom, ManagedAtom};
 pub fn read_resolve_avid_graph(
     path: &std::path::Path, sequence: &str, ffprobe: &std::path::Path,
 ) -> Result<graph::source::SourceGraph> {

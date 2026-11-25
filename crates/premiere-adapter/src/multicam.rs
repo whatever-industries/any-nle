@@ -2,7 +2,8 @@
 use super::*;
 use graph::source::{MulticamAlternative, MulticamPiece};
 use prproj::convert::multicam::{
-    PreparedCamera, PreparedGroupAudio, PreparedMulticam, PreparedMulticamUse, MAX_GROUPS, RATE,
+    is_linked_original_camera, PreparedCamera, PreparedGroupAudio, PreparedMulticam,
+    PreparedMulticamUse, MAX_GROUPS, RATE,
 };
 
 fn refusal(id: &str, reason: &str) -> GraphError {
@@ -31,6 +32,7 @@ pub(super) fn prepare<'a>(
     input: &mut PreparedProjectInput,
     ownership: &HashMap<String, (usize, usize)>,
     clock: ClockProfile,
+    mono_views: &HashMap<&str, String>,
     diagnostics: &mut Vec<String>,
     losses: &mut Vec<Loss>,
     best_effort: bool,
@@ -74,6 +76,10 @@ pub(super) fn prepare<'a>(
     let pcm24_direct: HashSet<_> = input.clips.iter().filter_map(|clip| match clip {
         PreparedClip::Legacy(c) if input.direct_dnxhr_origins.contains_key(&c.id)
             && c.audio.iter().all(|a| a.bits == 24) => Some(c.id.as_str()),
+        _ => None,
+    }).collect();
+    let linked_originals: HashSet<_> = input.clips.iter().filter_map(|clip| match clip {
+        PreparedClip::Original(c) if is_linked_original_camera(c) => Some(c.metadata.id.as_str()),
         _ => None,
     }).collect();
     let mut indices = HashMap::new();
@@ -182,16 +188,21 @@ pub(super) fn prepare<'a>(
                 labels.push(label);
                 audio_alternatives[j][i] = index;
             }
-            let clip = clip_id(picture.item.as_deref().unwrap());
-            if direct && !pcm24_direct.contains(clip.as_str()) {
+            let item = picture.item.as_deref().unwrap();
+            let clip = clip_id(item);
+            let mono_view = mono_views.get(item).filter(|id| linked_originals.contains(id.as_str()));
+            if direct && !pcm24_direct.contains(clip.as_str())
+                && !(audio.len() == 2 && (mono_view.is_some() || linked_originals.contains(clip.as_str())))
+            {
                 let width = if audio.len() == 3 { "three" } else { "two" };
                 return Err(refusal(&m.id, &format!(
-                    "linked camera {} requires qualified DNx LB and {width} original mono PCM24 siblings",
+                    "linked camera {} requires qualified DNx LB and {width} original mono PCM24 siblings, or two verified ProRes HQ/PCM24 MOV cameras with independent mono selectors",
                     i + 1
                 )));
             }
             cameras.push(PreparedCamera {
                 clip,
+                mono_view: mono_view.cloned(),
                 start: ticks(picture.start, "camera start")?,
                 source_in: ticks(
                     picture

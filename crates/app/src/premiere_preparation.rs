@@ -20,22 +20,17 @@ pub(crate) fn clock_profile(rewrap: bool) -> ClockProfile {
     }
 }
 
-/// Identify managed picture profiles carried by the explicit rewrap paths.
-pub(crate) fn managed_rewrap_items(graph: &SourceGraph, op1a_requested: bool) -> Vec<String> {
-    managed_rewrap_candidates(graph, op1a_requested).into_iter().map(|clip| clip.detail).collect()
-}
-
 pub(crate) struct ManagedRewrapCandidate<'a> {
     pub item: &'a str,
     pub detail: String,
     pub pending: bool,
 }
 
-pub(crate) fn selective_rewrap_preview(
+pub(crate) fn selective_rewrap_preview<'a>(
     graph: &SourceGraph,
-    candidates: &[ManagedRewrapCandidate<'_>],
+    candidates: impl IntoIterator<Item = &'a ManagedRewrapCandidate<'a>>,
 ) -> Vec<Vec<PathBuf>> {
-    let eligible: HashSet<_> = candidates.iter()
+    let eligible: HashSet<_> = candidates.into_iter()
         .filter(|row| !row.pending)
         .map(|row| row.item)
         .collect();
@@ -153,13 +148,19 @@ pub(crate) fn prepare_typed(
     managed: Option<(&HashSet<&str>, &HashSet<&str>)>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(PreparedPremiereInput, crate::source_luts::Applied), premiere_adapter::PreparationIssue> {
-    let mut prepared = premiere_adapter::prepare_avid_job(graph, options, clock, spooled, assisted, managed)
+    let mut prepared = {
+        let fill_only: HashSet<_> = matte.managed_fill_only.iter().map(String::as_str).collect();
+        let no_rewrap = HashSet::new();
+        let managed = managed.or_else(|| (!fill_only.is_empty()).then_some((&no_rewrap, &fill_only)));
+        premiere_adapter::prepare_avid_job(graph, options, clock, spooled, assisted, managed)
+    }
         .map_err(|mut issue| {
             issue.message = format!("Premiere preparation failed: {}", issue.message);
             issue
         })?;
     matte.apply(&mut prepared.input, graph)?;
     prepared.losses.retain(|loss| matte.keeps_loss(loss));
+    prepared.losses.extend(matte.overlay_omissions.iter().cloned());
     let mut luts = if clock == ClockProfile::LegacyImport || native_rewrap {
         let color_media = if native_rewrap {
             crate::source_luts::ColorMedia::Rewrap

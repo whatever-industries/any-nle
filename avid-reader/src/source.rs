@@ -110,7 +110,7 @@ pub struct SourceProject {
     /// Peak accounted source allocations during extraction, in bytes.
     pub accounted_bytes: usize,
 }
-/// Saved picture master and original PNG locator, independent of managed codec support.
+/// Saved picture master and original still locator, independent of managed codec support.
 #[derive(Debug)]
 pub struct SourceImportedStill {
     pub id: String,
@@ -1026,6 +1026,8 @@ impl SourceSubclipSampling {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourcePictureProfile {
     ImportedPngMatte,
+    ImportedPngMatteOverlay,
+    SplitStillMatte,
     EmptyColorAdapter,
     PlainLayeredSubmaster,
 }

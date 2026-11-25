@@ -57,6 +57,7 @@ fn input() -> PreparedProjectInput {
                 start: 24 * frame,
                 duration: 25 * frame,
                 content: "Caption Alpha".into(),
+                graphic_position: None,
             },
             PreparedText {
                 sequence: 0,
@@ -66,6 +67,7 @@ fn input() -> PreparedProjectInput {
                 start: 60 * frame,
                 duration: 24 * frame,
                 content: "Café — second line\nCaption Beta".into(),
+                graphic_position: None,
             },
             PreparedText {
                 sequence: 0,
@@ -75,6 +77,7 @@ fn input() -> PreparedProjectInput {
                 start: 0,
                 duration: 96 * frame,
                 content: "Editable Avid Text\nUnicode café".into(),
+                graphic_position: None,
             },
         ],
     }

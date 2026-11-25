@@ -148,6 +148,7 @@ pub struct Review {
     pub timeline_groups: Vec<ReviewGroup>,
     pub source_groups: Vec<ReviewGroup>,
     pub cli_equivalent: String,
+    pub(crate) diagnostic_locations: std::collections::HashMap<usize, crate::diagnostics::SavedLocation>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ReviewGroup {
@@ -206,6 +207,10 @@ pub struct ReviewBlocker {
     pub timeline_groups: Vec<ReviewGroup>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rewrap_sources: Vec<Vec<PathBuf>>,
+    #[serde(skip)]
+    pub(crate) diagnostic_locations: std::collections::HashMap<usize, crate::diagnostics::SavedLocation>,
+    #[serde(skip)]
+    pub(crate) diagnostic_reason: Option<crate::diagnostics::Reason>,
 }
 impl ReviewBlocker {
     pub fn new(kind: BlockerKind, message: impl Into<String>) -> Self {
@@ -215,7 +220,15 @@ impl ReviewBlocker {
             affected: Vec::new(),
             timeline_groups: Vec::new(),
             rewrap_sources: Vec::new(),
+            diagnostic_locations: Default::default(),
+            diagnostic_reason: None,
         }
+    }
+    pub(crate) fn push_diagnostic_edit(
+        &mut self, detail: String, location: crate::diagnostics::SavedLocation,
+    ) {
+        self.diagnostic_locations.insert(self.affected.len(), location);
+        self.affected.push(detail);
     }
     pub(crate) fn cli_summary(self) -> String {
         if self.affected.is_empty() {
@@ -297,3 +310,5 @@ pub use engine::{
     blocked_preflight_report, execute, load, load_encoded, prepare, prepare_for_review,
     save_blocked_preflight_report, PreparedJob,
 };
+pub(crate) use engine::write_json;
+pub use engine::check_blocked_report_path;

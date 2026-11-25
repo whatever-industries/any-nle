@@ -20,12 +20,20 @@ pub fn qualify(media: &[SourceMedia]) -> graph::R<()> {
                     (16..=8192).contains(&w) && (16..=8192).contains(&h) && w * h <= 16_777_216
                 }),
             };
+            let matching_hold = media.rate.is_some_and(|rate| {
+                let supported = rate == Rational::integer(24)
+                    || original.container == "jpeg" && (rate.num(), rate.den()) == (24_000, 1001);
+                supported
+                    && Rational::new(rate.den().into(), rate.num().into()) == Some(original.time_base)
+                    && Rational::new(
+                        i128::from(media.duration.num()) * i128::from(rate.num()),
+                        i128::from(media.duration.den()) * i128::from(rate.den()),
+                    ).is_some_and(|frames| frames.num() > 0 && frames.den() == 1)
+            });
             if !raster
                 || media.online != Some(true)
                 || original.stream_index != 0
-                || original.time_base != Rational::new(1, 24).unwrap()
-                || media.rate != Some(Rational::integer(24))
-                || !media.duration.to_units(24).is_some_and(|frames| frames > 0)
+                || !matching_hold
             {
                 return Err(refuse("invalid original still or editorial hold"));
             }
@@ -69,4 +77,46 @@ pub fn qualify(media: &[SourceMedia]) -> graph::R<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graph::source::OriginalStream;
+
+    #[test]
+    fn fractional_jpeg_hold_requires_its_exact_frame_grid() {
+        let mut jpeg = SourceMedia {
+            id: "jpeg".into(),
+            kind: StreamKind::Video,
+            locations: vec!["/Synthetic/hold.jpg".into()],
+            codec: Some("jpeg".into()),
+            frame_size: Some((1920, 1080)),
+            rate: Rational::new(24_000, 1001),
+            sample_rate: None,
+            bits: None,
+            duration: Rational::new(720 * 1001, 24_000).unwrap(),
+            start: Some(Rational::ZERO),
+            stream: Some(1),
+            online: Some(true),
+            clock: None,
+            original: Some(OriginalStream {
+                saved_locators: vec!["/Synthetic/hold.jpg".into()],
+                container: "jpeg".into(),
+                stream_index: 0,
+                time_base: Rational::new(1001, 24_000).unwrap(),
+                start_pts: 0,
+                duration_ts: 1,
+                channels: None,
+                channel_index: None,
+                sample_representation: None,
+            }),
+        };
+        assert!(qualify(std::slice::from_ref(&jpeg)).is_ok());
+        jpeg.duration = Rational::integer(30);
+        assert!(qualify(std::slice::from_ref(&jpeg)).is_err());
+        jpeg.duration = Rational::new(720 * 1001, 24_000).unwrap();
+        jpeg.original.as_mut().unwrap().time_base = Rational::new(1, 24).unwrap();
+        assert!(qualify(&[jpeg]).is_err());
+    }
 }

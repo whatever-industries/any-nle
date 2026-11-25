@@ -1,6 +1,6 @@
 import gzip,io,json,pathlib,sys,tempfile,unittest,zipfile,zlib
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
-from audit import Scanner
+from audit import Scanner, audit
 from package import RESOLVE_TEMPLATES, verify_backend, verify_resolve_templates
 from publish import validate_existing
 
@@ -49,6 +49,29 @@ class AuditTests(unittest.TestCase):
     def test_expansion_budget_refuses(self):
         scanner=Scanner(budget=1000)
         with self.assertRaises(ValueError):scanner.scan(gzip.compress(b'x'*5000))
+
+    def test_unavailable_audit_input_refuses_even_with_a_clean_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            (root / 'clean.txt').write_bytes(b'synthetic contents')
+            self.assertTrue(audit([root])['passed'])
+            with self.assertRaisesRegex(ValueError, 'audit input is unavailable'):
+                audit([root, root / 'missing.tar.gz'])
+
+    def test_relocated_extraction_has_the_same_redacted_audit_locations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            first = root / 'extracted-one'
+            second = root / 'extracted-two'
+            for extracted in (first, second):
+                extracted.mkdir()
+                (extracted / 'extra.txt').write_text('SyntheticPrivateSentinel')
+            one = audit([first], ['SyntheticPrivateSentinel'])
+            two = audit([second], ['SyntheticPrivateSentinel'])
+            self.assertFalse(one['passed'])
+            self.assertEqual(one, two)
+            self.assertNotIn('extracted-one', json.dumps(one))
+
 class ReleaseVersionTests(unittest.TestCase):
     def test_cargo_version_controls_early_workflow_validation(self):
         from release_version import validate_workflow
@@ -78,9 +101,10 @@ class ReleaseVersionTests(unittest.TestCase):
                 validate_workflow('2.1.7-alpha.4', source, receipt, source, root=root)
 
     def test_aggregate_refuses_wrong_version_and_unbound_candidates(self):
+        from intel_resolve_smoke import expected_receipt
         from package import TARGETS
         from release_version import gate_binding, release_version
-        from verify_candidate import verify_all
+        from verify_candidate import INTEL_MAC, verify_all
         from build_ffmpeg import sha
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -96,18 +120,91 @@ class ReleaseVersionTests(unittest.TestCase):
                 provenance.write_bytes(b'synthetic provenance')
                 for file in (package, provenance):
                     (candidate / (file.name + '.sha256')).write_text(f'{sha(file)}  {file.name}\n')
+                audit_path = candidate / 'package-audit.json'
+                audit_path.write_text(json.dumps(dict(schema='anynle.privacy-audit/1', passed=True,
+                                                      match_locations=[], undecodable_archives=[])))
                 receipt = dict(target=target, version=version, package=package.name, sha256=sha(package),
+                               provenance_sha256=sha(provenance),
+                               package_audit_sha256=sha(audit_path),
                                extracted_bytes_match=True, architecture_verified=True, launcher_icon_verified=True,
-                               cli_smoke=True, backend_smoke=True)
+                               cli_smoke=True, backend_smoke=True,
+                               backend_media=dict(schema='anynle.backend-smoke/1', target=target,
+                                                  passed=True, synthetic_cases=[
+                                   dict(codec='dnxhd', container='mxf', decoded_picture_and_pcm_equal=True),
+                                   dict(codec='prores_ks', container='mov', decoded_picture_and_pcm_equal=True),
+                                   dict(codec='png', container='png', decoded_rgba_equal=True),
+                               ]))
+                if target == INTEL_MAC:
+                    receipt['avid_resolve_smoke'] = expected_receipt()
                 for name, value in [
                     ('candidate-verification', receipt),
                     ('public-acceptance', dict(profile='synthetic-only', passed=118, private_corpus_qualification=False)),
-                    ('backend-smoke', dict(target=target, passed=True, synthetic_cases=[1, 2])),
-                    ('package-audit', dict(passed=True, match_locations=[])),
                 ]:
                     (candidate / (name + '.json')).write_text(json.dumps(value))
                 (candidate / 'gate-binding.txt').write_text(binding)
-            self.assertEqual(len(verify_all(root, version, expected_binding=binding)), 13)
+            from unittest.mock import patch
+            with patch('verify_candidate.sha', wraps=sha) as hash_file:
+                verified = verify_all(root, version, expected_binding=binding)
+            self.assertEqual(len(verified), 13)
+            sums = root / 'SHA256SUMS'
+            self.assertCountEqual([call.args[0] for call in hash_file.call_args_list],
+                                  [path for path in verified if path != sums])
+            self.assertEqual(verified[sums], sha(sums))
+            self.assertEqual(sums.read_text().splitlines(), [
+                f'{digest}  {path.name}' for path, digest in
+                sorted(verified.items(), key=lambda row: row[0].name) if path != sums
+            ])
+            arm_candidate = root / 'any-nle-macOS_ARM'
+            arm_receipt = arm_candidate / 'candidate-verification.json'
+            verified_arm = json.loads(arm_receipt.read_text())
+            backend_media = verified_arm['backend_media']
+            # A smoke receipt from the build directory does not qualify the package.
+            (arm_candidate / 'backend-smoke.json').write_text(json.dumps(backend_media))
+            for bad_media in (
+                None,
+                dict(backend_media, synthetic_cases=backend_media['synthetic_cases'][:-1]),
+                dict(backend_media, target=INTEL_MAC),
+            ):
+                unverified_arm = dict(verified_arm)
+                if bad_media is None:
+                    del unverified_arm['backend_media']
+                else:
+                    unverified_arm['backend_media'] = bad_media
+                arm_receipt.write_text(json.dumps(unverified_arm))
+                with self.assertRaisesRegex(ValueError, 'extracted synthetic backend smoke incomplete'):
+                    verify_all(root, version)
+            arm_receipt.write_text(json.dumps(verified_arm))
+            arm_audit = arm_candidate / 'package-audit.json'
+            original_audit = arm_audit.read_bytes()
+            altered_audit = dict(json.loads(original_audit), objects=999)
+            arm_audit.write_text(json.dumps(altered_audit))
+            with self.assertRaisesRegex(ValueError, 'verification does not bind privacy audit'):
+                verify_all(root, version)
+            altered_audit['passed'] = False
+            arm_audit.write_text(json.dumps(altered_audit))
+            arm_receipt.write_text(json.dumps(dict(verified_arm, package_audit_sha256=sha(arm_audit))))
+            with self.assertRaisesRegex(ValueError, 'package privacy gate failed'):
+                verify_all(root, version)
+            arm_audit.write_bytes(original_audit)
+            arm_receipt.write_text(json.dumps(verified_arm))
+            arm_provenance = next(arm_candidate.glob('*.provenance.tar.gz'))
+            original_provenance = arm_provenance.read_bytes()
+            proof = arm_provenance.with_name(arm_provenance.name + '.sha256')
+            original_proof = proof.read_text()
+            arm_provenance.write_bytes(b'different provenance')
+            proof.write_text(f'{sha(arm_provenance)}  {arm_provenance.name}\n')
+            with self.assertRaisesRegex(ValueError, 'verification does not bind provenance'):
+                verify_all(root, version)
+            arm_provenance.write_bytes(original_provenance)
+            proof.write_text(original_proof)
+            intel_receipt = root / 'any-nle-macOS_x64' / 'candidate-verification.json'
+            verified_intel = json.loads(intel_receipt.read_text())
+            for smoke in (None, dict(expected_receipt(), pcm_channels=1)):
+                invalid_intel = dict(verified_intel, avid_resolve_smoke=smoke)
+                intel_receipt.write_text(json.dumps(invalid_intel))
+                with self.assertRaisesRegex(ValueError, 'Intel Avid-to-Resolve package smoke'):
+                    verify_all(root, version)
+            intel_receipt.write_text(json.dumps(verified_intel))
             with self.assertRaisesRegex(ValueError, 'Cargo version'):
                 verify_all(root, '9.9.9')
             with self.assertRaisesRegex(ValueError, 'reviewed source'):
@@ -164,7 +261,9 @@ class DraftRecoveryTests(unittest.TestCase):
         for replacement in [
             patch('publish.gh', side_effect=self.github),
             patch('publish.ROOT', self.root),
-            patch('publish.verify_all', return_value=self.files),
+            patch('publish.verify_all', side_effect=lambda *_args, **_kwargs: {
+                path: publish.sha(path) for path in self.files
+            }),
             patch('publish.validate_workflow', return_value='reviewed binding'),
             patch.dict(os.environ, GITHUB_REPOSITORY=self.repo,
                        GITHUB_SHA=self.head, PRIVATE_GATE='b' * 64),
@@ -234,6 +333,16 @@ class DraftRecoveryTests(unittest.TestCase):
         self.assertEqual(self.draft_creations, 1)
         self.assertEqual(self.uploads, [p.name for p in self.files])
         self.assertFalse(self.draft['draft'])
+
+    def test_changed_bytes_after_verification_cannot_stage_a_draft(self):
+        from unittest.mock import patch
+
+        verified = {path: self.release.sha(path) for path in self.files}
+        self.files[0].write_bytes(b'replaced after verification')
+        with patch('publish.verify_all', return_value=verified), patch('publish.gh') as gh:
+            with self.assertRaisesRegex(ValueError, 'candidate changed after verification'):
+                self.release.publish(self.root, self.version, True)
+            gh.assert_not_called()
 
     def test_invisible_draft_can_recover_without_creating_another(self):
         from unittest.mock import call
@@ -311,6 +420,41 @@ class BackendTests(unittest.TestCase):
     def test_missing_backend_refuses(self):
         with tempfile.TemporaryDirectory() as t:
             with self.assertRaises(FileNotFoundError):verify_backend(pathlib.Path(t),'aarch64-apple-darwin')
+
+    def test_extracted_backend_uses_its_packaged_source_archive(self):
+        from build_ffmpeg import sha
+        from unittest.mock import patch
+        import package
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            bindir = root / 'bin'
+            resources = root / 'resources'
+            config = root / 'packaging'
+            for path in (bindir, resources, config):
+                path.mkdir()
+            spec = json.loads((package.ROOT / 'packaging/ffmpeg.json').read_text())
+            archive = resources / 'ffmpeg-8.1-source.tar.xz'
+            archive.write_bytes(b'synthetic source')
+            spec['sha256'] = sha(archive)
+            (config / 'ffmpeg.json').write_text(json.dumps(spec))
+            target = 'aarch64-apple-darwin'
+            tools = {}
+            for name in ('ffmpeg', 'ffprobe'):
+                path = bindir / name
+                path.write_bytes(b'synthetic ' + name.encode())
+                tools[name] = dict(file=name, sha256=sha(path))
+            manifest = dict(schema=1, target=target, ffmpeg_version=spec['version'],
+                            license=spec['license'], configure=spec['configure'], tools=tools,
+                            source={key: spec[key] for key in ('url', 'sha256')})
+            (bindir / 'backend-manifest.json').write_text(json.dumps(manifest))
+            with patch.object(package, 'ROOT', root):
+                self.assertEqual(verify_backend(bindir, target, source_directory=resources), manifest)
+                # A good adjacent archive cannot stand in for wrong package resources.
+                (bindir / archive.name).write_bytes(archive.read_bytes())
+                archive.write_bytes(b'wrong source')
+                with self.assertRaisesRegex(ValueError, 'corresponding source absent or wrong'):
+                    verify_backend(bindir, target, source_directory=resources)
 
     def test_source_download_retries_a_reset_and_publishes_only_verified_bytes(self):
         from build_ffmpeg import fetch, sha

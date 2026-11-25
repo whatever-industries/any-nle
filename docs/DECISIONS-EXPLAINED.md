@@ -314,9 +314,16 @@ The original imported media was unavailable for this replay.
 
 Single-shape Key Out uses mask inversion. At 50% opacity, the retained Avid
 render dims the inside of the contour and the Premiere render dims the
-outside. Review flags that approximation at the affected edit. Key Out
-with several shapes, feather, Bias, and topology changes have separate
-limits. See the [AniMatte qualification queue](ROADMAP.md#timeline-and-effects).
+outside. Review flags that approximation at the affected edit.
+
+For two static shapes at full opacity and zero feather on same-rate
+1080p24 or 1080p23.976 picture, Premiere uses an inverted first mask and
+a second mask in Subtract mode. Both contours and their overlap reveal
+the lower picture. The 23.976 control preserved both editable masks
+and the nonzero source trim after Save As and reopen. All measured
+interior samples across 57 frames followed the expected camera in each
+region. Feathered, animated, and larger Key Out stacks remain in the
+[AniMatte qualification queue](ROADMAP.md#timeline-and-effects).
 
 ### Keeping stereo edits together through a transition (reliability fix, 2026-10-29)
 

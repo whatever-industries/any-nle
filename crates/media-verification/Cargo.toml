@@ -6,3 +6,6 @@ publish = false
 
 [dependencies]
 anynle-graph = { path = "../graph" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

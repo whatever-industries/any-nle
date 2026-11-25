@@ -25,6 +25,7 @@ Their hashes and authoring record are in
   registry archive hashes; local first-party crates use the root MIT license.
   MPL 2.0 crates, including option-ext, include exact hash-verified registry source
   archives under `sources/rust/`; see `SOURCE_AVAILABILITY.md` for source access.
+  Local MCP support uses the Apache-2.0 [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk).
 - The GUI embeds the Inter 4.1 Regular and SemiBold TrueType fonts with
   optional PostScript glyph names removed. The glyph outlines and layout
   tables follow the upstream fonts. The Inter Project Authors provide the

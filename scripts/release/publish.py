@@ -81,9 +81,12 @@ def publish(candidates, version, make_public):
     repo, head = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]
     binding = validate_workflow(version, head, os.environ["PRIVATE_GATE"], head)
     assets = verify_all(candidates, version, expected_binding=binding)
+    for path, digest in assets.items():
+        if sha(path) != digest:
+            raise ValueError(f"candidate changed after verification: {path.name}")
     tag = "v" + version
     paths = {path.name: path for path in assets}
-    expected = {name: sha(path) for name, path in paths.items()}
+    expected = {path.name: digest for path, digest in assets.items()}
     notes = (ROOT / "RELEASE_NOTES.md").read_text(encoding="utf-8").rstrip() + "\n"
     # Bind even the assets that have not reached GitHub yet. The comment stays hidden in the release notes.
     manifest = json.dumps(dict(binding=binding, assets=expected), sort_keys=True, separators=(",", ":"))

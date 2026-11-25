@@ -69,11 +69,13 @@ jobs:
             suffix: Windows_x64
             msystem: UCRT64
             compiler: mingw-w64-ucrt-x86_64-toolchain
+            zlib: mingw-w64-ucrt-x86_64-zlib
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             suffix: Windows_ARM
             msystem: CLANGARM64
             compiler: mingw-w64-clang-aarch64-toolchain
+            zlib: mingw-w64-clang-aarch64-zlib
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             suffix: Linux_x64
@@ -123,7 +125,7 @@ jobs:
         if: startsWith(matrix.runner, 'ubuntu-')
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential pkg-config libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libssl-dev
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libssl-dev zlib1g-dev
       - name: Run explicit public synthetic profile
         env:
           PYTHON: ${{ steps.python.outputs.python-path }}
@@ -145,7 +147,7 @@ jobs:
         with:
           msystem: ${{ matrix.msystem }}
           update: true
-          install: base-devel git python ${{ matrix.compiler }}
+          install: base-devel git python ${{ matrix.compiler }} ${{ matrix.zlib }}
           cache: false
       - name: Build pinned LGPL backend on Windows
         if: startsWith(matrix.runner, 'windows-')
@@ -154,12 +156,13 @@ jobs:
       - name: Build pinned LGPL backend on Unix
         if: "!startsWith(matrix.runner, 'windows-')"
         run: python scripts/release/build_ffmpeg.py --target '${{ matrix.target }}' --output backend --work backend-work --offline-source
-      - name: Exercise bundled backend with synthetic picture and PCM
-        shell: bash
-        run: python scripts/release/backend_smoke.py --backend backend --target '${{ matrix.target }}' --output backend-smoke.json
       - name: Build native Rust GUI and CLI
         shell: bash
         run: cargo build --locked --release --manifest-path crates/Cargo.toml --target '${{ matrix.target }}' --bin any-nle --bin any-nle-gui
+      - name: Build Resolve archive read-back tool for Intel smoke
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: cargo build --locked --release --manifest-path crates/Cargo.toml --target x86_64-apple-darwin --bin resolve-source-probe
       - name: Install Windows installer compiler
         if: startsWith(matrix.runner, 'windows-')
         shell: pwsh
@@ -171,11 +174,14 @@ jobs:
       - name: Package native release
         shell: bash
         run: python scripts/release/package.py --target '${{ matrix.target }}' --binaries 'crates/target/${{ matrix.target }}/release' --backend backend --notices notices --output dist --version '${{ inputs.version }}'
-      - name: Audit packaged files and provenance
+      - name: Audit the package and test the extracted media tools
         shell: bash
         run: |
-          python scripts/release/audit.py 'dist/Any.NLE_${{ matrix.suffix }}_v${{ inputs.version }}.stage' --known-upstream-fixtures packaging/audit-known-upstream-fixtures.json --output package-audit.json
-          python scripts/release/verify_candidate.py --target '${{ matrix.target }}' --output dist --version '${{ inputs.version }}'
+          probe_args=()
+          if [[ '${{ matrix.target }}' == x86_64-apple-darwin ]]; then
+            probe_args=(--resolve-source-probe crates/target/x86_64-apple-darwin/release/resolve-source-probe)
+          fi
+          python scripts/release/verify_candidate.py --target '${{ matrix.target }}' --output dist --version '${{ inputs.version }}' "${probe_args[@]}"
       - name: Assemble the release candidate artifact
         shell: bash
         run: |
@@ -190,7 +196,7 @@ jobs:
           for filename in (stem + extension, stem + ".provenance.tar.gz"):
               for name in (filename, filename + ".sha256"):
                   shutil.copy2(pathlib.Path("dist") / name, output / name)
-          for name in ("package-audit.json", "backend-smoke.json", "candidate-verification.json", "gate-binding.txt"):
+          for name in ("package-audit.json", "candidate-verification.json", "gate-binding.txt"):
               shutil.copy2(name, output / name)
           shutil.copy2("public-checks/public-acceptance.json", output / "public-acceptance.json")
           PY
@@ -220,12 +226,13 @@ jobs:
         with:
           pattern: any-nle-*
           path: candidates
-      - name: Verify all six packages before staging
+      - name: Verify all six build-only candidates
+        if: ${{ inputs.build_only }}
         env:
           VERSION: ${{ inputs.version }}
           PRIVATE_GATE: ${{ inputs.private_gate_sha256 }}
         run: python3 scripts/release/verify_candidate.py --all candidates --version "$VERSION"
-      - name: Stage, download-verify, and optionally publish immutable release
+      - name: Verify candidates, stage, and optionally publish immutable release
         if: ${{ !inputs.build_only }}
         env:
           GH_TOKEN: ${{ github.token }}

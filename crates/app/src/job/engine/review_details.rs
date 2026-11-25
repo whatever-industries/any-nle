@@ -2,6 +2,7 @@
 use super::{media_blocker, BlockerKind, ClipMode, ReportNote, ReviewBlocker, ReviewGroup};
 use crate::premiere_preparation::{timeline_subject, timeline_subject_with_exact_offset};
 use avid_reader::source::SourceInput;
+use crate::diagnostics::SavedLocation;
 use media_blocker::{append_audio_group_details, append_media_edit_details, append_unresolved_uses};
 use std::{collections::{HashMap, HashSet}, path::PathBuf};
 
@@ -85,6 +86,9 @@ pub(super) fn source_read_blocker(
                 _ => OriginalLocator,
             };
             let mut blocker = in_bin(kind, issue.message, issue.bin);
+            if issue.kind == OriginalLocatorKind::MissingOriginal {
+                blocker.diagnostic_reason = Some(crate::diagnostics::Reason::MissingOriginal);
+            }
             blocker.affected.extend(issue.additional.into_iter().map(|(bin, mut detail)| {
                 if let Some(input) = inputs.get(bin) {
                     detail.push_str(&format!(" · {}", input.path.display()));
@@ -197,32 +201,41 @@ pub(super) fn premiere_preparation_blocker(
                 let subject = timeline_subject_with_exact_offset(
                     sequence, kind, track, Some(edit.record_start),
                 );
-                Some(format!("{subject} · {role} {}", edit.id))
+                Some((format!("{subject} · {role} {}", edit.id),
+                    SavedLocation::from_sequence(sequence, kind, track, Some(edit.record_start))))
             };
             let mut truncated = false;
             match error.occurrence {
                 Some(Transition(id)) => {
                     if let Some(t) = sequence.transitions.iter().find(|t| t.id == id) {
                         let subject = timeline_subject(sequence, t.kind, t.track, Some(t.cut));
-                        issue.affected.push(format!("{subject} · transition {id}"));
-                    } else if let Some(subject) = native_transition_subject(source, sequence, &id) {
-                        issue.affected.push(subject);
+                        issue.push_diagnostic_edit(format!("{subject} · transition {id}"),
+                            SavedLocation::from_sequence(sequence, t.kind, t.track, Some(t.cut)));
+                    } else if let Some((subject, location)) = native_transition_subject(source, sequence, &id) {
+                        issue.push_diagnostic_edit(subject, location);
                     }
                 }
-                Some(Placement(id)) => issue.affected.extend(
-                    sequence.placements.iter().find(|edit| edit.id == id)
-                        .and_then(|edit| placement_detail(edit, "edit")),
-                ),
+                Some(Placement(id)) => {
+                    if let Some((detail, location)) = sequence.placements.iter()
+                        .find(|edit| edit.id == id).and_then(|edit| placement_detail(edit, "edit"))
+                    {
+                        issue.push_diagnostic_edit(detail, location);
+                    }
+                }
                 Some(CombinedPlacements { ids, truncated: more }) => {
                     let ids: HashSet<_> = ids.iter().map(String::as_str).collect();
-                    issue.affected.extend(sequence.placements.iter()
+                    for (detail, location) in sequence.placements.iter()
                         .filter(|edit| ids.contains(edit.id.as_str()))
-                        .filter_map(|edit| placement_detail(edit, "combined edit member")));
+                        .filter_map(|edit| placement_detail(edit, "combined edit member"))
+                    {
+                        issue.push_diagnostic_edit(detail, location);
+                    }
                     truncated = more;
                 }
                 Some(GroupUse(id)) => {
                     if let Some(usage) = source.multicam_uses.iter().find(|u| u.id == id && u.sequence == sequence.id) {
-                        issue.affected.push(group_edit_subject(sequence, usage));
+                        issue.push_diagnostic_edit(group_edit_subject(sequence, usage),
+                            SavedLocation::from_sequence(sequence, usage.kind, usage.track, usage.record_start));
                     }
                 }
                 Some(Item(_) | Group(_)) | None => {}
@@ -248,7 +261,7 @@ fn native_transition_subject(
     source: &graph::source::SourceGraph,
     sequence: &graph::source::SourceSequence,
     id: &str,
-) -> Option<String> {
+) -> Option<(String, SavedLocation)> {
     use graph::Value;
 
     if !id.strip_prefix(&sequence.id).is_some_and(|suffix| suffix.starts_with('/')) {
@@ -265,7 +278,8 @@ fn native_transition_subject(
     let start = native_review_offset(sequence, row.get("rate"), row.get("position").and_then(|pos| pos.get("value")));
     let subject = timeline_subject_with_exact_offset(sequence, kind, track, start);
     let position_label = if start.is_some() { " (saved start)" } else { "" };
-    Some(format!("{subject} · transition {id}{position_label}"))
+    Some((format!("{subject} · transition {id}{position_label}"),
+        SavedLocation::from_sequence(sequence, kind, track, start)))
 }
 
 fn group_edit_subject(sequence: &graph::source::SourceSequence, usage: &graph::source::MulticamUse) -> String {
@@ -336,7 +350,8 @@ pub(super) fn append_group_preparation_details<'a>(
         if let Some(missing) = missing {
             detail.push_str(&format!(" · missing MXF package {}", missing.package));
         }
-        issue.affected.push(detail);
+        issue.push_diagnostic_edit(detail,
+            SavedLocation::from_sequence(sequence, usage.kind, usage.track, usage.record_start));
         owners.push(usage.id.as_str());
     }
     if uses.next().is_some() {
@@ -375,18 +390,22 @@ fn append_preparation_clip_uses(
                 let subject = timeline_subject_with_exact_offset(
                     sequence, kind, track, Some(edit.record_start),
                 );
-                Some(format!("{subject} · {state} {}", edit.id))
+                Some((format!("{subject} · {state} {}", edit.id),
+                    SavedLocation::from_sequence(sequence, kind, track, Some(edit.record_start))))
             });
         let group_uses = selected.by_sequence.get(sequence.id.as_str()).into_iter().flatten()
             .filter_map(|(group, usage)| {
                 let subject = timeline_subject_with_exact_offset(
                     sequence, usage.kind, usage.track, Some(usage.record_start?),
                 );
-                Some(format!("{subject} · Group {:?} · selected edit {}", group.name, usage.id))
+                Some((format!("{subject} · Group {:?} · selected edit {}", group.name, usage.id),
+                    SavedLocation::from_sequence(sequence, usage.kind, usage.track, usage.record_start)))
             });
         let mut uses = direct_uses.chain(group_uses);
         let start = issue.affected.len();
-        issue.affected.extend(uses.by_ref().take(remaining));
+        for (detail, location) in uses.by_ref().take(remaining) {
+            issue.push_diagnostic_edit(detail, location);
+        }
         let end = issue.affected.len();
         remaining -= end - start;
         if end > start {
@@ -450,7 +469,8 @@ pub(super) fn group_clip_mode_blocker(
                 [id] => names.get(id.as_str()).copied().unwrap_or(id),
                 _ => "Unresolved Group",
             };
-            issue.affected.push(format!("{subject} · {group} · edit {}", usage.id));
+            issue.push_diagnostic_edit(format!("{subject} · {group} · edit {}", usage.id),
+                SavedLocation::from_sequence(sequence, usage.kind, usage.track, usage.record_start));
             owners.push(&usage.id);
         }
         if uses.next().is_some() {
@@ -464,6 +484,7 @@ pub(super) fn group_clip_mode_blocker(
 pub(super) fn review_subjects(
     source: &graph::source::SourceGraph,
     notes: &[ReportNote],
+    diagnostic_locations: Option<&mut HashMap<usize, SavedLocation>>,
 ) -> HashMap<String, String> {
     let wanted: HashSet<&str> = notes
         .iter()
@@ -471,6 +492,12 @@ pub(super) fn review_subjects(
         .map(|n| n.object.as_str())
         .collect();
     let mut subjects = HashMap::new();
+    let mut saved = HashMap::new();
+    let mut locate = |id: &str, sequence, kind: crate::diagnostics::TrackKind, track, offset| {
+        if diagnostic_locations.is_some() {
+            saved.insert(id.to_owned(), SavedLocation::from_sequence(sequence, kind, track, offset));
+        }
+    };
     let mut names: HashMap<&str, &str> = HashMap::new();
     for item in &source.items {
         names.insert(&item.id, &item.name);
@@ -479,6 +506,7 @@ pub(super) fn review_subjects(
         names.insert(&sequence.id, &sequence.name);
         for transition in &sequence.transitions {
             if wanted.contains(transition.id.as_str()) {
+                locate(&transition.id, sequence, transition.kind.into(), transition.track, Some(transition.cut));
                 subjects.insert(
                     transition.id.clone(),
                     timeline_subject(sequence, transition.kind, transition.track, Some(transition.cut)),
@@ -490,10 +518,11 @@ pub(super) fn review_subjects(
                 let subject = timeline_subject_with_exact_offset(
                     sequence, graph::StreamKind::Video, text.track, text.record_start,
                 );
-                let kind = match text.kind {
-                    graph::source::TextKind::Caption => "caption",
-                    graph::source::TextKind::Graphic => "title",
+                let (kind, lane) = match text.kind {
+                    graph::source::TextKind::Caption => ("caption", crate::diagnostics::TrackKind::Caption),
+                    graph::source::TextKind::Graphic => ("title", crate::diagnostics::TrackKind::Video),
                 };
+                locate(&text.id, sequence, lane, text.track, text.record_start);
                 subjects.insert(text.id.clone(), format!("{subject} · {kind}"));
             }
         }
@@ -502,6 +531,7 @@ pub(super) fn review_subjects(
                 continue;
             }
             if let Some((kind, track)) = placement_lane(placement) {
+                locate(&placement.id, sequence, kind.into(), track, Some(placement.record_start));
                 subjects.insert(
                     placement.id.clone(),
                     timeline_subject(sequence, kind, track, Some(placement.record_start)),
@@ -511,6 +541,7 @@ pub(super) fn review_subjects(
         for edit in &sequence.disabled_placements {
             if wanted.contains(edit.id.as_str()) {
                 if let Some((kind, track)) = placement_lane(edit) {
+                    locate(&edit.id, sequence, kind.into(), track, Some(edit.record_start));
                     let subject = timeline_subject_with_exact_offset(
                         sequence, kind, track, Some(edit.record_start),
                     );
@@ -523,7 +554,8 @@ pub(super) fn review_subjects(
         .map(|sequence| (sequence.id.as_str(), sequence)).collect();
     for usage in &source.multicam_uses {
         if wanted.contains(usage.id.as_str()) {
-            if let Some(sequence) = sequences.get(usage.sequence.as_str()) {
+            if let Some(&sequence) = sequences.get(usage.sequence.as_str()) {
+                locate(&usage.id, sequence, usage.kind.into(), usage.track, usage.record_start);
                 subjects.insert(
                     usage.id.clone(),
                     timeline_subject(sequence, usage.kind, usage.track, usage.record_start),
@@ -536,6 +568,24 @@ pub(super) fn review_subjects(
     }
     for bin in &source.bins {
         names.insert(&bin.id, &bin.name);
+    }
+    let native_effects = notes.iter()
+        .filter(|note| note.why == "picture_effect"
+            && wanted.contains(note.object.as_str()) && !subjects.contains_key(&note.object))
+        .map(|note| note.object.as_str())
+        .collect();
+    for (id, (subject, location)) in native_picture_effect_subjects(source, &sequences, native_effects) {
+        if diagnostic_locations.is_some() {
+            saved.insert(id.clone(), location);
+        }
+        subjects.insert(id, subject);
+    }
+    if let Some(locations) = diagnostic_locations {
+        for (index, note) in notes.iter().enumerate() {
+            if let Some(&location) = saved.get(&note.object) {
+                locations.entry(index).or_insert(location);
+            }
+        }
     }
     for id in wanted {
         if subjects.contains_key(id) {
@@ -558,9 +608,43 @@ pub(super) fn review_subjects(
     subjects
 }
 
+fn native_picture_effect_subjects(
+    source: &graph::source::SourceGraph,
+    sequences: &HashMap<&str, &graph::source::SourceSequence>,
+    wanted: HashSet<&str>,
+) -> HashMap<String, (String, SavedLocation)> {
+    use graph::{StreamKind, Value};
+
+    let mut owners = HashMap::new();
+    if !wanted.is_empty() {
+        for receipt in source.sidecars.iter().filter(|row| row.adapter == "avid.source") {
+            let Some(&sequence) = sequences.get(receipt.object.as_str()) else { continue };
+            let Some(Value::Arr(events)) = receipt.data.get("unresolved") else { continue };
+            for event in events {
+                let Some(Value::Str(owner)) = event.get("owner") else { continue };
+                if wanted.contains(owner.as_str())
+                    && owner.strip_prefix(&sequence.id).is_some_and(|suffix| suffix.starts_with('/'))
+                {
+                    owners.entry(owner).and_modify(|row| *row = None).or_insert(Some((sequence, event)));
+                }
+            }
+        }
+    }
+    owners.into_iter().filter_map(|(owner, row)| {
+        let (sequence, event) = row?;
+        let (StreamKind::Video, track) = native_review_lane(event)? else { return None };
+        let frames = event.get("record_start").and_then(|start| start.get("value"));
+        let offset = native_review_offset(sequence, event.get("record_rate"), frames);
+        let subject = timeline_subject_with_exact_offset(sequence, StreamKind::Video, track, offset);
+        let location = SavedLocation::from_sequence(sequence, StreamKind::Video, track, offset);
+        Some((owner.clone(), (format!("{subject} · picture effect"), location)))
+    }).collect()
+}
+
 pub(super) fn locate_native_review_notes(
     source: &graph::source::SourceGraph,
     notes: &mut [ReportNote],
+    mut diagnostic_locations: Option<&mut HashMap<usize, crate::diagnostics::SavedLocation>>,
 ) -> HashMap<String, String> {
     use graph::Value;
 
@@ -604,7 +688,7 @@ pub(super) fn locate_native_review_notes(
             }
         }
     }
-    for note in notes {
+    for (index, note) in notes.iter_mut().enumerate() {
         let Some(owner) = legacy_owner(note) else { continue };
         let Some((sequence, event, field)) = owners.get(&(note.why.as_str(), owner)).copied().flatten() else { continue };
         if sequence.id != note.object {
@@ -625,6 +709,9 @@ pub(super) fn locate_native_review_notes(
         };
         let Some((kind, track)) = native_review_lane(event) else { continue };
         let offset = native_review_offset(sequence, timing.and_then(|row| row.get("record_rate")), frames);
+        if let Some(locations) = diagnostic_locations.as_deref_mut() {
+            locations.insert(index, crate::diagnostics::SavedLocation::from_sequence(sequence, kind, track, offset));
+        }
         let subject = timeline_subject_with_exact_offset(sequence, kind, track, offset);
         note.object = owner.to_owned();
         subjects.insert(note.object.clone(), format!("{subject} · {label}"));
@@ -662,6 +749,7 @@ fn native_review_offset(
 pub(super) fn locate_source_media_gaps(
     source: &graph::source::SourceGraph,
     notes: &mut [ReportNote],
+    mut diagnostic_locations: Option<&mut HashMap<usize, crate::diagnostics::SavedLocation>>,
 ) -> HashMap<String, String> {
     use graph::{MarkerOwner, Rational, StreamKind, Value};
 
@@ -706,7 +794,7 @@ pub(super) fn locate_source_media_gaps(
             }
         }
     }
-    for note in notes.iter_mut().filter(|note| note.why == "media_gap" && note.severity == "loss") {
+    for (index, note) in notes.iter_mut().enumerate().filter(|(_, note)| note.why == "media_gap" && note.severity == "loss") {
         let key = (note.object.as_str(), note.message.as_str());
         let Some(Some((sequence, marker))) = gaps.get(&key) else { continue };
         let id = marker.owner_occurrence.as_str();
@@ -722,6 +810,9 @@ pub(super) fn locate_source_media_gaps(
             continue;
         }
         let subject = timeline_subject_with_exact_offset(sequence, kind, track, Some(start));
+        if let Some(locations) = diagnostic_locations.as_deref_mut() {
+            locations.insert(index, crate::diagnostics::SavedLocation::from_sequence(sequence, kind, track, Some(start)));
+        }
         note.object = id.to_owned();
         subjects.insert(note.object.clone(), format!("{subject} · media gap"));
     }

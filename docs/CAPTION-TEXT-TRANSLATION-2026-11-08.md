@@ -33,6 +33,11 @@ caption/graphic style references use ArialMT/48pt; graphics use normalized(0.1,0
 These are explicit destination defaults, not source appearance. The older generic writer
 primitives and no-text Rust/Python oracle outputs are preserved.
 
+Review and direct conversion report one styling notice per prepared text
+occurrence. A cue that could not be placed keeps its source appearance
+notice and the placement reason. Graph/2 continues to carry the original
+appearance evidence.
+
 ## What the Avid knowledge already establishes
 
 AVB-0013 documents scoped position/size/kerning and property-list inheritance evidence.

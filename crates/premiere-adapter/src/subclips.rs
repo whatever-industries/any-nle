@@ -22,20 +22,36 @@ pub(super) fn urn(mob: &str) -> String {
 }
 
 fn track_matches(track: &Value, rate: &str, kind: i64, label: i64, backing: i64, target: &str) -> bool {
+    track_matches_at(track, rate, (kind, label), (0, backing), target)
+}
+
+fn track_matches_at(track: &Value, rate: &str, (kind, label): (i64, i64), (offset, length): (i64, i64), target: &str) -> bool {
     key(track, "component_class").and_then(str_value) == Some("SCLP")
         && key(track, "rate").and_then(str_value) == Some(rate)
         && field_int(track, "kind") == Some(kind)
         && field_int(track, "label") == Some(label)
         && field_int(track, "target_track") == Some(label)
-        && field_int(track, "target_offset") == Some(0)
-        && field_int(track, "length") == Some(backing)
+        && field_int(track, "target_offset") == Some(offset)
+        && field_int(track, "length") == Some(length)
         && key(track, "target_mob").and_then(str_value) == Some(target)
 }
 
 enum Subclip {
     Picture(PreparedPictureSubclip),
-    Av(PreparedAvSubclip),
+    Av(PreparedAvSubclip, Option<LinkedBacking>),
     AutoSync(Sequence, bool),
+}
+
+#[derive(Clone, Copy)]
+struct LinkedBacking {
+    offset: i64,
+    length: i64,
+}
+
+#[derive(Clone, Copy)]
+struct AvRoute {
+    index: usize,
+    linked: Option<LinkedBacking>,
 }
 
 pub(super) fn prepare(
@@ -104,7 +120,9 @@ pub(super) fn prepare(
                 if name.is_empty() || name.len() > 4096 || !mob_id(native_id) {
                     return Err("saved subclip name or identity is invalid");
                 }
-                if clock == ClockProfile::LegacyImport && key(row, "rate").and_then(str_value) == Some("24") {
+                if clock == ClockProfile::LegacyImport
+                    && matches!(key(row, "rate").and_then(str_value), Some(EXACT_24 | RATE))
+                {
                     if let Some(Value::Arr(tracks)) = key(row, "tracks") {
                         let target = |kind| tracks.iter().find(|t| field_int(t, "kind") == Some(kind))
                             .and_then(|t| key(t, "target_mob")).and_then(str_value);
@@ -135,7 +153,12 @@ pub(super) fn prepare(
                     .ok_or("backing master is unavailable in the selected bins")?
                     .ok_or("more than one selected master has the backing identity")?;
                 let parent_clip = clip_id(&parent.id);
-                let Some(PreparedClip::Legacy(master)) = clips.get(parent_clip.as_str()).copied() else {
+                let prepared = clips.get(parent_clip.as_str()).copied();
+                if let Some(PreparedClip::Original(original)) = prepared {
+                    let (subclip, linked) = original_range(row, tracks, parent, original, media, bin, target, rate)?;
+                    return Ok((native_id, Subclip::Av(subclip, Some(linked))));
+                }
+                let Some(PreparedClip::Legacy(master)) = prepared else {
                     return Err("backing master is not a prepared managed-media clip");
                 };
                 let video = master.video.as_ref()
@@ -198,12 +221,12 @@ pub(super) fn prepare(
                     bin, parent_clip, name: name.into(), start: start * unit, end: end * unit,
                 };
                 subclip.source_marker(master)?;
-                Ok((native_id, Subclip::Av(subclip)))
+                Ok((native_id, Subclip::Av(subclip, None)))
             };
             match admit() {
                 Ok((_, Subclip::Picture(subclip))) => input.picture_subclips.push(subclip),
-                Ok((mob, Subclip::Av(subclip))) => {
-                    av_routes.insert(urn(mob), Some(input.av_subclips.len()));
+                Ok((mob, Subclip::Av(subclip, linked))) => {
+                    av_routes.insert(urn(mob), Some(AvRoute { index: input.av_subclips.len(), linked }));
                     input.av_subclips.push(subclip);
                 }
                 Ok((mob, Subclip::AutoSync(sequence, has_clock))) => autosyncs.push((urn(mob), bin, sequence, has_clock, id)),
@@ -246,12 +269,60 @@ pub(super) fn prepare(
     }).collect())
 }
 
+fn original_range(
+    row: &Value, tracks: &[Value], parent: &SourceItem, original: &OriginalClip,
+    media: &HashMap<&str, &SourceMedia>, bin: usize, target: &str, rate: &str,
+) -> Result<(PreparedAvSubclip, LinkedBacking), &'static str> {
+    let unsupported = "linked A/V subclips require verified same-rate ProRes HQ and two ordered PCM24 mono selections";
+    let Some(video) = &original.video else { return Err(unsupported) };
+    let frame = model::ticks_per_unit(video.rate);
+    let backing = field_int(row, "backing_length").ok_or("backing length is unresolved")?;
+    let bound = |name| key(row, name).and_then(|value| field_int(value, "value"));
+    let (start, end) = bound("start").zip(bound("end"))
+        .ok_or("saved In and Out are unresolved")?;
+    let offset = tracks.iter().find(|t| field_int(t, "kind") == Some(1))
+        .and_then(|t| field_int(t, "target_offset")).filter(|&n| n >= 0)
+        .ok_or("linked subclip picture has no verified backing offset")?;
+    if !(0 <= start && start < end && end <= backing) || tracks.len() != 3
+        || ![(1, 1), (2, 1), (2, 2)].into_iter().all(|lane| {
+            tracks.iter().any(|t| track_matches_at(t, rate, lane, (offset, backing), target))
+        })
+    {
+        return Err("linked A/V subclip requires direct V1/A1/A2 references with a common backing offset and range");
+    }
+    let file_ticks = |frames| offset.checked_add(frames).and_then(|value| value.checked_mul(frame))
+        .ok_or("linked subclip backing range overflows");
+    let subclip = PreparedAvSubclip {
+        bin, parent_clip: original.metadata.id.clone(),
+        name: key(row, "name").and_then(str_value).unwrap_or_default().into(),
+        start: file_ticks(start)?, end: file_ticks(end)?,
+    };
+    let saved_clock_matches = parent.media.iter().filter_map(|r| media.get(r.media.as_str()))
+        .filter(|m| m.kind == StreamKind::Video).any(|m| {
+            m.clock.as_ref().is_some_and(|clock| !clock.drop && m.rate == Some(clock.rate)
+                && clock.exact_start().is_some_and(|start| {
+                    m.start == Some(start) && ticks(start, "linked subclip source clock").ok() == Some(video.source_start)
+                }))
+        });
+    if rate != RATE || parent.media.len() != 3 || !saved_clock_matches
+        || !parent.media.iter().all(|r| {
+            r.source_offset == Some(Rational::ZERO)
+                && media.get(r.media.as_str()).is_some_and(|m| m.online == Some(true))
+        })
+        || file_ticks(backing)? > video.duration
+        || !subclip.fits_original(original)
+    {
+        return Err(unsupported);
+    }
+    Ok((subclip, LinkedBacking { offset, length: backing }))
+}
+
 fn bind_av_uses(
     graph: &SourceGraph,
     sidecars: &Sidecars<'_>,
     ownership: &HashMap<String, (usize, usize)>,
     clips: &HashMap<&str, &PreparedClip>,
-    routes: &HashMap<String, Option<usize>>,
+    routes: &HashMap<String, Option<AvRoute>>,
     input: &PreparedProjectInput,
     losses: &mut Vec<Loss>,
 ) -> Vec<PreparedAvSubclipUse> {
@@ -284,15 +355,12 @@ fn bind_av_uses(
         let Some(mob) = key(head, "mob").and_then(str_value) else { continue };
         let Some(subclip) = routes.get(mob) else { continue };
         let bind = || -> Option<PreparedAvSubclipUse> {
-            let subclip = (*subclip)?;
+            let AvRoute { index: subclip, linked } = (*subclip)?;
             let [first, second] = path.as_slice() else { return None };
             let &(sequence, event) = ownership.get(&p.id)?;
             let seq = &input.sequences[sequence];
             let edit = &seq.events[event];
             let definition = &input.av_subclips[subclip];
-            let PreparedClip::Legacy(parent) = clips.get(definition.parent_clip.as_str()).copied()? else {
-                return None;
-            };
             let rate = match (seq.rate.num, seq.rate.den) {
                 (24, 1) => EXACT_24,
                 (24_000, 1001) => RATE,
@@ -300,42 +368,64 @@ fn bind_av_uses(
                 _ => return None,
             };
             if multicam.contains(&(sequence, event))
-                || !av_subclip_edit_fits(seq, edit, parent, definition)
+                || clip_id(&p.item) != definition.parent_clip
                 || key(second, "mob").and_then(str_value) != Some(parent_urns.get(p.item.as_str())?.as_str())
                 || [first, second].iter().any(|h| key(h, "rate").and_then(str_value) != Some(rate))
             {
                 return None;
             }
-            if let Some(edit_markers) = marked.get(&(sequence, event)) {
-                // Keep the regular edit path for a shared source frame or
-                // an unresolved edit marker position.
-                let source = definition.source_marker(parent).ok()?;
-                if let Some(source) = source {
-                    if edit_markers.iter().any(|start| start.is_none() || *start == Some(source.start)) {
-                        return None;
-                    }
-                }
-            }
             let unit = model::ticks_per_unit(seq.rate);
-            let saved = |v, field| key(v, field).and_then(|v| field_int(v, "value"));
-            if saved(first, "source_offset") != Some(edit.source_in / unit)
-                || saved(first, "length") != Some(edit.duration / unit)
-                || saved(second, "source_offset") != Some(0)
-                || saved(second, "length") != Some(parent.video.as_ref()?.duration / unit)
-            {
-                return None;
-            }
             let (audio_track, label) = match (p.video_track, p.audio_tracks.as_slice(), p.audio_streams.as_slice()) {
                 (Some(v), [], []) if edit.video_track == Some(v) && field_int(receipt, "native_kind") == Some(1) => (None, 1),
-                (None, [a], [label]) if field_int(receipt, "native_kind") == Some(2) => {
-                    let index = edit.audio_tracks.iter().position(|t| t == a)?;
-                    let files = model::event_audio_files(parent, edit).ok()?;
-                    if files.get(index)?.avid_track != Some(*label) { return None; }
-                    (Some(*a), *label)
-                }
+                (None, [a], [label]) if field_int(receipt, "native_kind") == Some(2) => (Some(*a), *label),
                 _ => return None,
             };
             if field_int(first, "track") != Some(label) || field_int(second, "track") != Some(label) {
+                return None;
+            }
+            let slot = match audio_track {
+                Some(a) => Some(edit.audio_tracks.iter().position(|&track| track == a)?),
+                None => None,
+            };
+            let (offset, backing_length) = match (clips.get(definition.parent_clip.as_str()).copied()?, linked) {
+                (PreparedClip::Legacy(parent), None) => {
+                    if !av_subclip_edit_fits(seq, edit, parent, definition)
+                        || slot.is_some_and(|index| model::event_audio_files(parent, edit).ok()
+                            .and_then(|files| files.get(index)?.avid_track) != Some(label))
+                    {
+                        return None;
+                    }
+                    // A shared source marker or unresolved edit marker keeps the regular source path.
+                    if let (Some(edit_markers), Some(source)) = (
+                        marked.get(&(sequence, event)), definition.source_marker(parent).ok()?,
+                    ) {
+                        if edit_markers.iter().any(|start| start.is_none() || *start == Some(source.start)) {
+                            return None;
+                        }
+                    }
+                    (0, parent.video.as_ref()?.duration / unit)
+                }
+                (PreparedClip::Original(parent), Some(backing)) => {
+                    let PreparedClip::Original(placed) = clips.get(edit.clip.as_str()).copied()? else { return None };
+                    if !definition.fits_original_edit(seq, edit, parent, placed)
+                        || slot.is_some_and(|index| !matches!(label, 1 | 2)
+                            || edit.audio_channels.get(index).copied() != Some(label))
+                    {
+                        return None;
+                    }
+                    (backing.offset, backing.length)
+                }
+                _ => return None,
+            };
+            let saved = |v, field| key(v, field).and_then(|v| field_int(v, "value"));
+            // The first hop is subclip-relative. The second must describe the
+            // same backing component that established the reusable bin range.
+            let local_in = saved(first, "source_offset").filter(|&in_point| in_point >= 0)?;
+            if local_in.checked_add(offset) != Some(edit.source_in / unit)
+                || saved(first, "length") != Some(edit.duration / unit)
+                || saved(second, "source_offset") != Some(offset)
+                || saved(second, "length") != Some(backing_length)
+            {
                 return None;
             }
             Some(PreparedAvSubclipUse { sequence, event, audio_track, subclip })

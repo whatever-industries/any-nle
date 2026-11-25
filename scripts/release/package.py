@@ -13,8 +13,9 @@ TARGETS={
 'aarch64-apple-darwin':('macOS_ARM','.zip'), 'x86_64-apple-darwin':('macOS_x64','.zip'),
 'x86_64-pc-windows-msvc':('Windows_x64','.exe'), 'aarch64-pc-windows-msvc':('Windows_ARM','.exe'),
 'x86_64-unknown-linux-gnu':('Linux_x64','.AppImage'), 'aarch64-unknown-linux-gnu':('Linux_ARM','.AppImage')}
-def verify_backend(directory,target):
+def verify_backend(directory, target, *, source_directory=None):
     directory=pathlib.Path(directory)
+    source_directory = directory if source_directory is None else pathlib.Path(source_directory)
     m=json.loads((directory/'backend-manifest.json').read_text())
     spec=json.loads((ROOT/'packaging/ffmpeg.json').read_text())
     if m['schema']!=1 or m['target']!=target or m['ffmpeg_version']!=spec['version'] or m['license']!=spec['license'] or m['source']!={'url':spec['url'],'sha256':spec['sha256']}: raise ValueError('backend provenance mismatch')
@@ -25,7 +26,9 @@ def verify_backend(directory,target):
         if m['tools'][name]['file']!=expected: raise ValueError('backend filename mismatch')
         p=directory/expected
         if p.is_symlink() or sha(p)!=m['tools'][name]['sha256']: raise ValueError('backend checksum mismatch')
-    if sha(directory/'ffmpeg-8.1-source.tar.xz')!=spec['sha256']: raise ValueError('corresponding source absent or wrong')
+    archive = source_directory / 'ffmpeg-8.1-source.tar.xz'
+    if archive.is_symlink() or sha(archive) != spec['sha256']:
+        raise ValueError('corresponding source absent or wrong')
     return m
 
 def assert_native_dependencies(binary,target):

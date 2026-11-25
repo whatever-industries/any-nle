@@ -24,6 +24,9 @@ use prproj::{RandomUuids, SeededUuids, UuidSource};
 pub(crate) const USAGE: &str = "usage:
   any-nle review --job SETTINGS.json
       Print the saved job's read-only preflight report (JSON).
+  any-nle mcp --diagnostics REPORT.json [--job SETTINGS.json]
+                  [--relink-report RELINK.json --moves MOVES.json [--checksums TRUSTED.json]]
+      Serve redacted support diagnostics to a local MCP client over stdio.
   any-nle run --job SETTINGS.json [--output NEW_PROJECT] [--new-media NEW_DIR]
       Run a saved native-wizard job with the same read-only preparation and explicit execution.
   any-nle verify-offline-relink REPORT.json MOVES.json [--checksums TRUSTED.json] [--ffprobe PATH]
@@ -623,15 +626,33 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     }
     let mut matte = crate::png_mattes::prepare(
         &read.result, &a.original_mappings, !a.wants_rewrap() && policy.bin_mode == BinMode::Separate,
+        a.ffprobe.as_deref().unwrap_or(Path::new("ffprobe")),
         &mut || Ok(()),
     ).map_err(|issue| issue.message)?;
-    let has_matte = !matte.picture.edits.is_empty();
+    let has_matte = !matte.is_empty();
     let problems = source_notes(a, &mut read, &matte)?;
     let AvidRead { result, inputs, .. } = read;
     let avid_adapter::ReadResult { graph, mut original_inputs, proxy_bindings, .. } = result;
     original_inputs.append(&mut matte.inputs);
+    let managed_stamps = if a.wants_rewrap() {
+        Vec::new()
+    } else {
+        // Direct managed links already have a resolved path. Observe their file
+        // state while preserving the direct CLI's existing qualification policy.
+        let mut paths: Vec<_> = graph.media.iter()
+            .filter(|media| media.original.is_none() && media.online == Some(true))
+            .flat_map(|media| &media.locations)
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        paths.into_iter()
+            .map(|path| source_input::original_stamp(Path::new(path)))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     if !a.rewrap_media {
-        let affected = premiere_preparation::managed_rewrap_items(&graph, a.wants_rewrap());
+        let affected: Vec<_> = premiere_preparation::managed_rewrap_candidates(&graph, a.wants_rewrap())
+            .into_iter().filter(|clip| !matte.managed_fill_only.contains(clip.item))
+            .map(|clip| clip.detail).collect();
         if !affected.is_empty() {
             return Err(format!(
                 "Selected Avid-managed OP-Atom clips need rewrap for Premiere. Use --rewrap-media NEW_DIR --rewrap-native-master.\n{}",
@@ -666,12 +687,16 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     let typed_pan = !a.wants_rewrap()
         && premiere_adapter::has_managed_pan_candidates(&graph);
     let typed_track_names = !a.wants_rewrap() && premiere_adapter::has_track_name_candidates(&graph);
+    // Premiere preparation reports the appearance of each prepared cue using
+    // its destination styling, and forwards source appearance for omitted cues.
     let mut source_losses: Vec<_> = graph.losses.iter()
         .filter(|loss| (loss.aspect != "subclip_bin_item" || a.rewrap_native_master)
+            && loss.aspect != "text_appearance"
             && loss.aspect != premiere_adapter::LAYERED_LOSS
             && !(typed_disabled && loss.aspect == "disabled_clip")
             && loss.aspect != avid_adapter::PAN_AUTOMATION_LOSS && matte.keeps_loss(loss))
         .cloned().collect();
+    source_losses.extend(matte.overlay_omissions.iter().cloned());
     let clock = premiere_preparation::clock_profile(a.wants_rewrap());
     let color_media = if a.rewrap_media {
         crate::source_luts::ColorMedia::Rewrap
@@ -727,8 +752,9 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
     let prepared_sequences = typed.as_ref().map_or(&model.sequences, |p| &p.sequences);
     let prepared_sequence_count = prepared_sequences.len();
     let prepared_event_count: usize = prepared_sequences.iter().map(|s| s.events.len()).sum::<usize>()
-        + typed.as_ref().map_or(0, |p| p.png_mattes.edits.len() + p.layered_submasters.len());
-    let prepared_stills = typed.as_ref().map_or(0, |p| p.png_mattes.stills.len());
+        + typed.as_ref().map_or(0, |p| p.png_mattes.edits.len() + p.png_mattes.split_edits.len() + p.layered_submasters.len());
+    let prepared_stills = typed.as_ref().map_or(0, |p| p.png_mattes.stills.len()
+        + p.png_mattes.jpeg_fills.iter().filter(|fill| fill.existing_clip.is_none()).count());
     let native_media = a.rewrap_media.then(|| rewrap::NativeMediaPreparation {
         model,
         source: &graph,
@@ -870,7 +896,12 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             ));
         }
     }
-    source_input::recheck(&inputs).map_err(|e| {
+    let recheck = |pins: &[avid_reader::source::SourceInput]| {
+        pins.iter()
+            .map(|pin| source_input::recheck_file_and_stamp(pin, &mut || Ok(())))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let mut source_stamps = recheck(&inputs).map_err(|e| {
         publication_failure(
             "source stability check failed",
             e,
@@ -879,20 +910,40 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             None,
         )
     })?;
-    source_input::recheck_checked(&original_inputs, &mut || Ok(()))
-        .and_then(|_| source_input::recheck_originals(&lut_pictures)).map_err(|e| {
-        publication_failure("original media stability check failed", e, &prepared, preparation.as_ref(), None)
-    })?;
+    let mut original_stamps = recheck(&original_inputs)
+        .and_then(|stamps| source_input::recheck_originals(&lut_pictures).map(|()| stamps))
+        .map_err(|e| {
+            publication_failure("original media stability check failed", e, &prepared, preparation.as_ref(), None)
+        })?;
     let mut auxiliary_outputs = Vec::new();
     if proxy_bindings.iter().any(|b| b.audio.is_some()) {
         println!("Creates new media. Rewrapping verified Avid proxies.");
         avid_adapter::proxy::execute_observed(&proxy_bindings, &mut |path| {
             auxiliary_outputs.push(path.to_owned());
         })?;
-        source_input::recheck(&inputs).and_then(|_| source_input::recheck(&original_inputs))
-            .and_then(|_| source_input::recheck_originals(&lut_pictures))
+        (|| {
+            source_stamps = recheck(&inputs)?;
+            original_stamps = recheck(&original_inputs)?;
+            source_input::recheck_originals(&lut_pictures)
+        })()
             .map_err(|e| format!("{e}; verified proxy files retained"))?;
     }
+    source_stamps.extend(original_stamps);
+    source_stamps.extend(lut_pictures);
+    source_stamps.extend(managed_stamps);
+    let check_source_state = |prepared: &prproj::convert::writer::PreparedProject, snapshot| {
+        source_input::recheck_originals(&source_stamps).map_err(|e| {
+            let error = publication_failure(
+                "source stability check failed", e, prepared, preparation.as_ref(), snapshot,
+            );
+            if auxiliary_outputs.is_empty() {
+                error
+            } else {
+                format!("{error}; verified proxy files retained: {auxiliary_outputs:?}")
+            }
+        })
+    };
+    check_source_state(&prepared, None)?;
     prepared.publish_assets().map_err(|e| {
         publication_failure(
             "asset publication failed",
@@ -902,6 +953,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             None,
         )
     })?;
+    check_source_state(&prepared, None)?;
     let mut published_snapshot = None;
     if let Some(path) = &a.graph_out {
         output::write_source_snapshot(path, &graph).map_err(|e| {
@@ -914,6 +966,7 @@ pub(crate) fn convert(a: &Args) -> Result<(), String> {
             )
         })?;
         published_snapshot = Some(path.as_path());
+        check_source_state(&prepared, published_snapshot)?;
     }
     let report = prepared.publish_project().map_err(|e| {
         publication_failure(
@@ -1083,6 +1136,7 @@ pub(crate) fn main() -> ExitCode {
             }
             return crate::job_review::run(Path::new(job));
         }
+        "mcp" => crate::mcp::run(rest),
         "run" => {
             if rest.len()<2 || !matches!(rest[0].as_str(),"--job"|"--job-json"|"--job-base64") {return usage("run --job SETTINGS.json [--output NEW.prproj] [--new-media NEW_DIR]");}
             #[cfg(target_os = "macos")]

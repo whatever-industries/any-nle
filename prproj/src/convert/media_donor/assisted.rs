@@ -18,6 +18,7 @@ struct Picture {
     frame_ticks: i64,
     raster: String,
     duration: i64,
+    rec709_source_override: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Sound {
@@ -49,6 +50,14 @@ const VIDEO_FIELDS: &[&str] = &[
     "AlphaType",
     "AlphaInfoIsUncertain",
     "IsPremultiplied",
+];
+
+const ORIGINAL_SRGB_PROFILE: &str =
+    r#"{"baseColorProfile":{"colorProfileName":"1,13,1,Narrow,YCC,10-bit,Display-Referred"},"baseProfileType":1}"#;
+const REC709_SOURCE_OVERRIDE: &[(&str, &str)] = &[
+    ("OverriddenColorSpace", r#"{"baseColorProfile":{"colorProfileName":"BT.709,10-bit,Display-Referred"},"baseProfileType":1}"#),
+    ("InputLUTSpecified", "true"),
+    ("IsColorSpacOverridden", "true"),
 ];
 
 #[derive(PartialEq, Eq)]
@@ -127,6 +136,11 @@ impl AssistedMedia {
                     for (key, value) in VIDEO_FIELDS.iter().zip(&encoding.video) {
                         set_scalar(tree, video, key, value.as_deref())?;
                     }
+                    if self.originals[path].picture.as_ref().is_some_and(|p| p.rec709_source_override) {
+                        for &(key, value) in REC709_SOURCE_OVERRIDE {
+                            set_scalar(tree, video, key, Some(value))?;
+                        }
+                    }
                 }
             }
         }
@@ -147,6 +161,16 @@ impl AssistedMedia {
                 return Err(invalid(format!(
                     "{path}: staged Premiere media encoding differs from import"
                 )));
+            }
+            if self.originals[path].picture.as_ref().is_some_and(|p| p.rec709_source_override) {
+                for record in records {
+                    let video = record.video.ok_or_else(|| invalid("staged source color override has no picture stream"))?;
+                    for &(key, expected) in REC709_SOURCE_OVERRIDE {
+                        if leaf(&document.tree, video, key)? != Some(expected) {
+                            return Err(invalid(format!("{path}: staged Rec.709 source override differs")));
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -254,6 +278,19 @@ impl AssistedMedia {
                     {
                         return Err(invalid("Premiere did not identify the picture codec"));
                     }
+                    if donor && picture.rec709_source_override {
+                        let expected_codec = u32::from_be_bytes(*b"apch");
+                        if number(tree, video, "CodecType")? != Some(i64::from(expected_codec))
+                            || leaf(tree, video, "OriginalColorSpace")? != Some(ORIGINAL_SRGB_PROFILE)
+                        {
+                            return Err(invalid("imported ProRes encoding or original sRGB color profile differs"));
+                        }
+                        for &(key, _) in REC709_SOURCE_OVERRIDE {
+                            if one(tree, video, key)?.is_some() {
+                                return Err(invalid("imported sRGB source already has a color override"));
+                            }
+                        }
+                    }
                 }
                 if let Some((audio, sound)) = audio.zip(facts.sound.as_ref()) {
                     if number(tree, audio, "Duration")? != Some(sound.duration)
@@ -299,6 +336,7 @@ impl Original {
                 frame_ticks: ticks_per_unit(video.rate),
                 raster: format!("0,0,{},{}", video.width, video.height),
                 duration: video.duration,
+                rec709_source_override: clip.rec709_source_override,
             }),
             sound: clip.audio.as_ref().map(|audio| Sound {
                 sample_ticks: ticks_per_unit(Fraction::new(audio.sample_rate, 1)),

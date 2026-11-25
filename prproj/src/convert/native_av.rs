@@ -354,11 +354,11 @@ pub(super) fn add_linked_av_subclip(
     add_av_master(project, media, clip, &subclip.name, Some((subclip.start, subclip.end)), ids)
 }
 
-fn set_subclip_bounds(project: &mut Project, source: crate::xml::NodeId, bounds: Option<(i64, i64)>) -> Result<()> {
+pub(super) fn set_subclip_bounds(project: &mut Project, source: crate::xml::NodeId, bounds: Option<(i64, i64)>) -> crate::error::Result<()> {
     let Some((start, end)) = bounds else { return Ok(()) };
     let tree = &mut project.doc.tree;
     let content = tree.find1(source, "MediaSource/Content")
-        .ok_or_else(|| invalid("subclip source lacks a content bag"))?;
+        .ok_or_else(|| crate::Error::Value("subclip source lacks a content bag".into()))?;
     for (field, value) in [
         ("StartBoundary", start.to_string()),
         ("EndBoundary", end.to_string()),

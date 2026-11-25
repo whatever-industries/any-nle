@@ -547,6 +547,40 @@ cuts, trims, original paths, and independent mono selectors. In the
 rendered split edit, all 48 picture frames and all 96,096 PCM samples
 per lane matched the retained Premiere control.
 
+## 23.976 direct DNxHD with PCM24
+
+The Premiere Separate files path can use its existing DNxHD LB media records
+on an ordinary same-rate cut. Preparation requires the saved 1080p DNxHD
+coding label, AVHD descriptor with resolution ID 1253, and two independent
+48 kHz PCM24 mono MXFs with matching clocks and extents. The output links all
+three originals. V1, A1 and A2 retain separate source trims and the project
+retains the source and sequence timecode origins.
+
+Verification uses both a serialized graph/2 control and an Avid-authored
+transcode with discrete mono selections. In Premiere 27.0.0 build 88,
+Save As, close and reopen retain all three paths, the media and sequence
+starts, and source in-points of 12, 13, and 14 frames on V1, A1, and A2.
+The 168-frame sequence plays to its end. Decoding the ranges from the
+reopened project's links reproduces 336,336 PCM24 samples per audio lane
+exactly against Avid Direct Out. Premiere render equality remains open.
+A contradictory descriptor extent fails before publication.
+The [PCM16 controls](#23976-direct-dnxhd-with-pcm16) and their existing
+research pins establish the shared DNxHD
+record format.
+
+### Saved stereo master with discrete timeline edits
+
+Separate files also accepts an ordered A1/A2 stereo pair on the bin master
+when the timeline selects the two mono sources independently and all three
+MXFs agree on origin and extent. Premiere receives a reusable audio sequence
+with the shared source timecode and the two mono clips panned left and right.
+After Save As and reopen in Premiere 27.0.0 build 88, both the cut and the
+stereo sequence played to their expected endpoints. Saved read-back
+confirmed the hard pans, three original paths and separate trims. The saved
+cut's two ranges each reconstruct 336,336 PCM24 samples exactly against Avid
+Direct Out. Stereo timeline placements and native Premiere render
+comparison remain open.
+
 ## Ranged filler marker read-back
 
 A graph-authored control over the qualified 29.97 DNxHD originals put six
@@ -974,6 +1008,24 @@ picture and PCM. Direct CLI and saved jobs agree on the reusable and existing
 timeline structure. Other rates, Grouped/Merged/Rewrap, and direct linking of
 the original polyphonic WAV are outside this check.
 CONV-0151
+
+### Reusable AutoSync with separate mono WAVs
+
+Separate files also rebuilds a 1080p23.976 AutoSync bin item whose saved
+tracks select a picture-only ProRes HQ MOV and two distinct 48 kHz PCM24
+mono WAV masters. Both WAVs use their own physical channel zero. The saved
+AutoSync lane selects which file Premiere places on A1 or A2. Graph/2
+retains each backing identity, track and independent source offset.
+
+Premiere 27.0.0 build 88 Save As and reopen preserved the reusable clock
+of `01:13:00:00` and all three [0,192) source ranges. Fresh Source Monitor
+insertion as individual clips survived a second reopen with V1, A1 and
+A2 linked to the same originals and ranges. Both audio lanes in the
+reopened reusable sequence's render matched all 384,384 samples of their
+assigned WAVs. It rendered 192 decoded frames. The 96 frames used in
+the separately retained editorial cut matched that Premiere render
+exactly. A graph reload control verified distinct backing offsets and
+refused an inconsistent saved WAV track selector. CONV-0213
 
 ### Original eight-channel WAV in Premiere
 

@@ -30,6 +30,8 @@ pub(crate) struct EssenceSpan {
     pub(super) body_sid: u32,
 }
 pub(super) struct IndexSpan {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(super) key_offset: u64,
     pub(super) offset: u64,
     pub(super) bytes: u64,
     pub(super) index_sid: u32,
@@ -131,6 +133,7 @@ pub(super) fn layout(path: &Path) -> R<Layout> {
         }
         if key == [6, 14, 43, 52, 2, 83, 1, 1, 13, 1, 2, 1, 1, 16, 1, 0] {
             indexes.push(IndexSpan {
+                key_offset: offset,
                 offset: pos,
                 bytes: len,
                 index_sid,

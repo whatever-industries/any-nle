@@ -78,6 +78,18 @@ fn numbered_two_inputs<'a>(ctx: &Ctx<'a>, effect: &Node) -> Option<[Option<&'a N
     Some(numbered_two_tracks(effect)?.map(|track| ctx.deref(track.get("component"))))
 }
 
+fn matte_key_bin_composition(ctx: &Ctx<'_>, mob: &Node) -> bool {
+    let Some(Value::List(tracks)) = mob.get("tracks") else { return false };
+    let [Value::Node(track)] = tracks.as_slice() else { return false };
+    int(track, "index") == Some(1)
+        && ctx.deref(track.get("component")).is_some_and(|component| {
+            component.class == *b"TKFX"
+                && int(component, "media_kind_id") == Some(KIND_PICTURE)
+                && matches!(component.get("effect_id").and_then(Value::as_str),
+                    Some("EFF2_2DMATTE" | "EFF2_BLEND_MATTE_KEY"))
+        })
+}
+
 // A source route only needs the supported range-routing facts, not arbitrary attributes,
 // descriptors, unselected graph branches, or source bytes.
 #[derive(Debug)]
@@ -331,6 +343,11 @@ fn compile_bin_inner(file: &AvbFile, bin: usize, source: Option<&source_capture:
                 retain_item(&mut summary.items, source, Item::GroupDependency { id: mob_id(mob), name }),
             (Some(MOB_COMPOSITION), Some(6))
                 if mob_id(mob).is_some_and(|id| freeze_owners.contains(&id)) => {}
+            (Some(MOB_COMPOSITION), Some(3)) if source.is_some() && matte_key_bin_composition(&ctx, mob) =>
+                retain_item(&mut summary.items, source, Item::Skipped(Skipped {
+                    name,
+                    reason: "reusable Avid Matte Key bin composition is unsupported".into(),
+                })),
             (Some(MOB_COMPOSITION), usage) => retain_item(&mut summary.items,source,Item::Skipped(Skipped {
                 name,
                 reason: format!("composition usage {:?} (subclip/group clip) as a bin item is not converted yet", usage),
@@ -2782,6 +2799,31 @@ mod tests {
         assert_eq!(facts.sequences[0].events[0].event.source_in, 14);
         assert!(facts.skipped.is_empty());
     }
+
+    #[test]
+    fn source_bin_matte_key_warning_requires_a_saved_matte_effect() {
+        let mut f = file();
+        for (number, effect_id) in [
+            (1, "EFF2_2DMATTE"),
+            (2, "EFF2_BLEND_MATTE_KEY"),
+            (3, "EFF2_SOME_OTHER_EFFECT"),
+        ] {
+            let mut effect = node(*b"TKFX", "TrackEffect");
+            effect.put("effect_id", Value::Str(effect_id.into()));
+            effect.put("media_kind_id", Value::Int(KIND_PICTURE));
+            effect.put("length", Value::Int(48));
+            effect.put("edit_rate", Value::Float(24.0));
+            let effect = add(&mut f, effect);
+            mob(&mut f, id(number), "Matte Key", MOB_COMPOSITION, 3, &[(1, effect)]);
+        }
+        let facts = source_project(std::slice::from_ref(&f));
+        assert_eq!(facts.skipped.len(), 3);
+        assert_eq!(facts.skipped.iter().filter(|item|
+            item.reason == "reusable Avid Matte Key bin composition is unsupported").count(), 2);
+        assert_eq!(facts.skipped.iter().filter(|item| item.reason.contains("composition usage")).count(), 1);
+        assert!(project(vec![f]).skipped.iter().all(|item| item.reason.contains("composition usage")));
+    }
+
     #[test]
     fn source_paths_release_decoder_before_next_bin_and_limit_before_open(){
         use crate::source::BinReadProgress;

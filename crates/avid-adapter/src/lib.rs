@@ -878,13 +878,17 @@ fn build_working_graph(
     let mut master_missing = Vec::new();
     let permit_partial_managed = originals.allow_media_gaps && !originals.allow_offline
         && permits_missing_media_fallbacks;
-    // Whole-project preparation must keep the exact imported still receipts
-    // that a Matte Key sequence may need to recover its managed-media gaps.
+    // Whole-project preparation keeps the imported-still receipts needed to
+    // recover a Matte Key's managed-media gaps.
     let png_matte_masters: HashSet<_> = if out.receipt_spool.is_some() {
         let imported: HashSet<_> = facts.imported_stills.iter().map(|still| still.master).collect();
-        sequences.as_ref().iter().filter(|sequence| sequence.unresolved.iter().any(|issue|
+        let shared_fill = sequences.as_ref().iter().filter(|sequence| sequence.unresolved.iter().any(|issue|
             issue.picture_profile == Some(av::SourcePictureProfile::ImportedPngMatte)))
-            .flat_map(|sequence| sequence.events.iter().map(|event| event.event.master))
+            .flat_map(|sequence| sequence.events.iter().map(|event| event.event.master));
+        let split_fill = sequences.as_ref().iter().flat_map(|sequence| &sequence.unresolved)
+            .filter(|issue| issue.picture_profile == Some(av::SourcePictureProfile::SplitStillMatte))
+            .filter_map(|issue| issue.matte_inputs.as_ref()?.fill.map(|fill| fill.mob));
+        shared_fill.chain(split_fill)
             .filter(|master| imported.contains(master))
             .collect()
     } else {
@@ -2340,7 +2344,22 @@ fn master(
                 ]);
                 None
             };
-            let original_clock = if let (Some(Observed::Known(count)), Some(rate), Some(saved), true) =
+            let original_clock = if let (Some(count), Some(rate)) = (selected.verified_mp4_timecode, selected.rate) {
+                let effective_count = u64::try_from(count).map_err(|_| "negative linked MP4 timecode")?;
+                native_original.push(("embedded_mp4_timecode", obj(vec![
+                    ("label", s(tc(count, 24))),
+                    ("rate", s(rate)),
+                    ("stream", Value::Int(2)),
+                ])));
+                Some(SourceClock {
+                    effective_count, rate, display_base: 24, drop: false,
+                    provenance: SourceClockProvenance {
+                        origin_count: effective_count, source_offset: 0, source_rate: rate,
+                        source_package: t.file_mob.umid_hex(), timecode_track: "tmcd/2".into(),
+                        route: graph::source::VERIFIED_LINKED_MOV_TIMECODE.into(),
+                    },
+                })
+            } else if let (Some(Observed::Known(count)), Some(rate), Some(saved), true) =
                 (&selected.embedded_mov_timecode, selected.rate, &m.start,
                  selected.kind == StreamKind::Video && (selected.verified_for_native_import || matches!(selected.codec.as_str(), "apch" | "apcs")))
             {
@@ -2382,6 +2401,9 @@ fn master(
             };
             if selected.verified_for_native_import {
                 native_original.push(("verified_for_native_import", Value::Bool(true)));
+            }
+            if selected.source_srgb_video_levels {
+                native_original.push(("source_srgb_video_levels", Value::Bool(true)));
             }
             let source_clock = source_clock.or(original_clock);
             if let Some(timecode) = &selected.embedded_mov_timecode {

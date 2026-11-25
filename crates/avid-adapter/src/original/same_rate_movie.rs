@@ -27,6 +27,21 @@ pub(super) fn select(
     select_movie(path, probe, master, ordinal, false)
 }
 
+pub(super) fn timecoded_hd_avc_aac<'a>(path: &Path, probe: &'a Value) -> Option<(&'a Value, &'a Value)> {
+    if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp4")) {
+        return None;
+    }
+    let Value::Arr(streams) = probe.get("streams")? else { return None };
+    let [video, audio, tc] = streams.as_slice() else { return None };
+    (text(video, "codec_name").as_deref() == Some("h264")
+        && number(video, "width") == Some(1920) && number(video, "height") == Some(1080)
+        && ratio(video, "avg_frame_rate") == Rational::new(24_000, 1001)
+        && is_audio(audio) && text(audio, "codec_name").as_deref() == Some("aac")
+        && text(tc, "codec_tag_string").as_deref() == Some("tmcd")
+        && video.get("tags").is_some_and(|tags| tags.get("timecode").is_some()))
+        .then_some((video, audio))
+}
+
 /// The portable movie layout is independent of the saved video codec.
 pub(super) fn may_need_import(path: &Path, probe: &Value) -> bool {
     if !path.extension().is_some_and(|ext| ["mov", "mp4"].iter().any(|s| ext.eq_ignore_ascii_case(s))) {
@@ -58,6 +73,36 @@ pub(super) fn select_verified_import(
     Ok((selected, defaulted))
 }
 
+fn srgb_video_levels(video: &Value, master: &av::SourceMaster) -> bool {
+    let [transform] = master.input_transforms.as_slice() else { return false; };
+    // Avid also saves the same stages without the automatic-list wrapper
+    // metadata. Verify the stages and their parameters in either record.
+    const NAMED_LIST: &str = concat!(
+        "<ColorTransformationList automaticConversion=\"true\">",
+        "<Name>From sRGB / Rec.709 [video levels] to Rec.709</Name>",
+    );
+    const GAMMA_STAGES: &str = concat!(
+        "<ColorTransformation><GammaLut><Name>sRGB to  linear</Name>",
+        "<BitDepth>10</BitDepth><Black>64</Black><White>940</White>",
+        "<Gamma>0.41666</Gamma><BlackGain>12.92</BlackGain><WhiteGain>1.055</WhiteGain>",
+        "<Clamp>true</Clamp></GammaLut></ColorTransformation>",
+        "<ColorTransformation><GammaLut><Name>Linear to REC709/2020</Name>",
+        "<BitDepth>10</BitDepth><Black>64</Black><White>940</White>",
+        "<Gamma>0.45</Gamma><BlackGain>4.5</BlackGain><WhiteGain>1.099</WhiteGain>",
+        "<Clamp>true</Clamp><Inverted/></GammaLut></ColorTransformation></ColorTransformationList>",
+    );
+    transform.track == 1
+        && master.master.tracks.iter().any(|track| track.kind == KIND_PICTURE
+            && track.index == 1 && track.file_mob == transform.file_mob)
+        && matches!(&transform.value, av::Observed::Known(xml)
+            if xml.strip_prefix(NAMED_LIST)
+                .or_else(|| xml.strip_prefix("<ColorTransformationList>")) == Some(GAMMA_STAGES))
+        && [
+            ("color_space", "bt709"), ("color_primaries", "bt709"),
+            ("color_transfer", "iec61966-2-1"), ("color_range", "tv"),
+        ].iter().all(|&(key, value)| text(video, key).as_deref() == Some(value))
+}
+
 fn select_movie(
     path: &Path, probe: &Value, master: &av::SourceMaster, ordinal: usize, importer: bool,
 ) -> Result<Option<(Selected, bool)>, String> {
@@ -65,6 +110,7 @@ fn select_movie(
     let mov = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
     let custom_prores = mov && matches!(probe.get("streams"),
         Some(Value::Arr(streams)) if streams.first().is_some_and(custom_prores_raster));
+    let timecoded_aac = !importer && timecoded_hd_avc_aac(path, probe).is_some();
     let Some(rate) = master.rate else {
         return if custom_prores {
             Err("linked ProRes HQ master edit rate is unresolved".into())
@@ -74,7 +120,9 @@ fn select_movie(
             Ok(None)
         };
     };
-    if !importer && !is_25_or_2997(Some(crate::rational(rate))) && picture_only_avc.is_none() && !custom_prores {
+    if !importer && !is_25_or_2997(Some(crate::rational(rate))) && picture_only_avc.is_none()
+        && !custom_prores && !timecoded_aac
+    {
         return Ok(None);
     }
     let mp4 = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"));
@@ -100,6 +148,20 @@ fn select_movie(
         .ok_or("linked movie raster is missing")?;
     let brand = probe.get("format").and_then(|f| f.get("tags")).and_then(|f| text(f, "major_brand"));
     let avc_pcm = !mxf && is_avc_pcm_movie(streams);
+    let srgb_prores = importer && mov && brand.as_deref() == Some("qt  ")
+        && tail.split_last().is_some_and(|(timecode, audio)| {
+            text(timecode, "codec_tag_string").as_deref() == Some("tmcd")
+                && (audio.is_empty() || matches!(audio, [stream] if
+                    text(stream, "codec_name").as_deref() == Some("pcm_s24le")))
+        })
+        && [("codec_name", "prores"), ("codec_tag_string", "apch"),
+            ("profile", "HQ"), ("pix_fmt", "yuv422p10le")]
+            .iter().all(|&(key, value)| text(video, key).as_deref() == Some(value));
+    // The standalone MP4 path still requires its complete AVC and AAC
+    // packet proofs, physical timecode and verified saved audio selectors.
+    let source_srgb_video_levels = (srgb_prores || timecoded_aac)
+        && raster == (1920, 1080) && (rate_exact.num(), rate_exact.den()) == (24_000, 1001)
+        && srgb_video_levels(video, master);
     let observed_codec;
     let codec = match (text(video, "codec_name").as_deref(), raster) {
         _ if importer => {
@@ -139,6 +201,8 @@ fn select_movie(
     };
     let defaulted = if avc_pcm {
         qualify_avc_pcm(streams, path, master)?
+    } else if source_srgb_video_levels {
+        qualify_movie_geometry_with_transfer(video, raster, rate_exact, "iec61966-2-1")?
     } else {
         qualify_movie_geometry_at_rate(video, raster, rate_exact)?
     };
@@ -163,11 +227,22 @@ fn select_movie(
         [] if importer || codec == "apch" || picture_only_avc.is_some() => (&tail[..0], None),
         [a] if is_audio(a) => (tail, None),
         [tc] if custom_prores || importer => (&tail[..0], Some(tc)),
-        [a, tc] if (importer || codec == "apch") && is_audio(a) => (&tail[..1], Some(tc)),
+        [a, tc] if (importer || codec == "apch" || timecoded_aac) && is_audio(a) => (&tail[..1], Some(tc)),
         [a, b] if !importer && (codec == "avc1" && mov || mxf) && is_audio(a) && is_audio(b) => (tail, None),
         _ => return Err("linked movie has unqualified additional streams".into()),
     };
-    let embedded = if importer || codec == "apch" {
+    if importer && audio.iter().any(|stream| text(stream, "codec_name").as_deref() == Some("aac")) {
+        return Err("linked AAC movie needs a qualified standalone route; assisted linking does not verify AAC sample placement".into());
+    }
+    let mp4_clock = if timecoded_aac {
+        let tc = timecode.ok_or("linked AAC MP4 timecode track is absent")?;
+        Some(verified_aac_mp4_timecode(probe, video, tc, master, rate_exact)?)
+    } else {
+        None
+    };
+    let embedded = if mp4_clock.is_some() {
+        None
+    } else if importer || codec == "apch" {
         movie_origin(path, probe, video, timecode, 1 + audio.len() as i64, master, rate, importer)?
     } else {
         if video.get("tags").is_some_and(|tags| tags.get("timecode").is_some())
@@ -219,8 +294,8 @@ fn select_movie(
             }
             let (representation, bits, priming) = if format == "aac" {
                 qualify_stereo_aac_lc(stream)?;
-                if importer || codec == "apch" || !has_aac_priming_packet(probe, index)
-                    || !same_rate_aac_master(master, samples, video, rate)
+                if codec == "apch" || !has_aac_priming_packet(probe, index)
+                    || !same_rate_aac_master(master, samples, video, rate, timecoded_aac)
                 {
                     return Err("linked movie AAC extent or saved priming route disagrees".into());
                 }
@@ -254,6 +329,7 @@ fn select_movie(
     let is_picture = kind == StreamKind::Video;
     Ok(Some((Selected {
         verified_for_native_import: importer,
+        source_srgb_video_levels: is_picture && source_srgb_video_levels,
         path: path.into(), online: true,
         stream: OriginalStream {
             saved_locators: raw.locators.clone(), container: if mxf { "mxf" } else { "mov" }.into(),
@@ -265,6 +341,7 @@ fn select_movie(
         sample_rate: (!is_picture).then_some(48_000), bits, duration,
         motion_audio_origin: None, same_rate_aac_origin: priming, mp3_delay_samples: None,
         column_timecode: None, embedded_mov_timecode: if is_picture { embedded.map(av::Observed::Known) } else { None },
+        verified_mp4_timecode: if is_picture { mp4_clock } else { None },
     }, defaulted)))
 }
 
@@ -331,6 +408,77 @@ fn prove_picture_grid(
             progress.fetch_add(1, Ordering::Relaxed);
         })
     }).map_err(|reason| format!("linked picture packet proof failed: {reason}"))
+}
+
+pub(super) fn prove_timecoded_avc_aac_packets(
+    path: &Path, tool: &Path, video: &Value, audio: &Value,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let rate = Rational::new(24_000, 1001).unwrap();
+    prove_picture_grid(path, tool, video, rate, check)?;
+    qualify_stereo_aac_lc(audio)?;
+    let samples = number(audio, "duration_ts").filter(|&count| count > 0)
+        .ok_or("linked AAC presentation sample extent is absent")?;
+    let mut command = Command::new(tool);
+    command.args(["-v", "error", "-protocol_whitelist", "file,pipe", "-f", "mov",
+        "-select_streams", "a:0", "-show_packets", "-show_entries",
+        "packet=pts,duration:packet_side_data=", "-of", "csv=p=0"]).arg(path);
+    run_probe(command, PICTURE_PACKET_IDLE_LIMIT, check, move |stdout, progress| {
+        verify_aac_packets(BufReader::new(stdout), samples, || { progress.fetch_add(1, Ordering::Relaxed); })
+    }).map_err(|reason| format!("linked AAC packet proof failed: {reason}"))
+}
+
+fn verify_aac_packets(mut packets: impl BufRead, samples: i64, mut mark_verified: impl FnMut()) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    let mut cursor = -1024;
+    while let Some(row) = read_picture_packet_row(&mut packets, &mut bytes)? {
+        // FFprobe appends an empty CSV column to the priming row with side data.
+        let row = if cursor == -1024 { row.strip_suffix(',').unwrap_or(row) } else { row };
+        let (pts, duration) = row.split_once(',').ok_or("linked AAC packet clock is missing")?;
+        let expected = if cursor < 0 { 1024 } else { (samples - cursor).min(1024) };
+        if expected <= 0 || pts.parse::<i64>().ok() != Some(cursor)
+            || duration.parse::<i64>().ok() != Some(expected)
+        {
+            return Err("linked AAC packet presentation clock is discontinuous".into());
+        }
+        cursor += expected;
+        mark_verified();
+    }
+    if cursor != samples {
+        return Err("linked AAC packets do not cover the declared presentation extent".into());
+    }
+    Ok(())
+}
+
+fn verified_aac_mp4_timecode(
+    probe: &Value, video: &Value, track: &Value, master: &av::SourceMaster, rate: Rational,
+) -> Result<i64, String> {
+    let label = video.get("tags").and_then(|tags| text(tags, "timecode"))
+        .ok_or("linked AAC MP4 picture timecode is absent")?;
+    let count = parse_non_drop_24_label(&label).ok_or("linked AAC MP4 requires a non-drop 24-frame timecode label")?;
+    verify_movie_timecode_track(video, track, 2, rate, &label)?;
+    if probe.get("format").and_then(|format| format.get("tags"))
+        .and_then(|tags| text(tags, "timecode")).is_some_and(|value| value != label)
+        || !master.master.saved_clock_segments.is_empty()
+        || master.file_clocks.iter().any(Option::is_some)
+        || master.master.start.as_ref().is_some_and(|saved|
+            saved.fps != 24 || saved.drop || saved.frames != count)
+    {
+        return Err("linked AAC MP4 timecode conflicts with saved clock evidence or has an unqualified saved clock route".into());
+    }
+    Ok(count)
+}
+
+pub(super) fn verified_picture_markers(master: &av::SourceMaster, rate: av::Rate, frames: i64) -> bool {
+    let markers = &master.master.markers;
+    markers.len() == master.marker_witnesses.len()
+        && markers.iter().zip(&master.marker_witnesses).all(|((kind, index, marker), witness)| {
+            (*kind, *index) == (KIND_PICTURE, 1)
+                && (witness.kind, witness.track) == (KIND_PICTURE, 1)
+                && witness.local_rate == Some(rate) && witness.master_frame == Some(marker.frame)
+                && (0..frames).contains(&marker.frame)
+                && marker.length.is_none_or(|length| length > 0 && length <= frames - marker.frame)
+        })
 }
 
 fn prove_pcm_grid(
@@ -474,6 +622,19 @@ fn movie_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aac_packet_proof_requires_priming_and_the_full_playable_tail() {
+        assert!(verify_aac_packets(&b"-1024,1024,\n0,1024\n1024,480\n"[..], 1504, || {}).is_ok());
+        for rows in [
+            "0,1024\n1024,480\n",
+            "-1024,1024,\n0,1024\n",
+            "-1024,1024,\n0,1024\n1025,479\n",
+            "-1024,1024,\n0,1024\n1024,481\n",
+        ] {
+            assert!(verify_aac_packets(rows.as_bytes(), 1504, || {}).is_err(), "{rows}");
+        }
+    }
 
     #[test]
     fn picture_packet_proof_accepts_decode_order_with_exact_presentation_grid() {

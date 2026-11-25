@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::model::Clip;
 use super::model::{check_text, Fraction, ModelError, MAX_ITEMS};
-use super::prepared::{PreparedClip, PreparedProjectInput};
+use super::prepared::{OriginalClip, PreparedClip, PreparedProjectInput, SampleRepresentation};
 use super::writer::{Result as WriteResult, WriteError};
 use crate::build::time::Time;
 use crate::ids::UuidSource;
@@ -21,11 +21,19 @@ pub const MAX_GROUPS: usize = 256;
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedCamera {
     pub clip: String,
+    /// Independent mono view of the same original when the bin master is stereo.
+    pub mono_view: Option<String>,
     pub start: i64,
     pub source_in: i64,
     pub duration: i64,
     /// Leaf Avid channel labels in the order of the independent group lanes.
     pub audio_labels: Vec<i64>,
+}
+
+impl PreparedCamera {
+    pub fn mono_clip(&self) -> &str {
+        self.mono_view.as_deref().unwrap_or(&self.clip)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,13 +75,46 @@ fn write_fail(reason: &str) -> WriteError {
     WriteError::Other(crate::Error::Value(format!("editable multicam: {reason}")))
 }
 
+/// A verified file-backed camera whose embedded audio exposes independent
+/// mono sources. Group-local trims use the same file origin for both streams.
+pub fn is_linked_original_camera(clip: &OriginalClip) -> bool {
+    clip.container == "mov"
+        && clip.is_same_rate_linked_pcm()
+        && !clip.separate_mono_streams
+        && clip.video.as_ref().zip(clip.audio.as_ref()).is_some_and(|(video, audio)| {
+            video.rate == RATE
+                && (video.width, video.height) == (1920, 1080)
+                && video.codec == "apch"
+                && audio.representation == SampleRepresentation::Pcm24
+                && audio.source_start == 0
+                && audio.duration == video.duration
+        })
+        && matches!(clip.groups.as_slice(), [left, right]
+            if left.as_slice() == [1] && right.as_slice() == [2])
+        && clip.channels.len() == 2
+        && clip.channels.iter().all(|channel| matches!(channel.avid_track, 1 | 2)
+            && channel.channel_index == channel.avid_track - 1)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CameraMedia<'a> {
+    Managed(&'a Clip, &'a [ItemId]),
+    Original(ItemId, &'a OriginalClip),
+}
+
+pub(super) fn original_mono(clip: &OriginalClip, label: i64) -> Option<(usize, f64)> {
+    let group = clip.groups.iter().position(|group| group.as_slice() == [label])?;
+    let channel = clip.channels.iter().find(|channel| channel.avid_track == label)?;
+    Some((group, channel.gain_db))
+}
+
 /// Build the native sequence-backed source item. The inner pan is transport:
 /// explicit hard pan avoids the native default mono-to-stereo center loss
 /// before the bus selects L/R. The outer timeline's mix is independent.
 pub(super) fn build(
     project: &mut Project,
     g: &PreparedMulticam,
-    leaves: [(ItemId, &[ItemId], &Clip); 2],
+    leaves: [(ItemId, CameraMedia<'_>); 2],
     target: ItemId,
     ids: &mut dyn UuidSource,
 ) -> WriteResult<ItemId> {
@@ -120,31 +161,42 @@ pub(super) fn build(
             .ok_or_else(|| write_fail("third active strip has no output matrix"))?;
         project.doc.tree.set_text(matrix, Some("[[0,[2]],[1,[3]]]"));
     }
-    for (i, (camera, (leaf, siblings, clip))) in g.cameras.iter().zip(leaves).enumerate() {
+    for (i, (camera, (leaf, media))) in g.cameras.iter().zip(leaves).enumerate() {
         let start = Time::new(camera.start);
         let mut placed = vec![project.add_clip(video[i], leaf, start, ids)?];
-        let groups = super::native_av::groups(clip)?;
+        let native_groups = match media {
+            CameraMedia::Managed(clip, siblings) if siblings.is_empty() =>
+                super::native_av::groups(clip)?,
+            _ => Vec::new(),
+        };
         for (j, &label) in camera.audio_labels.iter().enumerate() {
-            let file = clip
-                .audio
-                .iter()
-                .position(|a| a.avid_track == Some(label))
-                .ok_or_else(|| write_fail("camera audio label missing"))?;
             let selected = i == g.audio_cameras[j];
             // The selected inputs occupy the first slots. Each alternate has
             // its own muted track after the active inputs.
             let track = audio[if selected { j } else { j + channels }];
-            let item = if siblings.is_empty() {
-                let group = groups
-                    .iter()
-                    .position(|g| g.as_slice() == [file])
-                    .ok_or_else(|| write_fail("camera has no qualified mono group"))?;
-                super::native_av::place_audio(project, track, leaf, group, start, ids)?
-            } else {
-                let sibling = *siblings.get(file).ok_or_else(|| write_fail("linked camera mono item missing"))?;
-                project.add_clip(track, sibling, start, ids)?
+            let (item, gain) = match media {
+                CameraMedia::Original(item, clip) => {
+                    let (group, gain) = original_mono(clip, label)
+                        .ok_or_else(|| write_fail("original camera mono group missing"))?;
+                    (super::native_av::place_audio(project, track, item, group, start, ids)?, gain)
+                }
+                CameraMedia::Managed(clip, siblings) => {
+                    let file = clip.audio.iter().position(|a| a.avid_track == Some(label))
+                        .ok_or_else(|| write_fail("camera audio label missing"))?;
+                    let item = if siblings.is_empty() {
+                        let group = native_groups.iter()
+                            .position(|g| g.as_slice() == [file])
+                            .ok_or_else(|| write_fail("camera has no qualified mono group"))?;
+                        super::native_av::place_audio(project, track, leaf, group, start, ids)?
+                    } else {
+                        let sibling = *siblings.get(file)
+                            .ok_or_else(|| write_fail("linked camera mono item missing"))?;
+                        project.add_clip(track, sibling, start, ids)?
+                    };
+                    (item, clip.audio[file].gain_db)
+                }
             };
-            super::audio::set_clip_gain(project, item, clip.audio[file].gain_db)?;
+            super::audio::set_clip_gain(project, item, gain)?;
             if selected {
                 let pan = if j == 0 {
                     super::combined::Pan::Left
@@ -282,9 +334,13 @@ pub(super) fn validate(
             ));
         }
         let channels = g.audio_cameras.len();
+        let linked_originals = channels == 2 && input.options.bin_mode == "separate"
+            && g.cameras.iter().all(|camera| matches!(clips.get(camera.mono_clip()),
+                Some(PreparedClip::Original(clip)) if is_linked_original_camera(clip)));
         if !matches!(channels, 1..=3)
             || g.audio_cameras.iter().any(|&camera| camera >= g.cameras.len())
             || ((channels == 3 || (channels == 2 && g.audio_cameras != [0; 2]))
+                && !linked_originals
                 && (input.options.bin_mode != "separate" || g.cameras.iter().any(|camera| {
                     !input.direct_dnxhr_origins.contains_key(&camera.clip)
                 })))
@@ -294,17 +350,6 @@ pub(super) fn validate(
         let mut latest = 0;
         let mut camera_paths = HashSet::new();
         for c in &g.cameras {
-            let Some(PreparedClip::Legacy(leaf)) = clips.get(c.clip.as_str()).copied() else {
-                return Err(fail("group requires managed Avid leaf masters"));
-            };
-            let Some(v) = &leaf.video else {
-                return Err(fail("camera has no picture"));
-            };
-            if channels == 3 && (!camera_paths.insert(&v.path)
-                || leaf.audio.iter().any(|audio| !camera_paths.insert(&audio.path)))
-            {
-                return Err(fail("three-mono Group cameras require distinct picture and sibling paths"));
-            }
             let end = c
                 .start
                 .checked_add(c.duration)
@@ -318,7 +363,50 @@ pub(super) fn validate(
                 || !aligned(c.duration)
                 || c.duration == 0
                 || end > g.duration
-                || out > v.duration
+            {
+                return Err(fail("camera needs an aligned, exact positive span within the Group"));
+            }
+            let leaf = clips.get(c.clip.as_str()).copied();
+            if linked_originals {
+                let (Some(PreparedClip::Original(leaf)), Some(PreparedClip::Original(mono))) =
+                    (leaf, clips.get(c.mono_clip()).copied()) else {
+                    return Err(fail("camera picture and mono view must both be verified originals"));
+                };
+                if !camera_paths.insert(&leaf.path)
+                    || leaf.path != mono.path
+                    || leaf.metadata.material_umid != mono.metadata.material_umid
+                    || leaf.container != mono.container
+                    || leaf.video != mono.video || leaf.audio != mono.audio
+                    || leaf.channels != mono.channels
+                    || leaf.proxy_path != mono.proxy_path
+                    || leaf.premiere_assisted != mono.premiere_assisted
+                    || leaf.rec709_source_override != mono.rec709_source_override
+                    || leaf.separate_mono_streams != mono.separate_mono_streams
+                    || leaf.video.as_ref().is_none_or(|video| out > video.duration)
+                    || c.audio_labels.len() != channels
+                    || c.audio_labels[0] == c.audio_labels[1]
+                    || c.audio_labels.iter().any(|&label| original_mono(mono, label).is_none())
+                {
+                    return Err(fail("linked original cameras need distinct MOV paths, playable extents and two independent mono selectors"));
+                }
+                latest = latest.max(end);
+                continue;
+            }
+            let Some(PreparedClip::Legacy(leaf)) = leaf else {
+                return Err(fail("group requires managed Avid leaf masters or two verified ProRes HQ/PCM24 MOV cameras"));
+            };
+            if c.mono_view.is_some() {
+                return Err(fail("managed camera cannot use an original-file mono view"));
+            }
+            let Some(v) = &leaf.video else {
+                return Err(fail("camera has no picture"));
+            };
+            if channels == 3 && (!camera_paths.insert(&v.path)
+                || leaf.audio.iter().any(|audio| !camera_paths.insert(&audio.path)))
+            {
+                return Err(fail("three-mono Group cameras require distinct picture and sibling paths"));
+            }
+            if out > v.duration
                 || v.rate != RATE
                 || (v.width, v.height) != (1920, 1080)
                 || !v.codec.eq_ignore_ascii_case("avdn")
@@ -403,13 +491,12 @@ pub(super) fn validate(
             return Err(fail("group use requires a complete, exact ordinary-speed event without clip effects or edit markers"));
         }
         let matches = |c: &PreparedCamera| {
-            e.clip == c.clip
-                && u.source_in >= c.start
+            u.source_in >= c.start
                 && u.source_in - c.start <= c.duration - e.duration
                 && c.source_in.checked_add(u.source_in - c.start) == Some(e.source_in)
         };
         if let Some(v) = u.video {
-            if !g.cameras.get(v).is_some_and(matches) {
+            if !g.cameras.get(v).is_some_and(|c| e.clip == c.clip && matches(c)) {
                 return Err(fail("picture choice contradicts the bound leaf placement"));
             }
         }
@@ -426,9 +513,11 @@ pub(super) fn validate(
                         let Some(&default) = g.audio_cameras.get(channel) else { return true; };
                         let camera = if alternate { 1 - default } else { default };
                         let c = &g.cameras[camera];
-                        !matches(c) || c.audio_labels.get(channel) != Some(label)
+                        e.clip != c.mono_clip() || !matches(c) || c.audio_labels.get(channel) != Some(label)
                             || (alternate && (input.options.bin_mode != "separate"
-                                || !input.direct_dnxhr_origins.contains_key(&c.clip)))
+                                || (!input.direct_dnxhr_origins.contains_key(&c.clip)
+                                    && !matches!(clips.get(c.mono_clip()),
+                                        Some(PreparedClip::Original(clip)) if is_linked_original_camera(clip)))))
                     })
             {
                 return Err(fail(

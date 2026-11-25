@@ -480,6 +480,7 @@ pub(super) fn writer_clip(clip: &Clip, output: &Path) -> R<OriginalClip> {
     let label = a.avid_track.unwrap();
     Ok(OriginalClip {
         premiere_assisted: false,
+        rec709_source_override: false,
         separate_mono_streams: false,
         proxy_path: None,
         metadata: ClipMetadata {

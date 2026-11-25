@@ -1,6 +1,8 @@
 //! Attribute blocked Avid media to saved edit occurrences for Review.
 use super::{CancelToken, ReviewBlocker, ReviewGroup};
-use crate::{png_mattes, premiere_preparation::{timeline_subject, timeline_subject_at}};
+use crate::{png_mattes, premiere_preparation::{
+    timeline_subject, timeline_subject_at, timeline_subject_with_exact_offset,
+}};
 use avid_adapter::{AudioGroupIssue, MediaEditDetails};
 use avid_reader::{
     extract::{KIND_PICTURE, KIND_SOUND},
@@ -64,23 +66,37 @@ pub(super) fn append_png_edit(
     sequence_bins: &HashMap<String, usize>,
     bins: &[PathBuf],
     edit: png_mattes::FailedPngEdit,
+    cancel: &CancelToken,
 ) {
-    let Some(sequence) = source.sequences.iter().find(|seq| seq.id == edit.sequence) else {
-        return;
-    };
-    let record = Rational::new(edit.record_frame.into(), 24);
-    let subject = timeline_subject(sequence, StreamKind::Video, edit.track, record);
-    let mut note = format!("{subject} · PNG source preparation failed · edit {}", edit.id);
-    if !edit.saved_locators.is_empty() {
-        note.push_str(&format!(" · saved PNG {:?}", edit.saved_locators));
+    // Bound these details independently of the source-graph and media limits.
+    const MAX_PNG_EDIT_DETAILS: usize = 128;
+    let related = png_mattes::matching_overlay_failures(
+        source, &edit, MAX_PNG_EDIT_DETAILS, || cancel.is_cancelled(),
+    );
+    if related.len() == MAX_PNG_EDIT_DETAILS {
+        blocker.message.push_str("\nAffected PNG edits reached the diagnostic size limit.");
     }
-    blocker.timeline_groups.push(ReviewGroup {
-        bin: sequence_bins.get(&sequence.id).and_then(|&index| bins.get(index)).cloned(),
-        id: sequence.id.clone(),
-        name: sequence.name.clone(),
-        note_indices: vec![blocker.affected.len()],
-    });
-    blocker.affected.push(note);
+    let mut groups = TimelineGroups::new(&mut blocker.timeline_groups);
+    for edit in std::iter::once(edit).chain(related.into_iter().take(MAX_PNG_EDIT_DETAILS - 1)) {
+        let Some(sequence) = source.sequences.iter().find(|seq| seq.id == edit.sequence) else {
+            continue;
+        };
+        let subject = timeline_subject_with_exact_offset(
+            sequence, StreamKind::Video, edit.track, edit.record_start,
+        );
+        let mut note = format!("{subject} · PNG source preparation failed · edit {}", edit.id);
+        if !edit.saved_locators.is_empty() {
+            note.push_str(&format!(" · saved PNG {:?}", edit.saved_locators));
+        }
+        let bin = sequence_bins.get(&sequence.id).and_then(|&index| bins.get(index));
+        groups.extend(
+            &sequence.id, &sequence.name, bin.map(PathBuf::as_path),
+            std::iter::once(blocker.affected.len()),
+        );
+        blocker.diagnostic_locations.insert(blocker.affected.len(),
+            crate::diagnostics::SavedLocation::from_sequence(sequence, StreamKind::Video, edit.track, edit.record_start));
+        blocker.affected.push(note);
+    }
 }
 
 /// Follow up on an early verification failure using file metadata only.
@@ -371,6 +387,8 @@ pub(super) fn append_media_edit_details(
                 note.push_str(" · package ");
                 note.push_str(&edit.file_package);
             }
+            blocker.diagnostic_locations.insert(blocker.affected.len(),
+                crate::diagnostics::SavedLocation::new(edit.kind, edit.track, edit.offset, timeline.rate, timeline.clock));
             blocker.affected.push(note);
         }
         let indices = start..blocker.affected.len();
@@ -548,6 +566,10 @@ pub(super) fn append_unresolved_uses(
                 )
             });
             let subject = timeline_subject(sequence, kind, *track, position);
+            blocker.diagnostic_locations.insert(
+                blocker.affected.len(),
+                crate::diagnostics::SavedLocation::from_sequence(sequence, kind, *track, position),
+            );
             blocker.affected.push(format!(
                 "{subject} · {name:?} · edit {id} references unresolved source {master_id}"
             ));

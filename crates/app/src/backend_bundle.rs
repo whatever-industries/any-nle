@@ -2,6 +2,17 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+const BACKEND_SPEC: &str = include_str!("../../../packaging/ffmpeg.json");
+
+#[derive(Deserialize)]
+struct BackendSpec {
+    version: String,
+    url: String,
+    sha256: String,
+    license: String,
+    configure: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendTools {
     pub ffmpeg: PathBuf,
@@ -80,25 +91,18 @@ pub fn verify_directory(dir: &Path) -> Result<BackendTools, String> {
     let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
     let m: Manifest =
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid backend manifest: {e}"))?;
+    let spec: BackendSpec = serde_json::from_str(BACKEND_SPEC)
+        .map_err(|e| format!("invalid embedded backend specification: {e}"))?;
     if m.schema != 1
-        || m.ffmpeg_version != "8.1"
+        || m.ffmpeg_version != spec.version
         || m.target != target()?
-        || m.license != "LGPL-2.1-or-later"
-        || m.source.sha256 != "b072aed6871998cce9b36e7774033105ca29e33632be5b6347f3206898e0756a"
-        || m.source.url != "https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz"
+        || m.license != spec.license
+        || m.source.sha256 != spec.sha256
+        || m.source.url != spec.url
     {
         return Err("unsupported backend identity/license/source manifest".into());
     }
-    if [
-        "--disable-autodetect",
-        "--disable-gpl",
-        "--disable-nonfree",
-        "--disable-version3",
-        "--disable-network",
-    ]
-    .iter()
-    .any(|flag| !m.configure.iter().any(|s| s == flag))
-        || m.configure.len() > 256
+    if m.configure.len() > 256
         || m.configure.iter().any(|s| {
             s.len() > 2048
                 || matches!(
@@ -108,6 +112,15 @@ pub fn verify_directory(dir: &Path) -> Result<BackendTools, String> {
         })
     {
         return Err("bundled backend has unsupported build configuration".into());
+    }
+    if let Some(flag) = spec
+        .configure
+        .iter()
+        .find(|flag| !m.configure.contains(flag))
+    {
+        return Err(format!(
+            "Bundled media tools are missing required build option {flag}. Reinstall a complete Any NLE package."
+        ));
     }
     Ok(BackendTools {
         ffmpeg: tool(dir, &m.tools.ffmpeg, "ffmpeg")?,
@@ -200,7 +213,19 @@ mod tests {
             .unwrap();
         }
         let hash = prproj::hash::hex(&prproj::hash::sha256(data));
-        let m = serde_json::json!({"schema":1,"ffmpeg_version":"8.1","target":target().unwrap(),"license":"LGPL-2.1-or-later","source":{"url":"https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz","sha256":"b072aed6871998cce9b36e7774033105ca29e33632be5b6347f3206898e0756a"},"configure":["--disable-autodetect","--disable-gpl","--disable-nonfree","--disable-version3","--disable-network"],"tools":{"ffmpeg":{"file":format!("ffmpeg{}",std::env::consts::EXE_SUFFIX),"sha256":hash},"ffprobe":{"file":format!("ffprobe{}",std::env::consts::EXE_SUFFIX),"sha256":hash}}});
+        let spec: BackendSpec = serde_json::from_str(BACKEND_SPEC).unwrap();
+        let m = serde_json::json!({
+            "schema": 1,
+            "ffmpeg_version": spec.version,
+            "target": target().unwrap(),
+            "license": spec.license,
+            "source": {"url": spec.url, "sha256": spec.sha256},
+            "configure": spec.configure,
+            "tools": {
+                "ffmpeg": {"file": format!("ffmpeg{}", std::env::consts::EXE_SUFFIX), "sha256": hash},
+                "ffprobe": {"file": format!("ffprobe{}", std::env::consts::EXE_SUFFIX), "sha256": hash},
+            },
+        });
         let write = |v: &serde_json::Value| {
             std::fs::write(
                 dir.join("backend-manifest.json"),
@@ -209,6 +234,23 @@ mod tests {
             .unwrap()
         };
         write(&m);
+        assert!(verify_directory(&dir).unwrap().bundled);
+        let mut old_build = m.clone();
+        let flags = old_build["configure"].as_array_mut().unwrap();
+        let old_len = flags.len();
+        flags.retain(|flag| flag != "--enable-zlib");
+        assert_eq!(flags.len(), old_len - 1);
+        write(&old_build);
+        assert!(verify_directory(&dir)
+            .unwrap_err()
+            .contains("--enable-zlib"));
+
+        let mut custom_build = m.clone();
+        custom_build["configure"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("--prefix=/synthetic"));
+        write(&custom_build);
         assert!(verify_directory(&dir).unwrap().bundled);
         for field in ["target", "ffmpeg_version", "license"] {
             let mut bad = m.clone();

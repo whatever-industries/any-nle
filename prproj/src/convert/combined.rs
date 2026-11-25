@@ -901,10 +901,25 @@ pub fn create_stereo_nest(
     preset: &str,
     ids: &mut dyn UuidSource,
 ) -> Result<ItemId> {
+    create_stereo_nest_with_start(project, audio_items, target_bin, name, preset, None, ids)
+}
+
+pub(super) fn create_stereo_nest_with_start(
+    project: &mut Project,
+    audio_items: &[ItemId],
+    target_bin: ItemId,
+    name: &str,
+    preset: &str,
+    start: Option<i64>,
+    ids: &mut dyn UuidSource,
+) -> Result<ItemId> {
     if audio_items.len() != 2 {
         return Err(other("a stereo build needs exactly two mono parts"));
     }
     let sequence = project.add_sequence(name, preset, None, ids)?;
+    if let Some(start) = start {
+        project.set_zero_point(sequence, Time::new(start))?;
+    }
     let sequence_uid = project.sequence_id(sequence);
     let Some(root) = project.root_item() else { return Err(other("project has no root item")) };
     let item = project

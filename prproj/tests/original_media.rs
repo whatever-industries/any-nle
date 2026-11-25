@@ -41,6 +41,7 @@ fn original(shape: &str) -> OriginalClip {
         .collect();
     OriginalClip {
         premiere_assisted: false,
+        rec709_source_override: false,
         separate_mono_streams: false,
         proxy_path: None,
         metadata: ClipMetadata {
@@ -145,6 +146,124 @@ fn xml(p: &PathBuf) -> String {
         .read_to_string(&mut s)
         .unwrap();
     s
+}
+
+#[test]
+fn assisted_srgb_prores_requires_a_matching_donor_color_profile() {
+    use std::io::Write;
+
+    let scratch = Scratch::new();
+    let file = scratch.0.join("original.mov");
+    let rate = Fraction::new(24_000, 1001);
+    let duration = 48 * ticks_per_unit(rate);
+    let mut clip = original("dualmono");
+    clip.path = file.to_str().unwrap().into();
+    clip.metadata.rate = Some(rate);
+    let video = clip.video.as_mut().unwrap();
+    video.rate = rate;
+    video.duration = duration;
+    let audio = clip.audio.as_mut().unwrap();
+    audio.representation = SampleRepresentation::Pcm24;
+    audio.duration = duration;
+
+    let baseline = scratch.0.join("template.prproj");
+    prepare_typed_project_for_premiere_27(
+        &input(clip.clone()), &baseline, &mut SeededUuids::new("neutral"),
+        TypedMedia::Bound { bindings: &[], native_av: false }, None,
+    ).unwrap().publish().unwrap();
+
+    let output = scratch.0.join("qualified.prproj");
+    clip.video.as_mut().unwrap().codec = "apch".into();
+    clip.premiere_assisted = true;
+    clip.rec709_source_override = true;
+    let mut project = prepare_typed_project_for_premiere_27(
+        &input(clip), &output, &mut SeededUuids::new("qualified"),
+        TypedMedia::Bound { bindings: &[], native_av: false }, None,
+    ).unwrap();
+    let binding = xml(&baseline).replacen(
+        &format!("<CodecType>{}</CodecType>", u32::from_be_bytes(*b"avc1")),
+        &format!("<CodecType>{}</CodecType>", u32::from_be_bytes(*b"apch")),
+        1,
+    );
+    let start = binding.find("<OriginalColorSpace>").unwrap() + "<OriginalColorSpace>".len();
+    let end = start + binding[start..].find("</OriginalColorSpace>").unwrap();
+    let donor = |name: &str, profile: &str| {
+        let path = scratch.0.join(name);
+        let mut gzip = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).unwrap(), flate2::Compression::default(),
+        );
+        write!(gzip, "{}{}{}", &binding[..start], profile, &binding[end..]).unwrap();
+        gzip.finish().unwrap();
+        path
+    };
+    let neutral = donor("neutral.prproj", &binding[start..end]);
+    let error = project.verify_assisted_media(Some(&neutral)).unwrap_err();
+    assert!(error.to_string().contains("original sRGB color profile differs"), "{error}");
+    assert!(!output.exists());
+    let donor = donor("srgb.prproj",
+        r#"{"baseColorProfile":{"colorProfileName":"1,13,1,Narrow,YCC,10-bit,Display-Referred"},"baseProfileType":1}"#,
+    );
+    project.verify_assisted_media(Some(&donor)).unwrap();
+    project.publish().unwrap();
+    let doc = prproj::xml::parse_prproj(&output).unwrap();
+    let video = doc.tree.find1(doc.root, "VideoStream").unwrap();
+    let override_profile = doc.tree.findtext(video, "OverriddenColorSpace").unwrap().unwrap();
+    assert!(override_profile.contains("BT.709,10-bit,Display-Referred"));
+    assert_eq!(doc.tree.findtext(video, "InputLUTSpecified").unwrap().as_deref(), Some("true"));
+    assert_eq!(doc.tree.findtext(video, "IsColorSpacOverridden").unwrap().as_deref(), Some("true"));
+}
+
+#[test]
+fn picture_only_srgb_prores_override_requires_an_assisted_binding() {
+    let rate = Fraction::new(24_000, 1001);
+    let mut clip = original("prores_hq");
+    clip.metadata.rate = Some(rate);
+    let video = clip.video.as_mut().unwrap();
+    video.rate = rate;
+    video.duration = 48 * ticks_per_unit(rate);
+    clip.rec709_source_override = true;
+    assert!(validate_original(&clip).is_err());
+    clip.premiere_assisted = true;
+    validate_original(&clip).unwrap();
+}
+
+#[test]
+fn linked_srgb_avc_writes_an_editable_rec709_source_override() {
+    let scratch = Scratch::new();
+    let mut clip = original("dualmono");
+    let rate = Fraction::new(24_000, 1001);
+    let duration = 48 * ticks_per_unit(rate);
+    let video = clip.video.as_mut().unwrap();
+    video.rate = rate;
+    video.duration = duration;
+    let audio = clip.audio.as_mut().unwrap();
+    audio.duration = duration;
+
+    for use_override in [false, true] {
+        clip.rec709_source_override = use_override;
+        let path = scratch.0.join(format!("override-{use_override}.prproj"));
+        prepare_typed_project_for_premiere_27(
+            &input(clip.clone()), &path, &mut SeededUuids::new("sRGB AAC"),
+            TypedMedia::Bound { bindings: &[], native_av: false }, None,
+        ).unwrap().publish().unwrap();
+        let doc = prproj::xml::parse_prproj(&path).unwrap();
+        let video = doc.tree.find1(doc.root, "VideoStream").unwrap();
+        let profile = doc.tree.findtext(video, "OriginalColorSpace").unwrap().unwrap();
+        assert_eq!(profile.contains("1,13,1,Narrow,YCC,8-bit"), use_override);
+        for (key, value) in [
+            ("OverriddenColorSpace", r#"{"baseColorProfile":{"colorProfileName":"BT.709,8-bit,Display-Referred"},"baseProfileType":1}"#),
+            ("InputLUTSpecified", "true"),
+            ("IsColorSpacOverridden", "true"),
+        ] {
+            assert_eq!(doc.tree.findtext(video, key).unwrap().as_deref(), use_override.then_some(value));
+        }
+        let audio = doc.tree.find1(doc.root, "AudioStream").unwrap();
+        assert_eq!(doc.tree.findtext(audio, "SampleType").unwrap().as_deref(), Some("7"));
+    }
+
+    clip.audio.as_mut().unwrap().representation = SampleRepresentation::Pcm24;
+    let error = validate_original(&clip).unwrap_err();
+    assert!(error.to_string().contains("requires a verified sRGB original profile"));
 }
 
 #[test]

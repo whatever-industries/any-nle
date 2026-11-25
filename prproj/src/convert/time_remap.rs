@@ -9,9 +9,18 @@ use crate::build::{leaf, top};
 use crate::error::{value, Result};
 use crate::model::project::py_int;
 use crate::model::{Project, TrackItemId};
+use crate::xml::mutations::append_leaf;
 
 const TIME_REMAP_CLASS_ID: &str = "ace5148e-9c9b-40ed-9f82-64cb67308464";
 const TIME_PARAM_CLASS_ID: &str = "278ae1f9-ab7b-4dff-a53c-21029a399a9d";
+
+/// Premiere's Source Timecode frame hold, in file-relative ticks.
+pub(super) fn set_frame_hold(project: &mut Project, item: TrackItemId, ticks: i64) {
+    let clip = project.track_item(item).clip;
+    let tree = &mut project.doc.tree;
+    append_leaf(tree, clip, "FrameHoldStart", &ticks.to_string());
+    append_leaf(tree, clip, "FrameHold", "5");
+}
 
 /// `_format_remap_value`: source seconds at 24 fixed decimal places.
 fn remap_value(v: f64) -> String {

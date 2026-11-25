@@ -12,8 +12,12 @@ APP_TESTS += ['rewrap::tests::rewrap_preview_splits_distinct_wide_bundles_and_in
 APP_TESTS += ['rewrap::tests::mono_rewrap_reports_exact_file_failure_separately_from_recipe_error']
 APP_TESTS += ['avid_media::master::tests::managed_master_places_referenced_objects_before_the_bin_root']
 APP_TESTS += ['avid_media::linked::markers::tests::point_marker_requires_dependencies_before_its_owner']
+APP_TESTS += ['rewrap::terminal::tests::managed_dnxhd_requires_indexed_cid_1253_and_zero_alignment_tail']
+APP_TESTS += ['avid_media::linked::transition::tests::writes_centered_transition_with_owned_source_handles']
+APP_TESTS += ['avid_media::linked::native_bin::tests::timeline_uses_the_prepared_source_and_track_for_each_edit']
 APP_TESTS += ['png_mattes::tests::png_gap_recovery_requires_exact_occurrence_master_and_range']
 RESOLVE_SOURCE_TESTS = [
+    'premiere::capture::physical::tests::timecoded_avc_aac_candidate_requires_exact_encoding_and_stream_roles',
     'archive::tests::bundled_resolve_templates_bind_the_reviewed_role_bytes',
     'source::multicam::tests::multipart_picture_angle_keeps_both_trims_and_the_gap',
     'source::multicam::tests::single_group_audio_slot_preserves_each_virtual_channel',
@@ -37,7 +41,11 @@ def run(output):
         ('gui_bin_picker', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'wizard::bin_picker::tests'], 4, workspace),
         ('gui_report', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'report'], 3, workspace),
         ('gui_svg_arrow', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'icons::tests'], 1, workspace),
+        ('gui_diagnostics', ['-p', 'anynle-gui', '--bin', 'any-nle-gui', 'diagnostics_review_and_activity'], 1, workspace),
+        ('diagnostics', ['-p', 'anynle-app', '--lib', 'diagnostics::tests'], 1, workspace),
+        ('support_mcp', ['-p', 'anynle-app', '--test', 'support_mcp'], 2, workspace),
         ('media_verification', ['-p', 'anynle-media-verification', '--lib'], 4, workspace),
+        ('source_input', ['-p', 'anynle-app', '--lib', 'source_input::tests'], 3 if os.name == 'nt' else 4, workspace),
         ('resolve_source', ['-p', 'anynle-resolve-adapter', '--lib'], len(RESOLVE_SOURCE_TESTS), workspace),
         ('premiere_preparation', ['-p', 'anynle-premiere-adapter', '--test', 'preparation'], 54, workspace),
         ('premiere_import_worker', ['-p', 'anynle-app', '--lib', 'premiere_import::worker'], 2, workspace),

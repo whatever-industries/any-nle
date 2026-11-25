@@ -13,6 +13,8 @@ path = "src/main.rs"
 base64 = "=0.22.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rmcp = { version = "=3.11.0", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt", "io-std", "sync"] }
 sha2 = "0.10"
 fs2 = "=0.4.3"
 anynle-graph = { path = "../graph" }
@@ -24,6 +26,10 @@ anynle-premiere-adapter = { path = "../premiere-adapter" }
 anynle-media-verification = { path = "../media-verification" }
 avid-reader = { path = "../../avid-reader" }
 prproj = { path = "../../prproj" }
+
+[dev-dependencies]
+tempfile = "3"
+zip = { version = "4.6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 anynle-resolve-adapter = { path = "../resolve-adapter" }

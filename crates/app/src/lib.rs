@@ -1,5 +1,7 @@
 //! Shared Any NLE application engine. The CLI and native wizard share preparation and publication.
 mod application;
+pub mod diagnostics;
+mod mcp;
 mod job_review;
 mod managed_op1a;
 mod png_mattes;

@@ -673,6 +673,17 @@ pub struct Matte {
     pub not_converted: Vec<String>,
 }
 
+impl Matte {
+    pub fn is_two_shape_hard_key_out(&self) -> bool {
+        self.inverted
+            && self.opacities == [100.0, 100.0]
+            && self.feathers == [(0.0, 0.0), (0.0, 0.0)]
+            && self.not_converted.is_empty()
+            && matches!(self.shapes.as_slice(), [first, second]
+                if matches!(first.as_slice(), [(0, _)]) && matches!(second.as_slice(), [(0, _)]))
+    }
+}
+
 /// One multichannel (stereo) edit: sequence audio track, clip audio tracks in channel order,
 /// edit gain dB or None, per-channel pan percent or None.
 #[derive(Clone, Debug, PartialEq)]

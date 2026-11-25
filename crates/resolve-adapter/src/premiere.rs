@@ -2,7 +2,7 @@
 mod capture;
 pub(crate) mod color_mode;
 mod components;
-pub use capture::{read_premiere_avid_graph, read_premiere_media_graph};
+pub use capture::{read_premiere_avid_graph, read_premiere_media_graph, verify_avid_avc_aac, VerifiedAvcAac, verify_avid_managed_atom, ManagedAtom};
 mod controls;
 mod fades;
 mod frame_hold;

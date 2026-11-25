@@ -1,5 +1,5 @@
 //! Generate the verified macOS UME MOV and WaveAiff source-record layouts.
-use super::{markers, native_bin, Plan, Result, Route, RASTER, RATE};
+use super::{markers, native_bin, EditRate, Plan, Result, Route, RASTER, TIMECODE_BASE};
 use crate::avid_media::avb::canonical_descriptor;
 use avid_reader::{
     document::{AvbDocument, MobKind},
@@ -14,7 +14,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const EDIT_RATE: f64 = RATE as f64;
 const SAMPLE_RATE: i64 = 48_000;
 const WAV_PROVIDER: Uuid = Uuid {
     data1: 0x3711d3cc,
@@ -22,13 +21,13 @@ const WAV_PROVIDER: Uuid = Uuid {
     data3: 0x49d7,
     data4: [0xb0, 0xae, 0xc1, 0x18, 0x10, 0x1d, 0x1a, 0x16],
 };
-const UME_PROVIDER: Uuid = Uuid {
+pub(super) const UME_PROVIDER: Uuid = Uuid {
     data1: 0x87a0584d,
     data2: 0xcafa,
     data3: 0x41f5,
     data4: [0x9a, 0x68, 0xf0, 0xca, 0xde, 0xfd, 0xbb, 0x71],
 };
-const TERMINAL_SOURCE: MobId = MobId {
+pub(super) const TERMINAL_SOURCE: MobId = MobId {
     label: [6, 10, 43, 52, 1, 1, 1, 1, 1, 1, 15, 0],
     length: 0x13,
     instance: [0; 3],
@@ -40,7 +39,7 @@ const TERMINAL_SOURCE: MobId = MobId {
     },
 };
 
-pub(super) fn build(plan: &Plan<'_>) -> Result<AvbDocument> {
+pub(super) fn new_bin() -> Result<(AvbDocument, u32)> {
     let timestamp = unix_seconds(SystemTime::now())?;
     let saved = AvbTimestamp(timestamp).to_utc();
     let saved_at = format!(
@@ -48,30 +47,53 @@ pub(super) fn build(plan: &Plan<'_>) -> Result<AvbDocument> {
         saved.year, saved.month, saved.day, saved.hour, saved.minute, saved.second
     );
     let uid = u64::from_be_bytes(new_unique_mob_id()?.material.data4);
-    let mut doc = AvbDocument::new_empty_bin(uid, saved_at, timestamp, false);
+    Ok((
+        AvbDocument::new_empty_bin(uid, saved_at, timestamp, false),
+        timestamp,
+    ))
+}
+
+pub(super) fn build(plan: &Plan<'_>, avc: Option<&super::mp4::Encoding>) -> Result<AvbDocument> {
+    let (mut doc, timestamp) = new_bin()?;
+    if let Some(avc) = avc {
+        let masters =
+            super::mp4::source_chain(&mut doc, &plan.sources[0], plan.rate, avc, timestamp)?;
+        native_bin::write_timeline(&mut doc, plan, &[masters], timestamp)?;
+        return Ok(doc);
+    }
     let video = source_chain(
         &mut doc,
-        &plan.routes[0],
+        &plan.sources[0].routes[0],
+        plan.rate,
         timestamp,
         true,
-        &plan.picture_markers,
+        &plan.sources[0].picture_markers,
     )?;
-    let audio = source_chain(&mut doc, &plan.routes[1], timestamp, false, &[])?;
-    native_bin::write_timeline(&mut doc, plan, [video, audio, audio], timestamp)?;
+    let audio = source_chain(
+        &mut doc,
+        &plan.sources[0].routes[1],
+        plan.rate,
+        timestamp,
+        false,
+        &[],
+    )?;
+    native_bin::write_timeline(&mut doc, plan, &[[video, audio, audio]], timestamp)?;
     Ok(doc)
 }
 
-fn unix_seconds(time: SystemTime) -> Result<u32> {
+pub(super) fn unix_seconds(time: SystemTime) -> Result<u32> {
     Ok(time.duration_since(UNIX_EPOCH)?.as_secs().try_into()?)
 }
 
 fn source_chain(
     doc: &mut AvbDocument,
     route: &Route<'_>,
+    rate: EditRate,
     timestamp: u32,
     picture: bool,
     marker_plan: &[markers::Marker<'_>],
 ) -> Result<MobId> {
+    let edit_rate = rate.saved();
     let path = Path::new(route.path);
     let volume = path
         .strip_prefix("/Volumes")
@@ -126,7 +148,7 @@ fn source_chain(
     let samples = if picture {
         0
     } else {
-        i64::from(route.extent) * (SAMPLE_RATE / RATE)
+        i64::from(route.extent) * rate.samples_per_frame()
     };
     let audio_headers = || {
         [
@@ -143,6 +165,7 @@ fn source_chain(
         MobKind::Source,
         physical_id,
         route.extent,
+        edit_rate,
         timestamp,
     )?;
     doc.set_field(physical, "descriptor", Value::Ref(upstream))?;
@@ -153,13 +176,13 @@ fn source_chain(
             .into_iter()
             .chain([("_SAVED_AAF_AUDIO_LENGTH", Value::Int(0))]),
     )?;
-    let clock = doc.create_timecode(EDIT_RATE, route.extent, RATE as u16, route.clock)?;
-    let clock = bracket(doc, 3, clock)?;
+    let clock = doc.create_timecode(edit_rate, route.extent, TIMECODE_BASE as u16, route.clock)?;
+    let clock = bracket(doc, edit_rate, 3, clock)?;
     set_attrs(doc, clock, [("_SAVED_AAF_SLOTID", Value::Int(1))])?;
     doc.append_track(physical, 1, clock)?;
     for lane in 1..=lanes {
-        let clip = doc.create_source_clip(EDIT_RATE, kind, route.extent, TERMINAL_SOURCE, 0, 0)?;
-        let component = bracket(doc, kind, clip)?;
+        let clip = doc.create_source_clip(edit_rate, kind, route.extent, TERMINAL_SOURCE, 0, 0)?;
+        let component = bracket(doc, edit_rate, kind, clip)?;
         set_attrs(
             doc,
             component,
@@ -176,7 +199,7 @@ fn source_chain(
     doc.add_bin_source(physical)?;
 
     let desc = if picture {
-        picture_descriptor(doc, file_locator, embedded, route.extent)?
+        picture_descriptor(doc, file_locator, embedded, route.extent, edit_rate)?
     } else {
         audio_descriptor(
             doc,
@@ -192,6 +215,7 @@ fn source_chain(
         MobKind::Source,
         file_id,
         route.extent,
+        edit_rate,
         timestamp,
     )?;
     doc.set_field(file, "descriptor", Value::Ref(desc))?;
@@ -204,8 +228,8 @@ fn source_chain(
         ]),
     )?;
     for lane in 1..=lanes {
-        let clip = doc.create_source_clip(EDIT_RATE, kind, route.extent, physical_id, lane, 0)?;
-        let component = bracket(doc, kind, clip)?;
+        let clip = doc.create_source_clip(edit_rate, kind, route.extent, physical_id, lane, 0)?;
+        let component = bracket(doc, edit_rate, kind, clip)?;
         let mut attributes = vec![
             ("_SAVED_AAF_SLOTID", Value::Int(if picture { 1 } else { 2 })),
             ("_SAVED_AAF_PHYSICAL_TRACK_NUMBER", Value::Int(1)),
@@ -225,6 +249,7 @@ fn source_chain(
         MobKind::Master,
         master_id,
         route.extent,
+        edit_rate,
         timestamp,
     )?;
     let user = attrs(
@@ -259,8 +284,8 @@ fn source_chain(
         .ok_or("new master lacks attributes")?;
     markers::attach(doc, master_attrs, marker_list)?;
     for lane in 1..=lanes {
-        let clip = doc.create_source_clip(EDIT_RATE, kind, route.extent, file_id, lane, 0)?;
-        let component = bracket(doc, kind, clip)?;
+        let clip = doc.create_source_clip(edit_rate, kind, route.extent, file_id, lane, 0)?;
+        let component = bracket(doc, edit_rate, kind, clip)?;
         if picture {
             set_attrs(doc, component, [("_SAVED_AAF_SLOTID", Value::Int(1))])?;
         } else {
@@ -282,23 +307,24 @@ fn source_chain(
     Ok(master_id)
 }
 
-fn composition(
+pub(super) fn composition(
     doc: &mut AvbDocument,
     name: &str,
     kind: MobKind,
     id: MobId,
     length: u32,
+    edit_rate: f64,
     timestamp: u32,
 ) -> Result<u32> {
     let object = doc.create_composition(name, kind, id, length, timestamp)?;
-    doc.set_field(object, "edit_rate", Value::Float(EDIT_RATE))?;
+    doc.set_field(object, "edit_rate", Value::Float(edit_rate))?;
     Ok(object)
 }
 
-fn bracket(doc: &mut AvbDocument, kind: i64, clip: u32) -> Result<u32> {
-    let head = doc.create_filler(EDIT_RATE, kind, 0)?;
-    let tail = doc.create_filler(EDIT_RATE, kind, 0)?;
-    doc.create_sequence(EDIT_RATE, kind, &[head, clip, tail])
+pub(super) fn bracket(doc: &mut AvbDocument, edit_rate: f64, kind: i64, clip: u32) -> Result<u32> {
+    let head = doc.create_filler(edit_rate, kind, 0)?;
+    let tail = doc.create_filler(edit_rate, kind, 0)?;
+    doc.create_sequence(edit_rate, kind, &[head, clip, tail])
         .map_err(Into::into)
 }
 
@@ -311,7 +337,7 @@ fn entries<'a>(fields: impl IntoIterator<Item = (&'a str, Value)>) -> Value {
     )
 }
 
-fn attrs<'a>(
+pub(super) fn attrs<'a>(
     doc: &mut AvbDocument,
     fields: impl IntoIterator<Item = (&'a str, Value)>,
 ) -> Result<u32> {
@@ -322,7 +348,7 @@ fn attrs<'a>(
     })?)
 }
 
-fn set_attrs<'a>(
+pub(super) fn set_attrs<'a>(
     doc: &mut AvbDocument,
     owner: u32,
     fields: impl IntoIterator<Item = (&'a str, Value)>,
@@ -335,7 +361,7 @@ fn set_attrs<'a>(
     Ok(doc.set_field(attributes, "entries", entries(fields))?)
 }
 
-fn common_descriptor(
+pub(super) fn common_descriptor(
     kind: i64,
     locator: u32,
     physical: Value,
@@ -350,7 +376,12 @@ fn common_descriptor(
     ]
 }
 
-fn physical_descriptor(doc: &mut AvbDocument, locator: u32, uuid: Uuid, kind: i64) -> Result<u32> {
+pub(super) fn physical_descriptor(
+    doc: &mut AvbDocument,
+    locator: u32,
+    uuid: Uuid,
+    kind: i64,
+) -> Result<u32> {
     add_descriptor(
         doc,
         *b"MDES",
@@ -364,6 +395,7 @@ fn picture_descriptor(
     locator: u32,
     physical: u32,
     frames: u32,
+    edit_rate: f64,
 ) -> Result<u32> {
     let handler = attrs(
         doc,
@@ -375,34 +407,61 @@ fn picture_descriptor(
             ]),
         )],
     )?;
+    picture_fields(doc, locator, physical, frames, edit_rate, handler, None)
+}
+
+pub(super) fn picture_fields(
+    doc: &mut AvbDocument,
+    locator: u32,
+    physical: u32,
+    frames: u32,
+    edit_rate: f64,
+    handler: u32,
+    avc_transfer: Option<Uuid>,
+) -> Result<u32> {
+    let avc = avc_transfer.is_some();
     let (width, height) = RASTER;
     let mut fields = common_descriptor(1, locator, Value::Ref(physical), UME_PROVIDER);
     fields.extend([
         ("attributes", Value::Ref(handler)),
-        ("edit_rate", Value::Float(EDIT_RATE)),
+        ("edit_rate", Value::Float(edit_rate)),
         ("aspect_ratio", pair(16, 9)),
         ("line_map", pair(0, 0)),
         ("uniformness", Value::Bool(false)),
         ("next_did_desc", Value::Null),
         ("compress_method", Value::Bytes(b"RI00".to_vec())),
-        (
-            "essence_compression",
-            Value::Uuid(Uuid {
+        ("frame_checked_with_mapper", Value::Bool(false)),
+    ]);
+    fields.push((
+        "essence_compression",
+        Value::Uuid(if avc {
+            super::mp4::AVC_COMPRESSION
+        } else {
+            Uuid {
                 data1: 0x04010202,
                 data2: 0x0306,
                 data3: 0x0400,
                 data4: [6, 14, 43, 52, 4, 1, 1, 13],
-            }),
-        ),
-        ("frame_checked_with_mapper", Value::Bool(false)),
-    ]);
+            }
+        }),
+    ));
+    if let Some(transfer) = avc_transfer {
+        fields.extend([
+            ("transfer_characteristic", Value::Uuid(transfer)),
+            ("color_primaries", Value::Uuid(super::mp4::REC709_PRIMARIES)),
+            ("coding_equations", Value::Uuid(super::mp4::REC709_MATRIX)),
+        ]);
+    }
     integers(
         &mut fields,
         [
             ("length", frames.into()),
             ("is_omfi", 0),
             ("data_offset", 0),
-            ("stored_height", height),
+            (
+                "stored_height",
+                if avc { (height + 15) / 16 * 16 } else { height },
+            ),
             ("stored_width", width),
             ("sampled_height", height),
             ("sampled_width", width),
@@ -424,12 +483,12 @@ fn picture_descriptor(
             ("client_fill_end", 0),
             ("offset_to_rle_frame_index", -1),
             ("horizontal_subsampling", 2),
-            ("vertical_subsampling", 1),
-            ("component_width", 10),
+            ("vertical_subsampling", if avc { 2 } else { 1 }),
+            ("component_width", if avc { 8 } else { 10 }),
             ("color_sitting", 0),
-            ("black_ref_level", 64),
-            ("white_ref_level", 940),
-            ("color_range", 877),
+            ("black_ref_level", if avc { 16 } else { 64 }),
+            ("white_ref_level", if avc { 235 } else { 940 }),
+            ("color_range", if avc { 220 } else { 877 }),
             ("frame_index_offset", 0),
             ("alpha_sampled_width", 0),
             ("ignore_bw", 0),
@@ -511,7 +570,7 @@ fn integers(
     );
 }
 
-fn add_descriptor(
+pub(super) fn add_descriptor(
     doc: &mut AvbDocument,
     class: [u8; 4],
     type_name: &'static str,

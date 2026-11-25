@@ -403,14 +403,49 @@ impl AvbDocument {
         media_kind_id: i64,
         components: &[u32],
     ) -> Result<u32> {
+        self.create_sequence_components(edit_rate, media_kind_id, components, false)
+    }
+
+    /// Create a sequence whose transition components subtract their length
+    /// from the running position. Both adjacent source clips must cover the
+    /// full overlap. Callers supply the clips with their handles included.
+    pub fn create_sequence_with_transitions(
+        &mut self,
+        edit_rate: f64,
+        media_kind_id: i64,
+        components: &[u32],
+    ) -> Result<u32> {
+        self.create_sequence_components(edit_rate, media_kind_id, components, true)
+    }
+
+    fn create_sequence_components(
+        &mut self,
+        edit_rate: f64,
+        media_kind_id: i64,
+        components: &[u32],
+        allow_transitions: bool,
+    ) -> Result<u32> {
         validate_edit_rate(edit_rate)?;
         validate_media_kind(media_kind_id)?;
         if components.is_empty() {
             return Err(Error::new("sequence requires at least one component", 0));
         }
-        for &id in components {
+        for (index, &id) in components.iter().enumerate() {
             let component = self.node(id).ok_or_else(|| Error::new(format!("missing component {id}"), 0))?;
-            if !matches!(&component.class, b"FILL" | b"SCLP" | b"TCCP" | b"SEQU") {
+            if allow_transitions && component.class == *b"TNFX" {
+                let length = component.get("length").and_then(Value::as_int).filter(|&length| length > 0);
+                let cut = component.get("cutpoint").and_then(Value::as_int);
+                let covers = |index: usize| {
+                    components.get(index).and_then(|&id| self.node(id)).is_some_and(|clip| {
+                        clip.class == *b"SCLP" && clip.get("length").and_then(Value::as_int) >= length
+                    })
+                };
+                if length.is_none() || cut.is_none_or(|cut| cut < 0 || Some(cut) > length)
+                    || !index.checked_sub(1).is_some_and(covers) || !covers(index + 1)
+                {
+                    return Err(Error::new(format!("transition {id} lacks a valid cut or adjacent source handles"), 0));
+                }
+            } else if !matches!(&component.class, b"FILL" | b"SCLP" | b"TCCP" | b"SEQU") {
                 return Err(Error::new(format!("object {id} is not a sequence component"), 0));
             }
             if component.get("media_kind_id") != Some(&Value::Int(media_kind_id))

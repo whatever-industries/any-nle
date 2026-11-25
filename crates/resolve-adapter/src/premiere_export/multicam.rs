@@ -225,6 +225,7 @@ pub(super) fn prepare(
         duration: prepared.length * FRAME,
         cameras: std::array::from_fn(|index| PreparedCamera {
             clip: camera_ids[index].to_string(),
+            mono_view: None,
             start: prepared.offsets[index] * FRAME,
             source_in: 0,
             duration: prepared.cameras[index].frames * FRAME,

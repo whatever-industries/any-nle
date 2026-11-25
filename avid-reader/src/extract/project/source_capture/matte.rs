@@ -1,4 +1,4 @@
-//! Saved-control witnesses for AVB-0006's imported straight-alpha stills.
+//! Saved-control witnesses for imported straight-alpha stills.
 //! Matching these signatures does not prove the physical PNG or its raster,
 //! the lower track's coverage, or how another editor will composite the result.
 use super::*;
@@ -6,6 +6,11 @@ use crate::color::file_order_hex;
 
 const SHARED_CONTROL: &str = "dca5f78a7b361949afc75ca00a5bd558";
 const ADAPTER_PAYLOAD: &str = "d85c7fbdfd154e42a34d11642fbbb867";
+const MATTE_PARAMETERS: &[(&str, i64, Option<i64>, bool)] = &[
+    ("1133b7131c163140bddab3df672fc6de", 1, Some(1), true),
+    ("2f9c977d4fe93941b154638729b884db", 1, Some(0), true),
+    (SHARED_CONTROL, 1, Some(1), false),
+];
 
 pub(super) fn imported_png(
     ctx: &Ctx<'_>,
@@ -50,7 +55,8 @@ pub(super) fn imported_png(
     {
         return false;
     }
-    let track_leaf = |id| matte_track(ctx, effect, id).and_then(|n| picture_leaf(ctx, n));
+    let rate = Rate::new(24, 1).unwrap();
+    let track_leaf = |id| matte_track(ctx, effect, id).and_then(|n| picture_leaf(ctx, n, rate));
     let Some(background) = track_leaf(1) else {
         return false;
     };
@@ -64,7 +70,7 @@ pub(super) fn imported_png(
         || int(background, "length") != Some(1)
         || !saved_image_bounds(ctx, alpha)
         || !(saved_image_bounds(ctx, foreground) || empty_color_adapter(ctx, foreground).is_some())
-        || !effect_controls(ctx, effect, "EFF2_2DMATTE", 0, 360, 1 << 30)
+        || !effect_controls(ctx, effect, "EFF2_2DMATTE", (rate, 1), 0, 360, 1 << 30)
     {
         return false;
     }
@@ -76,20 +82,123 @@ pub(super) fn imported_png(
             .is_some_and(|n| {
                 n.class == *b"MCMR" && int(n, "position") == Some(0) && mob_id(n).is_some()
             })
-        && parameters(
-            ctx,
-            effect,
-            &[
-                ("1133b7131c163140bddab3df672fc6de", 1, Some(1), true),
-                ("2f9c977d4fe93941b154638729b884db", 1, Some(0), true),
-                (SHARED_CONTROL, 1, Some(1), false),
-            ],
-        )
+        && parameters(ctx, effect, MATTE_PARAMETERS)
+}
+
+/// This saved full-canvas hold has plain fill and alpha inputs. Physical
+/// alpha still has to be verified before using the direct overlay in Premiere.
+pub(super) fn imported_png_overlay(
+    ctx: &Ctx<'_>, effect: &Node, inputs: &MatteInputs, import: &MatteImport,
+    rate: Rate, length: i64,
+) -> bool {
+    matches!((inputs.fill, inputs.matte), (Some(fill), Some(alpha)) if fill.mob == alpha.mob)
+        && png_alpha_import(import)
+        && overlay_controls(ctx, effect, inputs, rate, length, false)
+}
+
+pub(super) fn png_alpha_import(import: &MatteImport) -> bool {
+    import.ignore_alpha == Some(false) && import.invert_alpha.is_some()
+        && !import.locators.is_empty() && import.locators.iter().all(|path|
+            std::path::Path::new(path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")))
+}
+
+pub(super) fn split_still(
+    ctx: &Ctx<'_>, effect: &Node, inputs: &MatteInputs, ambiguous: &HashSet<MobId>,
+    rate: Rate, length: i64,
+) -> bool {
+    let (Some(fill), Some(alpha)) = (inputs.fill, inputs.matte) else { return false };
+    if fill.mob == alpha.mob || ambiguous.contains(&fill.mob) || ambiguous.contains(&alpha.mob) {
+        return false;
+    }
+    let Some(master) = ctx.mobs.get(&fill.mob) else { return false };
+    int(master, "mob_type_id") == Some(MOB_MASTER)
+        && int(master, "usage_code") == Some(0)
+        && int(master, "length").is_some_and(|hold| hold >= length)
+        && float(master, "edit_rate").and_then(Rate::from_avid) == Some(rate)
+        && overlay_controls(ctx, effect, inputs, rate, length, true)
+}
+
+fn overlay_controls(
+    ctx: &Ctx<'_>, effect: &Node, inputs: &MatteInputs,
+    rate: Rate, length: i64, split: bool,
+) -> bool {
+    let (Some(fill), Some(matte)) = (inputs.fill, inputs.matte) else { return false };
+    if Some(rate) != Rate::new(24_000, 1001)
+        || inputs.background != MatteBackground::LowerTrack
+        || (fill.track, matte.track) != (1, 2)
+        || [fill, matte].iter().any(|input| input.start != 0 || input.length != length || input.rate != rate)
+    {
+        return false;
+    }
+    let Some(master) = ctx.mobs.get(&matte.mob) else { return false };
+    let Some(hold) = int(master, "length").filter(|&hold| length > 0 && length <= hold) else { return false };
+    let Some(settings) = import_settings(ctx, master) else { return false };
+    let track_leaf = |id| matte_track(ctx, effect, id).and_then(|node| picture_leaf(ctx, node, rate));
+    let plain_input = |id| track_leaf(id).is_some_and(|node| node.class == *b"SCLP"
+        && int(node, "length") == Some(length)
+        && null_fields(node, &["param_list", "effect_id"])
+        && (null_fields(node, &["attributes"]) || split && id == 2 && empty_attributes(ctx, node)));
+    let Some(Value::List(tracks)) = effect.get("tracks") else { return false };
+    let proxies = tracks.iter().all(|track| {
+        let Value::Node(track) = track else { return false };
+        int(track, "lock_number") == Some(0)
+            && saved_filler_proxy(ctx, track) == (SourceFillerProxy::Relative {
+                scope: i64::from(int(track, "index") == Some(1)), track: -1,
+            })
+            && ctx.deref(track.get("filler_proxy")).is_some_and(|proxy|
+                float(proxy, "edit_rate").and_then(Rate::from_avid) == Some(rate)
+                    && int(proxy, "length") == Some(i64::from(i32::MAX))
+                    && null_fields(proxy, &["attributes", "effect_id", "param_list",
+                        "precomputed", "left_bob", "right_bob", "session_attrs"]))
+    });
+    float(master, "edit_rate").and_then(Rate::from_avid) == Some(rate)
+        && proxies
+        && [("_IMPORTPICTSEQ", 0), ("_IMPORTASPECT", 2), ("_COLORLEVEL", 1), ("_LAYERED", 0)]
+        .iter().all(|(key, value)| unique_attribute(settings, key).and_then(Value::as_int) == Some(*value))
+        && matte_track(ctx, effect, 1).is_some_and(|node| overlay_background(ctx, node, rate, length))
+        && plain_input(2) && plain_input(3)
+        && effect_controls(ctx, effect, "EFF2_2DMATTE", (rate, length), 0, hold, 1 << 30)
+        && borrowed_attrs(ctx, effect).len() == 3
+        && unique_attribute(borrowed_attrs(ctx, effect), "_USE_DSK").and_then(Value::as_int) == Some(1)
+        && parameters(ctx, effect, MATTE_PARAMETERS)
+}
+
+fn empty_attributes(ctx: &Ctx<'_>, node: &Node) -> bool {
+    ctx.deref(node.get("attributes")).is_some_and(|attrs|
+        attrs.class == *b"ATTR" && matches!(attrs.get("entries"), Some(Value::Attrs(a)) if a.is_empty()))
+}
+
+fn overlay_background(ctx: &Ctx<'_>, node: &Node, rate: Rate, length: i64) -> bool {
+    // Scope 1 selects the lower track. This saved filler also has an empty
+    // attribute object and a picture cache position, neither supplies an edit.
+    let plain = |n: &Node| int(n, "media_kind_id") == Some(KIND_PICTURE)
+        && float(n, "edit_rate").and_then(Rate::from_avid) == Some(rate)
+        && null_fields(n, &["effect_id", "param_list", "left_bob", "precomputed", "session_attrs"]);
+    if node.class != *b"SEQU" || !plain(node) || !null_fields(node, &["right_bob", "attributes"]) {
+        return false;
+    }
+    let Some(Value::RefList(parts)) = node.get("components") else { return false };
+    let [lead, body, tail] = parts.as_slice() else { return false };
+    [(lead, 0), (body, length), (tail, 0)].iter().all(|(part, span)| {
+        let Some(fill) = ctx.deref(Some(part)) else { return false };
+        if fill.class != *b"FILL" || !plain(fill) || int(fill, "length") != Some(*span) {
+            return false;
+        }
+        if *span == 0 {
+            return null_fields(fill, &["right_bob", "attributes"]);
+        }
+        empty_attributes(ctx, fill)
+            && ctx.deref(fill.get("right_bob")).is_some_and(|cache|
+                cache.class == *b"DIDP" && int(cache, "track_type") == Some(KIND_PICTURE)
+                    && int(cache, "track_index") == Some(1) && int(cache, "strip") == Some(0)
+                    && cache.get("spos_invalid") == Some(&Value::Bool(false)))
+    })
 }
 
 /// Match the observed empty payload, not every adapter with this effect ID.
 pub(super) fn empty_color_adapter<'a>(ctx: &Ctx<'a>, effect: &'a Node) -> Option<&'a Node> {
-    if !effect_controls(ctx, effect, "EFF2_LUTSFX", 15, 15, 1 << 29)
+    let rate = Rate::new(24, 1).unwrap();
+    if !effect_controls(ctx, effect, "EFF2_LUTSFX", (rate, 1), 15, 15, 1 << 29)
         || borrowed_attrs(ctx, effect).len() != 2
         || !parameters(
             ctx,
@@ -108,7 +217,7 @@ pub(super) fn empty_color_adapter<'a>(ctx: &Ctx<'a>, effect: &'a Node) -> Option
     let [Value::Node(_)] = tracks.as_slice() else {
         return None;
     };
-    let leaf = picture_leaf(ctx, matte_track(ctx, effect, 1)?)?;
+    let leaf = picture_leaf(ctx, matte_track(ctx, effect, 1)?, rate)?;
     (leaf.class == *b"SCLP"
         && int(leaf, "length") == int(effect, "length")
         && float(leaf, "edit_rate") == Some(24.0)
@@ -149,10 +258,10 @@ pub(super) fn equal_1600_picture_bounds(xml: &str) -> bool {
     xml == RECTANGLES
 }
 
-fn picture_leaf<'a>(ctx: &Ctx<'a>, node: &'a Node) -> Option<&'a Node> {
+fn picture_leaf<'a>(ctx: &Ctx<'a>, node: &'a Node, rate: Rate) -> Option<&'a Node> {
     let plain = |n: &Node| {
         int(n, "media_kind_id") == Some(KIND_PICTURE)
-            && float(n, "edit_rate") == Some(24.0)
+            && saved_effect_rate(n, rate)
             && null_fields(
                 n,
                 &["precomputed", "session_attrs", "left_bob", "right_bob"],
@@ -174,10 +283,20 @@ fn null_fields(node: &Node, fields: &[&str]) -> bool {
     fields.iter().all(|k| node.get(k) == Some(&Value::Null))
 }
 
+fn saved_effect_rate(node: &Node, rate: Rate) -> bool {
+    let saved = float(node, "edit_rate");
+    if Some(rate) == Rate::new(24, 1) {
+        saved == Some(24.0)
+    } else {
+        saved.and_then(Rate::from_avid) == Some(rate)
+    }
+}
+
 fn effect_controls(
     ctx: &Ctx<'_>,
     effect: &Node,
     id: &str,
+    (rate, length): (Rate, i64),
     left: i64,
     right: i64,
     level: i64,
@@ -186,8 +305,8 @@ fn effect_controls(
     effect.class == *b"TKFX"
         && effect.get("effect_id").and_then(Value::as_str) == Some(id)
         && int(effect, "media_kind_id") == Some(KIND_PICTURE)
-        && float(effect, "edit_rate") == Some(24.0)
-        && int(effect, "length") == Some(1)
+        && saved_effect_rate(effect, rate)
+        && int(effect, "length") == Some(length)
         && null_fields(
             effect,
             &[

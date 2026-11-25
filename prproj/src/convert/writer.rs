@@ -21,15 +21,16 @@ use super::avid_color::{self, ExtendedSdrGrade};
 use super::color_mode::ClipLut;
 use super::colors;
 use super::combined::{
-    combined_order, create_grouped_with_media as create_grouped, create_merged, create_stereo_nest, declare_stereo_chain, display_format,
+    combined_order, create_grouped_with_media as create_grouped, create_merged, create_stereo_nest,
+    create_stereo_nest_with_start, declare_stereo_chain, display_format,
     group_for_channel, move_to_processed_clips, narrow_to_group, parts_bin, set_clip_pan, set_clip_pan_keys, tag_merged_audio, tag_merged_picture, Pan,
 };
-use super::lumetri::{apply_lumetri_lut, cube_text, cube_text_domain, itx3_lut_domain};
+use super::lumetri::{apply_lumetri_lut, cube_text, cube_text_domain, itx3_lut, itx3_lut_domain};
 use super::markers as mk;
 use super::matte::apply_matte;
 use super::motion::{apply_corner_pin, apply_corner_pin_with_flop, apply_flip, apply_motion_keys};
 use super::multicam::PreparedGroupAudio;
-use super::time_remap::set_time_remap;
+use super::time_remap::{set_frame_hold, set_time_remap};
 use super::metadata;
 use super::prepared::{PictureEffect, PreparedLayeredSubmaster, PreparedPictureEffect, PreparedPictureNest, PreparedText, PreparedTrackLane, PreparedVideoDissolve};
 use super::model::{event_audio_files, py_str_repr, ticks_per_unit, Clip, ColorCorrection, Event, EventAudio, Fraction, Marker, Model, ModelError, Sequence};
@@ -708,6 +709,8 @@ struct Writer<'a> {
     picture_nests: HashSet<(usize, usize)>,
     png_items: Vec<ItemId>,
     png_edits: HashMap<usize, Vec<&'a super::prepared::PreparedPngEdit>>,
+    jpeg_fills: Vec<ItemId>,
+    split_mattes: HashMap<usize, Vec<&'a super::prepared::PreparedSplitMatte>>,
     constant_speeds: HashMap<(usize, usize), super::prepared::PreparedConstantSpeed>,
     video_dissolves: HashMap<usize, Vec<&'a PreparedVideoDissolve>>,
     audio_edge_fades: HashMap<(usize, usize, i64), &'a super::prepared::PreparedAudioEdgeFade>,
@@ -1019,7 +1022,11 @@ impl Writer<'_> {
                 let rate = clip.rate.unwrap_or(Fraction::new(24, 1));
                 let rewrapped = self.uses_rewrap(&clip.id);
                 let preset = preset_bound(&build_name, rate, 1920, 1080, &mut self.report, rewrapped)?;
-                let build = create_stereo_nest(&mut self.project, &pair_items, target, &build_name, &preset, self.ids)?;
+                let start = clip.video.as_ref()
+                    .and_then(|video| self.media.direct_combined_display_start(&video.path));
+                let build = create_stereo_nest_with_start(
+                    &mut self.project, &pair_items, target, &build_name, &preset, start, self.ids,
+                )?;
                 self.apply_metadata(build, clip)?;
                 label_items(&mut self.project, clip, &[build], model.options)?;
                 self.build_markers(clip, build, Some(&[format!("A{left}"), format!("A{right}")]))?;
@@ -1606,6 +1613,7 @@ impl Writer<'_> {
             self.report.unverified.push(format!("sequence {seq_name}: expanded audio-track count requires fresh native Premiere read-back; structural checks do not qualify playback"));
         }
         let picture_tracks = seq.events.iter().filter_map(|event| event.video_track)
+            .chain(self.split_mattes.get(&sequence_index).into_iter().flatten().map(|edit| edit.track))
             .chain(expanded_groups().flat_map(|group| &group.uses)
                 .filter(|edit| edit.angle.is_some()).map(|edit| edit.track))
             .chain(model.layered_submasters.iter().filter(|nest| nest.sequence == sequence_index).map(|nest| nest.track))
@@ -1659,13 +1667,38 @@ impl Writer<'_> {
                 &mut self.project, sequence, seq, &preset, self.sequence_parent,
                 &self.model.png_mattes.stills, &self.png_items, edits, self.ids,
             )?;
+            let frame = ticks_per_unit(seq.rate);
+            for edit in edits.iter().filter(|edit| edit.background.is_none()) {
+                let source = &self.model.png_mattes.stills[edit.foreground
+                    .ok_or_else(|| other("PNG overlay is missing its source"))?];
+                let filename = source.path.file_name().and_then(|name| name.to_str()).unwrap_or(&source.name);
+                let start = edit.start / frame;
+                let end = add(edit.start, edit.duration)? / frame;
+                self.report.notes.push(format!(
+                    "sequence {seq_name}: linked binary-alpha PNG {} on V2 at record frames [{start}, {end})",
+                    py_str_repr(filename),
+                ));
+            }
+        }
+        if let Some(edits) = self.split_mattes.get(&sequence_index) {
+            let frame = ticks_per_unit(seq.rate);
+            for edit in edits {
+                let managed = model.png_mattes.jpeg_fills[edit.fill].managed_start.is_some();
+                png_mattes::place_split(&mut self.project, sequence, frame, edit, self.jpeg_fills[edit.fill], managed, self.ids)?;
+                self.report.notes.push(format!(
+                    "sequence {seq_name}: {} on V{} at record frame {} with {}",
+                    if managed { "JPEG Matte Key uses the verified Avid MXF because the original JPEG is offline" } else { "linked JPEG Matte Key" },
+                    edit.track, edit.start / frame,
+                    if edit.hole.is_some() { "editable Add and Subtract masks" } else { "an editable mask" },
+                ));
+            }
         }
         let mut captions = Vec::new();
         for t in model.texts.iter().filter(|t| t.sequence == sequence_index) {
             match t.kind {
                 super::prepared::PreparedTextKind::Graphic => {
                     let destination_text = t.content.replace('\n', "\r");
-                    let added = self.project.add_graphic(vtracks[t.track as usize - 1], &destination_text, Some(Time::new(t.start)), Some(Time::new(t.duration)), "Translated Avid Text", (0.1,0.35), self.ids)?;
+                    let added = self.project.add_graphic(vtracks[t.track as usize - 1], &destination_text, Some(Time::new(t.start)), Some(Time::new(t.duration)), "Translated Avid Text", t.graphic_position.unwrap_or((0.1, 0.35)), self.ids)?;
                     // The compatibility primitive's retained template has a 1.8 pt
                     // LucidaConsole override. Use a readable, explicit destination
                     // default here; this is not a claim to preserve Avid styling.
@@ -1730,12 +1763,18 @@ impl Writer<'_> {
                 if let Some(v) = e.video_track {
                     placed.push(self.project.add_clip(track_at(&vtracks,v)?, source, start, self.ids)?);
                 }
-                let clip = clip.ok_or_else(|| other("multicam leaf registry mismatch"))?;
-                let files = event_audio_files(clip, e)?;
+                let files = clip.map(|clip| event_audio_files(clip, e)).transpose()?;
                 for (j, (&audio, &track)) in u.audio.iter().zip(&e.audio_tracks).enumerate() {
                     let target = track_at(&atracks, track)?;
                     let gain = edit_value(&e.audio_gains, j)?;
-                    let original_gain = files[j].gain_db;
+                    let original_group = original.map(|clip| {
+                        super::multicam::original_mono(clip, e.audio_channels[j])
+                            .ok_or_else(|| other("original camera mono selector is missing"))
+                    }).transpose()?;
+                    let file = files.as_ref().and_then(|files| files.get(j)).copied();
+                    let original_gain = original_group.map(|(_, gain)| gain)
+                        .or_else(|| file.map(|file| file.gain_db))
+                        .ok_or_else(|| other("multicam leaf registry mismatch"))?;
                     let (item, applied_gain) = match audio {
                         PreparedGroupAudio::Group(channel) => {
                             let item = self.project.add_clip(target, source, start, self.ids)?;
@@ -1744,9 +1783,21 @@ impl Writer<'_> {
                             (item, gain.map_or(0.0, |g| g - original_gain))
                         }
                         PreparedGroupAudio::LinkedAlternate(_) => {
-                            let sibling = self.items[&e.clip].1.get(identity(clip, files[j]))
-                                .copied().ok_or_else(|| other("linked alternate Group audio sibling is missing"))?;
-                            let item = self.project.add_clip(target, sibling, start, self.ids)?;
+                            let item = if let Some((group, _)) = original_group {
+                                let Payload::Original(source) = payload else {
+                                    return Err(other("original camera is missing"));
+                                };
+                                super::native_av::place_audio(
+                                    &mut self.project, target, source, group, start, self.ids,
+                                )?
+                            } else {
+                                let clip = clip.ok_or_else(|| other("multicam leaf registry mismatch"))?;
+                                let file = file
+                                    .ok_or_else(|| other("linked alternate Group audio file is missing"))?;
+                                let sibling = self.items[&e.clip].1.get(identity(clip, file))
+                                    .copied().ok_or_else(|| other("linked alternate Group audio sibling is missing"))?;
+                                self.project.add_clip(target, sibling, start, self.ids)?
+                            };
                             linked_group_audio.push(item);
                             (item, gain.unwrap_or(original_gain))
                         }
@@ -1758,11 +1809,25 @@ impl Writer<'_> {
             } else { match &payload {
                 Payload::Original(source)=>{
                     let c=original.ok_or_else(||other("original clip registry mismatch"))?;
-                    if let Some(v)=e.video_track {placed.push(self.project.add_clip(track_at(&vtracks,v)?,*source,start,self.ids)?);}
+                    if let Some(v)=e.video_track {
+                        let picture = self.av_subclip_uses.get(&(sequence_index, i, None))
+                            .map_or(*source, |&index| self.av_subclip_items[index]);
+                        placed.push(self.project.add_clip(track_at(&vtracks,v)?,picture,start,self.ids)?);
+                    }
                     for (j,&track) in e.audio_tracks.iter().enumerate(){
                         let lane=super::original::mono_source_channel(c,e,j).ok_or_else(||other("original mono source channel missing"))?;
-                        let group=c.groups.iter().position(|g|g==&vec![lane]).ok_or_else(||other("original mono group missing"))?;
-                        let item=super::native_av::place_audio(&mut self.project,track_at(&atracks,track)?,*source,group,start,self.ids)?;
+                        let (source, group) = if let Some(&index) = self.av_subclip_uses.get(&(sequence_index, i, Some(track))) {
+                            let group = match lane {
+                                1 => 0,
+                                2 => 1,
+                                _ => return Err(other("A/V subclip requires an exact mono source label")),
+                            };
+                            (self.av_subclip_items[index], group)
+                        } else {
+                            let group=c.groups.iter().position(|g|g.as_slice()==[lane]).ok_or_else(||other("original mono group missing"))?;
+                            (*source, group)
+                        };
+                        let item=super::native_av::place_audio(&mut self.project,track_at(&atracks,track)?,source,group,start,self.ids)?;
                         let channel=c.channels.iter().find(|a|a.avid_track==lane).unwrap();
                         master_gain.insert(item,edit_value(&e.audio_gains,j)?.unwrap_or(channel.gain_db));edit_pan.insert(item,(edit_value(&e.audio_pans,j)?,track));placed.push(item);
                     }
@@ -2011,10 +2076,7 @@ impl Writer<'_> {
                 normalize_placement(&mut self.project, t, r)?;
                 if is_video {
                     if let Some(held_ticks) = self.model.frame_holds.get(&(sequence_index, i)) {
-                        let clip = self.project.track_item(t).clip;
-                        let tree = &mut self.project.doc.tree;
-                        crate::xml::mutations::append_leaf(tree, clip, "FrameHoldStart", &held_ticks.to_string());
-                        crate::xml::mutations::append_leaf(tree, clip, "FrameHold", "5");
+                        set_frame_hold(&mut self.project, t, *held_ticks);
                     }
                     if dissolve_events.contains(&i) && dissolve_items.insert(i, t).is_some() {
                         return Err(other("dissolve endpoint produced more than one picture item"));
@@ -2070,7 +2132,8 @@ impl Writer<'_> {
                 }
             }
             if let Some(matte) = &e.matte {
-                if matte.inverted && matte.shapes.len() > 1 {
+                let invert_union = picture_effect == Some(PictureEffect::MatteKeyOutUnion);
+                if matte.inverted && matte.shapes.len() > 1 && !invert_union {
                     // See writer.py: per-mask inversion is not Avid's Key Out of several shapes.
                     self.report.notes.push(format!("sequence {seq_name} event {i}: Avid AniMatte Key Out with several shapes not converted yet"));
                 } else {
@@ -2078,14 +2141,16 @@ impl Writer<'_> {
                     let unit = ticks_per_unit(rate);
                     for &t in &placed {
                         if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
-                            for n in apply_matte(&mut self.project, t, matte, e.source_in, unit)? {
+                            for n in apply_matte(&mut self.project, t, matte, e.source_in, unit, invert_union)? {
                                 self.report.notes.push(format!("sequence {seq_name} event {i}: {n}"));
                             }
                         }
                     }
-                    self.report.notes.push(format!(
-                        "sequence {seq_name} event {i}: Avid AniMatte as Opacity mask(s), per-frame path keys for tracking (provisional)"
-                    ));
+                    if !invert_union {
+                        self.report.notes.push(format!(
+                            "sequence {seq_name} event {i}: Avid AniMatte as Opacity mask(s), per-frame path keys for tracking (provisional)"
+                        ));
+                    }
                 }
                 if matte.feathers.iter().any(|f| *f != (0.0, 0.0)) {
                     self.report.notes.push(format!("sequence {seq_name} event {i}: AniMatte feather not converted yet (units not calibrated)"));
@@ -2194,8 +2259,7 @@ impl Writer<'_> {
                 let curves_ui8: Vec<(String, Vec<(f64, f64)>)> =
                     cc.curves.iter().map(|(k, v)| (k.clone(), v.iter().map(|&(x, y)| (x * 255.0, y * 255.0)).collect())).collect();
                 if !avid_color::is_identity(&cc.tone, cc.saturation, &curves_ui8) {
-                    // The whole modelled Avid correction as one LUT embedded in Lumetri
-                    // (PRPROJ-0027), also saved as a .cube next to the project.
+                    // Export the same modeled correction as a project-local cube.
                     let transform = avid_color::rgb_transform(&cc.tone, cc.saturation, &curves_ui8)?;
                     let points = avid_color::cube_lut(&*transform, LUT_SIZE)?;
                     let stem = self.out_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2209,18 +2273,39 @@ impl Writer<'_> {
                     let title=format!("Avid Color Correction, {} {tc}",seq.name);
                     let digest=crate::hash::hex(&crate::hash::sha256(cube_text(&points,LUT_SIZE,&title).as_bytes()));
                     self.assets.push(PreparedLut {path:cube.clone(),recipe:LutRecipe::Legacy(cc.clone()),title,sha256:digest});
+                    let native_curve = original.is_some_and(|clip|
+                        clip.premiere_assisted && clip.rec709_source_override)
+                        && cc.tone.is_empty()
+                        && matches!(cc.saturation, None | Some(100.0))
+                        && matches!(cc.curves.as_slice(), [(channel, keys)]
+                            if channel == "master"
+                                && keys.first() == Some(&(0.0, 0.0))
+                                && keys.last() == Some(&(1.0, 1.0))
+                                && keys.windows(2).all(|pair| pair[0].0 < pair[1].0)
+                                && keys.iter().all(|&(_, y)| (0.0..=1.0).contains(&y)));
+                    let mut color_mode_lut = native_curve.then(|| {
+                        let name = cube.file_stem().unwrap_or_default().to_string_lossy();
+                        ClipLut::new(&name, itx3_lut(&points, LUT_SIZE as u32))
+                    });
                     for &t in &placed {
                         if self.project.doc.tree.tag(self.project.track_item(t).element) == "VideoClipTrackItem" {
-                            apply_lumetri_lut(&mut self.project, t, &points, LUT_SIZE as u32, &cube, self.ids)?;
+                            if let Some(lut) = &mut color_mode_lut {
+                                lut.apply(&mut self.project, t)?;
+                            } else {
+                                apply_lumetri_lut(&mut self.project, t, &points, LUT_SIZE as u32, &cube, self.ids)?;
+                            }
                         }
                     }
                     let cube_name = cube.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     if cube != requested_cube {
                         self.report.notes.push(format!("sequence {seq_name} event {i}: LUT export filename already used; saved as {cube_name}; existing files kept"));
                     }
-                    self.report.notes.push(format!(
-                        "sequence {seq_name} event {i}: Avid color correction as an embedded Lumetri LUT ({cube_name}); modelled from one measured Avid fixture, provisional"
-                    ));
+                    let note = if native_curve {
+                        format!("Avid Master RGB curve as an embedded Color Mode LUT ({cube_name}); modeled approximation")
+                    } else {
+                        format!("Avid color correction as an embedded Lumetri LUT ({cube_name}); modelled from one measured Avid fixture, provisional")
+                    };
+                    self.report.notes.push(format!("sequence {seq_name} event {i}: {note}"));
                 }
                 if !cc.not_converted.is_empty() {
                     self.report.notes.push(format!(
@@ -2818,32 +2903,10 @@ fn direct_dnxhr_files(
     media: &[super::rewrap::MediaRelink],
     native_av: bool,
 ) -> Result<HashMap<String, DirectDnxhrFile>> {
-    if let Some(ids) = model.direct_dnxhd_pcm24.filter(|ids| !ids.is_empty()) {
-        let cameras: HashSet<_> = model.multicams.iter().flat_map(|group| &group.cameras)
-            .map(|camera| camera.clip.as_str())
-            .chain(model.layered_submasters.iter().flat_map(|nest| &nest.layers).map(|layer| layer.clip.as_str()))
-            .collect();
-        // Copies of the same master can share the verified package. All
-        // marked copies still go through the media and clock checks below.
-        let package = |id: &str| {
-            let clip = model.clips.get(id)?;
-            let mob = clip.material_umid.as_deref().filter(|mob| !mob.is_empty())?;
-            let [a, b] = clip.audio.as_slice() else { return None };
-            let video = clip.video.as_ref()?;
-            let (first, second) = if a.avid_track == Some(1) { (a, b) } else { (b, a) };
-            Some((mob, video.path.as_str(), first.path.as_str(), second.path.as_str()))
-        };
-        let qualified_packages: HashSet<_> = cameras.iter().filter(|id| ids.contains(**id))
-            .filter_map(|id| package(id))
-            .collect();
-        if ids.iter().any(|id| {
-            !model.direct_dnxhr_origins.contains_key(id)
-                || (!cameras.contains(id.as_str())
-                    && !model.clips.get(id.as_str()).is_some_and(|clip| clip.audio.is_empty())
-                    && !package(id).is_some_and(|key| qualified_packages.contains(&key)))
-        }) {
-            return Err(other("direct DNxHD LB needs a verified picture-only item, Group or Submaster source"));
-        }
+    if model.direct_dnxhd_pcm24.is_some_and(|ids| {
+        ids.iter().any(|id| !model.direct_dnxhr_origins.contains_key(id))
+    }) {
+        return Err(other("direct DNxHD LB/PCM24 requires a verified media origin"));
     }
     if model.direct_dnxhr_origins.is_empty() {
         return Ok(HashMap::new());
@@ -2858,6 +2921,10 @@ fn direct_dnxhr_files(
     let one_mono_cameras: HashSet<_> = model.multicams.iter()
         .filter(|group| group.audio_cameras.len() == 1)
         .flat_map(|group| group.cameras.iter().map(|camera| camera.clip.as_str()))
+        .collect();
+    let stereo_edits: HashSet<_> = model.sequences.iter().flat_map(|sequence| &sequence.events)
+        .filter(|edit| !edit.stereo.is_empty())
+        .map(|edit| edit.clip.as_str())
         .collect();
     let mut files = HashMap::new();
     for (id, &origin) in model.direct_dnxhr_origins {
@@ -2877,14 +2944,14 @@ fn direct_dnxhr_files(
             }));
         }
         let bits = c.audio.first().map_or(24, |a| a.bits);
-        let dnxhd_group_camera = model.direct_dnxhd_pcm24.is_some_and(|ids| ids.contains(id));
+        let dnxhd_pcm24 = model.direct_dnxhd_pcm24.is_some_and(|ids| ids.contains(id));
         let (rate, start, duration) = if let Some(v) = picture {
             (v.rate, v.start, v.duration)
         } else {
             let ([first] | [first, _]) = c.audio.as_slice() else {
                 return Err(other("direct DNxHR OP-Atom without picture requires one or two mono siblings"));
             };
-            if dnxhd_group_camera || model.multicams.iter().any(|group|
+            if dnxhd_pcm24 || model.multicams.iter().any(|group|
                 group.cameras.iter().any(|camera| camera.clip == *id))
             {
                 return Err(other("direct DNxHR OP-Atom without picture requires a standalone clip"));
@@ -2893,6 +2960,9 @@ fn direct_dnxhr_files(
                 first.start, first.duration)
         };
         let profile = (rate.num, rate.den, bits);
+        let stereo_master = dnxhd_pcm24 && channel_count == 2 && origin == start
+            && c.stereo_pairs == [(1, 2)] && !stereo_edits.contains(id.as_str())
+            && !model.multicams.iter().any(|group| group.cameras.iter().any(|camera| camera.clip == *id));
         if picture.is_none() && (profile != (24_000, 1001, 24) || model.options.bin_mode != "separate") {
             return Err(other("direct DNxHR OP-Atom without picture requires 23.976 Separate files with PCM24"));
         }
@@ -2901,16 +2971,16 @@ fn direct_dnxhr_files(
         {
             return Err(other("picture-only and wider direct Group profiles require 23.976 Separate files with any audio at PCM24"));
         }
-        if channel_count == 1 && (dnxhd_group_camera || one_mono_cameras.contains(id.as_str())) {
+        if channel_count == 1 && (dnxhd_pcm24 || one_mono_cameras.contains(id.as_str())) {
             return Err(other("one available mono sibling requires a standalone DNxHR clip"));
         }
-        if dnxhd_group_camera && (profile != (24_000, 1001, 24) || model.options.bin_mode != "separate") {
+        if dnxhd_pcm24 && (profile != (24_000, 1001, 24) || model.options.bin_mode != "separate") {
             return Err(other("direct DNxHD LB/PCM24 requires 23.976 Separate files"));
         }
         let (display, dnxhr) = match profile {
             (24, 1, 16) if origin == 0 && matches!(model.options.bin_mode.as_str(), "grouped" | "merged") =>
                 ("100", false),
-            (24_000, 1001, 24) => ("110", !dnxhd_group_camera),
+            (24_000, 1001, 24) => ("110", !dnxhd_pcm24),
             (24_000, 1001, 16) => ("110", false),
             (30_000, 1001, 24) if c.time_display == Some(102) => ("102", false),
             _ => return Err(other("unsupported direct DNx OP-Atom rate or bin mode")),
@@ -2930,7 +3000,7 @@ fn direct_dnxhr_files(
                 || duration % (super::model::TICKS_PER_SECOND / 48_000) != 0)
             || bits == 16 && (origin != start || origin / unit >= 24 * 60 * 60 * 24)
             || !valid_labels
-            || !c.stereo_pairs.is_empty() || !c.multichannel_groups.is_empty()
+            || (!c.stereo_pairs.is_empty() && !stereo_master) || !c.multichannel_groups.is_empty()
             || c.audio.iter().any(|s| s.sample_rate != 48000 || s.bits != bits || s.start != start
                 || s.duration != duration || !paths.insert(s.path.as_str()))
         {
@@ -2998,6 +3068,12 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
             .map(|m|(m.source_path.as_str(), m.target_path.as_str())).collect();
         for g in model.multicams {
             for c in &g.cameras {
+                if model.originals.contains_key(c.clip.as_str()) {
+                    if native_av || model.options.bin_mode != "separate" {
+                        return Err(other("linked original Group cameras require Separate files"));
+                    }
+                    continue;
+                }
                 let video = model.clips[&c.clip].video.as_ref().ok_or_else(|| other("multicam camera has no picture"))?;
                 if native_av {
                     if !picture_bindings.get(video.path.as_str()).is_some_and(|p|p.to_ascii_lowercase().ends_with(".mxf")) {
@@ -3180,6 +3256,11 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
             index.entry(edit.sequence).or_insert_with(Vec::new).push(edit);
             index
         }),
+        jpeg_fills: Vec::new(),
+        split_mattes: model.png_mattes.split_edits.iter().fold(HashMap::new(), |mut index, edit| {
+            index.entry(edit.sequence).or_insert_with(Vec::new).push(edit);
+            index
+        }),
         constant_speeds: model.constant_speeds.iter().map(|&s| ((s.sequence, s.event), s)).collect(),
         video_dissolves,
         audio_crossfades,
@@ -3211,7 +3292,8 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         }
         let target = writer.project.add_bin(parent, &b.name, writer.ids)?;
         if !model.multicams.is_empty() || !model.multicam_tracks.is_empty() || !model.picture_subclips.is_empty() || !model.av_subclips.is_empty()
-            || !model.png_mattes.stills.is_empty() || !model.autosync_bins.is_empty()
+            || !model.png_mattes.stills.is_empty() || !model.png_mattes.jpeg_fills.is_empty()
+            || !model.autosync_bins.is_empty()
         {
             compound_targets.push(target);
         }
@@ -3227,13 +3309,37 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         writer.png_items = png_mattes::import(
             &mut writer.project, &model.png_mattes.stills, &compound_targets, writer.ids,
         )?;
-        let keys = model.png_mattes.edits.iter().filter(|e| e.foreground.is_some_and(|i| {
+        let keys = model.png_mattes.edits.iter().filter(|e| e.background.is_some() && e.foreground.is_some_and(|i| {
             matches!(model.png_mattes.stills[i].alpha, super::prepared::PngAlpha::Straight { .. })
         })).count();
         writer.report.notes.push(format!(
             "Linked {} PNG still interpretations and rebuilt {keys} editable Matte Key nests",
             writer.png_items.len()
         ));
+        let overlays = model.png_mattes.edits.iter().filter(|e| e.background.is_none()).count();
+        if overlays > 0 {
+            writer.report.notes.push(format!("Linked {overlays} binary-alpha Matte Key overlay(s)"));
+        }
+    }
+    for fill in &model.png_mattes.jpeg_fills {
+        let item = if let Some(start) = fill.managed_start {
+            png_mattes::import_managed_fill(
+                &mut writer.project, &mut writer.media, fill, start, compound_targets[fill.bin], writer.ids,
+            )?
+        } else if let Some(id) = &fill.existing_clip {
+            if !writer.items.contains_key(id) {
+                writer.import_clip(id, Some(compound_targets[fill.bin]))?;
+            }
+            writer.items.get(id).and_then(|(picture, _)| *picture)
+                .ok_or_else(|| other("verified JPEG fill has no picture item"))?
+        } else {
+            let item = writer.project.import_prepared_still(
+                &fill.path, compound_targets[fill.bin], ".jpg", writer.ids,
+            )?;
+            writer.project.set_item_name(item, &fill.name)?;
+            item
+        };
+        writer.jpeg_fills.push(item);
     }
     for seq in model.sequences {
         for e in &seq.events {
@@ -3259,8 +3365,14 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         ));
     }
     for subclip in model.av_subclips {
-        let parent = &model.clips[&subclip.parent_clip];
         writer.project.import_target = Some(compound_targets[subclip.bin]);
+        if let Some(parent) = model.originals.get(subclip.parent_clip.as_str()) {
+            let item = super::original::add_subclip(&mut writer.project, parent, subclip, writer.ids)?;
+            writer.project.import_target = None;
+            writer.av_subclip_items.push(item);
+            continue;
+        }
+        let parent = &model.clips[&subclip.parent_clip];
         let item = super::native_av::add_linked_av_subclip(
             &mut writer.project, &mut writer.media, parent, subclip, writer.ids,
         )?;
@@ -3278,14 +3390,24 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
     }
     for group in model.multicams {
         for camera in &group.cameras {
-            if !writer.items.contains_key(&camera.clip) {
-                writer.import_clip(&camera.clip, layout.map(|_| root))?;
+            for clip in std::iter::once(camera.clip.as_str()).chain(camera.mono_view.as_deref()) {
+                if !writer.items.contains_key(clip) {
+                    writer.import_clip(clip, layout.map(|_| root))?;
+                }
             }
         }
         let leaf = |c: &super::multicam::PreparedCamera| -> Result<_> {
             let (picture, siblings) = &writer.items[&c.clip];
             let picture = picture.ok_or_else(|| other("multicam camera item not imported"))?;
-            Ok((picture, siblings.as_slice(), &model.clips[&c.clip]))
+            let media = match model.originals.get(c.mono_clip()) {
+                Some(clip) => {
+                    let audio_view = writer.items[c.mono_clip()].0
+                        .ok_or_else(|| other("multicam camera mono view not imported"))?;
+                    super::multicam::CameraMedia::Original(audio_view, clip)
+                }
+                None => super::multicam::CameraMedia::Managed(&model.clips[&c.clip], siblings),
+            };
+            Ok((picture, media))
         };
         let leaves = [leaf(&group.cameras[0])?, leaf(&group.cameras[1])?];
         let item = super::multicam::build(&mut writer.project, group, leaves, compound_targets[group.bin], writer.ids)?;
@@ -3308,15 +3430,23 @@ fn prepare_view(model:&WriterInput,legacy:&Model,out_path:impl AsRef<Path>,ids:&
         let alternate_edits = model.multicam_uses.iter().flat_map(|usage| &usage.audio)
             .filter(|choice| matches!(choice, super::multicam::PreparedGroupAudio::LinkedAlternate(_)))
             .count();
+        let has_originals = model.multicams.iter().flat_map(|group| &group.cameras)
+            .any(|camera| model.originals.contains_key(camera.clip.as_str()));
         if alternate_edits != 0 {
+            let media = if has_originals {
+                "original mono channel"
+            } else {
+                "original mono MXF"
+            };
             writer.report.notes.push(format!(
-                "{alternate_edits} alternate Group audio timeline edit(s) link directly to the selected camera's original mono MXF"
+                "{alternate_edits} alternate Group audio timeline edit(s) link directly to the selected camera's {media}"
             ));
         }
         if has_three_mono {
             writer.report.notes.push("Three-mono Group scope: two continuous 23.976 DNx LB cameras with discrete mono PCM24 siblings. Picture angles remain editable in Premiere. Independent audio switches use linked mono clips.".into());
         } else if !has_one_mono {
-            writer.report.unverified.push("Editable Group scope: two continuous same-rate DNx cameras with two mono PCM24 lanes; User acceptance pending. Alternate audio on the qualified linked route is a direct mono clip. Retimed or discontinuous alternatives and wider audio are outside this profile.".into());
+            let profile = if has_originals { "DNx or linked ProRes HQ MOV" } else { "DNx" };
+            writer.report.unverified.push(format!("Editable Group scope: two continuous same-rate {profile} cameras with two mono PCM24 lanes; User acceptance pending. Alternate audio on the qualified linked route is a direct mono clip. Retimed or discontinuous alternatives and wider audio are outside this profile."));
         }
         if has_one_mono {
             writer.report.notes.push("One-mono Group scope: two same-rate DNx cameras with one saved mono PCM24 lane. Picture and audio default camera selections remain independent.".into());

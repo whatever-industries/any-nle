@@ -22,7 +22,7 @@ mod same_rate_movie;
 pub(super) mod legacy_mxf;
 const MAX_ORIGINAL_INDEX_BYTES: usize = 64 << 20;
 pub const SOURCE_MEDIA_UNAVAILABLE: &str = "preferred source media unavailable";
-pub use still::{verify_imported_png, PngRole};
+pub use still::{verify_imported_jpeg, verify_imported_jpeg_mxf, verify_imported_png, BinaryAlphaShape, PngRole, PngVerificationError, VerifiedPng};
 #[derive(Clone, Debug)]
 pub struct RootMapping {
     pub saved_root: PathBuf,
@@ -44,7 +44,7 @@ pub struct OriginalOptions {
     pub preserve_managed_audio_without_picture: bool,
     /// Verify ordinary linked streams for a destination with a native importer.
     pub verify_linked_imports: bool,
-    /// Collect saved-path and MXF package details for Review blockers.
+    /// Collect saved-path, physical media and MXF package details for Review blockers.
     pub collect_blocked_locators: bool,
 }
 impl Default for OriginalOptions {
@@ -69,6 +69,7 @@ impl Default for OriginalOptions {
 #[derive(Clone, Debug)]
 pub struct Selected {
     pub verified_for_native_import: bool,
+    pub source_srgb_video_levels: bool,
     pub path: PathBuf,
     pub online: bool,
     pub stream: OriginalStream,
@@ -88,6 +89,8 @@ pub struct Selected {
     pub column_timecode: Option<av::SavedFileClock>,
     /// A file-declared 24 fps MOV timecode, separate from Avid logging and stream PTS.
     pub(crate) embedded_mov_timecode: Option<av::Observed<i64>>,
+    /// Physically verified 23.976 MP4 non-drop timecode, independent of the Avid master.
+    pub(crate) verified_mp4_timecode: Option<i64>,
 }
 #[derive(Default)]
 pub struct OriginalIndex {
@@ -296,6 +299,7 @@ fn offline_original(master: &av::SourceMaster, index: usize) -> Result<Option<Se
     }
     Ok(Some(Selected {
         verified_for_native_import: false,
+        source_srgb_video_levels: false,
         path,
         online: false,
         stream: OriginalStream {
@@ -322,6 +326,7 @@ fn offline_original(master: &av::SourceMaster, index: usize) -> Result<Option<Se
         mp3_delay_samples: None,
         column_timecode: None,
         embedded_mov_timecode: None,
+        verified_mp4_timecode: None,
     }))
 }
 pub(crate) fn text(v: &Value, k: &str) -> Option<String> {
@@ -395,6 +400,12 @@ fn qualify_movie_geometry(
 }
 
 fn qualify_movie_geometry_at_rate(video: &Value, raster: (i64, i64), rate: Rational) -> Result<bool, String> {
+    qualify_movie_geometry_with_transfer(video, raster, rate, "bt709")
+}
+
+fn qualify_movie_geometry_with_transfer(
+    video: &Value, raster: (i64, i64), rate: Rational, transfer: &str,
+) -> Result<bool, String> {
     if number(video, "width") != Some(raster.0)
         || number(video, "height") != Some(raster.1)
         || ratio(video, "avg_frame_rate") != Some(rate)
@@ -408,9 +419,9 @@ fn qualify_movie_geometry_at_rate(video: &Value, raster: (i64, i64), rate: Ratio
         ));
     }
     let mut defaulted = false;
-    for field in ["color_space", "color_transfer", "color_primaries"] {
+    for (field, expected) in [("color_space", "bt709"), ("color_transfer", transfer), ("color_primaries", "bt709")] {
         match video.get(field) {
-            Some(Value::Str(value)) if value=="bt709"=>{},
+            Some(Value::Str(value)) if value==expected=>{},
             None=>defaulted=true,
             Some(Value::Str(value)) if matches!(value.as_str(),"unknown"|"unspecified")=>defaulted=true,
             _=>return Err(format!("original picture {field} is unqualified: requires BT.709 or an untagged/unspecified value; HDR and other color profiles are not admitted")),
@@ -617,24 +628,28 @@ fn embedded_avc_mov_timecode(
         {
             return None;
         }
-        let parts = label.as_bytes();
-        if parts.len() != 11 || [2, 5, 8].into_iter().any(|i| parts[i] != b':') {
-            return None;
-        }
-        let mut fields = [0; 4];
-        for (field, pair) in fields.iter_mut().zip(parts.split(|&c| c == b':')) {
-            if pair.len() != 2 || !pair.iter().all(u8::is_ascii_digit) {
-                return None;
-            }
-            *field = i64::from((pair[0] - b'0') * 10 + pair[1] - b'0');
-        }
-        let [h, m, s, f] = fields;
-        (h < 24 && m < 60 && s < 60 && f < 24).then_some((h * 3600 + m * 60 + s) * 24 + f)
+        parse_non_drop_24_label(label)
     })();
     Some(match count {
         Some(count) => av::Observed::Known(count),
         None => av::Observed::Unresolved("embedded MOV timecode lacks one matching 24 fps non-drop track and picture declaration".into()),
     })
+}
+
+fn parse_non_drop_24_label(label: &str) -> Option<i64> {
+    let parts = label.as_bytes();
+    if parts.len() != 11 || [2, 5, 8].into_iter().any(|i| parts[i] != b':') {
+        return None;
+    }
+    let mut fields = [0; 4];
+    for (field, pair) in fields.iter_mut().zip(parts.split(|&c| c == b':')) {
+        if pair.len() != 2 || !pair.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        *field = i64::from((pair[0] - b'0') * 10 + pair[1] - b'0');
+    }
+    let [h, m, s, f] = fields;
+    (h < 24 && m < 60 && s < 60 && f < 24).then_some((h * 3600 + m * 60 + s) * 24 + f)
 }
 
 fn verify_prores_hq_timecode_track(
@@ -1185,6 +1200,9 @@ fn probe_with_linked_imports(
     if let Some(rate) = same_rate_movie::avc_picture_only_rate(path, &metadata) {
         same_rate_movie::prove_avc_picture_cadence(path, tool, &metadata, rate, check)?;
     }
+    if let Some((video, audio)) = same_rate_movie::timecoded_hd_avc_aac(path, &metadata) {
+        same_rate_movie::prove_timecoded_avc_aac_packets(path, tool, video, audio, check)?;
+    }
     let prores_color_defaulted = match metadata.get("streams") {
         Some(Value::Arr(streams)) if streams.first().is_some_and(|s|
             text(s, "codec_name").as_deref() == Some("prores")
@@ -1575,7 +1593,7 @@ fn has_aac_priming_packet(probe: &Value, stream: i64) -> bool {
 }
 
 fn same_rate_aac_master(
-    master: &av::SourceMaster, samples: i64, picture: &Value, rate: av::Rate,
+    master: &av::SourceMaster, samples: i64, picture: &Value, rate: av::Rate, allow_picture_markers: bool,
 ) -> bool {
     let [a, b, c] = master.master.tracks.as_slice() else { return false; };
     let Some(encoded_length) = samples.checked_add(1024) else { return false; };
@@ -1599,7 +1617,8 @@ fn same_rate_aac_master(
         && master.master.other_groups.is_empty()
         && master.offsets.len() == 3
         && master.offsets.iter().all(|o| matches!(o, av::Observed::Known(0)))
-        && master.master.markers.is_empty()
+        && (master.master.markers.is_empty()
+            || allow_picture_markers && same_rate_movie::verified_picture_markers(master, rate, frames))
         && (legacy || shared_saved_locator(master).is_some()
             && master.originals.iter().zip(&master.master.tracks).any(|(original, track)|
                 track.kind == avid_reader::extract::KIND_PICTURE && original.as_ref().is_some_and(|raw|
@@ -1626,7 +1645,7 @@ fn qualify_uhd_avc_aac(probe: &Value, streams: &[Value], master: &av::SourceMast
     if number(video, "index") != Some(0) || number(audio, "index") != Some(1)
         || !has_aac_priming_packet(probe, 1)
         || !number(audio, "duration_ts").is_some_and(|samples|
-            same_rate_aac_master(master, samples, video, av::Rate::new(24_000, 1001).unwrap()))
+            same_rate_aac_master(master, samples, video, av::Rate::new(24_000, 1001).unwrap(), false))
     {
         return Err("UHD AVC AAC MP4 requires matching 23.976 descriptors, two saved channels and verified AAC priming".into());
     }
@@ -2003,14 +2022,14 @@ impl OriginalIndex {
                     // Pin bytes on both sides of the probe. Neither mtime nor a post-probe
                     // hash alone establishes which bytes supplied the stream facts.
                     let before = crate::revision::file_revision_checked(&path, check)
-                        .map_err(|e| media_issue(format!("original revision read failed: {e}"), true, check))?;
+                        .map_err(|e| media_issue(describe(format!("original revision read failed: {e}")), true, check))?;
                     if pinned.get(&path).is_some_and(|old| old != &before) {
                         return Err(media_issue("original content changed between source selections".into(), true, check));
                     }
                     let observed = inspect(&path, check)
                         .map_err(|error| media_issue(describe(error), true, check))?;
                     let after = crate::revision::file_revision_checked(&path, check)
-                        .map_err(|e| media_issue(format!("original revision recheck failed: {e}"), true, check))?;
+                        .map_err(|e| media_issue(describe(format!("original revision recheck failed: {e}")), true, check))?;
                     if before != after {
                         return Err(media_issue("original content changed during stream probe".into(), true, check));
                     }
@@ -2099,8 +2118,9 @@ impl OriginalIndex {
                     }
                     otherwise => otherwise.map_err(|error| media_issue(describe(error), true, check))?,
                 };
-                let Value::Arr(streams) = v.get("streams").ok_or("probe lacks streams")? else {
-                    return Err("probe streams malformed".into());
+                let Value::Arr(streams) = v.get("streams").ok_or_else(||
+                    media_issue(describe("probe lacks streams".into()), true, check))? else {
+                    return Err(media_issue(describe("probe streams malformed".into()), true, check));
                 };
                 if streams.len() > 3 {
                     if i == 0 && (unused_path.is_some() || gap_path.is_some()) && streams.iter().all(|stream|
@@ -2115,7 +2135,7 @@ impl OriginalIndex {
                         }
                         continue 'master;
                     }
-                    return Err("original has unqualified additional streams".into());
+                    return Err(media_issue(describe("original has unqualified additional streams".into()), true, check));
                 }
                 let videos: Vec<_> = streams
                     .iter()
@@ -2132,7 +2152,7 @@ impl OriginalIndex {
                             && text(s, "codec_tag_string").as_deref() != Some("tmcd")
                     })
                 {
-                    return Err("original stream selection is ambiguous/unqualified".into());
+                    return Err(media_issue(describe("original stream selection is ambiguous/unqualified".into()), true, check));
                 }
                 let mut picture_codec = "avc1";
                 let avc_pcm = physical_container == "mov" && is_avc_pcm_movie(streams)
@@ -2146,9 +2166,8 @@ impl OriginalIndex {
                 let uhd_avc_aac = uhd_avc_mp4 && audios.first().is_some_and(|audio|
                     text(audio, "codec_tag_string").as_deref() == Some("mp4a"));
                 if physical_container == "mov" {
-                    let video = videos
-                        .first()
-                        .ok_or("original movie picture stream absent")?;
+                    let video = videos.first().ok_or_else(||
+                        media_issue(describe("original movie picture stream absent".into()), true, check))?;
                     let picture_profile = if text(video, "codec_name").as_deref() == Some("prores") {
                         picture_codec = if text(video, "codec_tag_string").as_deref() == Some("apcs") {
                             "apcs"
@@ -2177,30 +2196,32 @@ impl OriginalIndex {
                     } else {
                         qualify_movie(video, audios.first().copied(), adapter_masters.contains(&m.master.mob_id))
                     };
-                    if picture_profile.is_err() && options.verify_linked_imports
+                    let picture_profile = if picture_profile.is_err() && options.verify_linked_imports
                         && !adapter_masters.contains(&m.master.mob_id)
                         && same_rate_movie::may_need_import(&path, v)
                     {
                         let imported = same_rate_movie::select_verified_import(
                             &path, v, m, i, &options.ffprobe, check,
                         );
-                        if let Ok((selected, defaulted)) = imported {
-                            used = used.checked_add(selection_cost(m, raw, &path))
-                                .and_then(|size| size.checked_add(if i == 0 && defaulted {
-                                    std::mem::size_of::<String>() + UNTAGGED_COLOR_NOTE.len()
-                                } else { 0 }))
-                                .filter(|n| *n <= MAX_ORIGINAL_INDEX_BYTES)
-                                .ok_or("original index exceeds 64 MiB")?;
-                            if i == 0 && defaulted { out.notes.push(UNTAGGED_COLOR_NOTE.into()); }
-                            out.tracks.insert((m.id.clone(), i), selected);
-                            continue;
-                        }
-                        if let Err(reason) = imported {
-                            if !(i == 0 && (gap_path.is_some() || unused_path.is_some()) && unsupported_pcm_movie(m, streams)) {
-                                return Err(describe(reason).into());
+                        match imported {
+                            Ok((selected, defaulted)) => {
+                                used = used.checked_add(selection_cost(m, raw, &path))
+                                    .and_then(|size| size.checked_add(if i == 0 && defaulted {
+                                        std::mem::size_of::<String>() + UNTAGGED_COLOR_NOTE.len()
+                                    } else { 0 }))
+                                    .filter(|n| *n <= MAX_ORIGINAL_INDEX_BYTES)
+                                    .ok_or("original index exceeds 64 MiB")?;
+                                if i == 0 && defaulted { out.notes.push(UNTAGGED_COLOR_NOTE.into()); }
+                                out.tracks.insert((m.id.clone(), i), selected);
+                                continue;
                             }
+                            Err(_) if i == 0 && (gap_path.is_some() || unused_path.is_some())
+                                && unsupported_pcm_movie(m, streams) => picture_profile,
+                            Err(reason) => Err(reason),
                         }
-                    }
+                    } else {
+                        picture_profile
+                    };
                     let defaulted = match picture_profile {
                         Ok(defaulted) => defaulted,
                         Err(reason) if i == 0 && (gap_path.is_some()
@@ -2215,7 +2236,7 @@ impl OriginalIndex {
                             }
                             continue 'master;
                         }
-                        Err(reason) => return Err(describe(reason).into()),
+                        Err(reason) => return Err(media_issue(describe(reason), true, check)),
                     };
                     if defaulted && fresh_probe {
                         used = used
@@ -2283,6 +2304,7 @@ impl OriginalIndex {
                 }
                 let mut selected = Selected {
                     verified_for_native_import: false,
+                    source_srgb_video_levels: false,
                     path: path.clone(),
                     online: true,
                     stream: OriginalStream {
@@ -2313,6 +2335,7 @@ impl OriginalIndex {
                     mp3_delay_samples: None,
                     column_timecode: None,
                     embedded_mov_timecode: None,
+                    verified_mp4_timecode: None,
                 };
                 if kind == StreamKind::Video {
                     let rate =
@@ -2364,7 +2387,7 @@ impl OriginalIndex {
                         && !adapter_masters.contains(&m.master.mob_id)
                         && (uhd_avc_aac || path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mov"))
                             && videos.first().is_some_and(|picture|
-                                same_rate_aac_master(m, len, picture, av::Rate::new(24, 1).unwrap())));
+                                same_rate_aac_master(m, len, picture, av::Rate::new(24, 1).unwrap(), false)));
                     if !matches!(channels, 1 | 2)
                         || raw.channels != Some(channels)
                         || raw.sample_rate != Some(sr as f64)
@@ -2410,7 +2433,7 @@ impl OriginalIndex {
         // Recheck every selected file, including cache hits. Publication rechecks these pins.
         for input in &out.original_inputs {
             if crate::revision::file_revision_checked(&input.path, check)
-                .map_err(|e| format!("original final revision read failed: {e}"))?
+                .map_err(|e| format!("original final revision read failed at {}: {e}", input.path.display()))?
                 != input.revision
             {
                 return Err("original content changed before source read completed".into());

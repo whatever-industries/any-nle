@@ -7,7 +7,7 @@ a fully self-contained application on every Linux distribution.
 
 A working X11 or Wayland desktop, compatible OpenGL/EGL drivers, and the desktop's
 D-Bus session and file-picker portal are required. On Ubuntu, the usual runtime
-packages include `libx11-6`, `libxcursor1`, `libxrandr2`, `libxi6`, `libxinerama1`,
+packages include `zlib1g` for the media tools and `libx11-6`, `libxcursor1`, `libxrandr2`, `libxi6`, `libxinerama1`,
 `libxkbcommon0`, `libwayland-client0`, `libegl1`, `libgl1`, `libdbus-1-3`,
 `xdg-desktop-portal` and the portal backend for that desktop. The per-package
 `linux-runtime.json` lists the exact SONAME dependencies observed for the built

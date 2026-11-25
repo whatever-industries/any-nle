@@ -22,6 +22,27 @@ pub fn add_item(
     name: &str,
     ids: &mut dyn UuidSource,
 ) -> Result<ItemId> {
+    add_item_with_bounds(project, c, name, None, ids)
+}
+
+pub(super) fn add_subclip(
+    project: &mut Project,
+    parent: &OriginalClip,
+    subclip: &PreparedAvSubclip,
+    ids: &mut dyn UuidSource,
+) -> Result<ItemId> {
+    let mut clip = parent.clone();
+    clip.groups = vec![vec![1], vec![2]];
+    add_item_with_bounds(project, &clip, &subclip.name, Some((subclip.start, subclip.end)), ids)
+}
+
+fn add_item_with_bounds(
+    project: &mut Project,
+    c: &OriginalClip,
+    name: &str,
+    bounds: Option<(i64, i64)>,
+    ids: &mut dyn UuidSource,
+) -> Result<ItemId> {
     validate_original(c).map_err(|e| Error::Value(e.to_string()))?;
     let dir = resolve_path(project.path())
         .parent()
@@ -99,6 +120,16 @@ pub fn add_item(
             let color = tree.find1(e, "OriginalColorSpace")
                 .ok_or_else(|| Error::Value("linked MXF color field is absent".into()))?;
             tree.set_text(color, Some(r#"{"baseColorProfile":{"colorProfileName":"BT.709,32f,Display-Referred"},"baseProfileType":1,"colorSpaceMetadata":{"dataRangeInfoValid":1}}"#));
+        }
+        if c.rec709_source_override && !c.premiere_assisted {
+            let tree = &mut project.doc.tree;
+            let color = tree.find1(e, "OriginalColorSpace")
+                .ok_or_else(|| Error::Value("linked AVC color field is absent".into()))?;
+            tree.set_text(color, Some(r#"{"baseColorProfile":{"colorProfileName":"1,13,1,Narrow,YCC,8-bit,Display-Referred"},"baseProfileType":1}"#));
+            append_leaf(tree, e, "OverriddenColorSpace",
+                r#"{"baseColorProfile":{"colorProfileName":"BT.709,8-bit,Display-Referred"},"baseProfileType":1}"#);
+            append_leaf(tree, e, "InputLUTSpecified", "true");
+            append_leaf(tree, e, "IsColorSpacOverridden", "true");
         }
         let stream = project.register(e)?;
         m::new_movie_media(
@@ -223,7 +254,7 @@ pub fn add_item(
         &mut project.doc.tree,
         name,
         frame_rate,
-        duration,
+        bounds.map_or(duration, |(start, end)| end - start),
         if c.video.is_none() {
             Some("1")
         } else if c.audio.is_none() {
@@ -232,7 +263,7 @@ pub fn add_item(
             None
         },
         &format,
-        source_start,
+        source_start + bounds.map_or(0, |(start, _)| start),
         "",
     );
     if let Some(reel) = reel {
@@ -248,6 +279,7 @@ pub fn add_item(
         } else {
             m::new_movie_media_source(&mut project.doc.tree, &uid, v.duration)
         };
+        super::native_av::set_subclip_bounds(project, e, bounds)?;
         if let Some(uid) = &proxy {
             let content = project
                 .doc
@@ -270,6 +302,7 @@ pub fn add_item(
     }
     if let Some(a) = &c.audio {
         let source_node = m::new_audio_media_source(&mut project.doc.tree, &uid, a.duration);
+        super::native_av::set_subclip_bounds(project, source_node, bounds)?;
         let source = project.register(source_node)?;
         let second_source = if c.separate_mono_streams {
             let sample_rate = ticks_per_unit(Fraction::new(a.sample_rate, 1));
@@ -406,7 +439,9 @@ pub fn add_item(
     let item_uid = ids.uuid4().to_string();
     let e = m::new_clip_item(&mut project.doc.tree, &item_uid, &master_uid, name, label.0);
     let e = project.register_uid(e, &item_uid)?;
-    let item = project.attach_imported_item(e, &item_uid, master, &refs, &c.path, duration)?;
+    let item = project.attach_imported_item(
+        e, &item_uid, master, &refs, &c.path, bounds.map_or(duration, |(start, end)| end - start),
+    )?;
     project.item_extra.entry(item).or_default().channel_groups = Some(
         c.groups
             .iter()

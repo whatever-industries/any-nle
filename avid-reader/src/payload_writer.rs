@@ -72,6 +72,15 @@ pub fn encode_supported_payload(
             b"PRCL" | b"CTRL" | b"ECCP" => {
                 let source = match original_payload {
                     Some(bytes) => curve_source(node.class, bytes, big_endian)?,
+                    // New PRCL objects use the Component factory's absent
+                    // extension for a null parameter list.
+                    None if node.class == *b"PRCL" => CurveSourceOnly {
+                        clip: SourceOnly {
+                            param_list_present: Some(false),
+                            ..SourceOnly::default()
+                        },
+                        ..CurveSourceOnly::default()
+                    },
                     None => CurveSourceOnly::default(),
                 };
                 write_curve(node, big_endian, source, byte_limit)?

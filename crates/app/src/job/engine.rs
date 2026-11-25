@@ -12,7 +12,7 @@ use review_details::{
 use review_details::{append_group_preparation_details, premiere_preparation_blocker};
 pub(crate) use review_details::sequence_timing_blocker;
 use crate::premiere_import::avid;
-use crate::source_input::{original_stamp, recheck_originals, OriginalStamp};
+use crate::source_input::{original_stamp, recheck_originals_checked, OriginalStamp};
 use crate::{backend_bundle, output, premiere_preparation, rewrap, source_input};
 use avid_reader::source::SourceInput;
 use mapping::{AvidToPremiere, BinMode};
@@ -127,6 +127,11 @@ pub fn save_blocked_preflight_report(
     blocker: &ReviewBlocker,
     path: &Path,
 ) -> Result<(), String> {
+    check_blocked_report_path(spec, path)?;
+    write_json(path, &blocked_preflight_report(spec, blocker), &mut Vec::new())
+}
+
+pub fn check_blocked_report_path(spec: &JobSpec, path: &Path) -> Result<(), String> {
     let sidecars: Vec<_> = [
         RECEIPT_SUFFIX,
         REPLAY_SUFFIX,
@@ -141,8 +146,7 @@ pub fn save_blocked_preflight_report(
         std::iter::once(spec.output.as_path())
             .chain(sidecars.iter().map(PathBuf::as_path))
             .chain(spec.new_media.as_deref()).chain(spec.rewrap_needed.as_deref()),
-    )?;
-    write_json(path, &blocked_preflight_report(spec, blocker), &mut Vec::new())
+    )
 }
 
 pub fn blocked_preflight_report<'a>(
@@ -214,6 +218,11 @@ impl PreparedJob {
 
     /// Export all findings from this preflight without consuming the prepared job.
     pub fn save_preflight_report(&self, path: &Path) -> Result<(), String> {
+        self.check_report_path(path)?;
+        write_json(path, &self.preflight_report(), &mut Vec::new())
+    }
+
+    pub fn check_report_path(&self, path: &Path) -> Result<(), String> {
         let reserved = [
             Some(self.spec.output.as_path()),
             Some(self.receipt.as_path()),
@@ -230,9 +239,7 @@ impl PreparedJob {
         check_preflight_report_path(path, reserved.into_iter().flatten().chain(proxy_outputs))?;
         self.document
             .check_reserved_output(path)
-            .map_err(|error| error.to_string())?;
-
-        write_json(path, &self.preflight_report(), &mut Vec::new())
+            .map_err(|error| error.to_string())
     }
 
     pub fn preflight_report(&self) -> impl serde::Serialize + '_ {
@@ -581,45 +588,46 @@ fn prepare_job(
         "source verification",
         "Hashing referenced native media in place; no footage is copied",
     );
-    let media_error = |path: &Path, message: String| {
+    let media_error = |index: usize, message: String| {
         let mut issue = ReviewBlocker::new(AvidMedia, message);
         if for_review && !cancel.is_cancelled() {
+            let kind = media_blocker::FileKind::Managed;
             media_blocker::append_file_uses(
-                &mut issue, &read.graph, &read.sequence_bins, &bins, path,
-                media_blocker::FileKind::Managed,
+                &mut issue, &read.graph, &read.sequence_bins, &bins, &native_paths[index], kind,
+            );
+            media_blocker::append_unavailable_files(
+                &mut issue, &read.graph, &read.sequence_bins, &bins,
+                native_paths[index + 1..].iter().map(PathBuf::as_path), kind, cancel,
             );
         }
         issue
     };
     let mut media_inputs = Vec::new();
     for (index, path) in native_paths.iter().enumerate() {
-        match source_input::pin_file_checked(path, &mut || cancel.check()) {
-            Ok(input) => media_inputs.push(input),
-            Err(message) => {
-                let mut issue = media_error(path, message);
-                if for_review {
-                    media_blocker::append_unavailable_files(
-                        &mut issue, &read.graph, &read.sequence_bins, &bins,
-                        native_paths[index + 1..].iter().map(PathBuf::as_path),
-                        media_blocker::FileKind::Managed, cancel,
-                    );
-                }
-                return Err(issue);
-            }
-        }
+        let input = source_input::pin_file_checked(path, &mut || cancel.check())
+            .map_err(|message| media_error(index, message))?;
+        media_inputs.push(input);
     }
     if !media_inputs.is_empty() {
         check_cancel()?;
-        let again = read_source(cb)?;
+        let again = match read_source(cb) {
+            Err(error) if cancel.is_cancelled() => return Err(error),
+            result => result,
+        };
+        check_cancel()?;
+        // Losing a managed binding can make the second source scan produce a
+        // different graph or fail. Attribute file changes using the first graph,
+        // which still has the saved edits and stream bindings.
+        for (index, input) in media_inputs.iter().enumerate() {
+            source_input::recheck_file_checked(input, &mut || cancel.check())
+                .map_err(|message| media_error(index, message))?;
+        }
+        let again = again?;
         if again.graph != read.graph {
             return Err(ReviewBlocker::new(
                 Retry,
                 "Source interpretation changed while native media was being verified",
             ));
-        }
-        for input in &media_inputs {
-            source_input::recheck_file_checked(input, &mut || cancel.check())
-                .map_err(|message| media_error(&input.path, message))?;
         }
         read = again;
     }
@@ -633,18 +641,19 @@ fn prepare_job(
     }
     media_inputs.extend(read.original_inputs.iter().cloned());
     let mut matte = crate::png_mattes::prepare(&read, &mappings, spec.mode == ClipMode::Separate,
+        &tools.ffprobe,
         &mut || cancel.check()).map_err(|error| {
             let mut issue = ReviewBlocker::new(OriginalMedia, error.message);
             if for_review && !cancel.is_cancelled() {
                 if let Some(edit) = error.edit {
                     media_blocker::append_png_edit(
-                        &mut issue, &read.graph, &read.sequence_bins, &bins, edit,
+                        &mut issue, &read.graph, &read.sequence_bins, &bins, edit, cancel,
                     );
                 }
             }
             issue
         })?;
-    let png_count = matte.inputs.len();
+    let extra_still_count = matte.extra_linked_originals();
     media_inputs.append(&mut matte.inputs);
     check_cancel()?;
     source_input::recheck_checked(&inputs, &mut || cancel.check()).map_err(blocker(Retry))?;
@@ -740,8 +749,10 @@ fn prepare_job(
         premiere_preparation::managed_rewrap_candidates(&read.graph, false)
     };
     let candidate_ids: HashSet<_> = candidates.iter().map(|clip| clip.item).collect();
+    let matte_only_ids = matte.managed_fill_only.clone();
     let approved_items: HashSet<_> = candidates.iter()
-        .filter(|clip| !clip.pending && spec.rewrap_needed.is_some()).map(|clip| clip.item).collect();
+        .filter(|clip| !clip.pending && spec.rewrap_needed.is_some() && !matte_only_ids.contains(clip.item))
+        .map(|clip| clip.item).collect();
     let omitted_items: HashSet<_> = candidate_ids.difference(&approved_items).copied().collect();
     let rewrap_approved = !approved_items.is_empty();
     let selected_rewrap_ids: HashSet<_> = approved_items.iter()
@@ -842,8 +853,8 @@ fn prepare_job(
     };
     inv.native_media = paths(Some(false), false);
     inv.ume_originals = paths(Some(true), true);
-    inv.total_media = paths(None, false) + png_count;
-    inv.found_media = paths(None, true) + png_count;
+    inv.total_media = paths(None, false) + extra_still_count;
+    inv.found_media = paths(None, true) + extra_still_count;
     notes.push(note("info","source verification","Referenced media content is hashed in place during pre-flight and rechecked before publication.","This can take time for large sources; it prevents using stale pre-flight facts after a file changes."));
     inv.notes
         .retain(|n| n != super::inventory::PRESENCE_PENDING);
@@ -991,7 +1002,10 @@ fn prepare_job(
                     .chain(clip.audio.iter().map(|a| a.path.as_str())).collect()
             }
             _ => Vec::new(),
-        }).filter(|path| !offline.contains(path)).collect::<HashSet<_>>().len() + png_count
+        }).chain(input.png_mattes.jpeg_fills.iter()
+            .filter(|fill| fill.managed_start.is_some())
+            .filter_map(|fill| fill.path.to_str()))
+            .filter(|path| !offline.contains(path)).collect::<HashSet<_>>().len() + extra_still_count
     });
     let has_verified_op1a = crate::managed_op1a::has_verified_streams(&read.graph);
     let mut document = if has_verified_op1a && rewrap_approved {
@@ -1054,7 +1068,8 @@ fn prepare_job(
     let media_linking = linked.then(|| MediaLinking {
         direct_files,
         premiere_files: document.assisted_originals().cloned().collect(),
-        rewrap_available: candidates.iter().filter(|clip| !clip.pending && !rewrap_approved)
+        rewrap_available: candidates.iter().filter(|clip|
+            !clip.pending && !rewrap_approved && !matte_only_ids.contains(clip.item))
             .map(|clip| clip.detail.clone()).collect(),
         rewrapped_clips: candidates.iter().filter(|clip| approved_items.contains(clip.item))
             .map(|clip| clip.detail.clone()).collect(),
@@ -1064,7 +1079,8 @@ fn prepare_job(
     let rewrap_sources = {
         let mut sources = media.as_ref().map(|plan| plan.estimate_sources()).unwrap_or_default();
         if !rewrap_approved && !candidates.is_empty() {
-            sources.extend(premiere_preparation::selective_rewrap_preview(&read.graph, &candidates));
+            let remaining = candidates.iter().filter(|clip| !matte_only_ids.contains(clip.item));
+            sources.extend(premiere_preparation::selective_rewrap_preview(&read.graph, remaining));
         }
         let mut seen = HashSet::new();
         sources.extend(read.proxy_bindings.iter().filter_map(|binding| {
@@ -1104,9 +1120,11 @@ fn prepare_job(
     for b in read.proxy_bindings.iter().filter(|b| b.audio.is_some()) {
         document.check_reserved_output(&b.path).map_err(|e|ReviewBlocker::new(ProxyMedia,e.to_string()))?;
     }
-    let native_subjects = locate_native_review_notes(&read.graph, &mut notes);
-    let gap_subjects = locate_source_media_gaps(&read.graph, &mut notes);
-    let mut subjects = review_subjects(&read.graph, &notes);
+    let mut diagnostic_locations = HashMap::new();
+    let mut locations = for_review.then_some(&mut diagnostic_locations);
+    let native_subjects = locate_native_review_notes(&read.graph, &mut notes, locations.as_deref_mut());
+    let gap_subjects = locate_source_media_gaps(&read.graph, &mut notes, locations.as_deref_mut());
+    let mut subjects = review_subjects(&read.graph, &notes, locations);
     subjects.extend(native_subjects);
     subjects.extend(gap_subjects);
     let review = Review {
@@ -1128,6 +1146,7 @@ fn prepare_job(
         source_groups: if for_review {
             review_source_groups(&read.graph, &notes, &bins)
         } else { Vec::new() },
+        diagnostic_locations,
         notes,
         cli_equivalent: cli_command(&spec).map_err(blocker(Retry))?,
     };
@@ -1184,28 +1203,37 @@ fn retain(job: &PreparedJob) -> Vec<PathBuf> {
     paths.dedup();
     paths
 }
-fn recheck_media(
-    inputs: &[SourceInput],
+fn recheck_job_sources(
+    job: &PreparedJob,
     cancel: &CancelToken,
     cb: &mut dyn FnMut(Progress),
-) -> Result<(), String> {
-    let total = inputs.len();
-    for (completed, input) in inputs.iter().enumerate() {
+) -> Result<Vec<OriginalStamp>, String> {
+    let bin_count = job.inputs.len();
+    let total_media = job.media_inputs.len();
+    let mut stamps = Vec::with_capacity(bin_count + total_media);
+    for (index, input) in job.inputs.iter().chain(&job.media_inputs).enumerate() {
         cancel.check()?;
-        let name = input.path.file_name().unwrap_or(input.path.as_os_str()).to_string_lossy();
-        cb(Progress {
-            stage: "source verification".into(),
-            current_bin: None,
-            completed,
-            total,
-            message: format!("Rechecking media {}/{}: {name}", completed + 1, total),
-        });
-        source_input::recheck_file_checked(input, &mut || cancel.check())?;
+        if index >= bin_count {
+            let completed = index - bin_count;
+            let name = input.path.file_name().unwrap_or(input.path.as_os_str()).to_string_lossy();
+            cb(Progress {
+                stage: "source verification".into(),
+                current_bin: None,
+                completed,
+                total: total_media,
+                message: format!("Rechecking media {}/{}: {name}", completed + 1, total_media),
+            });
+        }
+        stamps.push(source_input::recheck_file_and_stamp(input, &mut || cancel.check())?);
     }
-    Ok(())
+    // A bin or media file can change while a later input is being hashed.
+    cancel.check()?;
+    recheck_originals_checked(&stamps, &mut || cancel.check())?;
+    recheck_originals_checked(&job.originals, &mut || cancel.check())?;
+    Ok(stamps)
 }
 
-fn write_json<T: serde::Serialize>(
+pub(crate) fn write_json<T: serde::Serialize>(
     path: &Path,
     value: &T,
     owned: &mut Vec<PathBuf>,
@@ -1257,17 +1285,13 @@ pub fn execute(
             output::preflight(&job.spec.output, Some(path))?;
         }
         job.document.recheck_outputs().map_err(|e| e.to_string())?;
-        source_input::recheck_checked(&job.inputs, &mut || cancel.check())?;
-        recheck_media(&job.media_inputs, cancel, cb)?;
-        recheck_originals(&job.originals)?;
+        let mut source_stamps = recheck_job_sources(&job, cancel, cb)?;
         if job.document.assisted_originals().len() != 0 {
             phase = "Premiere media linking";
             progress(cb, "media", "Premiere is importing verified originals in a scratch project");
             avid::bind(&mut job.document)?;
             cancel.check()?;
-            source_input::recheck_checked(&job.inputs, &mut || cancel.check())?;
-            recheck_media(&job.media_inputs, cancel, cb)?;
-            recheck_originals(&job.originals)?;
+            source_stamps = recheck_job_sources(&job, cancel, cb)?;
             for path in job.document.assisted_originals() {
                 job.review.notes.push(note("info", "media",
                     format!("Used Premiere to link {path}"),
@@ -1293,16 +1317,17 @@ pub fn execute(
                 &mut |path| job.aux_outputs.push(path.to_owned()))?;
         }
         cancel.check()?;
-        // Media writes can take time. Link-only jobs already ran these checks
-        // immediately before publication.
+        // Media writes can take time. Link-only jobs already ran the content checks.
         if job.media.is_some() || writes_proxy {
-            source_input::recheck_checked(&job.inputs, &mut || cancel.check())?;
-            recheck_media(&job.media_inputs, cancel, cb)?;
-            recheck_originals(&job.originals)?;
+            source_stamps = recheck_job_sources(&job, cancel, cb)?;
         }
         phase = "asset publication";
         progress(cb, "publication", "Publishing prepared assets and project");
         job.document.publish_assets().map_err(|e| e.to_string())?;
+        cancel.check()?;
+        phase = "source recheck before project publication";
+        recheck_originals_checked(&source_stamps, &mut || cancel.check())?;
+        recheck_originals_checked(&job.originals, &mut || cancel.check())?;
         cancel.check()?;
         phase = "project publication";
         let preparation_notes = job.document.report().notes.len();
@@ -1458,7 +1483,7 @@ mod tests {
             note("loss", "occurrence:1", "Alternate audio", "group_audio_editability"),
             note("loss", "group:1", "Group metadata", "group_metadata"),
         ];
-        let labels = review_subjects(&source, &notes);
+        let labels = review_subjects(&source, &notes, None);
         assert_eq!(labels["occurrence:1"], "Same name · A2 · 00:01:00;02");
         assert_eq!(labels["group:1"], "Two cameras");
         let mut same_name = source.sequences[0].clone();
@@ -1467,9 +1492,9 @@ mod tests {
         same_name.start = None;
         source.sequences.push(same_name);
         source.multicam_uses[0].sequence = "seq:2".into();
-        assert_eq!(review_subjects(&source, &notes)["occurrence:1"], "Same name · A2 · frame 1 from sequence start");
+        assert_eq!(review_subjects(&source, &notes, None)["occurrence:1"], "Same name · A2 · frame 1 from sequence start");
         source.multicam_uses[0].record_start = Rational::new(1, 48_000);
-        assert_eq!(review_subjects(&source, &notes)["occurrence:1"], "Same name · A2");
+        assert_eq!(review_subjects(&source, &notes, None)["occurrence:1"], "Same name · A2");
 
         let mut report = prproj::convert::writer::Report::default();
         for sequence in 0..2 {
@@ -1537,7 +1562,7 @@ mod tests {
         };
         sequence.placements[0].record_start = Rational::new(1, 48_000).unwrap();
         source.sequences.push(sequence);
-        let labels = review_subjects(&source, &notes);
+        let labels = review_subjects(&source, &notes, None);
         assert_eq!(labels["dissolve"], "Same name · V5 · frame 1 from sequence start");
         assert_eq!(labels["edit"], "Same name · A7");
         assert_eq!(labels["picture"], "Same name · V9 · frame 24 from sequence start");
@@ -1902,6 +1927,45 @@ mod tests {
     }
 
     #[test]
+    fn review_uses_exact_saved_clock_for_native_picture_effects() {
+        let mut graph = premiere_edit_review_graph();
+        let sequence = &mut graph.sequences[0];
+        sequence.rate = graph::Rational::parse("24000/1001").unwrap();
+        graph.sidecars[2].data = graph::json::parse(r#"{"unresolved":[
+            {"owner":"first/matte","kind":1,"track":2,
+             "record_start":{"value":168},"record_rate":"24000/1001"},
+            {"owner":"first/other_clock","kind":1,"track":2,
+             "record_start":{"value":168},"record_rate":"24"},
+            {"owner":"first/duplicate","kind":1,"track":2},
+            {"owner":"first/duplicate","kind":1,"track":3},
+            {"owner":"second/matte","kind":1,"track":3,
+             "record_start":{"value":168},"record_rate":"24"}
+        ]}"#).unwrap();
+        graph.validate().unwrap();
+        let notes = ["first/matte", "first/other_clock", "first/duplicate", "second/matte"]
+            .map(|owner| note("loss", owner, "Saved overlay omitted", "picture_effect"));
+        let mut locations = HashMap::new();
+        let subjects = review_subjects(&graph, &notes, Some(&mut locations));
+        assert_eq!(subjects["first/matte"], "Same name · V2 · frame 168 from sequence start · picture effect");
+        assert_eq!(subjects["first/other_clock"], "Same name · V2 · picture effect");
+        assert!(locations[&0].record_offset.is_some());
+        assert!(locations[&1].record_offset.is_none());
+        assert_eq!(subjects["first/duplicate"], "Same name");
+        assert_eq!(subjects["second/matte"], "Same name");
+
+        let mut issue = ReviewBlocker::new(BlockerKind::OriginalMedia, "PNG decode failed");
+        let owners = HashMap::from([("first".into(), 0), ("second".into(), 1)]);
+        let bins = [PathBuf::from("First/Edit.avb"), PathBuf::from("Second/Edit.avb")];
+        media_blocker::append_png_edit(&mut issue, &graph, &owners, &bins, crate::png_mattes::FailedPngEdit {
+            sequence: "first".into(), id: "first/matte".into(), track: 2,
+            record_start: graph::Rational::new(168 * 1001, 24_000), saved_locators: vec![],
+            shared_overlay_source: false,
+        }, &CancelToken::default());
+        assert_eq!(issue.affected, ["Same name · V2 · frame 168 from sequence start · PNG source preparation failed · edit first/matte"]);
+        assert_eq!(issue.timeline_groups[0].bin.as_ref(), Some(&bins[0]));
+    }
+
+    #[test]
     fn review_locates_disabled_gap_notes_using_saved_owner_and_clock() {
         let mut graph = premiere_edit_review_graph();
         graph.sidecars[2].data = graph::json::parse(r#"{"unresolved":[
@@ -1923,13 +1987,13 @@ mod tests {
             note("loss", "second", "first/native/1: Different saved owner", "disabled_clip"),
             note("loss", "second/portable", "Disabled source edit kept as a gap", "disabled_clip"),
         ];
-        let subjects = locate_native_review_notes(&graph, &mut notes);
+        let subjects = locate_native_review_notes(&graph, &mut notes, None);
         assert_eq!(subjects["first/native/1"], "Same name · V4 · frame 48 from sequence start · disabled edit");
         assert_eq!(subjects["first/native/2"], "Same name · A2 · disabled edit");
         assert_eq!(notes.each_ref().map(|n| n.object.as_str()), [
             "first/native/1", "first/native/2", "first", "second", "second/portable",
         ]);
-        assert_eq!(review_subjects(&graph, &notes)["second/portable"],
+        assert_eq!(review_subjects(&graph, &notes, None)["second/portable"],
             "Same name · A7 · 1/48000 seconds from sequence start · disabled edit");
         let bins = [PathBuf::from("First/Edit.avb"), PathBuf::from("Second/Edit.avb")];
         let owners = HashMap::from([("first".into(), 0), ("second".into(), 1)]);
@@ -1970,7 +2034,7 @@ mod tests {
             note("loss", "second", "first/route/1: master clip was not converted", "source_route"),
         ];
         let messages = notes.each_ref().map(|note| note.message.clone());
-        let subjects = locate_native_review_notes(&graph, &mut notes);
+        let subjects = locate_native_review_notes(&graph, &mut notes, None);
         assert_eq!(subjects.len(), 3);
         assert_eq!(subjects["first/route/1"], "Same name · V4 · frame 48 from sequence start · omitted edit");
         assert_eq!(subjects["first/route/2"], "Same name · A2 · omitted edit");
@@ -2032,7 +2096,7 @@ mod tests {
             note("loss", "first", "Source has a graph placement.", "media_gap"),
             note("loss", "first/edit", "Destination-only gap.", "media_gap"),
         ];
-        let subjects = locate_source_media_gaps(&source, &mut notes);
+        let subjects = locate_source_media_gaps(&source, &mut notes, None);
         assert_eq!(notes.each_ref().map(|row| row.object.as_str()), [
             "first/gap", "second", "first", "first", "first/edit",
         ]);
@@ -2067,7 +2131,7 @@ mod tests {
             note("loss", "title:1", "Missing saved time", "text"),
             note("loss", "caption:1", "Appearance not carried", "text_appearance"),
         ];
-        let subjects = review_subjects(&source, &notes);
+        let subjects = review_subjects(&source, &notes, None);
         assert_eq!(subjects["caption:1"], "Same name · V3 · 1/48000 seconds from sequence start · caption");
         assert_eq!(subjects["title:1"], "Same name · V5 · title");
 
@@ -2371,6 +2435,7 @@ mod tests {
                 timeline_groups: vec![],
                 source_groups: vec![],
                 cli_equivalent: String::new(),
+                diagnostic_locations: HashMap::new(),
             },
             document,
             media: None,
@@ -2512,6 +2577,87 @@ mod tests {
         assert!(!t.0.join("new.prproj").exists());
         assert_eq!(std::fs::read(media).unwrap(), b"other");
     }
+
+    #[test]
+    fn linked_media_removed_while_checking_a_later_file_blocks_publication() {
+        let t = Scratch::new();
+        let mut job = prepared(&t.0);
+        let paths = [t.0.join("picture.mxf"), t.0.join("audio.mxf")];
+        for path in &paths {
+            std::fs::write(path, b"synthetic media").unwrap();
+        }
+        job.media_inputs = source_input::pin(&paths).unwrap();
+        let done = execute(job, &CancelToken::default(), &mut |p| {
+            assert_ne!(p.stage, "publication");
+            if p.stage == "source verification" && p.completed == 1 {
+                std::fs::remove_file(&paths[0]).unwrap();
+            }
+        });
+        assert_eq!(done.status, CompletionStatus::Failed);
+        assert!(done.message.contains(paths[0].to_str().unwrap()));
+        assert!(done.output.is_none());
+        assert!(!t.0.join("new.prproj").exists());
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), b"synthetic media");
+    }
+
+    #[test]
+    fn source_bin_moved_after_hashing_blocks_publication() {
+        for boundary in ["source verification", "publication"] {
+            let t = Scratch::new();
+            let mut job = prepared(&t.0);
+            let bin = t.0.join("source.avb");
+            let moved = t.0.join("moved.avb");
+            let media = t.0.join("picture.mxf");
+            std::fs::write(&bin, b"synthetic source bin").unwrap();
+            std::fs::write(&media, b"synthetic media").unwrap();
+            job.inputs = source_input::pin(std::slice::from_ref(&bin)).unwrap();
+            job.media_inputs = source_input::pin(std::slice::from_ref(&media)).unwrap();
+            let done = execute(job, &CancelToken::default(), &mut |p| {
+                if p.stage == boundary {
+                    std::fs::rename(&bin, &moved).unwrap();
+                }
+            });
+            assert_eq!(done.status, CompletionStatus::Failed, "{boundary}");
+            assert!(done.message.contains(bin.to_str().unwrap()));
+            assert!(done.output.is_none());
+            assert!(!t.0.join("new.prproj").exists());
+            assert_eq!(std::fs::read(moved).unwrap(), b"synthetic source bin");
+            assert_eq!(std::fs::read(media).unwrap(), b"synthetic media");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_media_replaced_at_asset_publication_with_same_size_and_mtime_refuses() {
+        let t = Scratch::new();
+        let media = t.0.join("source.mxf");
+        let replacement = t.0.join("replacement.mxf");
+        std::fs::write(&media, b"first").unwrap();
+        std::fs::write(&replacement, b"other").unwrap();
+        let mtime = std::fs::metadata(&media).unwrap().modified().unwrap();
+        std::fs::File::open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&replacement).unwrap().modified().unwrap(),
+            mtime
+        );
+        let mut job = prepared(&t.0);
+        job.media_inputs = source_input::pin(std::slice::from_ref(&media)).unwrap();
+        let done = execute(job, &CancelToken::default(), &mut |p| {
+            if p.stage == "publication" {
+                std::fs::rename(&replacement, &media).unwrap();
+            }
+        });
+        assert_eq!(done.status, CompletionStatus::Failed);
+        assert!(done.message.contains(media.to_str().unwrap()));
+        assert!(!t.0.join("new.prproj").exists());
+        assert_eq!(std::fs::read(media).unwrap(), b"other");
+        assert!(done.report.iter().any(|row| row.severity == "error"
+            && row.object == "source recheck before project publication"));
+    }
+
     #[test]
     fn linked_media_recheck_reports_each_file_and_honors_cancellation() {
         let t = Scratch::new();

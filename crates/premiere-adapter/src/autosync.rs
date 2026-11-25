@@ -1,8 +1,7 @@
 //! Rebuild a saved split-source AutoSync subclip as a reusable Premiere sequence.
 use super::subclips::{field_int, mob_id};
 use super::*;
-
-const FRAME: i64 = TICKS_PER_SECOND / 24;
+use prproj::convert::prepared::SampleRepresentation;
 
 pub(super) fn prepare(
     row: &Value,
@@ -13,6 +12,13 @@ pub(super) fn prepare(
     clips: &HashMap<&str, &PreparedClip>,
     sidecars: &Sidecars<'_>,
 ) -> Result<(Sequence, bool), &'static str> {
+    let rate_label = key(row, "rate").and_then(str_value);
+    let (rate, split_wavs) = match rate_label {
+        Some("24") => (Rational::integer(24), false),
+        Some("24000/1001") => (Rational::new(24_000, 1001).unwrap(), true),
+        _ => return Err("AutoSync requires a supported exact picture rate"),
+    };
+    let frame = model::ticks_per_unit(fraction(rate));
     let backing = field_int(row, "backing_length").ok_or("saved backing length is unresolved")?;
     let bound = |key_name| key(row, key_name).and_then(|value| field_int(value, "value"));
     let (start, end) = bound("start")
@@ -20,6 +26,9 @@ pub(super) fn prepare(
         .ok_or("saved In and Out are unresolved")?;
     if !(0 <= start && start < end && end <= backing) || !(2..=9).contains(&tracks.len()) {
         return Err("AutoSync requires a bounded V1 range and up to eight independent mono lanes");
+    }
+    if split_wavs && tracks.len() != 3 {
+        return Err("23.976 AutoSync requires V1 and two independent linked mono WAVs");
     }
     let native_mob = key(row, "mob").and_then(str_value);
     let from_track =
@@ -30,9 +39,9 @@ pub(super) fn prepare(
             let t = matches.next().ok_or("AutoSync source lane is missing")?;
             if matches.next().is_some()
                 || key(t, "component_class").and_then(str_value) != Some("SCLP")
-                || key(t, "rate").and_then(str_value) != Some("24")
+                || key(t, "rate").and_then(str_value) != rate_label
                 || field_int(t, "length") != Some(backing)
-                || field_int(t, "target_track") != Some(number)
+                || field_int(t, "target_track") != Some(if split_wavs { 1 } else { number })
             {
                 return Err(
                 "AutoSync source lane is ambiguous or is not a direct same-rate source reference",
@@ -46,7 +55,7 @@ pub(super) fn prepare(
                 parents.get(mob).copied().flatten().ok_or(
                     "AutoSync backing master is missing or ambiguous in the selected bins",
                 )?;
-            if item.rate != Some(Rational::integer(24))
+            if item.rate != Some(rate)
                 || !item.markers.is_empty()
                 || !item.stream_groups.is_empty()
             {
@@ -71,20 +80,21 @@ pub(super) fn prepare(
         .video
         .as_ref()
         .ok_or("AutoSync picture is unavailable")?;
-    let fits = |offset: i64, duration: i64| {
-        offset
-            .checked_add(backing)
-            .and_then(|n| n.checked_mul(FRAME))
-            .is_some_and(|out| out <= duration)
-    };
+    let backing_end = |offset: i64| offset.checked_add(backing).and_then(|n| n.checked_mul(frame));
+    let fits = |offset, duration| backing_end(offset).is_some_and(|out| out <= duration);
+    let picture_codec = if split_wavs { "apch" } else { "avc1" };
     if clip.audio.is_some()
         || clip.container != "mov"
-        || picture.codec != "avc1"
-        || picture.rate != Fraction::new(24, 1)
+        || picture.codec != picture_codec
+        || picture.rate != fraction(rate)
         || (picture.width, picture.height) != (1920, 1080)
         || !fits(picture_offset, picture.duration)
     {
-        return Err("AutoSync requires a linked 1080p24 H.264 picture-only original with enough source frames");
+        return Err(if split_wavs {
+            "AutoSync requires a linked 1080p23.976 ProRes HQ picture-only original with enough source frames"
+        } else {
+            "AutoSync requires a linked 1080p24 H.264 picture-only original with enough source frames"
+        });
     }
     let [reference] = &camera.media[..] else {
         return Err("AutoSync requires exactly one picture reference");
@@ -93,8 +103,8 @@ pub(super) fn prepare(
     if reference.source_offset != Some(Rational::ZERO) || picture_media.online != Some(true) {
         return Err("AutoSync picture offset or online link is unverified");
     }
-    let duration = (end - start) * FRAME;
-    let picture_in = (picture_offset + start) * FRAME;
+    let duration = (end - start) * frame;
+    let picture_in = (picture_offset + start) * frame;
     let event = |id: &str, source_in, video_track, audio_tracks, audio_channels| Event {
         clip: id.into(),
         record_start: 0,
@@ -127,6 +137,12 @@ pub(super) fn prepare(
     let channel_count = tracks.len() - 1;
     for lane in 1..=channel_count as i64 {
         let (sound, audio_clip, offset) = from_track(2, lane)?;
+        if split_wavs {
+            let end = backing_end(offset).ok_or("AutoSync WAV backing extent overflows")?;
+            validate_split_wav(sound, audio_clip, media, &mut paths, end)?;
+            events.push(event(audio_clip.id(), (offset + start) * frame, None, vec![lane], vec![1]));
+            continue;
+        }
         if sound.id != sound_item.id || sound.id == camera.id || offset != sound_offset {
             return Err("AutoSync audio lanes need one separate sound master with a common saved offset");
         }
@@ -146,7 +162,7 @@ pub(super) fn prepare(
             {
                 return Err("AutoSync requires all eight verified original WAV mono channels");
             }
-            events.push(event(audio_clip.id(), (offset + start) * FRAME, None, vec![lane], vec![lane]));
+            events.push(event(audio_clip.id(), (offset + start) * frame, None, vec![lane], vec![lane]));
             continue;
         }
         let PreparedClip::Legacy(audio) = audio_clip else { unreachable!() };
@@ -173,7 +189,7 @@ pub(super) fn prepare(
         }
         events.push(event(
             audio_clip.id(),
-            (offset + start) * FRAME,
+            (offset + start) * frame,
             None,
             vec![lane],
             vec![lane],
@@ -184,10 +200,15 @@ pub(super) fn prepare(
     let clock = picture_media.clock.as_ref().and_then(|clock| {
         clock.exact_start().filter(|start| {
             Some(*start) == picture_media.start
-                && clock.rate == Rational::integer(24)
+                && clock.rate == rate
                 && !clock.drop
         })
     });
+    if split_wavs && (clip.proxy_path.is_some() || !clock.is_some_and(|start|
+        ticks(start, "AutoSync source clock").ok() == Some(picture.source_start)))
+    {
+        return Err("23.976 AutoSync requires a verified non-drop picture source clock and original link");
+    }
     let start = match clock {
         None => 0,
         Some(start) => ticks(start, "AutoSync source clock")
@@ -207,4 +228,30 @@ pub(super) fn prepare(
         start,
     };
     Ok((sequence, clock.is_some()))
+}
+
+fn validate_split_wav<'a>(
+    sound: &SourceItem,
+    clip: &'a PreparedClip,
+    media: &HashMap<&str, &SourceMedia>,
+    paths: &mut HashSet<&'a str>,
+    backing_end: i64,
+) -> Result<(), &'static str> {
+    let unsupported = "23.976 AutoSync requires two distinct online mono PCM24 WAVs with verified ranges";
+    let PreparedClip::Original(clip) = clip else { return Err(unsupported) };
+    let [reference] = sound.media.as_slice() else { return Err(unsupported) };
+    let source = media[reference.media.as_str()];
+    if clip.container != "wav" || clip.video.is_some() || clip.proxy_path.is_some()
+        || !clip.audio.as_ref().is_some_and(|audio| {
+            audio.sample_rate == 48_000 && audio.channels == 1 && audio.stream_index == 0
+                && audio.representation == SampleRepresentation::Pcm24 && backing_end <= audio.duration
+        })
+        || source.kind != StreamKind::Audio || source.stream != Some(1) || source.online != Some(true)
+        || reference.gain_db != 0.0 || reference.source_offset != Some(Rational::ZERO)
+        || !matches!(clip.channels.as_slice(), [channel] if channel.avid_track == 1 && channel.channel_index == 0)
+        || !paths.insert(clip.path.as_str())
+    {
+        return Err(unsupported);
+    }
+    Ok(())
 }

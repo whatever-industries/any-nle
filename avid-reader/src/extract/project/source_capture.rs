@@ -708,7 +708,8 @@ impl InputContext {
         }
         let import = picture_import(ctx, attrs, &self.budget);
         if import.locators.is_empty() || import.locators.iter().any(|path| {
-            !path.rsplit_once('.').is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("png"))
+            !path.rsplit_once('.').is_some_and(|(_, suffix)| ["png", "jpg", "jpeg"]
+                .iter().any(|ext| suffix.eq_ignore_ascii_case(ext)))
         }) {
             return None;
         }
@@ -1981,13 +1982,22 @@ impl Capture {
                     return;
                 }
                 let inputs = matte_inputs(ctx, node);
-                issue.matte_import = matte_import(ctx, &inputs, ambiguous, &self.budget);
+                let split = matches!((length, self.rate), (Some(span), Some(rate))
+                    if track >= 2 && matte::split_still(ctx, node, &inputs, ambiguous, rate, span));
+                issue.matte_import = matte_import(ctx, &inputs, split, ambiguous, &self.budget);
                 issue.matte_inputs = Some(Box::new(inputs));
                 if let (Some(1), Some(import)) = (length, &issue.matte_import) {
                     if self.rate == Rate::new(24, 1)
                         && matte::imported_png(ctx, node, &inputs, import)
                     {
                         issue.picture_profile = Some(SourcePictureProfile::ImportedPngMatte);
+                    }
+                }
+                if let (Some(span), Some(rate), Some(import)) = (length, self.rate, &issue.matte_import) {
+                    if split && matte::png_alpha_import(import) {
+                        issue.picture_profile = Some(SourcePictureProfile::SplitStillMatte);
+                    } else if track == 2 && matte::imported_png_overlay(ctx, node, &inputs, import, rate, span) {
+                        issue.picture_profile = Some(SourcePictureProfile::ImportedPngMatteOverlay);
                     }
                 }
                 if let (Some(span), Some(matte)) = (length, inputs.matte) {
@@ -2677,13 +2687,13 @@ fn plain_layered_submaster(
 }
 
 fn matte_import(
-    ctx: &Ctx<'_>, inputs: &MatteInputs, ambiguous: &HashSet<MobId>, budget: &SharedBudget,
+    ctx: &Ctx<'_>, inputs: &MatteInputs, split: bool, ambiguous: &HashSet<MobId>, budget: &SharedBudget,
 ) -> Option<MatteImport> {
     let (fill, matte) = (inputs.fill?, inputs.matte?);
-    if fill.mob != matte.mob || fill.track == matte.track || ambiguous.contains(&fill.mob) {
+    if (!split && fill.mob != matte.mob) || fill.track == matte.track || ambiguous.contains(&matte.mob) {
         return None;
     }
-    let master = ctx.mobs.get(&fill.mob)?;
+    let master = ctx.mobs.get(&matte.mob)?;
     if int(master, "mob_type_id") != Some(MOB_MASTER) {
         return None;
     }

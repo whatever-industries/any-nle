@@ -5,6 +5,7 @@
   "license": "LGPL-2.1-or-later",
   "configure": [
     "--disable-autodetect",
+    "--enable-zlib",
     "--disable-gpl",
     "--disable-nonfree",
     "--disable-version3",

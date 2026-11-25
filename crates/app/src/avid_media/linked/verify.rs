@@ -1,5 +1,5 @@
 //! Check the saved stream, clock, and range against the online original.
-use super::{Result, Route, RASTER, RATE};
+use super::{mp4, EditRate, Result, Route, SourceSet, RASTER, TIMECODE_BASE};
 use crate::{
     avid_media::{frame_extent, Stream},
     backend_bundle::BackendTools,
@@ -48,8 +48,50 @@ struct TimecodeTag {
     timecode: Option<String>,
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn avc_aac(
+    source: &SourceSet<'_>,
+    rate: EditRate,
+    tools: &BackendTools,
+) -> Result<mp4::Encoding> {
+    let [picture, left, _] = &source.routes;
+    let path = Path::new(picture.path);
+    if fs::canonicalize(path)? != path {
+        return Err(format!(
+            "{}: original locator is no longer canonical",
+            path.display()
+        )
+        .into());
+    }
+    let media = anynle_resolve_adapter::verify_avid_avc_aac(path, &tools.ffprobe)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if media.rate != rate.exact()
+        || media.picture_base != picture.stream.time_base
+        || media.picture_ticks != picture.stream.duration_ts
+        || media.audio_samples != left.stream.duration_ts
+        || media.timecode != format_timecode(i64::from(picture.clock), TIMECODE_BASE)
+        || media.srgb != source.srgb_as_rec709()
+    {
+        return Err(format!(
+            "{}: AVC/AAC clock, extent or interpretation disagrees with graph/2",
+            path.display()
+        )
+        .into());
+    }
+    Ok(mp4::Encoding {
+        level: media.level,
+        audio_samples: media.audio_samples,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn avc_aac(_: &SourceSet<'_>, _: EditRate, _: &BackendTools) -> Result<mp4::Encoding> {
+    Err("native AVC/AAC links require macOS".into())
+}
+
 pub(super) fn original(
     route: &Route<'_>,
+    rate: EditRate,
     picture: bool,
     generate: bool,
     tools: &BackendTools,
@@ -71,7 +113,9 @@ pub(super) fn original(
     let metadata: PhysicalMetadata = serde_json::from_str(&data)?;
     let stream = match metadata.streams.as_slice() {
         [video, tc] if picture => {
-            let label = format_timecode(i64::from(route.clock), RATE);
+            let label = format_timecode(i64::from(route.clock), TIMECODE_BASE);
+            let exact = rate.exact();
+            let ffprobe_rate = format!("{}/{}", exact.num(), exact.den());
             let has_label = |s: &PhysicalStream| {
                 s.tags.as_ref().and_then(|tags| tags.timecode.as_deref()) == Some(label.as_str())
             };
@@ -79,7 +123,7 @@ pub(super) fn original(
                 || video.stream.codec_name.as_deref() != Some("prores")
                 || video.codec_tag_string != "apch"
                 || video.profile.as_deref() != Some("HQ")
-                || video.avg_frame_rate.as_deref() != Some("24/1")
+                || video.avg_frame_rate.as_deref() != Some(ffprobe_rate.as_str())
                 || video.start_pts != Some(0)
                 || video.stream.width.zip(video.stream.height) != Some(RASTER)
                 || video.stream.pix_fmt.as_deref() != Some("yuv422p10le")
@@ -164,9 +208,10 @@ pub(super) fn original(
         &tools.ffprobe,
         path,
         &stream.stream,
-        picture.then_some(Rational::integer(RATE)),
+        picture.then_some(rate.exact()),
     )?;
-    let expected_units = i64::from(route.extent) * if picture { 1 } else { 2000 };
+    let expected_units =
+        i64::from(route.extent) * if picture { 1 } else { rate.samples_per_frame() };
     if stream.stream.index != 0
         || stream.start_pts.unwrap_or(0) != 0
         || Rational::parse(&stream.stream.time_base) != Some(route.stream.time_base)

@@ -359,7 +359,9 @@ fn check_wave_extent(path: &Path, samples: i64, channels: i64, bits: i64) -> Res
     Err(fail())
 }
 
-fn atom(entry: &Entry, path: &Path, ffprobe: &Path) -> Result<(), String> {
+fn atom(
+    entry: &Entry, path: &Path, ffprobe: &Path, reason: &mut crate::diagnostics::Reason,
+) -> Result<(), String> {
     let identity = avid_reader::mxf::read_identity(path).map_err(|e| e.to_string())?;
     let package = entry
         .package
@@ -367,6 +369,7 @@ fn atom(entry: &Entry, path: &Path, ffprobe: &Path) -> Result<(), String> {
         .ok_or("saved file package is missing")?;
     if identity.file_packages.as_slice() != [package.as_str()] || identity.file_essence_tracks != 1
     {
+        *reason = crate::diagnostics::Reason::MxfPackageMismatch;
         return Err(format!("expected exactly one essence track for saved file package {package}; check the sibling"));
     }
     let clock = identity
@@ -520,6 +523,25 @@ pub(crate) fn verify(
     checksums: Option<&Path>,
     ffprobe: &Path,
 ) -> Result<(), String> {
+    verify_mappings(report, moves, checksums, ffprobe, &mut crate::diagnostics::Reason::RelinkRejected,
+        |mapping| println!("Verified {} → {}", mapping.original, mapping.destination.display()))
+        .map(|_| ())
+}
+
+pub(crate) fn verify_diagnostics(report: &Path, moves: &Path, checksums: Option<&Path>, ffprobe: &Path) -> crate::diagnostics::Diagnostics {
+    let mut reason = crate::diagnostics::Reason::RelinkRejected;
+    let result = verify_mappings(report, moves, checksums, ffprobe, &mut reason, |_| {});
+    crate::diagnostics::Diagnostics::relink(result.map_err(|_| reason))
+}
+
+fn verify_mappings(
+    report: &Path,
+    moves: &Path,
+    checksums: Option<&Path>,
+    ffprobe: &Path,
+    reason: &mut crate::diagnostics::Reason,
+    mut verified: impl FnMut(&Move),
+) -> Result<usize, String> {
     let report: Report = read_json(report, 64 << 20)?;
     let moves: Vec<Move> = read_json(moves, 1 << 20)?;
     if report.schema != "anynle.offline-relink/1" || moves.is_empty() {
@@ -598,8 +620,12 @@ pub(crate) fn verify(
                 "mappings must be unique and target an absolute path without parent escapes".into(),
             );
         }
-        let path =
-            fs::canonicalize(candidate).map_err(|e| format!("{}: {e}", candidate.display()))?;
+        let path = fs::canonicalize(candidate).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                *reason = crate::diagnostics::Reason::RelinkCandidateMissing;
+            }
+            format!("{}: {e}", candidate.display())
+        })?;
         let before = stamp(&path)?;
         if checked.contains_key(&path) || online.contains(&path) {
             return Err(format!(
@@ -617,13 +643,13 @@ pub(crate) fn verify(
                 ));
             }
         }
-        let check = || {
+        let mut check = || {
             if let Some(package) = &rows[0].package {
                 if rows.iter().any(|e| e.package.as_ref() != Some(package)) {
                     return Err("conflicting file packages share the saved path".into());
                 }
                 for entry in rows {
-                    atom(entry, &path, ffprobe)?;
+                    atom(entry, &path, ffprobe, reason)?;
                 }
             } else {
                 let basename = rows[0]
@@ -672,11 +698,7 @@ pub(crate) fn verify(
         }
     }
     for mapping in &moves {
-        println!(
-            "Verified {} → {}",
-            mapping.original,
-            mapping.destination.display()
-        );
+        verified(mapping);
     }
-    Ok(())
+    Ok(moves.len())
 }

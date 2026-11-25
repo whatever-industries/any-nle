@@ -1,46 +1,175 @@
 //! Validate the graph and resolve each edit to its saved physical stream.
-use super::{markers, Plan, Result, Route, Span, RASTER, RATE};
-use graph::{source::SourceGraph, Rational, StreamKind};
-use std::path::Path;
+use super::{
+    markers,
+    source_profile::{MediaIndex, Profile},
+    transition, EditBinding, EditRate, Plan, PreparedEdit, Result, Span, RASTER, TIMECODE_BASE,
+};
+use graph::{
+    source::{SourceGraph, SourceSequence},
+    Rational, StreamKind,
+};
 
-fn captured_receipt(row: &graph::Sidecar) -> bool {
-    use graph::Value;
-    match row.adapter.as_str() {
-        // The native entry points validate the saved mixers before handing
-        // the graph to this destination. Keep the qualifying receipts intact.
-        "premiere.source"
-        | "premiere.media_capture"
-        | "premiere.media_identity"
-        | "premiere.audio_groups"
-        | "resolve.fairlight"
-        | "resolve.active_timeline"
-        | "resolve.bin_order" => true,
-        "resolve.media_metadata" => matches!(&row.data, Value::Obj(fields)
-            if fields.iter().all(|(field, _)| field == "UniqueMediaPoolItemId" || field == "Reel")),
-        "resolve.source" => matches!(&row.data, Value::Obj(fields)
-            if fields.iter().all(|(field, _)| matches!(field.as_str(),
-                "kind" | "cache_frames" | "video_cache_count" | "saved_selector"
-                | "saved_cache_track" | "saved_channel" | "cache_samples" | "audio_import_rate"
-                | "timeline_handle" | "media_pool_clip" | "bin_id" | "record_origin" | "record_length"))),
-        _ => false,
-    }
+pub(super) fn frames(rate: EditRate, time: Rational) -> Option<u32> {
+    rate.frames(time)?.try_into().ok()
 }
 
-fn frames(time: Rational) -> Option<u32> {
-    time.to_units(RATE)?.try_into().ok()
+pub(super) fn timeline_clock(rate: EditRate, time: Option<Rational>) -> Option<u32> {
+    frames(rate, time?).filter(|count| *count < 86_400 * TIMECODE_BASE as u32)
 }
 
-fn timeline_clock(time: Option<Rational>) -> Option<u32> {
-    frames(time?).filter(|count| *count < 86_400 * RATE as u32)
-}
-
-fn matches_clock(clock: Option<&graph::source::SourceClock>, start: u32) -> bool {
+pub(super) fn matches_clock(
+    clock: Option<&graph::source::SourceClock>,
+    start: u32,
+    rate: EditRate,
+) -> bool {
     clock.is_none_or(|clock| {
         clock.effective_count == u64::from(start)
-            && clock.rate == Rational::integer(RATE)
+            && clock.rate == rate.exact()
             && clock.display_base == 24
             && !clock.drop
     })
+}
+
+pub(super) fn neutral_edit(edit: &graph::Placement, picture: bool) -> bool {
+    let separate = if picture {
+        edit.audio_tracks.is_empty() && edit.audio_streams.is_empty()
+    } else {
+        edit.video_track.is_none()
+    };
+    separate
+        && edit.grouped_audio.is_empty()
+        && edit.gain_db == 0.0
+        && matches!(edit.volume_db, None | Some(0.0))
+        && edit.volume_keys.is_empty()
+        && edit
+            .track_gains_db
+            .iter()
+            .all(|gain| matches!(gain, None | Some(0.0)))
+        && edit.track_pans.iter().all(Option::is_none)
+        && edit.speed.is_none()
+        && edit.frame_map.is_none()
+        && edit.transform.is_none()
+        && edit.effects.is_empty()
+}
+
+pub(super) fn prepare_span(
+    occurrence: &graph::Placement,
+    source_offset: Option<Rational>,
+    extent: u32,
+    rate: EditRate,
+) -> Result<Span> {
+    let source = source_offset.and_then(|offset| occurrence.source_in.checked_add(offset));
+    let span = Span {
+        record: frames(rate, occurrence.record_start)
+            .ok_or_else(|| format!("{}: record start is not on the frame grid", occurrence.id))?,
+        source: source.and_then(|time| frames(rate, time)).ok_or_else(|| {
+            format!(
+                "{}: source trim has an unknown offset or falls off the frame grid",
+                occurrence.id
+            )
+        })?,
+        length: frames(rate, occurrence.duration)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                format!(
+                    "{}: edit needs a positive whole-frame duration",
+                    occurrence.id
+                )
+            })?,
+    };
+    if span
+        .source
+        .checked_add(span.length)
+        .is_none_or(|end| end > extent)
+        || span.source > i32::MAX as u32
+    {
+        return Err(format!(
+            "{}: source range exceeds the original extent",
+            occurrence.id
+        )
+        .into());
+    }
+    if span.record.checked_add(span.length).is_none() {
+        return Err(format!("{}: record range overflows", occurrence.id).into());
+    }
+    Ok(span)
+}
+
+pub(super) const LANES: [(StreamKind, i64, &str); 3] = [
+    (StreamKind::Video, 1, "V1"),
+    (StreamKind::Audio, 1, "A1"),
+    (StreamKind::Audio, 2, "A2"),
+];
+
+pub(super) fn neutral_sequence(
+    graph: &SourceGraph,
+    sequence: &SourceSequence,
+    start: u32,
+    rate: EditRate,
+    allow_empty_tracks: bool,
+) -> bool {
+    sequence.frame_size == Some(RASTER)
+        && !sequence.name.trim().is_empty()
+        && matches_clock(sequence.clock.as_ref(), start, rate)
+        && sequence.texts.is_empty()
+        && sequence.disabled_placements.is_empty()
+        && graph.losses.is_empty()
+        && graph.multicams.is_empty()
+        && graph.multicam_uses.is_empty()
+        && sequence
+            .tracks
+            .iter()
+            .filter(|t| !allow_empty_tracks || !t.empty)
+            .count()
+            == 3
+}
+
+pub(super) fn lane_edits(
+    sequence: &SourceSequence,
+    lane_index: usize,
+) -> Result<Vec<&graph::Placement>> {
+    let (kind, lane, label) = LANES[lane_index];
+    if !sequence.tracks.iter().any(|track| {
+        track.kind == kind
+            && track.index == lane
+            && !track.empty
+            && matches!(track.level_db, None | Some(0.0))
+            && track.name.as_deref().is_none_or(|name| name == label)
+    }) {
+        return Err(format!("{label}: missing neutral track").into());
+    }
+    Ok(sequence
+        .placements
+        .iter()
+        .filter(|edit| {
+            if kind == StreamKind::Video {
+                edit.video_track == Some(lane)
+            } else {
+                edit.audio_tracks == [lane]
+            }
+        })
+        .collect())
+}
+
+pub(super) fn prepare_transitions(
+    sequence: &SourceSequence,
+    lane_index: usize,
+    rate: EditRate,
+    edits: &mut [(&str, PreparedEdit)],
+) -> Result<Vec<transition::Transition>> {
+    let (kind, lane, label) = LANES[lane_index];
+    edits.sort_by_key(|(_, edit)| edit.span.record);
+    let spans: Vec<_> = edits.iter().map(|(id, edit)| (*id, edit.span)).collect();
+    transition::prepare(
+        sequence
+            .transitions
+            .iter()
+            .filter(|t| t.kind == kind && t.track == lane),
+        &spans,
+        rate,
+        kind == StreamKind::Video,
+        label,
+    )
 }
 
 pub(super) fn plan<'a>(
@@ -54,272 +183,132 @@ pub(super) fn plan<'a>(
     if sequence.id != sequence_id {
         return Err("linked bin sequence ID was not found".into());
     }
-    let active_bins: Vec<_> = graph.bins.iter().filter(|b| !b.items.is_empty()).collect();
-    if !matches!(active_bins.as_slice(), [bin] if (captured || graph.bins.len() == 1 && bin.parent.is_none())
-        && graph.items.iter().all(|item| bin.items.contains(&item.id)))
-    {
-        return Err("linked bin pilot requires both items in the same source bin".into());
+    if super::mixed::applies(graph) {
+        return super::mixed::plan(graph, sequence);
     }
-    for row in &graph.sidecars {
-        if !captured || !captured_receipt(row) {
-            return Err(format!(
-                "{}: unsupported Avid source receipt {}",
-                row.object, row.adapter
-            )
-            .into());
-        }
-    }
+    let profile = Profile::identify(graph);
+    profile.check_owners(graph, captured)?;
+    let overrides = profile.check_receipts(graph, captured)?;
+    let rate = EditRate::from_graph(sequence.rate)?;
     let start =
-        timeline_clock(sequence.start).ok_or("sequence needs a known full-frame 24 fps start")?;
-    if sequence.rate != Rational::integer(RATE)
-        || sequence.frame_size != Some(RASTER)
-        || sequence.name.trim().is_empty()
-        || !matches_clock(sequence.clock.as_ref(), start)
-        || !sequence.transitions.is_empty()
-        || !sequence.texts.is_empty()
-        || !sequence.disabled_placements.is_empty()
-        || !graph.losses.is_empty()
-        || !graph.multicams.is_empty()
-        || !graph.multicam_uses.is_empty()
-        || graph.items.len() != 2
-        || graph.media.len() != 3
-        || sequence
-            .tracks
-            .iter()
-            .filter(|t| !captured || !t.empty)
-            .count()
-            != 3
-        || sequence.placements.len() != 3
+        timeline_clock(rate, sequence.start).ok_or("sequence needs a known whole-frame start")?;
+    if !neutral_sequence(
+        graph,
+        sequence,
+        start,
+        rate,
+        captured || profile == Profile::ManagedAtom,
+    ) || !profile.accepts_counts(graph.items.len(), graph.media.len())
     {
-        return Err(
-            "linked bin pilot requires a neutral 1080p24 V1/A1/A2 graph with two originals".into(),
-        );
+        return Err(profile.layout_error().into());
     }
+    profile.check_rate_and_overrides(rate, overrides, graph.items.len())?;
+    let media_index = MediaIndex::new(graph);
     let mut lanes = Vec::with_capacity(3);
     let mut item_ids = Vec::with_capacity(3);
     let mut picture_markers = Vec::new();
-    for (kind, lane, label) in [
-        (StreamKind::Video, 1, "V1"),
-        (StreamKind::Audio, 1, "A1"),
-        (StreamKind::Audio, 2, "A2"),
-    ] {
-        if !sequence.tracks.iter().any(|track| {
-            track.kind == kind
-                && track.index == lane
-                && !track.empty
-                && matches!(track.level_db, None | Some(0.0))
-                && track.name.as_deref().is_none_or(|name| name == label)
-        }) {
-            return Err(format!("{label}: missing neutral track").into());
-        }
+    let mut transitions = [Vec::new(), Vec::new(), Vec::new()];
+    for (lane_index, (kind, _, label)) in LANES.into_iter().enumerate() {
         let picture = kind == StreamKind::Video;
-        let select = |edit: &&graph::Placement| {
-            if picture {
-                edit.video_track == Some(lane)
-            } else {
-                edit.audio_tracks == [lane]
-            }
-        };
-        let mut edits = sequence.placements.iter().filter(select);
+        let edits = lane_edits(sequence, lane_index)?;
         let edit = edits
-            .next()
+            .first()
+            .copied()
             .ok_or_else(|| format!("{label}: missing edit"))?;
-        if edits.next().is_some()
-            || (picture && (!edit.audio_tracks.is_empty() || !edit.audio_streams.is_empty()))
-            || (!picture && edit.video_track.is_some())
-            || !edit.grouped_audio.is_empty()
-            || edit.gain_db != 0.0
-            || !matches!(edit.volume_db, None | Some(0.0))
-            || !edit.volume_keys.is_empty()
-            || edit
-                .track_gains_db
-                .iter()
-                .any(|gain| !matches!(gain, None | Some(0.0)))
-            || edit.track_pans.iter().any(Option::is_some)
-            || edit.speed.is_some()
-            || edit.frame_map.is_some()
-            || edit.transform.is_some()
-            || !edit.effects.is_empty()
-        {
-            return Err(format!("{}: expected one neutral edit on {label}", edit.id).into());
-        }
         let item = graph
             .items
             .iter()
             .find(|item| item.id == edit.item)
             .ok_or("missing edit item")?;
-        let members = item
-            .media
-            .iter()
-            .filter_map(|binding| {
-                let media = graph.media.iter().find(|media| media.id == binding.media)?;
-                (media.kind == kind).then_some((binding, media))
-            })
-            .collect::<Vec<_>>();
-        let selected = if picture {
-            matches!(members.as_slice(), [_]).then(|| members[0])
-        } else if let [selector] = edit.audio_streams.as_slice() {
-            let mut matches = members
-                .iter()
-                .filter(|(_, media)| media.stream == Some(*selector));
-            let first = matches.next();
-            first.filter(|_| matches.next().is_none()).copied()
-        } else {
-            None
-        };
-        let (binding, media) =
-            selected.ok_or_else(|| format!("{}: unresolved stream selector", edit.id))?;
-        if (!picture && !item.markers.is_empty())
-            || item.color_rgb16.is_some()
-            || !(item.stream_groups.is_empty()
-                || captured && !picture && item.stream_groups == [vec![1, 2]])
-            || item
-                .rate
-                .is_some_and(|rate| rate != Rational::integer(RATE))
-            || binding.gain_db != 0.0
-            || item.media.len() != if picture { 1 } else { 2 }
-        {
-            return Err(format!("{}: unsupported item controls or layout", edit.id).into());
-        }
-        let original = media
-            .original
-            .as_ref()
-            .ok_or("missing physical stream facts")?;
-        let ([path], [saved_path]) = (
-            media.locations.as_slice(),
-            original.saved_locators.as_slice(),
-        ) else {
-            return Err("linked bin pilot needs one exact original locator per stream".into());
-        };
-        let extension = if picture { "mov" } else { "wav" };
-        if path != saved_path
-            || !Path::new(path).is_absolute()
-            || !Path::new(path)
-                .extension()
-                .is_some_and(|s| s.eq_ignore_ascii_case(extension))
-            || media.online == Some(false)
-            || original.container != extension
-            || original.stream_index != 0
-            || original.start_pts != 0
-            || original.duration_ts <= 0
-            || original.time_base.num() <= 0
-        {
-            return Err(format!(
-                "{}: original locator or physical stream is unqualified",
-                edit.id
-            )
-            .into());
-        }
-        let source_lane = if picture {
-            if media.frame_size != Some(RASTER)
-                || media.rate != Some(Rational::integer(RATE))
-                || original.channel_index.is_some()
-            {
-                return Err("picture edit needs 1080p24 without an audio selector".into());
-            }
-            1
-        } else {
-            if media.sample_rate != Some(48_000)
-                || !matches!(media.bits, Some(16 | 24))
-                || original.channels != Some(2)
-            {
-                return Err("audio edit needs two-channel 48 kHz PCM16 or PCM24".into());
-            }
-            original
-                .channel_index
-                .filter(|n| matches!(n, 0 | 1))
-                .ok_or("missing stereo WAV channel")?
-                + 1
-        };
-        let duration = Rational::new(
-            i128::from(original.duration_ts) * i128::from(original.time_base.num()),
-            i128::from(original.time_base.den()),
-        )
-        .ok_or("invalid physical duration")?;
-        let extent = frames(duration)
-            .filter(|n| *n > 0)
-            .ok_or("original extent needs whole edit frames")?;
+        let qualified = profile.qualify_route(
+            &media_index,
+            item,
+            edit,
+            kind,
+            lane_index,
+            rate,
+            captured,
+            item_ids.first().copied(),
+        )?;
         if picture {
-            picture_markers = markers::prepare(&item.markers, binding.source_offset, extent)?;
+            picture_markers = qualified.markers;
         }
-        // Premiere's WAV capture leaves display timecode absent. The
-        // separate physical check still requires a zero embedded origin.
-        let clock = if captured && !picture && media.start.is_none() {
-            0
-        } else {
-            timeline_clock(media.start).ok_or("missing original timecode")?
+        let binding = EditBinding {
+            group: 0,
+            route: lane_index,
+            track: qualified.route.source_lane,
         };
-        if duration != media.duration || !matches_clock(media.clock.as_ref(), clock) {
-            return Err(format!("{}: conflicting source extent or timecode", edit.id).into());
+        let mut spans = Vec::with_capacity(edits.len());
+        for occurrence in edits {
+            if !neutral_edit(occurrence, picture) {
+                return Err(
+                    format!("{}: expected a neutral edit on {label}", occurrence.id).into(),
+                );
+            }
+            if occurrence.item != edit.item || occurrence.audio_streams != edit.audio_streams {
+                return Err(format!(
+                    "{}: {label} needs a consistent source item and channel",
+                    occurrence.id
+                )
+                .into());
+            }
+            let span = prepare_span(
+                occurrence,
+                qualified.binding.source_offset,
+                qualified.route.extent,
+                rate,
+            )?;
+            spans.push((occurrence.id.as_str(), PreparedEdit { span, binding }));
         }
-        if !picture && clock != 0 {
-            return Err(
-                format!("{}: this WAV profile requires a zero source start", edit.id).into(),
-            );
-        }
-        let source = binding
-            .source_offset
-            .and_then(|offset| edit.source_in.checked_add(offset));
-        let span = Span {
-            record: frames(edit.record_start).ok_or("record start is not on the frame grid")?,
-            source: source
-                .and_then(frames)
-                .ok_or("source trim has an unknown offset or falls off the frame grid")?,
-            length: frames(edit.duration)
-                .filter(|n| *n > 0)
-                .ok_or("edit needs a positive whole-frame duration")?,
-        };
-        if span
-            .source
-            .checked_add(span.length)
-            .is_none_or(|end| end > extent)
-            || span.source > i32::MAX as u32
-        {
-            return Err(format!("{}: source range exceeds the original extent", edit.id).into());
-        }
-        item_ids.push(item.id.as_str());
+        transitions[lane_index] = prepare_transitions(sequence, lane_index, rate, &mut spans)?;
+        item_ids.push(qualified.item.id.as_str());
         lanes.push((
-            Route {
-                path,
-                name: &item.name,
-                tape: item.tape.as_deref(),
-                clock,
-                extent,
-                source_lane,
-                bits: media.bits,
-                stream: original,
-            },
-            span,
+            qualified.route,
+            spans.into_iter().map(|(_, edit)| edit).collect::<Vec<_>>(),
         ));
     }
     let [(video, v), (left, a), (right, b)] =
         lanes.try_into().map_err(|_| "missing linked lane")?;
-    if item_ids[0] == item_ids[1]
-        || item_ids[1] != item_ids[2]
-        || video.path == left.path
-        || left.path != right.path
-        || left.clock != right.clock
-        || left.extent != right.extent
-        || left.source_lane == right.source_lane
-        || left.bits != right.bits
-        || left.stream.time_base != right.stream.time_base
-        || left.stream.duration_ts != right.stream.duration_ts
-    {
-        return Err("A1 and A2 must select distinct channels of the same verified WAV item".into());
+    let source = profile.finish(
+        &media_index,
+        graph.items.iter(),
+        [video, left, right],
+        &item_ids,
+        overrides,
+        picture_markers,
+    )?;
+    timeline_plan(sequence, rate, start, vec![source], [v, a, b], transitions)
+}
+
+pub(super) fn timeline_plan<'a>(
+    sequence: &'a SourceSequence,
+    rate: EditRate,
+    start: u32,
+    sources: Vec<super::SourceSet<'a>>,
+    edits: [Vec<PreparedEdit>; 3],
+    transitions: [Vec<transition::Transition>; 3],
+) -> Result<Plan<'a>> {
+    if transitions.iter().map(Vec::len).sum::<usize>() != sequence.transitions.len() {
+        return Err("every linked transition must belong to V1, A1 or A2".into());
     }
-    let length = [v, a, b]
+    if edits.iter().map(Vec::len).sum::<usize>() != sequence.placements.len() {
+        return Err("every linked edit must belong to V1, A1 or A2".into());
+    }
+    let length = edits
         .iter()
-        .map(|span| span.record.checked_add(span.length))
-        .try_fold(0, |length, end| Some(length.max(end?)))
-        .ok_or("sequence end overflow")?;
-    let sequence_markers = markers::prepare(&sequence.markers, Some(Rational::ZERO), length)?;
+        .filter_map(|lane| lane.last())
+        .map(|edit| edit.span.record + edit.span.length)
+        .max()
+        .ok_or("missing linked edits")?;
+    let sequence_markers = markers::prepare(&sequence.markers, Some(Rational::ZERO), length, rate)?;
     Ok(Plan {
         name: &sequence.name,
+        rate,
         start,
         length,
-        routes: [video, left, right],
-        spans: [v, a, b],
-        picture_markers,
+        sources,
+        edits,
+        transitions,
         sequence_markers,
     })
 }

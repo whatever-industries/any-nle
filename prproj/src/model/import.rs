@@ -508,9 +508,16 @@ impl Project {
     pub(crate) fn import_prepared_png(
         &mut self, path: &Path, bin: ItemId, uuids: &mut dyn UuidSource,
     ) -> Result<ItemId> {
+        self.import_prepared_still(path, bin, ".png", uuids)
+    }
+
+    pub(crate) fn import_prepared_still(
+        &mut self, path: &Path, bin: ItemId, suffix: &str, uuids: &mut dyn UuidSource,
+    ) -> Result<ItemId> {
+        let profile = m::still_profile(suffix).ok_or_else(|| Error::Value("unknown verified still profile".into()))?;
         self.check_target_bin(Some(bin))?;
         let previous = self.import_target.replace(bin);
-        let result = self.build_still(path, m::still_profile(".png").unwrap(), 1920, 1080, None, uuids);
+        let result = self.build_still(path, profile, 1920, 1080, None, uuids);
         self.import_target = previous;
         result
     }

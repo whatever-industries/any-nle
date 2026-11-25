@@ -18,7 +18,7 @@ class Scanner:
         if depth>10: raise ValueError('archive recursion budget exceeded')
         self.bytes+=len(data);self.objects+=1
         if self.bytes>self.budget: raise ValueError('expanded audit byte budget exceeded')
-        lower=data.lower()
+        lower=data.lower() if self.tokens else b''
         count=sum(t in lower for t in self.tokens)+sum(bool(p.search(data)) for p in CREDENTIALS)
         if count:self.hits.append({'location_sha256':hashlib.sha256(location.encode()).hexdigest(),'matches':count})
         stream=io.BytesIO(data)
@@ -52,27 +52,41 @@ class Scanner:
         # Project/model fixtures may be zlib streams embedded after a binary header.
         offsets=[m.start() for m in re.finditer(rb'\x78[\x01\x5e\x9c\xda]',data)]
         if len(offsets)>10000:raise ValueError('zlib candidate budget exceeded')
+        view = memoryview(data)
         for offset in offsets:
             try:
-                d=zlib.decompressobj();raw=d.decompress(data[offset:],self.budget-self.bytes+1)
+                d=zlib.decompressobj();raw=d.decompress(view[offset:],self.budget-self.bytes+1)
                 if d.eof:self.scan(raw,location+'!zlib@'+str(offset),depth+1)
                 elif d.unconsumed_tail:raise ValueError('zlib expanded byte budget exceeded')
             except zlib.error:pass
     def report(self):return {'schema':'anynle.privacy-audit/1','objects':self.objects,'expanded_bytes':self.bytes,'match_locations':self.hits,'undecodable_archives':self.undecodable,'expansion_complete':not self.undecodable,'passed':not self.hits and all(x['accepted_upstream_fixture'] for x in self.undecodable)}
+def load_known_upstream(path):
+    manifest = json.loads(pathlib.Path(path).read_text())
+    if manifest.get('schema') != 'anynle.known-upstream-archive-fixtures/1':
+        raise ValueError('unknown upstream fixture manifest')
+    return manifest['fixtures']
+
 def audit(paths,tokens=(),known_upstream=()):
     scanner=Scanner(tokens,known_upstream=known_upstream)
-    for path in paths:
+    for number, path in enumerate(paths, 1):
         path=pathlib.Path(path)
-        for p in sorted(path.rglob('*')) if path.is_dir() else [path]:
-            if p.is_file():scanner.scan(p.read_bytes(),str(p))
+        if path.is_dir():
+            files = sorted(p for p in path.rglob('*') if p.is_file())
+            if not files:
+                raise ValueError('audit input directory has no files')
+            for file in files:
+                relative = file.relative_to(path).as_posix()
+                scanner.scan(file.read_bytes(), f'input-{number}/{relative}')
+        elif path.is_file():
+            scanner.scan(path.read_bytes(), f'input-{number}/{path.name}')
+        else:
+            raise ValueError('audit input is unavailable')
+    if not scanner.objects:
+        raise ValueError('audit has no inputs')
     return scanner.report()
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('paths',nargs='+');p.add_argument('--private-token-file');p.add_argument('--known-upstream-fixtures');p.add_argument('--output',required=True);a=p.parse_args()
     tokens=pathlib.Path(a.private_token_file).read_text().splitlines() if a.private_token_file else []
-    known=[]
-    if a.known_upstream_fixtures:
-        manifest=json.loads(pathlib.Path(a.known_upstream_fixtures).read_text())
-        if manifest.get('schema')!='anynle.known-upstream-archive-fixtures/1':raise ValueError('unknown upstream fixture manifest')
-        known=manifest['fixtures']
+    known=load_known_upstream(a.known_upstream_fixtures) if a.known_upstream_fixtures else []
     result=audit(a.paths,tokens,known);pathlib.Path(a.output).write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps({k:v for k,v in result.items() if k!='match_locations'}));raise SystemExit(0 if result['passed'] else 1)

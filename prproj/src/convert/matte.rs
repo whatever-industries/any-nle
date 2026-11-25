@@ -18,6 +18,8 @@ const PATH_PARAM: usize = 9;
 /// ParameterIDs of Mask Opacity and Inverted (tesseract-converter, 26.5 form).
 const MASK_OPACITY_ID: &str = "15";
 const INVERTED_ID: &str = "17";
+const MASK_BLEND_MODE_ID: &str = "21";
+const MASK_SUBTRACT: &str = "1";
 
 fn set_value(project: &mut Project, param: NodeId, text: &str) -> Result<()> {
     let Some(leaf) = project.doc.tree.find(param, "StartKeyframe")? else { return value("param has no StartKeyframe") };
@@ -161,7 +163,28 @@ fn opacity(project: &mut Project, placed: TrackItemId) -> Result<NodeId> {
 }
 
 /// `apply_matte`: one Opacity mask per matte shape. Returns report notes.
-pub fn apply_matte(project: &mut Project, placed: TrackItemId, matte: &Matte, source_in: i64, unit: i64) -> Result<Vec<String>> {
+pub fn apply_matte(
+    project: &mut Project, placed: TrackItemId, matte: &Matte,
+    source_in: i64, unit: i64, invert_union: bool,
+) -> Result<Vec<String>> {
+    write_masks(project, placed, matte, source_in, unit, invert_union)?;
+    let mut notes = Vec::new();
+    if invert_union {
+        notes.push("Two-shape AniMatte Key Out as ordered inverted and Subtract Opacity masks".into());
+    } else if matte.shapes.len() > 1 {
+        notes.push(format!(
+            "{} AniMatte shapes as {} Opacity masks (Premiere adds masks together)",
+            matte.shapes.len(),
+            matte.shapes.len()
+        ));
+    }
+    Ok(notes)
+}
+
+pub(super) fn write_masks(
+    project: &mut Project, placed: TrackItemId, matte: &Matte,
+    source_in: i64, unit: i64, subtract_second: bool,
+) -> Result<()> {
     let holder = opacity(project, placed)?;
     for (index, keys) in matte.shapes.iter().enumerate() {
         let param_ids = build_mask_params(&mut project.doc)?;
@@ -186,9 +209,15 @@ pub fn apply_matte(project: &mut Project, placed: TrackItemId, matte: &Matte, so
             let p = by_id(project, MASK_OPACITY_ID)?;
             set_value(project, p, &format_lumetri_value(opacity)?)?;
         }
-        if matte.inverted {
+        // A subtracting second shape uses its original path, including
+        // when the first shape is an inverted AniMatte Key Out.
+        if matte.inverted && (!subtract_second || index == 0) {
             let p = by_id(project, INVERTED_ID)?;
             set_value(project, p, "true")?;
+        }
+        if subtract_second && index == 1 {
+            let p = by_id(project, MASK_BLEND_MODE_ID)?;
+            set_value(project, p, MASK_SUBTRACT)?;
         }
         if keys.len() > 1 {
             let tree = &mut project.doc.tree;
@@ -218,13 +247,5 @@ pub fn apply_matte(project: &mut Project, placed: TrackItemId, matte: &Matte, so
             tree.insert(path, at + 1, frames);
         }
     }
-    let mut notes = Vec::new();
-    if matte.shapes.len() > 1 {
-        notes.push(format!(
-            "{} AniMatte shapes as {} Opacity masks (Premiere adds masks together)",
-            matte.shapes.len(),
-            matte.shapes.len()
-        ));
-    }
-    Ok(notes)
+    Ok(())
 }

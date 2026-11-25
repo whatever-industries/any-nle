@@ -101,6 +101,7 @@ pub(super) fn prepare(
                 start,
                 duration,
                 content: content.clone(),
+                graphic_position: None,
             };
             if t.kind == TextKind::Caption {
                 captions.push(value);
@@ -139,8 +140,8 @@ pub(super) fn prepare(
     }
     for t in &model.texts {
         loss(losses, &t.source_id, "text_destination_style", match t.kind {
-            PreparedTextKind::Caption => "Subtitle text uses destination ArialMT/48 pt defaults; source styling is not reproduced",
-            PreparedTextKind::Graphic => "Editable point text uses destination ArialMT/48 pt at normalized position (0.1,0.35); source text-box geometry and appearance are not reproduced",
+            PreparedTextKind::Caption => "Text and timing transfer as a subtitle with Premiere's ArialMT/48 pt default styling.",
+            PreparedTextKind::Graphic => "Text and timing transfer as editable point text with Premiere's ArialMT/48 pt styling at normalized position (0.1, 0.35).",
         });
     }
     Ok(())

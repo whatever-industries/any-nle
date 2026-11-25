@@ -1,44 +1,45 @@
-# Any NLE v0.1.0-alpha.11
+# Any NLE v0.1.0-alpha.12
 
-## Avid to Resolve preview on macOS
+## Avid to Premiere 27
 
-- The package includes reviewed project templates for 1920×1080 at
-  23.976 fps. The wizard can link qualified managed DNxHR LB OP-Atom
-  picture and two independent PCM24 mono lanes in place, or optionally
-  rewrap managed media to OP1a. Review can estimate the size of that rewrap.
-- The Apple Silicon reopen and render checks covered both media choices,
-  linked originals, visible managed-media reel names, and a two-camera
-  Group. Direct links can be prepared with Resolve closed. Assisted media
-  linking requires Resolve Studio 21.2.0 build 00006 with local external
-  scripting available. [Tested profiles](docs/RESOLVE-TURNOVER-IMPLEMENTATION.md#local-avid-release-template-checks)
+- Preserve more linked edits and reusable bin items, including qualified
+  timecoded AVC/AAC, discrete managed PCM24, ProRes A/V subclips, AutoSync
+  with independent mono WAVs, and editable two-camera ProRes Groups.
+- Keep qualified still holds and editable JPEG and PNG alpha matte masks.
+  A verified managed MXF can supply a JPEG matte fill when the original
+  JPEG is offline. Supported sRGB originals can keep an editable Rec.709
+  source interpretation. [Conversion evidence](docs/AVID-PREMIERE-EVIDENCE.md)
+- Review and Activity can preview and export redacted diagnostics. An
+  optional local MCP server explains findings and can run read-only
+  checks for supplied settings or relink proposals.
+  [Diagnostics setup](docs/GUI-WIZARD.md#share-diagnostics)
 
-## Conversion and source capture
+## Internal Avid writer and packaged media tools
 
-- Avid Review reports affected edit locations in more cases and preserves
-  verified direct links when only selected media needs rewrap.
-  [Roadmap](docs/ROADMAP.md#avid--premiere)
-- The internal Resolve to Premiere preview uses saved physical WAV channel
-  assignments and shares source capture across timelines in project Review.
-  [Resolve reader guide](docs/RESOLVE-SOURCE-READER.md#review-a-project-for-premiere)
-- Graph/2 retains additional Avid marker, clock, and Timewarp facts.
-  Destination preparation applies media and picture-effect qualification.
-  [Source graph guide](docs/SOURCE-GRAPH-MIGRATION.md)
+- The internal macOS Premiere to Avid prototype writes a mixed linked
+  MP4 and managed DNxHD timeline into one Avid bin. Offline read-back
+  verifies independent mono trims and centered transitions.
+  [Tested profiles](docs/AVID-MANAGED-MEDIA-STAGING.md#mixed-managed-and-ume-edits)
+- Packaged FFmpeg enables PNG decoding with alpha. The release checks
+  exercise the extracted media tools on all six targets and compare
+  both Avid to Resolve media choices on Intel macOS.
+  [Release checks](docs/RELEASE.md#build-stage-and-publish)
 
 ## Download
 
 | Platform |
 | --- |
-| [**Windows (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.11/Any.NLE_Windows_x64_v0.1.0-alpha.11.exe) |
-| [**Windows (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.11/Any.NLE_Windows_ARM_v0.1.0-alpha.11.exe) |
-| [**macOS (Apple Silicon)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.11/Any.NLE_macOS_ARM_v0.1.0-alpha.11.zip) |
-| [**macOS (Intel)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.11/Any.NLE_macOS_x64_v0.1.0-alpha.11.zip) |
-| [**Linux (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.11/Any.NLE_Linux_x64_v0.1.0-alpha.11.AppImage) |
-| [**Linux (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.11/Any.NLE_Linux_ARM_v0.1.0-alpha.11.AppImage) |
+| [**Windows (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.12/Any.NLE_Windows_x64_v0.1.0-alpha.12.exe) |
+| [**Windows (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.12/Any.NLE_Windows_ARM_v0.1.0-alpha.12.exe) |
+| [**macOS (Apple Silicon)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.12/Any.NLE_macOS_ARM_v0.1.0-alpha.12.zip) |
+| [**macOS (Intel)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.12/Any.NLE_macOS_x64_v0.1.0-alpha.12.zip) |
+| [**Linux (x64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.12/Any.NLE_Linux_x64_v0.1.0-alpha.12.AppImage) |
+| [**Linux (ARM64)**](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.12/Any.NLE_Linux_ARM_v0.1.0-alpha.12.AppImage) |
 
 Each package includes the `any-nle` CLI, `any-nle-gui`, verified FFmpeg/ffprobe
 8.1, dependency notices, an SBOM and corresponding FFmpeg source. macOS
 packages also include the reviewed Resolve templates. Separate
-provenance archives and [SHA256 checksums](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.11/SHA256SUMS) accompany the downloads.
+provenance archives and [SHA256 checksums](https://github.com/whatever-industries/any-nle/releases/download/v0.1.0-alpha.12/SHA256SUMS) accompany the downloads.
 
 macOS apps are ad hoc signed and verified, without Apple notarization. Windows
 installers are unsigned and install for the current user. Linux AppImages require

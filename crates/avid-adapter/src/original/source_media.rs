@@ -159,6 +159,7 @@ fn qualify(
         let audio = (0..2)
             .map(|channel| Selected {
                 verified_for_native_import: false,
+                source_srgb_video_levels: false,
                 path: path.clone(),
                 online: true,
                 stream: OriginalStream {
@@ -184,6 +185,7 @@ fn qualify(
                 mp3_delay_samples: None,
                 column_timecode: None,
                 embedded_mov_timecode: None,
+                verified_mp4_timecode: None,
             })
             .collect();
         (defaulted, audio)
@@ -239,6 +241,7 @@ fn qualify(
     Ok((
         Selected {
             verified_for_native_import: false,
+            source_srgb_video_levels: false,
             path,
             online: true,
             stream: OriginalStream {
@@ -264,6 +267,7 @@ fn qualify(
             mp3_delay_samples: None,
             column_timecode: Some(clock.clone()),
             embedded_mov_timecode: None,
+            verified_mp4_timecode: None,
         },
         audio,
         defaulted,

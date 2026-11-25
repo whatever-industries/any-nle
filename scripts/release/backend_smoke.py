@@ -1,10 +1,31 @@
 #!/usr/bin/env python3
-"""Exercise the exact bundled tools with two entirely generated media cases."""
-import argparse,hashlib,json,pathlib,subprocess,tempfile
+"""Exercise the exact bundled tools with generated media."""
+import argparse,json,pathlib,struct,subprocess,tempfile,zlib
 from package import verify_backend
 
-def smoke(backend,target,output):
-    backend=pathlib.Path(backend).resolve();verify_backend(backend,target)
+def check_png(root, ffprobe, run):
+    image = root / 'synthetic-alpha.png'
+    pixels = bytes((32, 64, 96, 0, 32, 64, 96, 128, 32, 64, 96, 255))
+
+    def chunk(kind, data):
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+
+    image.write_bytes(b'\x89PNG\r\n\x1a\n'
+        + chunk(b'IHDR', struct.pack('>IIBBBBB', 3, 1, 8, 6, 0, 0, 0))
+        + chunk(b'IDAT', zlib.compress(b'\0' + pixels))
+        + chunk(b'IEND', b''))
+    probe = json.loads(subprocess.check_output([ffprobe, '-v', 'error', '-show_frames',
+        '-show_entries', 'frame=width,height,pix_fmt', '-of', 'json', str(image)]))
+    if probe.get('frames') != [{'width': 3, 'height': 1, 'pix_fmt': 'rgba'}]:
+        raise ValueError('bundled ffprobe did not decode one RGBA PNG frame')
+    decoded = run(['-i', str(image), '-map', '0:v:0', '-c:v', 'rawvideo', '-pix_fmt', 'rgba', '-f', 'rawvideo', '-'])
+    if decoded != pixels:
+        raise ValueError('bundled FFmpeg changed synthetic PNG pixels or alpha')
+    return {'codec': 'png', 'container': 'png', 'decoded_rgba_equal': True}
+
+def exercise(backend, target):
+    """Run synthetic cases using the caller's verified backend directory."""
+    backend=pathlib.Path(backend).resolve()
     ext='.exe' if 'windows' in target else ''
     ffmpeg=str(backend/('ffmpeg'+ext));ffprobe=str(backend/('ffprobe'+ext));cases=[]
     def run(args):return subprocess.check_output([ffmpeg,'-v','error','-nostdin',*args])
@@ -24,7 +45,12 @@ def smoke(backend,target,output):
                 before,after=essence(original),essence(copy)
                 if not before or before!=after:raise ValueError('synthetic rewrap decoded essence changed')
             cases.append({'codec':codec,'container':container,'decoded_picture_and_pcm_equal':True})
-    result={'schema':'anynle.backend-smoke/1','target':target,'synthetic_cases':cases,'passed':True}
+        cases.append(check_png(root, ffprobe, run))
+    return {'schema':'anynle.backend-smoke/1','target':target,'synthetic_cases':cases,'passed':True}
+
+def smoke(backend,target,output):
+    verify_backend(backend,target)
+    result=exercise(backend,target)
     pathlib.Path(output).write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result))
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--backend',required=True);p.add_argument('--target',required=True);p.add_argument('--output',required=True);a=p.parse_args();smoke(a.backend,a.target,a.output)

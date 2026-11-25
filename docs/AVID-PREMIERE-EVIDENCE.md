@@ -588,6 +588,12 @@ authoring of coincident source/edit ranges remains open.
 [Native point-marker comparison](SPLIT-EDIT-AUDIO-2026-11-06.md#native-coincident-point-markers-and-linked-aaf)
 [Sequence span comparison](SPLIT-EDIT-AUDIO-2026-11-06.md#retained-native-sequence-span-and-linked-aaf)
 [Source copy comparison](SPLIT-EDIT-AUDIO-2026-11-06.md#native-source-range-and-point-copy)
+
+When a bound edit marker spans multiple prepared edits on its saved
+track, Review names that track and reports that the full range carries
+over as one sequence marker. This uses the saved binding and prepared
+record ranges, with the existing ownership report for unresolved cases.
+
 A derived AVB now preserves both coincident ranges after Premiere 27
 reopen when **Keep the other marker as a sequence marker** is enabled.
 [Marker ownership check](SPLIT-EDIT-AUDIO-2026-11-06.md#coincident-source-and-edit-markers)
@@ -760,6 +766,94 @@ removes the gap markers for the recovered edits. Structural replay
 matched the four editable nests and both alpha polarities. A missing
 or damaged original blocks Review with the triggering edit's track,
 record timecode, bin and saved PNG locator.
+
+A 1080p23.976 sequence also qualified a full-canvas PNG overlay with neutral
+Matte Key controls and only transparent and opaque pixels. Graph/2 records
+the exact fill and alpha slots of the same imported master, the lower-track
+background reference, the saved range and the import polarity. Separate
+files links that PNG as an editable V2 clip. Premiere 27.0.0 build 88 retained
+record frames [168,216), source frames [0,48), and the original path with
+straight alpha after Save As and reopen. The six captions and three
+transitions retained their saved placement. In an 864-frame export, the
+overlay changed exactly the expected 48 scaled picture frames compared
+with the previous Premiere export. Across those 48 frames, the sampled
+opaque interior averaged 1.92 absolute 8-bit RGB codes from the native Avid
+render. Both PCM24 channels matched the previous Premiere export over
+1,729,728 samples each. The direct overlay is qualified for binary alpha
+with these controls. (CONV-0212)
+
+Review names the linked PNG and its exact V2 record range when the overlay
+is prepared. A skipped reusable bin composition gets a Matte Key warning
+when its saved picture effect identifies it. This accounts for the
+successful timeline edit and the separate unsupported bin item.
+
+A valid full-canvas PNG with partially transparent pixels or uniform alpha
+leaves the lower track in place. Separate files reports the specific V2
+occurrence and its exact span in Review. When a verified direct overlay's
+original is missing, Review also reports the saved locator and the
+conversion keeps the lower track. Review locates the omission or
+file-verification failure by saved track and timecode, using the exact
+sequence rate. The skipped overlay adds no linked
+item, and its saved fill and matte facts stay in graph/2. Ambiguous
+locators and corrupt PNGs still trigger a refusal. The older one-frame
+Matte Key composite requires its saved PNG inputs.
+
+Review of a corrupt direct-overlay PNG shared by two same-named
+timelines identifies both V2 occurrences at their own timecodes. The
+first file error stays the blocker. The additional details come from
+verified overlay receipts with exactly the same saved locators.
+
+#### JPEG fill with separate PNG alpha
+
+Separate files conversion also writes the verified 1080p23.976 split
+Matte Key. Graph/2 retains both master identities, both source ranges,
+the lower-track reference, and the alpha import polarity. Preparation
+links the verified JPEG and decodes its separate PNG alpha. When the
+selected polarity forms a rectangle, Premiere receives an editable Add
+mask on the original timeline track. One strictly enclosed rectangular
+hole maps to a second editable mask set to Subtract. Other alpha shapes
+leave the lower track visible and report the affected edit.
+
+A reopened Premiere 27.0.0 build 88 control retained four 48-frame
+placements from two JPEGs, one linked and one originally imported in
+Avid. The imported fill uses the original JPEG saved in Avid's import
+settings. Six frames exported after reopen showed all four composites,
+the direct PNG overlay, and the independent V1 crop and AniMatte. A
+single-line title with matching bounds immediately above a full-width
+lower matte strip can sit on the strip with Premiere's default styling.
+
+A second Save As and reopen replay used the same four edits with a hole
+in the alpha. All four retained both editable Opacity paths and their
+blend modes. In the rendered samples, the hole revealed the lower
+picture to within one 8-bit RGB code. The sampled fill outside the hole
+matched the solid-matte control exactly.
+
+If the original JPEG cannot be found at its saved or mapped path, the
+converter can use the imported still's managed MXF. It matches the Avid
+file-package UMID and checks the saved clock and the single coded picture.
+The qualified profile is 1080p23.976 Rec.709 DNxHD OP-Atom (CID 1237).
+Premiere links the MXF in place and holds its first frame for the saved
+edit range. The separate PNG continues to supply the editable mask.
+
+Premiere 27.0.0 build 88 retained both 48-frame MXF-backed edits, their
+source clocks, and both mask paths after Save As and reopen. Across all
+96 rendered frames, sampled fill pixels matched the decoded MXF frame.
+The sampled hole matched the lower-picture control with a mean difference
+of 0.17 8-bit RGB codes across separate ProRes exports. The JPEG took
+precedence when it was online. If neither fill is available, Review
+reports the omitted edit and the lower picture plays through.
+
+### Saved color settings on managed picture
+
+A retained 1080p23.976 managed DNxHD edit saves an automatic sRGB to
+Rec.709 source setting on its master. The picture placement has no active
+Color Adapter. Across 88 aligned interior frames, the Avid export differed
+from the linked MXF by 0.30 mean absolute 8-bit RGB codes. Applying the
+nominal sRGB to Rec.709 gamma conversion to those decoded source pixels
+increased the error to 13.06. The reopened Premiere output differed from
+Avid by 2.49 codes under the same scaled comparison. Review identifies
+saved master settings at the master and reports active timeline Color
+Adapters at their edits. (CONV-0215)
 
 ## Native checks and linked AAF benchmarks
 

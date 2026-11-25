@@ -85,7 +85,7 @@ fn avid_mp3_delay(
     Some(MPEG_FRAME_SAMPLES + head_samples)
 }
 
-fn image_kind(path: &Path) -> Option<&'static str> {
+pub(super) fn image_kind(path: &Path) -> Option<&'static str> {
     let suffix = path.extension()?.to_str()?;
     if suffix.eq_ignore_ascii_case("jpg") || suffix.eq_ignore_ascii_case("jpeg") {
         Some("jpeg")
@@ -155,10 +155,15 @@ pub(super) fn probe_still(path: &Path, tool: &Path) -> Result<Option<(i64, i64)>
             .or_else(|| tags.get("orientation"))
             .is_some()
     }) || !frame.get("side_data_list").is_none_or(|data| {
-        matches!(data, Value::Arr(rows) if rows.iter().all(|row| {
-            kind == "tiff" && matches!(text(row, "side_data_type").as_deref(),
+        matches!(data, Value::Arr(rows) if rows.is_empty() || match kind {
+            "tiff" => rows.iter().all(|row| matches!(text(row, "side_data_type").as_deref(),
                 Some("3x3 displaymatrix" | "EXIF metadata"))
-        }))
+            ),
+            "png" => matches!(rows.as_slice(), [row]
+                if text(row, "side_data_type").as_deref() == Some("EXIF metadata"))
+                && super::still::linked_png_with_dimension_metadata(path, raster),
+            _ => false,
+        })
     })
     {
         return Err(
@@ -416,6 +421,10 @@ pub(super) fn select(
         let (format, stream) = single_stream(&probe.metadata)?;
         let kind = image_kind(path).expect("supported still suffix");
         let raster = probe.still_decoded.ok_or("linked still was not decoded")?;
+        let still_rate = master.rate.filter(|rate| {
+            (rate.num, rate.den) == (24, 1)
+                || kind == "jpeg" && (rate.num, rate.den) == (24_000, 1001)
+        });
         let physical = match kind {
             "png" => {
                 format == "png_pipe"
@@ -441,6 +450,11 @@ pub(super) fn select(
                     )
             }
         };
+        // Avid also saves a linked PNG matte as a two-frame source. The
+        // packet and frame probes still establish just one physical image.
+        let saved_extent = raw.descriptor_length == 1 && track.length == 1
+            || kind == "png" && text(stream, "pix_fmt").as_deref() == Some("rgba")
+                && raw.descriptor_length == 2 && track.length == 2 && master.master.length == 2;
         if !physical
             || text(stream, "codec_type").as_deref() != Some("video")
             || number(stream, "width").zip(number(stream, "height")) != Some(raster)
@@ -455,23 +469,22 @@ pub(super) fn select(
             || master.master.tracks.len() != 1
             || track.kind != KIND_PICTURE
             || track.index != 1
-            || master.rate != av::Rate::new(24, 1)
-            || raw.descriptor_rate != 24.0
-            || track.edit_rate != 24.0
+            || still_rate.is_none()
+            || av::Rate::from_avid(raw.descriptor_rate) != still_rate
+            || av::Rate::from_avid(track.edit_rate) != still_rate
             || raw.descriptor_class != "RGBA"
             || raw.display_raster != Some(raster)
             || raw.file_track != Some(1)
-            || raw.descriptor_length != 1
-            || track.length != 1
+            || !saved_extent
             || master.master.length <= 0
             || track.clip_length != master.master.length
         {
-            return Err("linked still requires a matching 24 fps single-image Avid descriptor and original".into());
+            return Err("linked still requires a matching single-image Avid descriptor and original at 24 fps, or 23.976 fps for JPEG".into());
         }
         (
             kind,
             StreamKind::Video,
-            Some(Rational::integer(24)),
+            still_rate.map(crate::rational),
             Some(raster),
             None,
             None,
@@ -479,7 +492,11 @@ pub(super) fn select(
             1,
         )
     };
-    let time_base = Rational::new(1, sample_rate.unwrap_or(24).into()).unwrap();
+    let time_base = if let Some(rate) = rate {
+        Rational::new(rate.den().into(), rate.num().into())
+    } else {
+        Rational::new(1, sample_rate.expect("audio sample rate").into())
+    }.ok_or("linked media time base is invalid")?;
     let editorial_extent = if kind == StreamKind::Video {
         master.master.length
     } else {
@@ -487,6 +504,7 @@ pub(super) fn select(
     };
     Ok(Some(Selected {
         verified_for_native_import: false,
+        source_srgb_video_levels: false,
         path: path.into(),
         online: true,
         stream: OriginalStream {
@@ -506,13 +524,14 @@ pub(super) fn select(
         rate,
         sample_rate,
         bits: (container == "tiff").then_some(16),
-        duration: Rational::new(editorial_extent.into(), time_base.den().into())
+        duration: anynle_media_verification::stream_duration(editorial_extent, time_base)
             .ok_or("linked media duration overflow")?,
         motion_audio_origin: None,
         same_rate_aac_origin: false,
         mp3_delay_samples,
         column_timecode: None,
         embedded_mov_timecode: None,
+        verified_mp4_timecode: None,
     }))
 }
 

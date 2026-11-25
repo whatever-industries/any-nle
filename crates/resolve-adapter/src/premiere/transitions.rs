@@ -1,4 +1,4 @@
-//! Two-ended Premiere transitions on the qualified V1 and A1 lanes.
+//! Two-ended Premiere transitions with destination-specific admission.
 use super::ticks;
 use crate::Result;
 use graph::{
@@ -18,13 +18,35 @@ pub(super) fn capture(
     sequence: &mut SourceSequence,
     frame_ticks: i64,
 ) -> Result<()> {
+    capture_for(project, track, kind, sequence, frame_ticks, false)
+}
+
+pub(super) fn capture_for_avid(
+    project: &Project,
+    track: &TrackData,
+    kind: StreamKind,
+    sequence: &mut SourceSequence,
+    frame_ticks: i64,
+) -> Result<()> {
+    capture_for(project, track, kind, sequence, frame_ticks, true)
+}
+
+fn capture_for(
+    project: &Project,
+    track: &TrackData,
+    kind: StreamKind,
+    sequence: &mut SourceSequence,
+    frame_ticks: i64,
+    avid: bool,
+) -> Result<()> {
     if track.transitions.len() > crate::prepare::MAX_EDITS_PER_LANE {
         return Err("Premiere transition count exceeds the linked lane limit".into());
     }
     let tree = &project.doc.tree;
+    let lane = i64::from(track.index) + 1;
     let on_lane = |edit: &Placement| match kind {
-        StreamKind::Video => edit.video_track == Some(1),
-        StreamKind::Audio => edit.audio_tracks.as_slice() == [1],
+        StreamKind::Video => edit.video_track == Some(lane),
+        StreamKind::Audio => edit.audio_tracks.as_slice() == [lane],
     };
     let mut starts = HashMap::new();
     let mut ends = HashMap::new();
@@ -88,10 +110,13 @@ pub(super) fn capture(
         if !seen.insert(node) {
             return Err(refuse("duplicate saved transition reference on its lane").into());
         }
-        if track.index != 0 {
+        if track.index != 0 && !(avid && kind == StreamKind::Audio && track.index == 1) {
+            if avid {
+                return Err(refuse("expected a transition on V1, A1 or A2").into());
+            }
             return Err(refuse("expected a transition on V1 or A1").into());
         }
-        let saved = read(project, node, kind, sequence.rate, frame_ticks, id)?;
+        let saved = read(project, node, kind, sequence.rate, frame_ticks, id, avid)?;
         let outgoing = endpoint(&ends, saved.cut, "outgoing", id)?;
         let incoming = endpoint(&starts, saved.cut, "incoming", id)?;
         let out = &sequence.placements[outgoing];
@@ -107,7 +132,9 @@ pub(super) fn capture(
             );
         }
         if out.frame_map.is_some() || input.frame_map.is_some() {
-            return Err(refuse("transition endpoints with sampled picture timing are unqualified").into());
+            return Err(
+                refuse("transition endpoints with sampled picture timing are unqualified").into(),
+            );
         }
         pending.push((saved, outgoing, incoming));
     }
@@ -137,7 +164,7 @@ pub(super) fn capture(
         let transition = SourceTransition {
             id: format!("premiere:transition:{}", saved.id),
             kind,
-            track: 1,
+            track: lane,
             cut: saved.cut,
             duration: saved.duration,
             cut_offset: saved.before,
@@ -208,6 +235,7 @@ fn read<'a>(
     rate: Rational,
     frame_ticks: i64,
     id: &'a str,
+    avid: bool,
 ) -> Result<SavedTransition<'a>> {
     use crate::dissolve::{Style, ALIGNMENT, PREMIERE_AUDIO_STYLE, PREMIERE_POWER_STYLE};
     use prproj::model::transition::*;
@@ -230,6 +258,7 @@ fn read<'a>(
         }
         StreamKind::Audio
             if tree.tag(node) == "AudioTransitionTrackItem"
+                && !avid
                 && rate == Rational::integer(24)
                 && match_name == "Constant Gain"
                 && constant_gain_fields(tree, node)? =>
@@ -238,7 +267,8 @@ fn read<'a>(
         }
         StreamKind::Audio
             if tree.tag(node) == "AudioTransitionTrackItem"
-                && rate == Rational::integer(24)
+                && (rate == Rational::integer(24)
+                    || avid && crate::dissolve::supported_rate(rate))
                 && match_name == "Constant Power"
                 && constant_power_fields(tree, node)? =>
         {
@@ -251,6 +281,9 @@ fn read<'a>(
             .into());
         }
         StreamKind::Audio => {
+            if avid {
+                return Err(refuse("expected a plain mono Constant Power crossfade").into());
+            }
             return Err(refuse(
                 "expected a qualified 24 fps A1 Constant Gain or Constant Power profile",
             )
@@ -263,6 +296,7 @@ fn read<'a>(
         || start % frame_ticks != 0
         || duration % frame_ticks != 0
         || before_frames.and_then(|n| n.checked_mul(frame_ticks)) != Some(offset)
+        || avid && alignment != "2"
         || transition_is_reversed(tree, node)?
         || transition_border_width(tree, node)? != 0
         || !transition_has_incoming_clip(tree, node)?

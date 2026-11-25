@@ -28,6 +28,7 @@ enum Action {
     SetBinSelected { path: PathBuf, selected: bool },
     OpenMedia,
     RunReview,
+    SaveDiagnostics { path: PathBuf },
     Snapshot,
     CaptureProjectLayout,
     CaptureProjectScreenshot { path: PathBuf },
@@ -160,6 +161,12 @@ fn apply(
             }
         }
         Action::Snapshot => response.snapshots.push(snapshot(app)?),
+        Action::SaveDiagnostics { path } => {
+            let report = app.review_diagnostics().ok_or("Run Review before exporting diagnostics.")?;
+            app.diagnostic_preview = Some((super::DiagnosticSource::Review, report));
+            app.save_diagnostic_preview(&path)?;
+            app.diagnostic_preview = None;
+        }
         Action::CaptureProjectLayout => response.layouts.push(project_layout(app, ctx)?),
         Action::CaptureProjectScreenshot { path } => {
             require_project_picker(app, "Capture a screenshot")?;

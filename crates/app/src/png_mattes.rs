@@ -1,7 +1,7 @@
-//! Destination preparation for the original PNG Matte Key profile (CONV-0143).
+//! Destination preparation for verified still Matte Key profiles.
 //! Work from source receipts and leave the source graph available for export.
 use avid_adapter::{
-    original::{verify_imported_png, PngRole, RootMapping},
+    original::{verify_imported_png, PngRole, PngVerificationError, RootMapping, VerifiedPng},
     ReadResult,
 };
 use avid_reader::source::SourceInput;
@@ -12,12 +12,18 @@ use prproj::convert::{
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
+
+mod split;
 
 const MATTE: &str = "EFF2_2DMATTE";
 const ADAPTER: &str = "EFF2_LUTSFX";
 const FRAME: i64 = TICKS_PER_SECOND / 24;
+const CONTROL_PROFILE: &str = "imported_png_matte_controls";
+const OVERLAY_PROFILE: &str = "imported_png_matte_overlay";
+const OVERLAY_RATE: &str = "24000/1001";
+const OVERLAY_FRAME: i64 = TICKS_PER_SECOND / 24_000 * 1001;
 
 pub(crate) struct PrepareIssue {
     pub message: String,
@@ -28,8 +34,9 @@ pub(crate) struct FailedPngEdit {
     pub sequence: String,
     pub id: String,
     pub track: i64,
-    pub record_frame: i64,
+    pub record_start: Option<Rational>,
     pub saved_locators: Vec<String>,
+    pub shared_overlay_source: bool,
 }
 
 impl From<String> for PrepareIssue {
@@ -48,6 +55,9 @@ impl From<&str> for PrepareIssue {
 pub(crate) struct Plan {
     pub picture: PreparedPngMattes,
     pub inputs: Vec<SourceInput>,
+    pub overlay_omissions: Vec<Loss>,
+    /// Masters reconstructed solely as split Matte Key fills.
+    pub managed_fill_only: HashSet<String>,
     replaced: HashMap<String, HashMap<&'static str, HashSet<String>>>,
     recovered_reader_notes: HashSet<String>,
     recovered_gap_markers: HashMap<String, HashSet<usize>>,
@@ -59,7 +69,8 @@ impl Plan {
         input: &mut prproj::convert::prepared::PreparedProjectInput,
         graph: &graph::source::SourceGraph,
     ) -> Result<(), String> {
-        let sequences: HashSet<_> = self.picture.edits.iter().map(|e| e.sequence).collect();
+        let sequences: HashSet<_> = self.picture.edits.iter()
+            .filter(|edit| edit.background.is_some()).map(|edit| edit.sequence).collect();
         for index in sequences {
             let seq = &mut input.sequences[index];
             let source = &graph.sequences[index];
@@ -82,10 +93,24 @@ impl Plan {
                 recovered.is_none_or(|indices| !indices.contains(&index))
             });
         }
+        split::position_graphics(self, &mut input.texts);
         input.png_mattes = std::mem::take(&mut self.picture);
         Ok(())
     }
+    pub fn is_empty(&self) -> bool {
+        self.picture.edits.is_empty() && self.picture.split_edits.is_empty()
+    }
+    pub fn extra_linked_originals(&self) -> usize {
+        self.picture.stills.iter().map(|still| &still.path)
+            .chain(self.picture.jpeg_fills.iter()
+                .filter(|fill| fill.existing_clip.is_none() && fill.managed_start.is_none())
+                .map(|fill| &fill.path))
+            .collect::<HashSet<_>>().len()
+    }
     pub fn keeps_loss(&self, loss: &Loss) -> bool {
+        if loss.aspect == "managed_media_omitted" && self.managed_fill_only.contains(&loss.object) {
+            return false;
+        }
         // A sequence can have several losses of the same kind. Compare the
         // complete message and owner for each recovered occurrence.
         !self
@@ -234,11 +259,47 @@ struct Builder<'a> {
     mappings: &'a [RootMapping],
     stills: HashMap<&'a str, Still<'a>>,
     imported: HashMap<(usize, &'a str), usize>,
-    inputs: HashMap<Vec<String>, (SourceInput, PngRole)>,
+    inputs: HashMap<Vec<String>, (VerifiedPng, PngRole)>,
     physical: HashMap<PathBuf, Vec<String>>,
+    split: split::Sources<'a>,
 }
 
 impl<'a> Builder<'a> {
+    fn inspect(
+        &mut self,
+        import: &Value,
+        role: PngRole,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<&VerifiedPng, PngVerificationError> {
+        let saved = locators(import).ok_or_else(|| "invalid saved PNG locator".to_owned())?;
+        let needs_decode = self
+            .inputs
+            .get(&saved)
+            .is_none_or(|(_, old)| *old != role && !(*old == PngRole::Matte && role == PngRole::Opaque));
+        if needs_decode {
+            check()?;
+            let source = verify_imported_png(&saved, self.mappings, role)?;
+            check()?;
+            if self
+                .physical
+                .get(&source.input.path)
+                .is_some_and(|other| *other != saved)
+                || self
+                    .inputs
+                    .get(&saved)
+                    .is_some_and(|(before, _)| before.input != source.input)
+            {
+                return Err(PngVerificationError::Invalid(
+                    "conflicting PNG original identities or source changed during verification"
+                        .into(),
+                ));
+            }
+            self.physical.insert(source.input.path.clone(), saved.clone());
+            self.inputs.insert(saved.clone(), (source, role));
+        }
+        Ok(&self.inputs[&saved].0)
+    }
+
     fn add(
         &mut self,
         bin: usize,
@@ -246,43 +307,17 @@ impl<'a> Builder<'a> {
         name: &str,
         import: &Value,
         alpha: PngAlpha,
+        role: PngRole,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<usize, String> {
-        let saved = locators(import).ok_or("invalid saved PNG locator")?;
-        let role = if alpha == PngAlpha::Ignore {
-            PngRole::Opaque
-        } else {
-            PngRole::Matte
-        };
-        let needs_decode = self
-            .inputs
-            .get(&saved)
-            .is_none_or(|(_, old)| *old == PngRole::Opaque && role == PngRole::Matte);
-        if needs_decode {
-            check()?;
-            let source = verify_imported_png(&saved, self.mappings, role)?;
-            check()?;
-            if self
-                .physical
-                .get(&source.path)
-                .is_some_and(|other| *other != saved)
-                || self
-                    .inputs
-                    .get(&saved)
-                    .is_some_and(|(before, _)| *before != source)
-            {
-                return Err(
-                    "conflicting PNG original identities or source changed during verification"
-                        .into(),
-                );
-            }
-            self.physical.insert(source.path.clone(), saved.clone());
-            self.inputs.insert(saved.clone(), (source, role));
+        let source = self.inspect(import, role, check).map_err(|error| error.to_string())?;
+        if let Some(reason) = source.overlay_alpha_issue {
+            return Err(reason.into());
         }
-        let path = &self.inputs[&saved].0.path;
+        let path = source.input.path.clone();
         if let Some(&index) = self.imported.get(&(bin, mob)) {
             let old = &self.plan.picture.stills[index];
-            if old.path != *path || old.alpha != alpha {
+            if old.path != path || old.alpha != alpha {
                 return Err("one saved PNG master has contradictory interpretations".into());
             }
             return Ok(index);
@@ -294,7 +329,7 @@ impl<'a> Builder<'a> {
         self.imported.insert((bin, mob), index);
         self.plan.picture.stills.push(PreparedPngStill {
             bin,
-            path: path.clone(),
+            path,
             name: name.into(),
             alpha,
         });
@@ -306,6 +341,7 @@ pub(crate) fn prepare(
     read: &ReadResult,
     mappings: &[RootMapping],
     separate: bool,
+    ffprobe: &Path,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<Plan, PrepareIssue> {
     if !separate {
@@ -326,13 +362,15 @@ pub(crate) fn prepare(
             let receipt = *receipts.get(seq.id.as_str())?;
             list(receipt, "unresolved")
                 .iter()
-                .any(|r| text(r, "picture_profile") == Some("imported_png_matte_controls"))
+                .any(|r| matches!(text(r, "picture_profile"), Some(CONTROL_PROFILE | OVERLAY_PROFILE | split::PROFILE)))
                 .then_some((index, seq, receipt))
         })
         .collect();
     if candidates.is_empty() {
         return Ok(Plan::default());
     }
+    let jpeg_masters: HashSet<_> = candidates.iter().flat_map(|(_, _, receipt)| split::rows(receipt))
+        .filter_map(|row| text(row.get("matte_inputs")?.get("fill")?, "mob")).collect();
     let mut builder = Builder {
         plan: Plan::default(),
         mappings,
@@ -340,6 +378,7 @@ pub(crate) fn prepare(
         imported: HashMap::new(),
         inputs: HashMap::new(),
         physical: HashMap::new(),
+        split: if jpeg_masters.is_empty() { split::Sources::default() } else { split::Sources::new(read) },
     };
     for (bin, record) in graph.bins.iter().enumerate() {
         let Some(&receipt) = receipts.get(record.id.as_str()) else {
@@ -354,6 +393,10 @@ pub(crate) fn prepare(
             let (Some(id), Some(mob)) = (text(import, "id"), text(import, "mob")) else {
                 continue;
             };
+            if jpeg_masters.contains(mob) {
+                builder.split.saved_imports.entry(mob)
+                    .and_modify(|found| *found = None).or_insert(Some((bin, import)));
+            }
             let Some(&(master, omitted)) = masters.get(id) else {
                 continue;
             };
@@ -379,19 +422,50 @@ pub(crate) fn prepare(
         }
     }
     for (index, seq, receipt) in candidates {
-        prepare_sequence(&mut builder, read, index, seq, receipt, check)
-            .map_err(|mut issue| {
-                issue.message = format!("PNG Matte Key · {}: {}", seq.name, issue.message);
-                issue
-            })?;
+        let issues = list(receipt, "unresolved");
+        let result = if issues.iter().any(|row| text(row, "picture_profile") == Some(CONTROL_PROFILE)) {
+            prepare_sequence(&mut builder, read, index, seq, receipt, check)
+        } else {
+            (|| {
+                if overlay_rows(receipt).next().is_some() {
+                    prepare_overlays(&mut builder, read, index, seq, receipt, check)?;
+                }
+                if split::rows(receipt).next().is_some() {
+                    split::prepare(&mut builder, read, index, seq, receipt, ffprobe, check)?;
+                }
+                Ok(())
+            })()
+        };
+        result.map_err(|mut issue| {
+            issue.message = format!("PNG Matte Key · {}: {}", seq.name, issue.message);
+            issue
+        })?;
     }
-    builder.plan.inputs = builder
+    let linked: HashSet<_> = builder.plan.picture.stills.iter().map(|still| still.path.as_path()).collect();
+    builder.plan.inputs.extend(builder
         .inputs
         .into_values()
-        .map(|(source, _)| source)
-        .collect();
+        .filter_map(|(source, _)| (linked.contains(source.input.path.as_path())
+            || builder.split.used_alpha.contains(source.input.path.as_path())).then_some(source.input)));
+    builder.plan.inputs.extend(builder.split.imports.into_values().flatten());
+    builder.plan.inputs.extend(builder.split.managed_inputs.into_values().map(|(_, _, source)| source));
     builder.plan.inputs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(builder.plan)
+}
+
+fn valid_sequence_clock(seq: &graph::source::SourceSequence, rate: Rational) -> bool {
+    seq.clock.as_ref().is_some_and(|clock| {
+        clock.rate == rate
+            && clock.display_base == 24
+            && !clock.drop
+            && clock.provenance.route == "direct sequence TC1"
+            && clock.provenance.source_rate == rate
+            && clock.provenance.source_offset == 0
+            && clock.provenance.origin_count == clock.effective_count
+            && clock
+                .exact_start()
+                .is_some_and(|start| Some(start) == seq.start)
+    })
 }
 
 fn prepare_sequence<'a>(
@@ -403,21 +477,9 @@ fn prepare_sequence<'a>(
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(), PrepareIssue> {
     let rate = Rational::integer(24);
-    let valid_clock = seq.clock.as_ref().is_some_and(|clock| {
-        clock.rate == rate
-            && clock.display_base == 24
-            && !clock.drop
-            && clock.provenance.route == "direct sequence TC1"
-            && clock.provenance.source_rate == rate
-            && clock.provenance.source_offset == 0
-            && clock.provenance.origin_count == clock.effective_count
-            && clock
-                .exact_start()
-                .is_some_and(|start| Some(start) == seq.start)
-            && seq.start.and_then(|start| start.to_units(24)).is_some()
-    });
     if seq.rate != rate
-        || !valid_clock
+        || !valid_sequence_clock(seq, rate)
+        || seq.start.and_then(|start| start.to_units(24)).is_none()
         || seq.frame_size.is_some_and(|size| size != (1920, 1080))
         || list(receipt, "compatibility_frame_size") != [Value::Int(1920), Value::Int(1080)]
         || !seq.placements.is_empty()
@@ -506,15 +568,16 @@ fn prepare_sequence<'a>(
                 sequence: seq.id.clone(),
                 id: owner.into(),
                 track: lane,
-                record_frame: frame,
+                record_start: Rational::new(frame.into(), 24),
                 saved_locators: locators(import).unwrap_or_default(),
+                shared_overlay_source: false,
             }),
         };
         let profile = (text(issue, "effect_id"), text(issue, "picture_profile"));
         let (index, aspect) = match profile {
-            (Some(MATTE), Some("imported_png_matte_controls")) if lane == 2 => {
+            (Some(MATTE), Some(CONTROL_PROFILE)) if lane == 2 => {
                 let (master, import, invert) =
-                    matte_sources(issue).ok_or("unresolved saved fill or alpha")?;
+                    matte_sources(issue, 1, "24").ok_or("unresolved saved fill or alpha")?;
                 let name = match invert {
                     true => "Matte Key source — Avid Invert",
                     false => "Matte Key source — Avid Normal",
@@ -525,6 +588,7 @@ fn prepare_sequence<'a>(
                     name,
                     import,
                     PngAlpha::Straight { invert: !invert },
+                    PngRole::Matte,
                     check,
                 ).map_err(|message| source_issue(message, import))?;
                 builder.plan.recovered_reader_notes.insert(format!(
@@ -580,7 +644,7 @@ fn prepare_sequence<'a>(
                 } else {
                     None
                 };
-                let index = builder.add(still_bin, mob, &name, import, PngAlpha::Ignore, check)
+                let index = builder.add(still_bin, mob, &name, import, PngAlpha::Ignore, PngRole::Opaque, check)
                     .map_err(|message| source_issue(message, import))?;
                 let bin_id = &read.graph.bins[still_bin].id;
                 if let Some((marker_index, comment)) = gap {
@@ -636,7 +700,8 @@ fn prepare_sequence<'a>(
         builder.plan.picture.edits.push(PreparedPngEdit {
             sequence,
             start: frame * FRAME,
-            background,
+            duration: FRAME,
+            background: Some(background),
             foreground,
         });
     }
@@ -651,7 +716,180 @@ fn prepare_sequence<'a>(
     Ok(())
 }
 
-fn matte_sources(issue: &Value) -> Option<(&str, &Value, bool)> {
+fn valid_overlay_sequence(seq: &graph::source::SourceSequence, receipt: &Value) -> bool {
+    let rate = Rational::new(24_000, 1001).unwrap();
+    seq.rate == rate
+        && valid_sequence_clock(seq, rate)
+        && seq.frame_size.is_none_or(|size| size == (1920, 1080))
+        && list(receipt, "compatibility_frame_size") == [Value::Int(1920), Value::Int(1080)]
+}
+
+struct SavedOverlay<'a> {
+    owner: &'a str,
+    frame: i64,
+    length: i64,
+    start: i64,
+    duration: i64,
+    master: &'a str,
+    import: &'a Value,
+    invert: bool,
+    reason: &'a str,
+}
+
+impl<'a> SavedOverlay<'a> {
+    fn read(issue: &'a Value, owners: &mut HashSet<&'a str>) -> Result<Self, &'static str> {
+        let owner = text(issue, "owner").ok_or("missing effect occurrence")?;
+        let frame = issue.get("record_start").and_then(|r| number(r, "value"))
+            .filter(|frame| *frame >= 0).ok_or("unresolved Matte Key record position")?;
+        let length = number(issue, "record_length").filter(|n| *n > 0)
+            .ok_or("unresolved Matte Key length")?;
+        if text(issue, "effect_id") != Some(MATTE)
+            || number(issue, "track") != Some(2)
+            || number(issue, "kind") != Some(1)
+            || text(issue, "record_rate") != Some(OVERLAY_RATE)
+            || !owners.insert(owner)
+        {
+            return Err("contradictory PNG overlay occurrence or record clock");
+        }
+        let start = frame.checked_mul(OVERLAY_FRAME).ok_or("Matte Key start exceeds Premiere timing bounds")?;
+        let duration = length.checked_mul(OVERLAY_FRAME).ok_or("Matte Key length exceeds Premiere timing bounds")?;
+        let (master, import, invert) =
+            matte_sources(issue, length, OVERLAY_RATE).ok_or("unresolved saved fill or alpha")?;
+        let reason = text(issue, "reason").ok_or("missing effect receipt reason")?;
+        Ok(Self { owner, frame, length, start, duration, master, import, invert, reason })
+    }
+
+    fn failed_edit(&self, sequence: &str, shared_overlay_source: bool) -> FailedPngEdit {
+        FailedPngEdit {
+            sequence: sequence.into(), id: self.owner.into(), track: 2,
+            record_start: Rational::new(self.start.into(), TICKS_PER_SECOND.into()),
+            saved_locators: locators(self.import).unwrap_or_default(),
+            shared_overlay_source,
+        }
+    }
+}
+
+fn overlay_rows(receipt: &Value) -> impl Iterator<Item = &Value> {
+    list(receipt, "unresolved").iter()
+        .filter(|issue| text(issue, "picture_profile") == Some(OVERLAY_PROFILE))
+}
+
+/// The same saved locators select the same PNG during this Review. Restrict
+/// additional details to qualified overlay routes without inspecting more files.
+pub(crate) fn matching_overlay_failures(
+    source: &graph::source::SourceGraph,
+    failed: &FailedPngEdit,
+    limit: usize,
+    check_cancel: impl Fn() -> bool,
+) -> Vec<FailedPngEdit> {
+    let mut matches = Vec::new();
+    if !failed.shared_overlay_source || failed.saved_locators.is_empty() || limit == 0 {
+        return matches;
+    }
+    let sequences: HashMap<_, _> = source.sequences.iter()
+        .map(|seq| (seq.id.as_str(), seq)).collect();
+    for receipt in source.sidecars.iter().filter(|row| row.adapter == "avid.source") {
+        if check_cancel() {
+            break;
+        }
+        let Some(&sequence) = sequences.get(receipt.object.as_str()) else { continue };
+        if !valid_overlay_sequence(sequence, &receipt.data) {
+            continue;
+        }
+        let mut owners = HashSet::new();
+        let rows = overlay_rows(&receipt.data);
+        let mut counts = HashMap::new();
+        for row in overlay_rows(&receipt.data) {
+            if check_cancel() {
+                return matches;
+            }
+            if let Some(owner) = text(row, "owner") {
+                *counts.entry(owner).or_insert(0usize) += 1;
+            }
+        }
+        for row in rows {
+            if check_cancel() || matches.len() == limit {
+                return matches;
+            }
+            let Ok(overlay) = SavedOverlay::read(row, &mut owners) else { continue };
+            if overlay.owner != failed.id
+                && counts[overlay.owner] == 1
+                && overlay.owner.strip_prefix(&sequence.id).is_some_and(|suffix| suffix.starts_with('/'))
+                && locators(overlay.import).as_ref() == Some(&failed.saved_locators)
+            {
+                matches.push(overlay.failed_edit(&sequence.id, true));
+            }
+        }
+    }
+    matches
+}
+
+fn prepare_overlays<'a>(
+    builder: &mut Builder<'a>,
+    read: &'a ReadResult,
+    sequence: usize,
+    seq: &'a graph::source::SourceSequence,
+    receipt: &'a Value,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), PrepareIssue> {
+    if !valid_overlay_sequence(seq, receipt) {
+        return Err("requires a 1080p23.976 sequence with a saved non-drop origin".into());
+    }
+    let bin = *read.sequence_bins.get(&seq.id).ok_or("missing source bin assignment")?;
+    let mut owners = HashSet::new();
+    for issue in overlay_rows(receipt) {
+        let overlay = SavedOverlay::read(issue, &mut owners)?;
+        let SavedOverlay { owner, frame, length, start, duration, master, import, invert, reason } = overlay;
+        if builder.plan.picture.edits.len() >= 10_000 {
+            return Err("too many PNG picture edits".into());
+        }
+        let unit = if length == 1 { "frame" } else { "frames" };
+        let span = format!("V2 at record frame {frame} for {length} {unit} ({OVERLAY_RATE} fps)");
+        let omission = match builder.inspect(import, PngRole::BinaryMatte, check) {
+            Ok(source) => source.overlay_alpha_issue.map(str::to_owned),
+            Err(PngVerificationError::MissingOriginal) => {
+                let saved = locators(import).expect("verified locator list");
+                Some(format!(
+                    "The original PNG is unavailable. Restore it at {} or map its saved root",
+                    saved.iter().map(|path| format!("{path:?}")).collect::<Vec<_>>().join(" or "),
+                ))
+            }
+            Err(error) => return Err(PrepareIssue {
+                message: error.to_string(),
+                edit: Some(overlay.failed_edit(&seq.id, true)),
+            }),
+        };
+        if let Some(reason) = omission {
+            builder.plan.overlay_omissions.push(Loss {
+                object: owner.into(),
+                aspect: "picture_effect".into(),
+                reason: format!("{span}: PNG Matte Key omitted. {reason}. The lower picture track is retained."),
+            });
+        } else {
+            let foreground = builder.add(
+                bin, master, "Matte Key overlay", import, PngAlpha::Straight { invert: !invert },
+                PngRole::BinaryMatte, check,
+            ).map_err(|message| PrepareIssue {
+                message, edit: Some(overlay.failed_edit(&seq.id, false)),
+            })?;
+            builder.plan.picture.edits.push(PreparedPngEdit {
+                sequence, start, duration, background: None, foreground: Some(foreground),
+            });
+        }
+        builder.plan.replace_loss(&seq.id, "picture_effect", format!("{span}: {reason}"));
+        builder.plan.recovered_reader_notes.insert(format!(
+            "{:?}: V2 at frame {frame}: Matte Key (EFF2_2DMATTE) not converted", seq.name
+        ));
+    }
+    Ok(())
+}
+
+fn matte_sources<'a>(issue: &'a Value, length: i64, rate: &str) -> Option<(&'a str, &'a Value, bool)> {
+    let (fill, alpha, import, invert) = still_sources(issue, length, rate)?;
+    (fill == alpha).then_some((fill, import, invert))
+}
+
+fn still_sources<'a>(issue: &'a Value, length: i64, rate: &str) -> Option<(&'a str, &'a str, &'a Value, bool)> {
     let inputs = issue.get("matte_inputs")?;
     if text(inputs, "background") != Some("lower_track") {
         return None;
@@ -659,13 +897,12 @@ fn matte_sources(issue: &Value) -> Option<(&str, &Value, bool)> {
     let fill = inputs.get("fill")?;
     let matte = inputs.get("matte")?;
     let master = text(fill, "mob")?;
-    if text(matte, "mob") != Some(master)
-        || number(fill, "track") != Some(1)
+    if number(fill, "track") != Some(1)
         || number(matte, "track") != Some(2)
         || [fill, matte].iter().any(|input| {
             number(input, "start") != Some(0)
-                || number(input, "length") != Some(1)
-                || text(input, "rate") != Some("24")
+                || number(input, "length") != Some(length)
+                || text(input, "rate") != Some(rate)
         })
     {
         return None;
@@ -673,6 +910,7 @@ fn matte_sources(issue: &Value) -> Option<(&str, &Value, bool)> {
     let import = issue.get("matte_import")?;
     (flag(import, "ignore_alpha") == Some(false)).then_some((
         master,
+        text(matte, "mob")?,
         import,
         flag(import, "invert_alpha")?,
     ))

@@ -370,7 +370,7 @@ pub(crate) fn verify_pcm_packet_grid(
     )
 }
 
-fn inspect_movie_packets(
+pub(crate) fn inspect_movie_packets(
     tool: &Path,
     path: &Path,
     container: &str,

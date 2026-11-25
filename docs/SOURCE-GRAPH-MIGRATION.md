@@ -544,6 +544,26 @@ matched all 24 AAF picture frames. Under default center pan, A2 matched all
 48,048 samples and A1 differed by at most one PCM24 count per output
 channel. Separate files mode requires two siblings of the same bit depth.
 
+The linked-original profile can also write a reusable bin subclip from
+one 1080p23.976 ProRes HQ MOV with embedded 48 kHz stereo PCM24. Its saved
+V1, A1 and A2 references must share one backing master, range and offset.
+The writer adds that offset to the saved bin bounds once and retains the
+original picture clock and independent left and right selections.
+Premiere 27 build 88 reopened the subclip at file range [8, 182). Fresh
+insertion on V1/A1/A2 matched all 174 frames of the existing range edit
+and 348,348 original PCM samples per lane. Existing timeline trims come
+from their own graph placements. (CONV-0214)
+
+A timeline edit can also use the reusable ProRes subclip as its Premiere
+source. Preparation requires the saved timeline-to-subclip and
+subclip-to-master references to agree with the bin receipt, file-relative
+trim and mono selection. A derived AVB keeps V1 and A1 at [18, 42) and A2
+at [21, 45), with all three edits referring to the subclip after Premiere
+27 Save As and reopen. All 24 frames match the direct-master control.
+Each mono lane matches the 48,048 samples at its own original trim.
+If a saved route disagrees, conversion retains the qualified direct
+source and reports the affected edit. (CONV-0216)
+
 The direct CLI also uses the reusable subclip writer for saved subclips
 in Separate files mode when the media comes from `--media`. The retained
 unmarked and source-marked A/V controls produce the same projects as the

@@ -23,6 +23,8 @@ const PREFIX: [u8; 5] = [0, 0, 2, 128, 3];
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Profile {
     Dnx,
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    ManagedDnxHd,
     ProResFreeze,
     ProResLt,
 }
@@ -39,6 +41,20 @@ pub(super) struct Terminal {
     indexed_offsets: Vec<u64>,
     profile: Profile,
 }
+
+/// Return the payload start, payload length and native index-key offset.
+#[cfg(target_os = "macos")]
+pub(crate) fn managed_dnxhd_layout(path: &Path, frames: i64) -> R<(u64, u64, u64)> {
+    let layout = layout(path)?;
+    let ([essence], [index]) = (layout.essence.as_slice(), layout.indexes.as_slice()) else {
+        return Err("managed DNxHD needs one essence payload and one index".into());
+    };
+    let coded = u64::try_from(frames).ok().and_then(|n| n.checked_mul(FRAME))
+        .ok_or("managed DNxHD frame extent overflows")?;
+    Terminal::physical_indexed(path, frames, Profile::ManagedDnxHd, essence.bytes > coded)?;
+    Ok((essence.offset, essence.bytes, index.key_offset))
+}
+
 fn require(ok: bool, why: &str) -> R<()> {
     if ok {
         Ok(())
@@ -60,14 +76,14 @@ fn read(file: &mut File, offset: u64, size: u64, max: u64) -> R<Vec<u8>> {
     file.read_exact(&mut data).map_err(|e| e.to_string())?;
     Ok(data)
 }
-fn header(file: &mut File, offset: u64) -> R<Vec<u8>> {
+fn header(file: &mut File, offset: u64, cid: u32) -> R<Vec<u8>> {
     let h = read(file, offset, 640, 640)?;
     require(
         h[..5] == PREFIX && h[5] & 2 == 0 && h[6] & 0x20 == 0,
         "not a supported progressive coding header",
     )?;
     require(
-        h[0x28..0x2c] == 1274u32.to_be_bytes()
+        h[0x28..0x2c] == cid.to_be_bytes()
             && h[0x18..0x1a] == 1080u16.to_be_bytes()
             && h[0x1a..0x1c] == 1920u16.to_be_bytes(),
         "coded CID/raster disagree",
@@ -104,7 +120,7 @@ fn picture_index_offsets(
 ) -> R<Vec<u64>> {
     let index_sid = indexes.first().ok_or("terminal picture index is missing")?.index_sid;
     let clock = match profile {
-        Profile::Dnx => 24000u64 << 32 | 1001,
+        Profile::Dnx | Profile::ManagedDnxHd => 24000u64 << 32 | 1001,
         Profile::ProResFreeze | Profile::ProResLt => 24u64 << 32 | 1,
     };
     let mut offsets = Vec::with_capacity(expected);
@@ -229,6 +245,7 @@ impl Terminal {
     pub(super) fn receipt(&self) -> Value {
         obj(vec![
             ("reason", text(match self.profile {
+                Profile::ManagedDnxHd => "verified indexed managed DNxHD CID 1253 pictures",
                 Profile::Dnx => "verified zero-only terminal packet after complete scoped DNxHR LB coded pictures; compatibility handling, not a universal padding rule",
                 Profile::ProResFreeze => "verified zero-only terminal packet after the complete generated ProRes Freeze Frame",
                 Profile::ProResLt => "verified zero-only terminal packet after complete indexed ProRes 422 LT pictures",
@@ -290,6 +307,7 @@ impl Terminal {
     pub(super) fn recheck(&self, path: &Path, probe: &Probe, tool: &Path, rate: Fraction) -> R<Self> {
         match self.profile {
             Profile::Dnx => Self::qualify(path, probe, tool, rate),
+            Profile::ManagedDnxHd => return Err("managed DNxHD is verified through its indexed layout".into()),
             Profile::ProResFreeze => Self::qualify_freeze(path, probe, tool),
             Profile::ProResLt => Self::qualify_lt(path, probe, tool),
         }
@@ -345,7 +363,7 @@ impl Terminal {
         )?;
         let mut file = File::open(path).map_err(|e| e.to_string())?;
         let frame_bytes = match profile {
-            Profile::Dnx => FRAME,
+            Profile::Dnx | Profile::ManagedDnxHd => FRAME,
             Profile::ProResLt => {
                 require(e.key[14..] == [6, 1] && (!has_tail || e.bytes % 4096 == 0),
                     "unsupported ProRes LT clip wrapping")?;
@@ -366,14 +384,18 @@ impl Terminal {
         };
         if profile != Profile::ProResLt {
             let coded = frames as u64 * frame_bytes;
-            require(e.bytes > coded, "no physical bytes after coded span")?;
-            let bytes = e.bytes - coded;
+            require(!has_tail || e.bytes > coded, "no physical bytes after coded span")?;
+            let bytes = e.bytes.checked_sub(coded).ok_or("coded span exceeds its physical essence")?;
             require(bytes <= MAX_TAIL && bytes < frame_bytes
-                && (profile == Profile::Dnx || bytes == 32000), "terminal span exceeds bound")?;
+                && match profile {
+                    Profile::Dnx => true,
+                    Profile::ManagedDnxHd => matches!(bytes, 0 | 8192),
+                    _ => bytes == 32000,
+                }, "terminal span exceeds bound")?;
         }
         let entries = frames as usize + usize::from(has_tail);
         let mut offsets = picture_index_offsets(&mut file, &layout.indexes, e.body_sid, entries, profile)?;
-        if !has_tail {
+        if !has_tail && profile == Profile::ProResLt {
             offsets.push(e.bytes);
         }
         let mut header_prefix = Vec::new();
@@ -407,7 +429,7 @@ impl Terminal {
                         require(&picture == first, "generated ProRes pictures are not byte-identical")?;
                         picture[..28].to_vec()
                     } else {
-                        header(&mut file, offset)?
+                        header(&mut file, offset, if profile == Profile::ManagedDnxHd { 1253 } else { 1274 })?
                     };
                     if i == 0 {
                         header_prefix = current;
@@ -513,7 +535,7 @@ impl Terminal {
                 "output is not exact frame-wrapped DNx picture",
             )?;
             require(
-                header(&mut file, e.offset)? == self.header_prefix,
+                header(&mut file, e.offset, 1274)? == self.header_prefix,
                 "output coded header format changed",
             )?;
         }
@@ -617,11 +639,15 @@ mod tests {
         }
     }
     fn control() -> (Vec<u8>, BTreeMap<u16, Vec<u8>>) {
-        let mut body = vec![0; FRAME as usize * 2 + 512];
+        dnx_control(1274, 512)
+    }
+
+    fn dnx_control(cid: u32, tail: usize) -> (Vec<u8>, BTreeMap<u16, Vec<u8>>) {
+        let mut body = vec![0; FRAME as usize * 2 + tail];
         for n in 0..2 {
             let at = n * FRAME as usize;
             body[at..at + 5].copy_from_slice(&PREFIX);
-            body[at + 0x28..at + 0x2c].copy_from_slice(&1274u32.to_be_bytes());
+            body[at + 0x28..at + 0x2c].copy_from_slice(&cid.to_be_bytes());
             body[at + 0x18..at + 0x1a].copy_from_slice(&1080u16.to_be_bytes());
             body[at + 0x1a..at + 0x1c].copy_from_slice(&1920u16.to_be_bytes());
         }
@@ -643,6 +669,21 @@ mod tests {
         ]);
         (body, fields)
     }
+    #[test]
+    fn managed_dnxhd_requires_indexed_cid_1253_and_zero_alignment_tail() {
+        let scratch = Scratch::new();
+        let (mut body, fields) = dnx_control(1253, 8192);
+        scratch.write_segments(&body, &[&fields]);
+        let check = || Terminal::physical_indexed(&scratch.0, 2, Profile::ManagedDnxHd, true);
+        assert_eq!(check().unwrap().bytes, 8192);
+        *body.last_mut().unwrap() = 1;
+        scratch.write_segments(&body, &[&fields]);
+        assert!(check().unwrap_err().contains("nonzero terminal data"));
+        let (wrong_cid, _) = dnx_control(1274, 8192);
+        scratch.write_segments(&wrong_cid, &[&fields]);
+        assert!(check().unwrap_err().contains("CID/raster"));
+    }
+
     #[test]
     fn compact_packet_witness_checks_the_full_span_at_the_frame_budget() {
         use std::fmt::Write;

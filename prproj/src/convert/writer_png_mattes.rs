@@ -1,9 +1,10 @@
-//! Keep the tested nonlinear blend inside a one-frame child with both inputs.
+//! Write the verified nonlinear nests and binary-alpha overlays.
 use super::{add, other, Result};
 use crate::build::time::Time;
 use crate::convert::{
-    model::{ticks_per_unit, Sequence},
-    prepared::{PngAlpha, PreparedPngEdit, PreparedPngStill},
+    model::{ticks_per_unit, Clip, Fraction, Matte, Sequence, VideoFile},
+    opatom::{self, DirectDnxhrFile, MediaTable},
+    prepared::{PngAlpha, PreparedJpegFill, PreparedPngEdit, PreparedPngStill, PreparedSplitMatte},
 };
 use crate::ids::UuidSource;
 use crate::model::{ItemId, Project, SequenceId};
@@ -46,7 +47,12 @@ pub(super) fn place(
 ) -> Result<()> {
     let frame = ticks_per_unit(seq.rate);
     for edit in edits {
-        let background = items[edit.background];
+        let Some(background) = edit.background else {
+            let foreground = edit.foreground.ok_or_else(|| other("PNG overlay is missing its source"))?;
+            place_span(project, sequence, 1, items[foreground], edit.start, edit.duration, ids)?;
+            continue;
+        };
+        let background = items[background];
         let mut v1 = background;
         let mut v2 = None;
         if let Some(foreground) = edit.foreground {
@@ -67,39 +73,95 @@ pub(super) fn place(
                     }
                     set_nonlinear_blend(project, child)?;
                     project.set_zero_point(child, Time::new(add(seq.start, edit.start)?))?;
-                    place_frame(project, child, 0, background, 0, frame, ids)?;
-                    place_frame(project, child, 1, items[foreground], 0, frame, ids)?;
+                    place_span(project, child, 0, background, 0, frame, ids)?;
+                    place_span(project, child, 1, items[foreground], 0, frame, ids)?;
                     project.set_nested_source_duration(child, frame)?;
                     v1 = item;
                 }
             }
         }
-        place_frame(project, sequence, 0, v1, edit.start, frame, ids)?;
+        place_span(project, sequence, 0, v1, edit.start, frame, ids)?;
         if let Some(v2) = v2 {
-            place_frame(project, sequence, 1, v2, edit.start, frame, ids)?;
+            place_span(project, sequence, 1, v2, edit.start, frame, ids)?;
         }
     }
     Ok(())
 }
 
-fn place_frame(
+fn place_span(
     project: &mut Project,
     sequence: SequenceId,
     lane: usize,
     source: ItemId,
     start: i64,
-    frame: i64,
+    duration: i64,
     ids: &mut dyn UuidSource,
-) -> Result<()> {
+) -> Result<crate::model::TrackItemId> {
     let track = *project
         .video_tracks(sequence)
         .get(lane)
         .ok_or_else(|| other("PNG composite needs two picture tracks"))?;
     let edit = project.add_clip(track, source, Time::new(start), ids)?;
     project.set_in_point(edit, Time::new(0))?;
-    project.set_out_point(edit, Time::new(frame))?;
-    project.set_end(edit, Time::new(add(start, frame)?))?;
+    project.set_out_point(edit, Time::new(duration))?;
+    project.set_end(edit, Time::new(add(start, duration)?))?;
+    Ok(edit)
+}
+
+pub(super) fn place_split(
+    project: &mut Project, sequence: SequenceId, frame: i64,
+    edit: &PreparedSplitMatte, fill: ItemId, managed_hold: bool, ids: &mut dyn UuidSource,
+) -> Result<()> {
+    let item = place_span(project, sequence, (edit.track - 1) as usize, fill, edit.start, edit.duration, ids)?;
+    if managed_hold {
+        crate::convert::time_remap::set_frame_hold(project, item, 0);
+    }
+    let shapes = std::iter::once(edit.rectangle).chain(edit.hole)
+        .map(|rectangle| vec![(0, rectangle_points(rectangle))]).collect();
+    let matte = Matte {
+        shapes,
+        inverted: false,
+        opacities: Vec::new(),
+        feathers: Vec::new(),
+        not_converted: Vec::new(),
+    };
+    crate::convert::matte::write_masks(project, item, &matte, 0, frame, edit.hole.is_some())?;
     Ok(())
+}
+
+pub(super) fn import_managed_fill(
+    project: &mut Project, media: &mut MediaTable, fill: &PreparedJpegFill,
+    start: i64, bin: ItemId, ids: &mut dyn UuidSource,
+) -> Result<ItemId> {
+    let rate = Fraction::new(24_000, 1001);
+    let video = VideoFile {
+        path: fill.path.to_str().ok_or_else(|| other("non-UTF-8 Matte Key MXF path"))?.to_owned(),
+        codec: "AVdn".into(),
+        width: 1920, height: 1080, rate, duration: ticks_per_unit(rate), start,
+    };
+    let clip = Clip {
+        id: String::new(), name: fill.name.clone(), material_umid: None, tape_name: None,
+        video: None, audio: Vec::new(), avid: None, time_display: None, stereo_pairs: Vec::new(),
+        multichannel_groups: Vec::new(), rate: Some(rate), markers: Vec::new(),
+    };
+    media.direct_dnxhr.insert(video.path.clone(), DirectDnxhrFile {
+        origin: start, picture: true, display: "110", dnxhr: false,
+    });
+    let previous = project.import_target.replace(bin);
+    let item = opatom::add_video_item(project, media, &video, &clip, None, ids);
+    project.import_target = previous;
+    Ok(item?)
+}
+
+fn rectangle_points([left, top, right, bottom]: [u32; 4]) -> Vec<[f64; 6]> {
+    // Extend edges at the canvas boundary so the mask has no antialiasing
+    // seam along the picture border.
+    let x0 = if left == 0 { -0.01 } else { f64::from(left) / 1920.0 };
+    let y0 = if top == 0 { -0.01 } else { f64::from(top) / 1080.0 };
+    let x1 = if right == 1920 { 1.01 } else { f64::from(right) / 1920.0 };
+    let y1 = if bottom == 1080 { 1.01 } else { f64::from(bottom) / 1080.0 };
+    [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].into_iter()
+        .map(|(x, y)| [x, y, 0.0, 0.0, 0.0, 0.0]).collect()
 }
 
 fn set_nonlinear_blend(project: &mut Project, sequence: SequenceId) -> Result<()> {

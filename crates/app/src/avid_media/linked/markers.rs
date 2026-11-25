@@ -1,5 +1,5 @@
 //! Point markers on generated Avid compositions.
-use super::{Result, RATE};
+use super::{EditRate, Result};
 use avid_reader::{
     document_attributes_extra::{AttributeValue, DocumentAttributesExt},
     io::MobId,
@@ -24,6 +24,7 @@ pub(super) fn prepare<'a>(
     markers: &'a [SourceMarker],
     offset: Option<Rational>,
     extent: u32,
+    edit_rate: EditRate,
 ) -> Result<Vec<Marker<'a>>> {
     if markers.len() > i16::MAX as usize {
         return Err("Avid marker list exceeds the native time-crumb count".into());
@@ -41,7 +42,7 @@ pub(super) fn prepare<'a>(
             || !marker.binding.placements.is_empty()
             || marker
                 .owner_rate
-                .is_some_and(|rate| rate != Rational::integer(RATE))
+                .is_some_and(|rate| rate != edit_rate.exact())
             || marker.owner_local.is_some() && marker.owner_local != marker.start
         {
             return Err(
@@ -52,7 +53,7 @@ pub(super) fn prepare<'a>(
             .start
             .zip(offset)
             .and_then(|(start, offset)| start.checked_add(offset))
-            .and_then(|time| time.to_units(RATE))
+            .and_then(|time| edit_rate.frames(time))
             .filter(|frame| {
                 *frame >= 0 && *frame < i64::from(extent) && *frame <= i64::from(i32::MAX)
             })
@@ -255,7 +256,7 @@ mod tests {
             owner: MarkerOwner::Sequence,
             owner_occurrence: "owner/point".into(),
             owner_local: Some(start),
-            owner_rate: Some(Rational::integer(RATE)),
+            owner_rate: Some(Rational::integer(24)),
             binding: SourceBinding {
                 placements: vec![],
                 reason: None,
@@ -263,7 +264,7 @@ mod tests {
             source: None,
             inherited: false,
         }];
-        let markers = prepare(&source, Rational::new(1, 24), 10)?;
+        let markers = prepare(&source, Rational::new(1, 24), 10, EditRate::Fps24)?;
         assert_eq!(markers[0].frame, 6);
         let mut doc = AvbDocument::new_empty_bin(1, "2026/01/01 00:00:00", 0, false);
         let list = write(&mut doc, &markers)?;

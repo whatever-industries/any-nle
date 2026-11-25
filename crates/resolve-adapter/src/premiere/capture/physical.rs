@@ -1,4 +1,8 @@
 //! File checks for Premiere source capture, independent of Resolve's writer profiles.
+mod managed_atom;
+pub use managed_atom::{verify_avid_managed_atom, ManagedAtom};
+pub(super) use managed_atom::RECEIPT as MANAGED_ATOM_RECEIPT;
+
 use crate::{linked::extent, media, Result};
 use graph::{Rational, StreamKind};
 use serde_json::Value;
@@ -16,6 +20,7 @@ pub(super) struct Physical {
     pub package: Option<String>,
     pub file_package: Option<String>,
     pub state: media::FileStamp,
+    pub managed: Option<ManagedAtom>,
 }
 
 pub(super) struct Stream {
@@ -28,6 +33,22 @@ pub(super) struct Stream {
     pub rate: Option<Rational>,
     pub channels: Option<i64>,
     pub bits: Option<i64>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AvcAacEncoding {
+    pub level: i64,
+    pub srgb: bool,
+}
+
+pub struct VerifiedAvcAac {
+    pub level: i64,
+    pub srgb: bool,
+    pub rate: Rational,
+    pub picture_base: Rational,
+    pub picture_ticks: i64,
+    pub audio_samples: i64,
+    pub timecode: String,
 }
 
 fn s<'a>(v: &'a Value, field: &str) -> &'a str {
@@ -59,6 +80,40 @@ pub(super) fn display_base(rate: Rational) -> Result<u16> {
 }
 
 pub(super) fn inspect(path: &Path, ffprobe: &Path) -> Result<Physical> {
+    inspect_with_avid_avc(path, ffprobe, false).map(|(media, _)| media)
+}
+
+pub(super) fn inspect_for_avid(
+    path: &Path,
+    ffprobe: &Path,
+) -> Result<(Physical, Option<AvcAacEncoding>)> {
+    inspect_with_avid_avc(path, ffprobe, true)
+}
+
+pub fn verify_avid_avc_aac(path: &Path, ffprobe: &Path) -> Result<VerifiedAvcAac> {
+    let (media, encoding) = inspect_for_avid(path, ffprobe)?;
+    let encoding =
+        encoding.ok_or("expected timecoded HD High-profile AVC with stereo AAC-LC in MP4")?;
+    let picture = media.video.ok_or("missing MP4 picture stream")?;
+    let [audio] = media.audio.as_slice() else {
+        return Err("missing MP4 stereo audio stream".into());
+    };
+    Ok(VerifiedAvcAac {
+        level: encoding.level,
+        srgb: encoding.srgb,
+        rate: picture.rate.ok_or("missing MP4 picture rate")?,
+        picture_base: picture.time_base,
+        picture_ticks: picture.count,
+        audio_samples: audio.count,
+        timecode: media.timecode.ok_or("missing MP4 source timecode")?,
+    })
+}
+
+fn inspect_with_avid_avc(
+    path: &Path,
+    ffprobe: &Path,
+    avid: bool,
+) -> Result<(Physical, Option<AvcAacEncoding>)> {
     let state = file_state(path)?;
     let extension = path
         .extension()
@@ -72,6 +127,9 @@ pub(super) fn inspect(path: &Path, ffprobe: &Path) -> Result<Physical> {
         _ => return Err("unsupported Premiere linked file extension".into()),
     };
     let probe = media::probe_file(ffprobe, path, container)?;
+    if avid && container == "mxf" && managed_atom::is_op_atom(&probe) {
+        return Ok((managed_atom::inspect(path, ffprobe, &probe, state)?, None));
+    }
     let format = &probe["format"];
     let tags = &format["tags"];
     let package = match (container, s(format, "format_name"), s(tags, "major_brand")) {
@@ -95,6 +153,11 @@ pub(super) fn inspect(path: &Path, ffprobe: &Path) -> Result<Physical> {
     if !(1..=4).contains(&streams.len()) {
         return Err("unqualified Premiere original stream count".into());
     }
+    let avc = if avid && extension == "mp4" {
+        avid_avc_encoding(streams)
+    } else {
+        None
+    };
     let mut video = None;
     let mut audio = Vec::new();
     let mut timecode = None;
@@ -111,13 +174,19 @@ pub(super) fn inspect(path: &Path, ffprobe: &Path) -> Result<Physical> {
         }
         match s(row, "codec_type") {
             "video" if index == 0 && container != "wav" => {
-                video = Some(inspect_video(row, &extension, path, ffprobe)?);
+                video = Some(inspect_video(
+                    row,
+                    &extension,
+                    path,
+                    ffprobe,
+                    avc.is_some_and(|codec| codec.srgb),
+                )?);
             }
             "audio" if timecode.is_none() && audio.len() < 2 => {
                 audio.push(inspect_audio(row, &extension, path, ffprobe)?);
             }
             "data"
-                if extension == "mov"
+                if (extension == "mov" || avc.is_some())
                     && s(row, "codec_tag_string") == "tmcd"
                     && timecode.is_none() =>
             {
@@ -155,18 +224,79 @@ pub(super) fn inspect(path: &Path, ffprobe: &Path) -> Result<Physical> {
     } else if timecode.is_none() && !s(&streams[0]["tags"], "timecode").is_empty() {
         return Err("picture reports a timecode without a verified track".into());
     }
+    if avc.is_some()
+        && tags["timecode"]
+            .as_str()
+            .is_some_and(|label| Some(label) != timecode.as_deref())
+    {
+        return Err("MP4 container timecode contradicts the verified track".into());
+    }
     if file_state(path)? != state {
         return Err("Premiere linked media changed while probing".into());
     }
-    Ok(Physical {
-        container,
-        video,
-        audio,
-        timecode,
-        package,
-        file_package: file_package.map(|id| id[2..].to_ascii_uppercase()),
-        state,
-    })
+    Ok((
+        Physical {
+            container,
+            video,
+            audio,
+            timecode,
+            package,
+            file_package: file_package.map(|id| id[2..].to_ascii_uppercase()),
+            state,
+            managed: None,
+        },
+        avc,
+    ))
+}
+
+fn avid_avc_encoding(streams: &[Value]) -> Option<AvcAacEncoding> {
+    let [picture, audio, clock] = streams else {
+        return None;
+    };
+    let transfer = s(picture, "color_transfer");
+    (s(picture, "codec_name") == "h264"
+        && s(picture, "codec_tag_string") == "avc1"
+        && s(picture, "profile") == "High"
+        && s(picture, "pix_fmt") == "yuv420p"
+        && n(picture, "width").zip(n(picture, "height")) == Some((1920, 1080))
+        && matches!(s(picture, "avg_frame_rate"), "24000/1001" | "24/1")
+        && s(picture, "color_range") == "tv"
+        && s(picture, "color_space") == "bt709"
+        && s(picture, "color_primaries") == "bt709"
+        && matches!(transfer, "bt709" | "iec61966-2-1")
+        && s(audio, "codec_name") == "aac"
+        && s(audio, "profile") == "LC"
+        && s(clock, "codec_tag_string") == "tmcd")
+        .then_some(AvcAacEncoding {
+            level: n(picture, "level").filter(|n| (1..=42).contains(n))?,
+            srgb: transfer == "iec61966-2-1",
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn timecoded_avc_aac_candidate_requires_exact_encoding_and_stream_roles() {
+        let picture = json!({
+            "codec_name": "h264", "codec_tag_string": "avc1", "profile": "High",
+            "pix_fmt": "yuv420p", "width": 1920, "height": 1080, "level": 40,
+            "avg_frame_rate": "24000/1001", "color_range": "tv",
+            "color_space": "bt709", "color_primaries": "bt709", "color_transfer": "iec61966-2-1"
+        });
+        let audio = json!({"codec_name": "aac", "profile": "LC"});
+        let timecode = json!({"codec_tag_string": "tmcd"});
+        let mut streams = [picture, audio, timecode];
+        assert!(avid_avc_encoding(&streams)
+            .is_some_and(|encoding| encoding.srgb && encoding.level == 40));
+        streams[0]["color_transfer"] = json!("smpte2084");
+        assert!(avid_avc_encoding(&streams).is_none());
+        streams[0]["color_transfer"] = json!("bt709");
+        streams.swap(1, 2);
+        assert!(avid_avc_encoding(&streams).is_none());
+    }
 }
 
 fn umid(s: &str) -> bool {
@@ -185,7 +315,13 @@ fn span(row: &Value, implicit_zero: bool) -> Result<(Rational, i64, Rational)> {
     Ok((time_base, count, extent(count, time_base)?))
 }
 
-fn inspect_video(row: &Value, extension: &str, path: &Path, ffprobe: &Path) -> Result<Stream> {
+fn inspect_video(
+    row: &Value,
+    extension: &str,
+    path: &Path,
+    ffprobe: &Path,
+    srgb: bool,
+) -> Result<Stream> {
     let size = n(row, "width")
         .zip(n(row, "height"))
         .ok_or("missing physical picture raster")?;
@@ -209,9 +345,10 @@ fn inspect_video(row: &Value, extension: &str, path: &Path, ffprobe: &Path) -> R
     if !supported
         || s(row, "field_order") != "progressive"
         || !matches!(s(row, "sample_aspect_ratio"), "1:1" | "N/A" | "")
-        || !["color_space", "color_transfer", "color_primaries"]
+        || !["color_space", "color_primaries"]
             .iter()
             .all(|f| matches!(s(row, f), "" | "unknown" | "bt709"))
+        || !matches!(s(row, "color_transfer"), "" | "unknown" | "bt709") && !srgb
         || !matches!(s(row, "color_range"), "tv" | "unknown" | "")
     {
         return Err("unqualified Premiere original picture profile".into());

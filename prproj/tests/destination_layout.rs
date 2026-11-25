@@ -167,6 +167,7 @@ fn linked_original_and_sequence_only_sources_remain_under_the_import_root() {
     input.bins[1].clips = vec!["original".into()];
     input.clips.push(PreparedClip::Original(OriginalClip {
         premiere_assisted: false,
+        rec709_source_override: false,
         separate_mono_streams: false,
         proxy_path: None,
         metadata: ClipMetadata {

@@ -165,7 +165,7 @@ This pilot established the source records used by the graph/2 writer.
 ### Graph/2 replay with a native link donor
 
 `avid-media-probe --linked-bin GRAPH.json SEQUENCE_ID DONOR.avb NEW.avb [FFMPEG FFPROBE]`
-is an internal writer for one neutral 1080p24 timeline. It expects one
+is an internal writer for one neutral 1080p timeline at 24 or 23.976 fps. It expects one
 flat bin, one ProRes HQ MOV, and two independently selected channels
 from a 48 kHz stereo PCM WAV. The donor supplies the native masters
 and their file and physical source records. File paths, provider IDs,
@@ -174,6 +174,10 @@ Graph/2 supplies the record start, edit ranges, source offsets, and
 physical channel selections. The writer creates a fresh sequence in
 the output bin and reads it back before publishing. The original
 media and the input bin are read in place.
+Each populated lane can contain multiple straight cuts from its verified
+source and channel. The writer preserves the gap lengths and independent
+source trims. Overlapping record ranges require an admitted transition
+with both saved endpoints and verified source handles.
 
 The PCM24 control wrote a sequence starting at `01:00:00:07`, seven
 frames later than the donor. Its graph supplied an eight-frame V1
@@ -187,7 +191,7 @@ native control.
 ### Generate native links from verified originals
 
 `avid-media-probe --linked-originals GRAPH.json SEQUENCE_ID NEW.avb [FFMPEG FFPROBE]`
-generates the source records for the same neutral 1080p24 graph profile
+generates the source records for the same neutral 1080p graph profile
 using originals on mounted macOS media volumes. The picture original
 must be a ProRes 422 HQ MOV at Rec.709 video levels with an exact
 embedded timecode track. The separate stereo WAV must use 48 kHz
@@ -210,7 +214,7 @@ accepts a saved Premiere `.prproj` or exported Resolve `.drp` on macOS.
 Use the exact saved sequence ID. The readers pass cuts, clocks, linked
 paths and physical selectors through graph/2 to the same native AVB writer.
 This profile writes one bin with V1 and two independently selected mono
-edits from a linked stereo WAV. It checks for neutral source mixers before
+lanes from a linked stereo WAV. It checks for neutral source mixers before
 publication. It admits one saved Resolve timeline and a selected Premiere
 sequence, including Premiere's default empty track declarations. Resolve
 originals use file-state and stream verification without full-file hashes.
@@ -223,6 +227,103 @@ lanes use source frames `[12, 36)`, one from each WAV channel.
 All 24 decoded frames and all 48,000 samples on each Direct Out PCM24
 lane matched their original references in each route. The wizard
 publication and wider editing profiles remain open.
+
+A three-cuts-per-lane Premiere control has adjacent picture cuts,
+interior filler, staggered audio trims, and a tail on A2. The direct
+project conversion and saved graph replay wrote the same nine edits
+over 26 frames. Media Composer saved and reopened the bin, and the
+saved ranges, original paths, and mono selectors agreed with both
+outputs. Playback reached the end in Media Composer. An isolated
+render comparison for this multi-cut control remains open.
+
+A 23.976 variant passes direct Premiere conversion and saved graph
+replay with exact `24000/1001` edit timing and 2,002 audio samples per
+frame. Its native Avid records use the saved `23.976` edit-rate value
+and a nominal 24-frame timecode display. Structural read-back covers
+both clocks and a nonzero picture timecode. Avid playback and rendered
+comparison for this rate remain open.
+
+#### Linked AVC and AAC in MP4
+
+The internal Premiere route can also link one timecoded, square-pixel
+1080p23.976 High-profile AVC MP4 with embedded 48 kHz stereo AAC-LC.
+Graph/2 retains the picture clock, the playable AAC sample extent,
+and each physical channel independently. Both audio edits keep their
+own trims. When Premiere saves separate picture and timeline-audio
+items for the same file, the writer preserves their identities and
+shares one verified physical package between them.
+
+The writer checks the MP4 timecode track, constant picture packet grid,
+AAC priming, and playable tail. Avid's saved picture package applies
+the native one-frame offset from its physical clock. The AAC package
+includes the priming packet in its stored length. The graph and master
+retain only the playable samples. A narrowly matched Premiere Rec.709
+source override also qualifies an sRGB-tagged original.
+
+The numbered control saved and reopened in Media Composer. Its first
+picture matched the intended source frame, and external read-back
+confirmed the paths, clock, and both independently trimmed mono lanes.
+An isolated AAC render comparison remains open.
+
+#### Existing managed DNxHD OP-Atom links
+
+The internal Premiere route can reconstruct one editable Avid master
+from a saved 1080p23.976 DNxHD CID 1253 picture MXF and two 48 kHz
+PCM24 mono MXFs. Graph/2 keeps the Premiere items and their exact
+locators, the ordered file-package IDs, the material package ID, the
+physical source clock, and each independently trimmed edit. The writer
+verifies the packet and essence extents, the picture index, and any
+zero-only terminal padding. The output refers to existing media in
+`Avid MediaFiles/MXF`. If Premiere links to copies outside that folder,
+the writer requires the same filenames and byte-identical copies in
+the mounted volume's numbered media folders.
+
+The isolated control passed direct conversion and saved-graph replay.
+Media Composer displayed the managed source picture, saved the bin,
+and reopened it. Reading the saved bin confirmed all three package
+links and trims, the nonzero source start, and both independent mono
+lanes. Full timeline render comparisons remain open.
+
+#### Centered picture and audio transitions
+
+The internal Premiere route carries two-ended transitions through
+graph/2 with their occurrence IDs, edit bindings, overlap, and cut offset.
+Within the linked ProRes/WAV profile, it writes an eight-frame centered
+Cross Dissolve on V1 and six-frame centered Constant Power crossfades on
+A1 and A2. The AVB contains a native Dissolve and two editable Audio
+Dissolves with Equal Power saved in both curve controls. The writer
+verifies the adjacent clips' exact overlap, source handles, and physical
+channels before publishing.
+
+The 23.976 control played from start to end in Media Composer. Avid saved
+and reopened the bin. External read-back of the saved bin confirmed all
+three transition spans, center cuts, source trims, and the independent mono
+channel assignments. Frame-by-frame blend and isolated PCM comparisons
+remain open.
+
+#### Mixed managed and UME edits
+
+On one neutral 1080p23.976 timeline, the internal original-file path
+can combine verified AVC/AAC MP4 and managed DNxHD OP-Atom with mono
+PCM24 siblings. Each edit references its own native master and track
+selector. The writer retains source markers on their respective
+masters and verifies both transition endpoints against the extent of
+the corresponding source. Each source set needs a verified binding on
+V1, A1 and A2. Within that set, a lane uses a consistent source item and
+channel.
+
+A saved Premiere excerpt with two edits per lane produced the same
+native source chains, ranges and selectors through direct conversion and
+unedited graph/2 replay. An eight-frame centered picture dissolve and
+both straight audio cuts landed at the same cut. A disposable graph
+variant also wrote both six-frame centered Constant Power crossfades at
+that cut. Staged AVB read-back verified all three transitions and both
+native media paths. Swapped siblings, insufficient source handles,
+contradictory endpoints and changed media refused publication.
+
+Native playback and isolated audio renders across the mixed transition
+remain open. Source formats beyond these two profiles, additional video
+layers and captions require separate qualification.
 
 ### Replay AVB controls from graph/2
 

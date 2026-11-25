@@ -17,7 +17,8 @@ use graph::{
     GroupedAudio, Loss, Placement, Rational, Sidecar, StreamKind, Value,
 };
 use metadata::leaf;
-use physical::Physical;
+use physical::{Physical, MANAGED_ATOM_RECEIPT};
+pub use physical::{verify_avid_avc_aac, VerifiedAvcAac, verify_avid_managed_atom, ManagedAtom};
 use prproj::{
     build::time::TICKS_PER_SECOND,
     model::{ItemId, Project, TrackItemId},
@@ -140,6 +141,7 @@ fn read_media_graph(
     });
 
     let mut files = HashMap::new();
+    let mut avid_avc = HashMap::new();
     let mut items = HashMap::new();
     let mut component_budget = components::Budget::default();
     let mut color_payloads = super::color_mode::SavedPayloads::default();
@@ -163,7 +165,7 @@ fn read_media_graph(
                     }
                 }
             }
-            if !track.transitions.is_empty() {
+            if !neutral_avid && !track.transitions.is_empty() {
                 return Err(format!(
                     "{id}: transition timing is outside Premiere linked media capture"
                 )
@@ -229,9 +231,15 @@ fn read_media_graph(
                     if let std::collections::hash_map::Entry::Vacant(file) =
                         files.entry(canonical.clone())
                     {
-                        file.insert(physical::inspect(&canonical, ffprobe).map_err(|error| {
-                            format!("{occurrence}: {}: {error}", saved_path.display())
-                        })?);
+                        let (facts, avc) = (if neutral_avid {
+                            physical::inspect_for_avid(&canonical, ffprobe)
+                        } else {
+                            physical::inspect(&canonical, ffprobe).map(|facts| (facts, None))
+                        }).map_err(|error| format!("{occurrence}: {}: {error}", saved_path.display()))?;
+                        if let Some(avc) = avc {
+                            avid_avc.insert(canonical.clone(), avc);
+                        }
+                        file.insert(facts);
                     }
                     let bin = owning_bin(&project, source, &mut folders, &mut graph.bins)?;
                     let item = capture_item(
@@ -244,6 +252,10 @@ fn read_media_graph(
                         &mut graph,
                     )
                     .map_err(|error| format!("{occurrence}: {}: {error}", saved_path.display()))?;
+                    if let Some(avc) = avid_avc.get(&canonical) {
+                        check_avid_avc_interpretation(&project, &item, *avc, &mut graph)
+                            .map_err(|error| format!("{occurrence}: {error}"))?;
+                    }
                     entry.insert(item);
                 }
                 let item = &items[&source];
@@ -314,6 +326,9 @@ fn read_media_graph(
                     format!("{id}: overlapping Premiere clips on {kind:?} track {index}").into(),
                 );
             }
+            if neutral_avid && !track.transitions.is_empty() {
+                super::transitions::capture_for_avid(&project, track, kind, &mut out, frame_ticks)?;
+            }
         }
     }
     if out.placements.is_empty() && out.disabled_placements.is_empty() {
@@ -365,6 +380,44 @@ fn read_media_graph(
         }
     }
     Ok(graph)
+}
+
+fn check_avid_avc_interpretation(
+    project: &Project, item: &Item, avc: physical::AvcAacEncoding, graph: &mut SourceGraph,
+) -> Result<()> {
+    if !item.bindings.has_picture() {
+        return Ok(());
+    }
+    let tree = &project.doc.tree;
+    let stream = saved::reference(project, item.primary, "VideoStream")?;
+    let override_profile = leaf(tree, stream, "OverriddenColorSpace")?
+        .map(serde_json::from_str::<serde_json::Value>).transpose()?;
+    let rec709 = serde_json::json!({
+        "baseColorProfile": {"colorProfileName": "BT.709,8-bit,Display-Referred"},
+        "baseProfileType": 1
+    });
+    if avc.srgb {
+        let original_profile = leaf(tree, stream, "OriginalColorSpace")?
+            .map(serde_json::from_str::<serde_json::Value>).transpose()?;
+        let expected_original = serde_json::json!({
+            "baseColorProfile": {"colorProfileName": "1,13,1,Narrow,YCC,8-bit,Display-Referred"},
+            "baseProfileType": 1
+        });
+        if override_profile.as_ref() != Some(&rec709)
+            || original_profile.as_ref() != Some(&expected_original)
+            || leaf(tree, stream, "IsColorSpacOverridden")? != Some("true")
+        {
+            return Err("sRGB-tagged AVC requires Premiere's saved Rec.709 source override".into());
+        }
+        graph.sidecars.push(Sidecar {
+            adapter: "premiere.avc_source_override".into(),
+            object: item.id.clone(),
+            data: Value::Str("srgb_as_rec709".into()),
+        });
+    } else if override_profile.is_some_and(|value| value != rec709) {
+        return Err("unsupported Premiere AVC source color override".into());
+    }
+    Ok(())
 }
 
 struct Item {
@@ -452,6 +505,7 @@ impl VerifiedBinding {
             package: None,
             file_package: None,
             state: physical::file_state(&spec.path)?,
+            managed: None,
         };
         Self::bind_physical(project, item, saved_path, spec, physical, bin, graph)
     }
@@ -490,6 +544,7 @@ impl VerifiedBinding {
         let physical = Physical {
             container: "mov", video: Some(video), audio, timecode: native.timecode.clone(),
             package: None, file_package: None, state: physical::file_state(&spec.path)?,
+            managed: None,
         };
         Self::bind_physical(project, source, saved_path, spec, physical, bin, graph)
     }
@@ -580,6 +635,13 @@ fn capture_item(
             ]),
         });
     }
+    if let Some(managed) = &physical.managed {
+        graph.sidecars.push(Sidecar {
+            adapter: MANAGED_ATOM_RECEIPT.into(),
+            object: id.clone(),
+            data: managed.receipt(),
+        });
+    }
     let resolved = path.to_str().ok_or("invalid Premiere original path")?;
     let locator = saved_path.to_str().ok_or("invalid saved Premiere path")?;
     let mut item_media = Vec::new();
@@ -598,7 +660,7 @@ fn capture_item(
             {
                 continue;
             }
-            let clock = (kind == StreamKind::Video).then(|| clock.clone()).flatten();
+            let clock = (kind == StreamKind::Video || physical.managed.is_some()).then(|| clock.clone()).flatten();
             graph.media.push(SourceMedia {
                 id: media_id.clone(),
                 kind,
@@ -659,7 +721,7 @@ fn capture_item(
         id: id.clone(),
         name: project.item_name(item),
         media: item_media,
-        umid: physical.package.clone(),
+        umid: physical.managed.as_ref().map(|m| m.material.clone()).or_else(|| physical.package.clone()),
         tape,
         rate,
         color_rgb16: None,
@@ -707,6 +769,13 @@ fn original_clock(
         }
         return Ok(None);
     };
+    if let Some(managed) = &physical.managed {
+        let exact = managed.clock.exact_start().ok_or("invalid managed OP-Atom clock")?;
+        if ticks(alternate.unwrap_or(start))? != exact || start != 0 && ticks(start)? != exact {
+            return Err("saved Premiere source timecode contradicts the managed OP-Atom package".into());
+        }
+        return Ok(Some(managed.clock.clone()));
+    }
     let rate = physical
         .video
         .as_ref()

@@ -11,6 +11,9 @@ pub(crate) mod source;
 mod terminal;
 mod validation;
 
+#[cfg(target_os = "macos")]
+pub(crate) use terminal::managed_dnxhd_layout;
+
 pub(crate) use backend::{read_stdout as read_media_tool, run as run_media_tool};
 
 pub(crate) fn inspect_staged_atom(tool: &std::path::Path, path: &std::path::Path) -> R<AtomEssence> {

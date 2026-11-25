@@ -50,8 +50,11 @@ impl ReceiptSpool {
         // only consumes its own record, and only with an existing placement.
         if !needs_neighbor_issues {
             if let Some((_, Value::Arr(issues))) = fields.iter_mut().find(|(key, _)| key == "unresolved") {
-                issues.retain(|row| rate == Rational::integer(24) && matches!(
-                    row.get("color_adapter").and_then(|facts| facts.get("placement")), Some(Value::Str(_))));
+                issues.retain(|row|
+                    matches!(row.get("picture_profile"), Some(Value::Str(profile))
+                        if profile == "imported_png_matte_overlay")
+                    || (rate == Rational::integer(24) && matches!(
+                        row.get("color_adapter").and_then(|facts| facts.get("placement")), Some(Value::Str(_)))));
                 issues.shrink_to_fit();
             }
         }

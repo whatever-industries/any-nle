@@ -53,6 +53,8 @@ pub struct OriginalChannel {
 pub struct OriginalClip {
     /// The draft media record must be replaced with a verified Premiere import.
     pub premiere_assisted: bool,
+    /// Interpret the verified narrow-range sRGB original as display-referred Rec.709.
+    pub rec709_source_override: bool,
     pub proxy_path: Option<String>,
     pub metadata: ClipMetadata,
     pub path: String,
@@ -99,7 +101,9 @@ impl OriginalClip {
                 _ => false,
             })
             && self.video.as_ref().is_some_and(|video| {
-                video.codec == self.container && video.rate == Fraction::new(24, 1)
+                video.codec == self.container
+                    && (video.rate == Fraction::new(24, 1)
+                        || self.container == "jpeg" && video.rate == Fraction::new(24_000, 1001))
                     && (16..=8192).contains(&video.width) && (16..=8192).contains(&video.height)
                     && video.width * video.height <= 16_777_216
             })
@@ -148,6 +152,17 @@ impl OriginalClip {
                     && (v.width, v.height) == (4096, 2160) && a.duration == v.duration
                     && a.channels == 2 && a.sample_rate == 48_000
                     && a.representation == SampleRepresentation::Pcm16Be
+            })
+    }
+
+    pub fn is_timecoded_hd_avc_aac(&self) -> bool {
+        self.container == "mov" && self.proxy_path.is_none() && !self.separate_mono_streams
+            && std::path::Path::new(&self.path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
+            && self.video.as_ref().zip(self.audio.as_ref()).is_some_and(|(v, a)| {
+                v.codec == "avc1" && v.rate == Fraction::new(24_000, 1001)
+                    && (v.width, v.height) == (1920, 1080) && a.duration == v.duration
+                    && a.channels == 2 && a.sample_rate == 48_000
+                    && a.representation == SampleRepresentation::Aac
             })
     }
 }
@@ -370,7 +385,7 @@ pub struct PreparedProjectInput {
     /// Verified direct DNx OP-Atom clip IDs and their physical media start ticks.
     /// The legacy clip fields carry the effective logging timecode.
     pub direct_dnxhr_origins: std::collections::HashMap<String, i64>,
-    /// Verified 23.976 DNxHD LB/PCM24 cameras using the DNxHD media template.
+    /// Verified 23.976 DNxHD LB/PCM24 clips using the DNxHD media template.
     pub direct_dnxhd_pcm24: HashSet<String>,
     pub constant_speeds: Vec<PreparedConstantSpeed>,
     /// Held file-relative ticks keyed by the destination sequence and picture edit.
@@ -410,6 +425,32 @@ pub struct PreparedTimelineMarks {
 pub struct PreparedPngMattes {
     pub stills: Vec<PreparedPngStill>,
     pub edits: Vec<PreparedPngEdit>,
+    pub jpeg_fills: Vec<PreparedJpegFill>,
+    pub split_edits: Vec<PreparedSplitMatte>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedJpegFill {
+    pub bin: usize,
+    pub path: std::path::PathBuf,
+    pub name: String,
+    /// A verified linked still already being written as a normal bin clip.
+    pub existing_clip: Option<String>,
+    /// Exact file clock in ticks for a verified single-frame DNxHD OP-Atom fill.
+    pub managed_start: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedSplitMatte {
+    pub sequence: usize,
+    pub track: i64,
+    pub start: i64,
+    pub duration: i64,
+    pub fill: usize,
+    /// Left, top, exclusive right, exclusive bottom in the verified 1080p raster.
+    pub rectangle: [u32; 4],
+    /// Strictly enclosed, with the same pixel bounds convention.
+    pub hole: Option<[u32; 4]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -430,18 +471,24 @@ pub enum PngAlpha {
 pub struct PreparedPngEdit {
     pub sequence: usize,
     pub start: i64,
-    pub background: usize,
+    pub duration: i64,
+    /// The nonlinear nest uses its own background. Binary overlays use the existing lower track.
+    pub background: Option<usize>,
     pub foreground: Option<usize>,
 }
 
 impl PreparedPngMattes {
     pub(super) fn validate(&self, input: &PreparedProjectInput) -> Result<(), ModelError> {
         let invalid = || ModelError("invalid PNG Matte Key source, edit clock or ownership".into());
-        if self.edits.is_empty() && self.stills.is_empty() {
+        if self.edits.is_empty() && self.stills.is_empty()
+            && self.split_edits.is_empty() && self.jpeg_fills.is_empty()
+        {
             return Ok(());
         }
-        if input.options.bin_mode != "separate" || self.edits.is_empty()
-            || self.edits.len() > 10_000 || self.stills.len() > 10_000
+        if input.options.bin_mode != "separate"
+            || (self.edits.is_empty() && self.split_edits.is_empty())
+            || self.edits.len().saturating_add(self.split_edits.len()) > 10_000
+            || self.stills.len().saturating_add(self.jpeg_fills.len()) > 10_000
         {
             return Err(invalid());
         }
@@ -459,15 +506,33 @@ impl PreparedPngMattes {
         let mut children = 0usize;
         let rate = Fraction::new(24, 1);
         let frame = ticks_per_unit(rate);
+        let mut overlays: BTreeMap<(usize, i64), Vec<(i64, i64)>> = BTreeMap::new();
         for edit in &self.edits {
             let seq = input.sequences.get(edit.sequence).ok_or_else(invalid)?;
-            let background = self.stills.get(edit.background).ok_or_else(invalid)?;
+            let end = edit.start.checked_add(edit.duration).filter(|end| seq.start.checked_add(*end).is_some())
+                .ok_or_else(invalid)?;
+            let Some(background) = edit.background else {
+                let rate = Fraction::new(24_000, 1001);
+                let frame = ticks_per_unit(rate);
+                if seq.rate != rate || (seq.width, seq.height) != (1920, 1080)
+                    || seq.start < 0 || seq.start % frame != 0
+                    || edit.start < 0 || edit.start % frame != 0
+                    || edit.duration <= 0 || edit.duration % frame != 0
+                    || !matches!(edit.foreground.and_then(|index| self.stills.get(index)).map(|s| s.alpha),
+                        Some(PngAlpha::Straight { .. }))
+                {
+                    return Err(invalid());
+                }
+                overlays.entry((edit.sequence, 2)).or_default().push((edit.start, end));
+                continue;
+            };
+            let background = self.stills.get(background).ok_or_else(invalid)?;
             if seq.rate != rate || (seq.width, seq.height) != (1920, 1080)
                 || seq.start < 0 || seq.start % frame != 0
                 || !seq.events.is_empty() || !seq.track_levels.is_empty() || !seq.audio_crossfades.is_empty()
                 || text_sequences.contains(&edit.sequence)
                 || edit.start < 0 || edit.start % frame != 0
-                || edit.start.checked_add(frame).and_then(|end| seq.start.checked_add(end)).is_none()
+                || edit.duration != frame
                 || !occupied.insert((edit.sequence, edit.start, 1))
                 || background.alpha != PngAlpha::Ignore
             {
@@ -484,8 +549,73 @@ impl PreparedPngMattes {
         if input.sequences.len() + children > 10_000 {
             return Err(invalid());
         }
+        let linked_jpegs: HashMap<_, _> = input.clips.iter().filter_map(|clip| match clip {
+            PreparedClip::Original(clip) if clip.container == "jpeg" =>
+                Some((clip.metadata.id.as_str(), std::path::Path::new(&clip.path))),
+            _ => None,
+        }).collect();
+        let overlay_rate = Fraction::new(24_000, 1001);
+        let overlay_frame = ticks_per_unit(overlay_rate);
+        for fill in &self.jpeg_fills {
+            let ext = fill.path.extension();
+            let qualified = match fill.managed_start {
+                Some(start) => fill.existing_clip.is_none() && start >= 0 && start % overlay_frame == 0
+                    && ext.is_some_and(|ext| ext.eq_ignore_ascii_case("mxf")),
+                None => ext.is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"))
+                    && fill.existing_clip.as_deref().is_none_or(|id|
+                        linked_jpegs.get(id).copied() == Some(fill.path.as_path())),
+            };
+            if fill.bin >= input.bins.len() || !fill.path.is_absolute() || !qualified {
+                return Err(invalid());
+            }
+            super::model::check_text(&fill.name, "Matte Key JPEG fill", 4096, false)?;
+        }
+        for edit in &self.split_edits {
+            let seq = input.sequences.get(edit.sequence).ok_or_else(invalid)?;
+            let [left, top, right, bottom] = edit.rectangle;
+            let end = edit.start.checked_add(edit.duration).filter(|end| seq.start.checked_add(*end).is_some())
+                .ok_or_else(invalid)?;
+            if seq.rate != overlay_rate || (seq.width, seq.height) != (1920, 1080)
+                || seq.start < 0 || seq.start % overlay_frame != 0
+                || edit.start < 0 || edit.start % overlay_frame != 0
+                || edit.duration <= 0 || edit.duration % overlay_frame != 0
+                || !(2..=64).contains(&edit.track) || edit.fill >= self.jpeg_fills.len()
+                || left >= right || right > 1920 || top >= bottom || bottom > 1080
+                || (edit.rectangle == [0, 0, 1920, 1080] && edit.hole.is_none())
+                || edit.hole.is_some_and(|[x0, y0, x1, y1]|
+                    !(left < x0 && x0 < x1 && x1 < right && top < y0 && y0 < y1 && y1 < bottom))
+            {
+                return Err(invalid());
+            }
+            overlays.entry((edit.sequence, edit.track)).or_default().push((edit.start, end));
+        }
+        for (&(sequence, track), spans) in &mut overlays {
+            spans.sort_unstable();
+            if spans.windows(2).any(|pair| pair[0].1 > pair[1].0)
+                || input.sequences[sequence].events.iter().any(|event|
+                    event.video_track == Some(track) && png_overlay_intersects(spans, event.record_start, event.duration))
+            {
+                return Err(invalid());
+            }
+        }
+        let overlaps = |sequence, track, start, duration| overlays.get(&(sequence, track)).is_some_and(|spans|
+            png_overlay_intersects(spans, start, duration));
+        if input.texts.iter().any(|text| text.kind == PreparedTextKind::Graphic
+            && overlaps(text.sequence, text.track, text.start, text.duration))
+            || input.layered_submasters.iter().any(|edit|
+                overlaps(edit.sequence, edit.track, edit.start, edit.duration))
+            || input.multicam_tracks.iter().any(|group| group.uses.iter().any(|edit|
+                edit.angle.is_some() && overlaps(group.sequence, edit.track, edit.start, edit.duration)))
+        {
+            return Err(invalid());
+        }
         Ok(())
     }
+}
+
+fn png_overlay_intersects(spans: &[(i64, i64)], start: i64, duration: i64) -> bool {
+    spans.get(spans.partition_point(|&(_, end)| end <= start)).is_some_and(|&(first, _)|
+        start.checked_add(duration).is_none_or(|end| first < end))
 }
 
 /// An editable picture retime whose signed playback rate and raw source
@@ -687,6 +817,52 @@ pub struct PreparedAvSubclip {
 }
 
 impl PreparedAvSubclip {
+    pub fn fits_original_edit(
+        &self, sequence: &Sequence, event: &Event, parent: &OriginalClip, placed: &OriginalClip,
+    ) -> bool {
+        let Some(video) = &parent.video else { return false };
+        event.clip == placed.metadata.id
+            && (placed.metadata.id == self.parent_clip
+                || (placed.metadata.id.strip_suffix(":timeline-mono") == Some(self.parent_clip.as_str())
+                    && matches!(placed.groups.as_slice(), [left, right]
+                        if left.as_slice() == [1] && right.as_slice() == [2])
+                    && placed.container == parent.container && placed.proxy_path.is_none()
+                    && !placed.separate_mono_streams
+                    && placed.path == parent.path && placed.video == parent.video
+                    && placed.audio == parent.audio && placed.channels == parent.channels
+                    && placed.premiere_assisted == parent.premiere_assisted
+                    && placed.rec709_source_override == parent.rec709_source_override))
+            && self.edit_range_fits(sequence, event, video.rate)
+    }
+
+    fn edit_range_fits(&self, sequence: &Sequence, event: &Event, rate: Fraction) -> bool {
+        let unit = ticks_per_unit(rate);
+        sequence.rate == rate
+            && event.speed_ratio.is_none() && event.time_remap.is_none() && event.stereo.is_empty()
+            && event.source_in >= self.start && event.source_in % unit == 0
+            && event.duration > 0 && event.duration % unit == 0
+            && event.source_in.checked_add(event.duration).is_some_and(|end| end <= self.end)
+    }
+
+    pub fn fits_original(&self, parent: &OriginalClip) -> bool {
+        let (Some(video), Some(audio)) = (&parent.video, &parent.audio) else { return false };
+        let rate = Fraction::new(24_000, 1001);
+        let frame = ticks_per_unit(rate);
+        parent.proxy_path.is_none() && parent.container == "mov"
+            && video.codec == "apch" && video.rate == rate && (video.width, video.height) == (1920, 1080)
+            && video.source_start >= 0 && video.source_start % frame == 0
+            && audio.representation == SampleRepresentation::Pcm24
+            && audio.sample_rate == 48_000 && audio.channels == 2
+            && !parent.separate_mono_streams && parent.metadata.markers.is_empty()
+            && matches!(parent.channels.as_slice(), [left, right] if
+                left.avid_track == 1 && left.channel_index == 0 && left.gain_db == 0.0
+                    && right.avid_track == 2 && right.channel_index == 1 && right.gain_db == 0.0)
+            && 0 <= self.start && self.start < self.end
+            && self.end <= video.duration.min(audio.duration)
+            && self.start % frame == 0 && self.end % frame == 0
+            && video.source_start.checked_add(self.end).is_some()
+    }
+
     /// A shared marker collection can carry a picture marker at its backing-file position.
     pub fn source_marker<'a>(&self, parent: &'a Clip) -> std::result::Result<Option<&'a Marker>, &'static str> {
         let invalid = "A/V subclip source markers require one V1 range contained in the subclip";
@@ -720,12 +896,7 @@ pub struct PreparedAvSubclipUse {
 
 pub fn av_subclip_edit_fits(sequence: &Sequence, event: &Event, parent: &Clip, subclip: &PreparedAvSubclip) -> bool {
     let Some(picture) = &parent.video else { return false };
-    let unit = ticks_per_unit(picture.rate);
-    event.clip == parent.id && sequence.rate == picture.rate
-        && event.speed_ratio.is_none() && event.time_remap.is_none() && event.stereo.is_empty()
-        && event.source_in >= subclip.start && event.source_in % unit == 0
-        && event.duration > 0 && event.duration % unit == 0
-        && event.source_in.checked_add(event.duration).is_some_and(|end| end <= subclip.end)
+    event.clip == parent.id && subclip.edit_range_fits(sequence, event, picture.rate)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -830,6 +1001,7 @@ pub enum PictureEffect {
     /// One horizontal reflection and one static pin, in source render order.
     CornerPinWithFlop { pin: CornerPin, flop_before_pin: bool },
     StaticMotion,
+    MatteKeyOutUnion,
     UltraKey { rgb: [u8; 3] },
     VideoToFullRange,
     FullToVideoRange,
@@ -927,6 +1099,19 @@ pub(super) fn validate_picture_effects(
                 && event.speed_ratio.is_none() && event.time_remap.is_none() => {}
             PictureEffect::CornerPin(_) | PictureEffect::CornerPinWithFlop { .. } =>
                 return Err(fail("invalid static Corner Pin or unqualified effect stack")),
+            PictureEffect::MatteKeyOutUnion => {
+                if !event.matte.as_ref().is_some_and(Matte::is_two_shape_hard_key_out)
+                    || !matches!((sequence.rate.num, sequence.rate.den), (24, 1) | (24_000, 1001))
+                    || (sequence.width, sequence.height) != (1920, 1080)
+                    || picture_geometry(event) != Some((sequence.rate, (1920, 1080)))
+                    || p.reflection_before_motion != [false; 2]
+                    || event.transform.is_some() || event.color_correction.is_some()
+                    || event.speed_ratio.is_some() || event.time_remap.is_some()
+                    || event.source_duration.is_some()
+                {
+                    return Err(fail("two-shape AniMatte Key Out needs a static hard matte on matching 1080p picture"));
+                }
+            }
             PictureEffect::Flip { horizontal, vertical }
                 if (horizontal || vertical) && event.transform.is_none()
                     && event.matte.is_none() && event.color_correction.is_none() => {}
@@ -1113,6 +1298,7 @@ pub struct PreparedText {
     pub start: i64,
     pub duration: i64,
     pub content: String,
+    pub graphic_position: Option<(f64, f64)>,
 }
 pub fn validate_texts(texts: &[PreparedText], sequences: &[Sequence]) -> Result<(), ModelError> {
     let fail = |s: &str| ModelError(s.into());
@@ -1121,6 +1307,11 @@ pub fn validate_texts(texts: &[PreparedText], sequences: &[Sequence]) -> Result<
     let mut payload_bytes = texts.len().checked_mul(std::mem::size_of::<PreparedText>()).ok_or_else(|| fail("text budget overflow"))?;
     for t in texts {
         let s = sequences.get(t.sequence).ok_or_else(|| fail("text references unknown sequence"))?;
+        if t.graphic_position.is_some_and(|(x, y)| t.kind != PreparedTextKind::Graphic
+            || !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y))
+        {
+            return Err(fail("invalid prepared graphic position"));
+        }
         check_text(&t.source_id, "text source id", 32768, false)?;
         payload_bytes = payload_bytes.checked_add(t.source_id.len()).and_then(|n|n.checked_add(t.content.len())).filter(|n|*n <= 64<<20).ok_or_else(||fail("text payload exceeds 64 MiB"))?;
         if t.content.is_empty() || t.content.len() > 32768 || t.content.chars().any(|c| c.is_control() && c != '\n' && c != '\t') { return Err(fail("text content exceeds bounds or contains unsupported controls")); }
@@ -1791,6 +1982,12 @@ impl PreparedProjectInput {
         }
         for subclip in &self.av_subclips {
             super::model::check_text(&subclip.name, "A/V subclip name", 4096, false)?;
+            if let Some(PreparedClip::Original(parent)) = clips.get(subclip.parent_clip.as_str()).copied() {
+                if self.options.bin_mode != "separate" || subclip.bin >= self.bins.len() || !subclip.fits_original(parent) {
+                    return Err(fail("A/V subclip requires a verified linked original and two ordered mono PCM lanes"));
+                }
+                continue;
+            }
             let Some(PreparedClip::Legacy(parent)) = clips.get(subclip.parent_clip.as_str()).copied() else {
                 return Err(fail("A/V subclip requires a prepared backing master"));
             };
@@ -1836,16 +2033,24 @@ impl PreparedProjectInput {
                 .ok_or_else(|| fail("unknown prepared A/V subclip sequence"))?;
             let event = seq.events.get(usage.event)
                 .ok_or_else(|| fail("unknown prepared A/V subclip edit"))?;
-            let PreparedClip::Legacy(parent) = clips[subclip.parent_clip.as_str()] else { unreachable!() };
-            let lane_exists = match usage.audio_track {
-                Some(track) => event.audio_tracks.iter().filter(|&&n| n == track).count() == 1
-                    && event_audio_files(parent, event).is_ok_and(|files| files.len() == event.audio_tracks.len()),
-                None => event.video_track.is_some(),
+            let lane = usage.audio_track.and_then(|track| {
+                let mut indices = event.audio_tracks.iter().enumerate().filter(|&(_, &n)| n == track);
+                let (slot, _) = indices.next()?;
+                indices.next().is_none().then_some(slot)
+            });
+            let lane_fits = |sound: bool| if usage.audio_track.is_some() { sound } else { event.video_track.is_some() };
+            let fits = match clips[subclip.parent_clip.as_str()] {
+                PreparedClip::Legacy(parent) => av_subclip_edit_fits(seq, event, parent, subclip)
+                    && lane_fits(lane.is_some()
+                        && event_audio_files(parent, event).is_ok_and(|files| files.len() == event.audio_tracks.len())),
+                PreparedClip::Original(parent) => matches!(clips.get(event.clip.as_str()).copied(),
+                    Some(PreparedClip::Original(placed)) if subclip.fits_original_edit(seq, event, parent, placed)
+                        && lane_fits(lane.and_then(|slot| super::original::mono_source_channel(placed, event, slot))
+                            .is_some_and(|label| matches!(label, 1 | 2)))),
             };
-            if !lane_exists || group_uses.contains(&(usage.sequence, usage.event))
+            if !fits || group_uses.contains(&(usage.sequence, usage.event))
                 || marked_edits.contains(&(usage.sequence, usage.event))
                 || !subclip_lanes.insert((usage.sequence, usage.event, usage.audio_track))
-                || !av_subclip_edit_fits(seq, event, parent, subclip)
             {
                 return Err(fail("invalid or duplicate prepared A/V subclip edit"));
             }
@@ -2050,6 +2255,15 @@ fn is_linked_prores_constant_speed(c: &OriginalClip, s: &Sequence, e: &Event) ->
 }
 pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
     let require = |b: bool, s: &str| if b { Ok(()) } else { Err(ModelError(s.into())) };
+    if c.rec709_source_override {
+        let imported_prores = c.premiere_assisted && c.container == "mov"
+            && c.video.as_ref().is_some_and(|v| v.codec == "apch"
+                && v.rate == Fraction::new(24_000, 1001) && (v.width, v.height) == (1920, 1080))
+            && c.audio.as_ref().is_none_or(|a|
+                a.representation == SampleRepresentation::Pcm24 && c.is_same_rate_linked_pcm());
+        require(imported_prores || !c.premiere_assisted && c.is_timecoded_hd_avc_aac(),
+            "the Rec.709 source override requires a verified sRGB original profile")?;
+    }
     super::model::check_text(&c.metadata.id, "original id", 256, false)?;
     super::model::check_text(&c.metadata.name, "original name", 4096, false)?;
     super::model::check_path(&c.path, "original path")?;
@@ -2125,17 +2339,13 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
             && ((v.width, v.height) == (1920, 1080) || c.supports_explicit_linked_raster())
             && (v.rate == Fraction::new(24, 1) || v.rate == Fraction::new(24000, 1001) || is_25_or_2997(v.rate)));
         let raster = (v.width, v.height);
-        let qualified_still = v.codec == c.container && c.audio.is_none()
+        let qualified_tiff = c.container == "tiff" && v.codec == "tiff" && c.audio.is_none()
             && c.proxy_path.is_none() && v.rate == Fraction::new(24, 1)
-            && suffix.is_some_and(|s| match c.container.as_str() {
-                "jpeg" | "png" => c.is_linked_still(),
-                "tiff" => raster == (1920, 64)
-                    && (s.eq_ignore_ascii_case("tif") || s.eq_ignore_ascii_case("tiff")),
-                _ => false,
-            });
+            && raster == (1920, 64)
+            && suffix.is_some_and(|s| s.eq_ignore_ascii_case("tif") || s.eq_ignore_ascii_case("tiff"));
         require(
             v.stream_index == 0 && (c.container == "mov" && (qualified_codec || c.premiere_assisted)
-                || c.container == "mxf" && c.is_same_rate_linked_pcm() || qualified_still
+                || c.container == "mxf" && c.is_same_rate_linked_pcm() || c.is_linked_still() || qualified_tiff
                 || c.is_linked_red_picture()),
             "unqualified original picture stream/profile",
         )?;
@@ -2147,7 +2357,7 @@ pub fn validate_original(c: &OriginalClip) -> Result<(), ModelError> {
             v.source_start >= 0
                 && v.source_start % frame == 0
                 && (v.source_start == 0 || v.codec == "apch" || c.is_timecoded_avc_pcm()
-                    || c.premiere_assisted || c.is_linked_red_picture()),
+                    || c.is_timecoded_hd_avc_aac() || c.premiere_assisted || c.is_linked_red_picture()),
             "unqualified original picture source timecode",
         )?;
         super::model::check_ticks(

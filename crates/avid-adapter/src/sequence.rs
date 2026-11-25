@@ -385,6 +385,8 @@ fn extend_effect_issue<'a>(
     if let Some(profile) = issue.picture_profile {
         fields.push(("picture_profile", s(match profile {
             av::SourcePictureProfile::ImportedPngMatte => "imported_png_matte_controls",
+            av::SourcePictureProfile::ImportedPngMatteOverlay => "imported_png_matte_overlay",
+            av::SourcePictureProfile::SplitStillMatte => "split_still_matte",
             av::SourcePictureProfile::EmptyColorAdapter => "empty_color_adapter_controls",
             av::SourcePictureProfile::PlainLayeredSubmaster => "plain_layered_submaster",
         })));

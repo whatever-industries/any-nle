@@ -10,8 +10,12 @@ executable directory. Windows names end in `.exe`. On macOS it is
 `Any NLE.app/Contents/MacOS`; on Linux it is `AppDir/usr/bin`; on Windows it is the
 per-user installation directory. The manifest schema is `1`, with version, exact
 Rust target, LGPL license, pinned upstream source URL/hash, configure flags and
-per-tool basename/SHA256. The runtime verifies bundled bytes before use. Explicit
-CLI backend overrides remain available. PATH is a development fallback only when
+per-tool basename/SHA256. Build, extracted-package verification and runtime
+use the pinned manifest requirements in `packaging/ffmpeg.json`. The runtime
+checks the required build options, including zlib for PNG decoding, and verifies
+the adjacent tool hashes before use. Candidate verification also checks the
+corresponding source archive in the extracted resources. Explicit CLI backend
+overrides remain available. PATH is a development fallback only when
 an unbundled CLI has no adjacent manifest; packaged GUI conversions require the
 verified bundle.
 
@@ -39,16 +43,22 @@ This alpha is not fully self-contained across arbitrary Linux distributions.
 The package records its observed host SONAMEs in `linux-runtime.json`.
 
 1. Build the backend using `build_ffmpeg.py --target TARGET --output backend
-   --work backend-work`; run `backend_smoke.py` with that directory and target.
+   --work backend-work`. For a development smoke check, run
+   `backend_smoke.py` with that directory and target.
 2. Run `scripts/public_acceptance.py --output public-checks`, packaging unit tests,
    and build the two Rust binaries with `cargo build --locked --release
    --manifest-path crates/Cargo.toml --target TARGET --bin any-nle --bin any-nle-gui`.
 3. Collect notices using `scripts/release/licenses.py notices`, then invoke
    `scripts/release/package.py` with target, binaries, backend, notices and output.
-   Run `verify_candidate.py` against the actual package, and audit the staged files
-   plus compressed provenance before publication.
+   Run `verify_candidate.py` against the actual package. It scans the entire
+   extracted package and the accompanying compressed provenance archive. The
+   candidate receipt binds the resulting `package-audit.json` alongside both
+   artifact digests. The verifier also uses the extracted FFmpeg and ffprobe
+   for the DNx and ProRes picture and PCM rewrap checks and the exact RGBA PNG
+   decode.
    For local replays, pass `--receipt PATH` to keep the verification receipt with
-   the replay outputs.
+   the replay outputs. Pass `--audit-receipt PATH` to set a different privacy
+   receipt path.
 
 The macOS package includes the reviewed synthetic Resolve templates for the
 1920×1080, 23.976 fps Avid route. Packaging and extracted-package verification
@@ -128,12 +138,23 @@ so an attestation for a different source cannot be dispatched accidentally. The
 private receipt remains an owner attestation; its contents are retained privately.
 One job downloads and verifies the pinned FFmpeg source archive. All six jobs
 build from that verified archive. The workflow
-verifies package extraction against the audited stage, checks executable target
+verifies package extraction against the staging directory, checks executable target
 headers and runs the packaged CLI/backend. Its aggregate gate checks all six
-receipts bind identical source and private receipt, then checks every asset hash.
+receipts bind the same source and private receipt. It checks both the installer
+and provenance hash recorded in each candidate receipt and uses those same
+digests to write `SHA256SUMS`. Build-only runs execute this gate directly.
+Publication runs it once before staging, then rechecks local files against
+the verified digests before creating or resuming a draft and before upload.
 Native checks also verify the packaged launcher icon on each platform.
 If the artwork changes, regenerate the committed resources with
 `scripts/release/make_icons.py` before building.
+The native Intel macOS job also runs both Avid → Resolve media choices with
+the extracted app's CLI, FFmpeg, and templates. It verifies six split edits
+and both mono selectors in each saved DRP, then compares all 24 picture
+frames and 48,048 PCM samples per lane in the rewrapped media. The aggregate
+release gate requires that result for the same Intel package and
+[synthetic fixture](../tests/fixtures/avid-resolve-release/README.md).
+Resolve editor reopen and render qualification is separate.
 The candidate artifacts retain evidence for seven days; release assets retain
 provenance and checksums.
 

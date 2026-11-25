@@ -156,6 +156,39 @@ Last choices are remembered locally. The shared job file stores exact paths for 
 equivalent. Settings schemas and bounds are validated. A preset save refuses an existing
 file. No telemetry, updater or default AVB association is installed.
 
+## Share diagnostics
+
+For Avid → Premiere, choose **Save diagnostics…** in Review to preview and
+export a shareable preflight report. In **Activity**, the same button exports
+the latest conversion outcome, including a failure or cancellation. The
+report includes media decisions, numbered findings, and exact edit positions
+when available. Timeline and source numbers are local to each report. Paths,
+project and clip names, marker comments, and raw error messages stay in the
+full local report. You can attach the shareable JSON to a chat or support request.
+
+### Connect an MCP client
+
+Add a local stdio server in a compatible AI client. Set its command to the
+installed **any-nle** executable and give it these arguments.
+
+```text
+mcp --diagnostics /absolute/path/Any-NLE-Diagnostics.json
+```
+
+The client launches the server on demand. It can summarize the report and
+explain a finding by ID. No Any NLE account is required. Even though the
+server runs on your computer, the client may send tool results to its model
+provider. Review the export before connecting.
+
+For a fresh read-only check, add `--job SETTINGS.json` for a saved Avid →
+Premiere job using the installed media tools. If the previous conversion
+already wrote the project's destination, choose a fresh destination in the
+job before rechecking. Add `--relink-report RELINK.json --moves MOVES.json`
+to verify proposed relinks, with `--checksums TRUSTED.json` if needed.
+Use absolute paths for the inputs. Only add checks for files you intend
+to let Any NLE read. Apply verified relinks in Premiere and run conversions
+in the wizard. [Relink report and move manifest](VERIFIED-RELINK.md)
+
 ## Automation
 
 Use the wizard's **Save job settings** action once and replay the same job
@@ -206,6 +239,7 @@ one JSON response to stdout. It can run while another app has focus.
     {"action": "open_media"},
     {"action": "capture_screenshot", "path": "media.png"},
     {"action": "run_review"},
+    {"action": "save_diagnostics", "path": "diagnostics.json"},
     {"action": "capture_screenshot", "path": "review.png"},
     {"action": "snapshot"}
   ]

@@ -1,6 +1,7 @@
 use crate::model::{Choices, ClipMode, Page, Preset, RequiredInput, Snapshot, Wizard};
 use crate::report::ReportBrowser;
 use crate::{direction, icons::Glyph, palette, storage};
+use anynle_app::diagnostics::Diagnostics;
 use anynle_app::job::{
     self, BinPath, BlockerKind, CancelToken, Completion, CompletionStatus, Inventory, JobSpec, PreparedJob,
     Progress, ReviewBlocker,
@@ -55,6 +56,7 @@ enum Pick {
     SavePreset,
     SaveJob,
     SavePreflightReport,
+    SaveDiagnostics,
     LoadJob,
     Ffmpeg,
     Ffprobe,
@@ -89,12 +91,19 @@ enum ReviewAction {
     #[cfg(target_os = "macos")]
     ShowError(String),
 }
+#[derive(Clone, Copy)]
+enum DiagnosticSource {
+    Review,
+    Conversion,
+}
+
 #[derive(Default)]
 struct Activity {
     errors: VecDeque<String>,
     unread: bool,
     open: bool,
     critical: bool,
+    latest_conversion: Option<Diagnostics>,
 }
 
 impl Activity {
@@ -127,11 +136,18 @@ impl Activity {
         }
     }
 
-    fn show(&mut self, ctx: &egui::Context) {
+    fn show(&mut self, ctx: &egui::Context, busy: bool) -> bool {
+        let mut share = false;
         egui::Window::new("Activity")
             .open(&mut self.open)
             .default_width(480.)
             .show(ctx, |ui| {
+                if let Some(latest) = &self.latest_conversion {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(format!("Latest conversion · {}", latest.outcome.label()));
+                        share = ui.add_enabled(!busy, egui::Button::new("Save diagnostics…")).clicked();
+                    });
+                }
                 if self.errors.is_empty() {
                     ui.label("No errors in this session.");
                     return;
@@ -166,6 +182,7 @@ impl Activity {
             }
             self.critical = !(open || close || response.should_close());
         }
+        share
     }
 }
 
@@ -192,6 +209,8 @@ pub struct App {
     progress: Option<Progress>,
     error: Option<String>,
     activity: Activity,
+    pending_diagnostics: Option<Diagnostics>,
+    diagnostic_preview: Option<(DiagnosticSource, Diagnostics)>,
     highlight_required_input: bool,
     notice: Option<String>,
     report: ReportBrowser,
@@ -262,6 +281,8 @@ impl App {
             progress: None,
             error: None,
             activity: Default::default(),
+            pending_diagnostics: None,
+            diagnostic_preview: None,
             highlight_required_input: false,
             notice: None,
             report: ReportBrowser::default(),
@@ -405,6 +426,9 @@ impl App {
         }
     }
     fn invalidate(&mut self) {
+        if matches!(self.diagnostic_preview, Some((DiagnosticSource::Review, _))) {
+            self.diagnostic_preview = None;
+        }
         self.prepared = None;
         self.rewrap_size = Default::default();
         self.review_blocker = None;
@@ -520,6 +544,7 @@ impl App {
         let Some(mut prepared) = self.prepared.take() else {
             return;
         };
+        self.pending_diagnostics = Some(Diagnostics::ready(prepared.review()));
         self.completion_subjects = prepared.take_review_subjects();
         self.report = ReportBrowser::default();
         self.start(CONVERTING);
@@ -609,6 +634,12 @@ impl App {
                     .set_title("Save preflight report")
                     .add_filter("JSON report", &["json"])
                     .set_file_name("Any NLE Preflight.json")
+                    .save_file()
+                    .map(|p| vec![p]),
+                Pick::SaveDiagnostics => d
+                    .set_title("Save diagnostics")
+                    .add_filter("JSON report", &["json"])
+                    .set_file_name("Any NLE Diagnostics.json")
                     .save_file()
                     .map(|p| vec![p]),
                 Pick::SavePreset => d
@@ -719,6 +750,9 @@ impl App {
                     self.busy = false;
                     self.wizard.invalidate();
                     self.invalidate();
+                    if let Some(pending) = self.pending_diagnostics.take() {
+                        self.activity.latest_conversion = Some(pending.worker_stopped());
+                    }
                     self.activity.record(message, true);
                 }
                 Event::Progress(p) => self.progress = Some(p),
@@ -773,6 +807,9 @@ impl App {
                     self.report = ReportBrowser::new(&c.report);
                     if c.status == CompletionStatus::Failed {
                         self.activity.record(c.message.clone(), true);
+                    }
+                    if let Some(pending) = self.pending_diagnostics.take() {
+                        self.activity.latest_conversion = Some(pending.completion(&c));
                     }
                     self.completion = Some(c);
                 }
@@ -879,6 +916,15 @@ impl App {
                                 }
                                 Pick::SavePreflightReport => {
                                     self.save_preflight_report(path.clone(), ctx);
+                                }
+                                Pick::SaveDiagnostics => {
+                                    match self.save_diagnostic_preview(path) {
+                                        Ok(()) => {
+                                            self.diagnostic_preview = None;
+                                            self.notice = Some(format!("Diagnostics saved to {}", path.display()));
+                                        }
+                                        Err(error) => self.error = Some(error),
+                                    }
                                 }
                                 Pick::LoadJob => {
                                     #[cfg(target_os = "macos")]
@@ -1414,6 +1460,13 @@ impl App {
                 for action in findings.show(ui) {
                     self.take_review_action(action, ui.ctx());
                 }
+                if !self.busy && (self.review_blocker.is_some() || self.prepared.is_some())
+                    && ui.button("Save diagnostics…").clicked()
+                {
+                    if let Some(report) = self.review_diagnostics() {
+                        self.diagnostic_preview = Some((DiagnosticSource::Review, report));
+                    }
+                }
             }
             review::Panel::Output => review::output(
                 ui,
@@ -1423,6 +1476,69 @@ impl App {
                 &mut self.rewrap_size,
             ),
         });
+    }
+    fn review_diagnostics(&self) -> Option<Diagnostics> {
+        self.prepared.as_ref().map(|prepared| Diagnostics::ready(prepared.review()))
+            .or_else(|| self.review_blocker.as_ref().map(Diagnostics::blocked))
+    }
+
+    fn save_diagnostic_preview(&self, path: &Path) -> Result<(), String> {
+        let (source, report) = self.diagnostic_preview.as_ref().ok_or("Open a diagnostics preview first.")?;
+        if matches!(source, DiagnosticSource::Review) {
+            if let Some(prepared) = &self.prepared {
+                prepared.check_report_path(path)?;
+            } else if self.review_blocker.is_some() {
+                job::check_blocked_report_path(&self.spec(), path)?;
+            } else {
+                return Err("Run Review again before saving diagnostics.".into());
+            }
+        }
+        report.save(path)
+    }
+
+    fn show_diagnostic_preview(&mut self, ctx: &egui::Context) {
+        let Some((_, report)) = &self.diagnostic_preview else { return };
+        let preview = egui::Modal::new(egui::Id::unique("diagnostics-preview")).show(ctx, |ui| {
+            ui.set_max_width(520.);
+            ui.heading("Shareable diagnostics");
+            ui.label(format!("{} · {}", report.stage.label(), report.outcome.label()));
+            ui.small("Includes media decisions and saved edit positions. Names, paths and raw logs are excluded.");
+            if let Some(summary) = report.media_summary() {
+                ui.label(summary);
+            }
+            if let Some(published) = report.project_published {
+                ui.label(if published { "Project published" } else { "Project unpublished" });
+            }
+            const PREVIEW_FINDINGS: usize = 20;
+            let hidden = report.findings.len().saturating_sub(PREVIEW_FINDINGS);
+            egui::ScrollArea::vertical().max_height(260.).show(ui, |ui| {
+                for finding in report.findings.iter().take(PREVIEW_FINDINGS) {
+                    ui.strong(format!("{} · {}", finding.id, finding.explanation()));
+                    let subject = finding.subject();
+                    if !subject.is_empty() {
+                        ui.small(subject);
+                    }
+                    ui.small(finding.action());
+                    ui.add_space(4.);
+                }
+            });
+            if hidden > 0 {
+                ui.small(format!("{hidden} more findings in the export."));
+            }
+            if report.omitted_findings > 0 {
+                ui.small(format!("{} further findings exceeded the export limit.", report.omitted_findings));
+            }
+            ui.horizontal(|ui| (
+                ui.add_enabled(!self.busy, egui::Button::new("Save report…")).clicked(),
+                ui.add_enabled(!self.busy, egui::Button::new("Close")).clicked(),
+            )).inner
+        });
+        let (save, close) = preview.inner;
+        if save {
+            self.pick(Pick::SaveDiagnostics, ctx);
+        } else if !self.busy && (close || preview.should_close()) {
+            self.diagnostic_preview = None;
+        }
     }
     fn finish(&mut self, ui: &mut egui::Ui) {
         let Some(c) = self.completion.as_ref() else {
@@ -1830,7 +1946,12 @@ impl eframe::App for App {
             self.activity.record(error, false);
             ctx.request_repaint();
         }
-        self.activity.show(&ctx);
+        if self.activity.show(&ctx, self.busy) {
+            if let Some(report) = &self.activity.latest_conversion {
+                self.diagnostic_preview = Some((DiagnosticSource::Conversion, report.clone()));
+            }
+        }
+        self.show_diagnostic_preview(&ctx);
         self.help_window(&ctx);
         #[cfg(target_os = "macos")]
         self.relink.show(&ctx, self.ffmpeg.as_deref(), self.ffprobe.as_deref());
@@ -2174,6 +2295,43 @@ pub(crate) mod report_view_tests {
         assert!(app.review_blocker.is_none());
         assert!(!app.wizard.can_convert());
         assert_eq!(app.notice.as_deref(), Some("Cancelled; no project was published."));
+    }
+
+    #[test]
+    fn diagnostics_review_and_activity_export_distinct_outcomes() {
+        let context = egui::Context::default();
+        let mut app = App::session(&context);
+        let directory = tempfile::tempdir().unwrap();
+        let review_path = directory.path().join("review.json");
+        let activity_path = directory.path().join("activity.json");
+        app.wizard.inputs.output = directory.path().join("Preview.prproj");
+        app.review_blocker = Some(ReviewBlocker::new(BlockerKind::RewrapMissingOriginal, "/private/path"));
+        let report = app.review_diagnostics().unwrap();
+        app.diagnostic_preview = Some((DiagnosticSource::Review, report.clone()));
+        app.save_diagnostic_preview(&review_path).unwrap();
+        assert!(app.save_diagnostic_preview(&review_path).is_err());
+        assert!(app.save_diagnostic_preview(&app.wizard.inputs.output.with_file_name("Preview.prproj.anynle-report.json")).is_err());
+        app.diagnostic_preview = None;
+
+        for status in [CompletionStatus::Cancelled, CompletionStatus::Failed, CompletionStatus::Complete] {
+            app.pending_diagnostics = Some(report.clone());
+            let outcome = serde_json::to_value(&status).unwrap();
+            app.receive_events(&context, Some(Event::Finished(Completion {
+                status, output: None, retained_paths: vec![], receipt: None,
+                report: vec![], message: "/private/session/project".into(),
+            })));
+            app.invalidate();
+            let latest = app.activity.latest_conversion.as_ref().unwrap();
+            assert_eq!(serde_json::to_value(latest.outcome).unwrap(), outcome);
+            assert_eq!(latest.stage, anynle_app::diagnostics::Stage::Conversion);
+        }
+        app.diagnostic_preview = Some((DiagnosticSource::Conversion, app.activity.latest_conversion.clone().unwrap()));
+        app.save_diagnostic_preview(&activity_path).unwrap();
+        let raw = std::fs::read_to_string(&activity_path).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(result["stage"], "conversion");
+        assert!(!raw.contains("/private"));
+        assert!(!std::fs::read_to_string(review_path).unwrap().contains("/private"));
     }
 
     #[test]

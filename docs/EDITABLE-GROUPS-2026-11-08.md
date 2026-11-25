@@ -389,3 +389,23 @@ unmarked Any NLE and linked AAF renders. Each isolated mono lane has
 144,144 sample frames and matches the unmarked conversion exactly under
 the same center pan. Each lane is within one PCM24 count of the retained
 AAF render. Source Group marks and markers have their own source receipts.
+## Link camera MOVs with embedded stereo
+
+Separate files supports two continuous ProRes HQ camera MOVs at
+1080p23.976 with embedded 48 kHz stereo PCM24. The original bin masters
+retain their stereo grouping. Graph/2 supplies the independent Group
+selections and placements. Preparation points at the original's mono
+view for audio and verifies that the view has the same media, clocks,
+extent, and physical selectors as the camera master. The existing
+Premiere helper supplies media records, once per distinct original.
+
+In Premiere 27.0.0 build 88, the reopened control retained both source
+paths, both source timecodes of `01:14:00:00`, and all nine timeline
+ranges. Picture and A1 follow A/B/A, with cuts at frames 90 and 135.
+A2 stays on camera A. Picture angles remain editable, and audio that
+differs from the Group default uses a direct link to the selected camera
+channel. Every one of the 192 decoded frames matched the intended camera
+in a comparison with both sources. Both 384,384-sample PCM24 lanes
+matched their Avid Direct Out reference exactly. A combined timeline
+also passed Review, Save As, reopen, and an 864-frame export. Its open
+effect and appearance losses remain in the conversion report.

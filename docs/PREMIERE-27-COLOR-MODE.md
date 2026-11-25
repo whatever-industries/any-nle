@@ -247,10 +247,20 @@ All 24 neutral frames matched between the carriers. Across the graded
 frames the carriers differed by up to 9.32 RGB codes at individual
 pixels, with a maximum whole-frame mean absolute difference of 0.133
 codes. The no-op TIFF source reproduced the large contrast and gain
-misses against Avid. The modeled LUT continues to use Lumetri. The
+misses against Avid. The broader modeled correction still uses Lumetri. The
 shared residual on saturated patches is consistent with the earlier
 Avid component-limiting evidence. The rail-crossing comparison below
 tests that explanation with a second source.
+
+On qualified Premiere-assisted sRGB ProRes with the saved Rec.709
+source interpretation, the writer embeds an isolated SDR Master RGB
+curve as a clip-owned Color Mode LUT. Graph/2 retains the original
+points. Premiere stores the sampled correction as a LUT with editable
+intensity. Premiere 27.0.0 build 88 retained the exact LUT table, source
+interpretation, and independent picture and audio trims after Save As,
+close, and reopen. Exports of the same frame with and without the LUT
+confirmed the expected deeper shadows and brighter highlights. This
+check compares the two Premiere renders.
 
 ### Gain and Contrast on a rail-crossing chart
 
